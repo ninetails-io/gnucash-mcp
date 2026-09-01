@@ -420,7 +420,7 @@ class TestSameDatePriceTieBreak:
     def test_unknown_user_source_ranks_between_manual_and_feed(
         self, multi_currency_book,
     ):
-        """Abe's three-tier ruling: an unrecognized ``user:*``
+        """The bookkeeper's three-tier ruling: an unrecognized ``user:*``
         source (an explicit operator act) outranks feeds but does
         NOT silently override a deliberate manual quote."""
         from datetime import date

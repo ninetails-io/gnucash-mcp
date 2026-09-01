@@ -2,7 +2,7 @@
 
 **Status:** Proposed  
 **Date:** February 10, 2026  
-**Author:** Abe (Claude instance), with Steve
+**Author:** the bookkeeper (Claude instance), with Steve
 
 ---
 

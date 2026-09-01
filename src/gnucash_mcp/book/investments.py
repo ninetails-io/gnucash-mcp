@@ -316,7 +316,7 @@ class InvestmentsMixin:
         book, comm, resolved_currency, price_date, source,
     ) -> str | None:
         """Source of a same-date row that beats ``source`` in the
-        tie-break (``_price_source_rank`` — Abe's ruling: manual
+        tie-break (``_price_source_rank`` — the bookkeeper's ruling: manual
         quote > other user:* > feed), or None when the written row
         is the effective rate for its date.
 

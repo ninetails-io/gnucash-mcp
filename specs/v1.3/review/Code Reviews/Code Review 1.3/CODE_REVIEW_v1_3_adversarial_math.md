@@ -930,4 +930,4 @@ Considered and ruled out — render is acceptable.
 
 4. **The avalanche non-convergence (H-1) is most likely to surface for the bookkeeper's persona-fiction users who carry high-APR credit card debt at marginal budgets.** The silent fail-mode (100-year payoff, multi-million-dollar interest) is exactly the "rationalized lie" pattern Stephen's predecessor flagged as the highest-priority correctness concern.
 
-5. **The placeholder-filter divergence (C-5) is the kind of "two tools that should agree don't" bug Abe / the bookkeeper would surface via cross-tool comparison.** Worth a targeted regression test that exercises both `_compute_net_worth_at` and `balance_sheet` on a book with a placeholder having direct splits.
+5. **The placeholder-filter divergence (C-5) is the kind of "two tools that should agree don't" bug the bookkeeper would surface via cross-tool comparison.** Worth a targeted regression test that exercises both `_compute_net_worth_at` and `balance_sheet` on a book with a placeholder having direct splits.

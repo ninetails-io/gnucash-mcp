@@ -459,7 +459,7 @@ Lin Wei (CNY) are both English-named, which is exactly why this bug
 class was invisible. A third persona with a **native-localized account
 hierarchy** converts the whole class from invisible to a failing test.
 
-- **New persona — Sabine Brenner** (Abe owns the final build): a
+- **New persona — Sabine Brenner** (the bookkeeper owns the final build): a
   Munich freelance Grafikdesignerin / Einzelunternehmerin running the
   **SKR03 Standardkontenrahmen** — the chart a real German sole
   proprietor actually uses, not a tidied-up English-shaped hierarchy.

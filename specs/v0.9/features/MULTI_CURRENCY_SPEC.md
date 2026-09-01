@@ -1,7 +1,7 @@
 # Multi-Currency Support Specification
 ## GnuCash MCP Server Enhancement
 
-**Author:** Abe Raham Jr.  
+**Author:** the bookkeeper  
 **Date:** 2026-02-06  
 **Status:** Draft  
 **Based on:** piecash 1.2.0 documentation, existing gnucash-mcp codebase
