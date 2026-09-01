@@ -596,6 +596,12 @@ history operation destroys real work. Rules:
    capture-rig-invalidating event. For before/after report
    verification, capture against the committed books at HEAD (or
    generate locally and capture both sides same-machine).
+   **The market-data cache IS refreshed per release** (standing as
+   of v1.4.4): `uv run python scripts/synthetic_book/market_data.py
+   --refresh --through <release date>` and commit the updated
+   `market_data_cache.json` — CI's demo-book continuation and every
+   clone-side `continue_book.py` run read it, and a stale cache
+   caps how current the living demo books can be.
 4. Tester/bookkeeper signoff on develop.
 5. **Satisfy Dependabot** — Dependabot scans only the default
    branch, so open alerts persist until a release lands; clearing
