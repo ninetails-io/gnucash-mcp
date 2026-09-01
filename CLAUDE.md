@@ -475,6 +475,18 @@ Three layers:
   zh_CN chart, multi-currency stress), and Sabine Brenner
   (EUR-default, German SKR03 chart — the i18n bug-class oracle).
 
+**Migrating tests across a behavior break.** When a change closes a
+creation path (e.g. the v1.5.0 currency-mismatch post refusal),
+migrate the affected tests by SUBJECT, not mechanically: tests
+whose subject survives the break re-route through the
+correct-practice path (the FX-staleness and tax-conversion tests
+moved to per-currency A/R); tests whose subject IS the
+now-uncreatable historical state engineer that state byte-faithfully
+via raw SQL (post through the still-open door, then flip the rows
+to what warning-era books actually hold). The state outlives the
+door that made it — real books carry it forever, so the guards that
+protect it need tests that can still construct it.
+
 Run with `uv run pytest`. Per-phase synthetic-book rebuild:
 `uv run python scripts/synthetic_book/phase_<N>.py` in order. Each
 phase backs up the book before running.

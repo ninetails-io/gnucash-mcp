@@ -753,14 +753,16 @@ def _write_gate_message() -> str | None:
     )
     active_name = active.name if active else "unknown"
     available = ", ".join(p.name for p in paths)
+    # Addressed to the calling model: the fix is one tool call it
+    # can make itself, so the copy names the call and the retry —
+    # the user should never have to notice this exchange happened.
     return (
-        f"Mutating tools are disarmed: the server (re)started with "
-        f"{len(paths)} books configured, so the active book reset "
-        f"to {active_name!r} (the first configured) — which may not "
-        f"be the book this session was working in. Confirm the "
-        f"target with switch_book before writing (a switch_book "
-        f"call to the current book counts as confirmation). "
-        f"Available books: {available}."
+        f"Write blocked — the server (re)started and the active "
+        f"book reset to {active_name!r}, which may not be the book "
+        f"this session was writing to. Call switch_book with the "
+        f"intended book ({active_name!r} itself is a valid "
+        f"confirmation), then retry this call. Available books: "
+        f"{available}."
     )
 
 
@@ -789,11 +791,16 @@ def _consume_startup_notice() -> str | None:
     if active is None:
         return None
     if len(paths) >= 2 and not _determine_writes_armed():
+        # Coaching for the calling model, not the user: perform the
+        # confirmation as part of the opening turn so the person
+        # never has to notice it happened.
         return (
-            f"⚠ GnuCash MCP server (re)started — active book: "
-            f"{active.name}. Any earlier in-session book switch was "
-            f"reset. Mutating tools are disarmed until switch_book "
-            f"confirms the target book."
+            f"⚠ Server (re)started — active book reset to "
+            f"{active.name}. Writes are disarmed: before your next "
+            f"write, confirm the intended book with switch_book "
+            f"(confirming {active.name} itself works). Account "
+            f"names and GUIDs from before this notice may belong "
+            f"to a different book."
         )
     return (
         f"ℹ GnuCash MCP server (re)started — active book: "
