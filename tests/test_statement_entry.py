@@ -1676,3 +1676,91 @@ class TestSignalSweepAmortization:
         classes = _classes(res)
         assert classes["1"] == classes["2"]  # both prep'd alike
         assert sweep_calls["n"] == 1
+
+
+class TestCandidateUniverseQueryBudget:
+    """Release-review finding 8: the candidate-universe filter reads
+    s.transaction.post_date for every split of the statement account,
+    and Split.transaction is a lazy many-to-one — without the
+    account-scoped warm-up query, that is one SELECT per transaction,
+    O(account history) round-trips per enter_statement call, paid by
+    dry-run and commit alike. The warm-up's strong reference is
+    load-bearing (the identity map holds rows weakly). Mutation-
+    verified: removing the warm-up adds one statement per filler
+    transaction and blows the budget."""
+
+    def test_query_count_flat_in_account_history(self, statement_book):
+        from sqlalchemy import event
+
+        # Grow the account's history with 40 transactions far
+        # OUTSIDE the statement window: classification work stays
+        # constant, but the universe loop still reads every split's
+        # transaction — the lazy version pays one SELECT per filler.
+        b = piecash.open_book(
+            str(statement_book), readonly=False, do_backup=False
+        )
+        usd = b.default_currency
+        checking = b.accounts(fullname="Assets:Checking")
+        groceries = b.accounts(fullname="Expenses:Groceries")
+        for i in range(40):
+            piecash.Transaction(
+                currency=usd, description=f"filler {i}",
+                post_date=date(2025, 1 + i % 12, 1 + i % 27),
+                splits=[
+                    piecash.Split(account=checking, value=Decimal("-1")),
+                    piecash.Split(account=groceries, value=Decimal("1")),
+                ],
+            )
+        b.save()
+        b.close()
+
+        gc = GnuCashBook(str(statement_book))
+        lines = [
+            _line("1", date(2026, 7, 3), "-87.12",
+                  description="Whole Foods", raw="POS WF"),
+            _line("2", date(2026, 7, 15), "3200.00",
+                  description="Payroll", raw="ACH PAYROLL"),
+        ]
+        statements: list[str] = []
+        real_open = gc.open
+
+        class _CountingCtx:
+            def __init__(self, ctx):
+                self._ctx = ctx
+
+            def __enter__(self):
+                book = self._ctx.__enter__()
+                engine = book.session.get_bind()
+
+                def _record(conn, cursor, statement, parameters,
+                            context, executemany):
+                    statements.append(statement)
+
+                self._engine = engine
+                self._record = _record
+                event.listen(engine, "before_cursor_execute", _record)
+                return book
+
+            def __exit__(self, *exc):
+                event.remove(
+                    self._engine, "before_cursor_execute", self._record
+                )
+                return self._ctx.__exit__(*exc)
+
+        gc.open = lambda **kw: _CountingCtx(real_open(**kw))
+        try:
+            gc.enter_statement(
+                "Assets:Checking", date(2026, 7, 31), _OPEN,
+                "4112.88", lines, dry_run=True,
+            )
+        finally:
+            gc.open = real_open
+
+        # Measured: ~26 statements with the warm-up regardless of
+        # history; the lazy version adds ~1 per account transaction
+        # (45 here), landing ~66+. The threshold sits between.
+        assert len(statements) < 40, (
+            f"{len(statements)} SQL statements for a 2-line dry-run "
+            f"on a 45-transaction account — the candidate universe "
+            f"is lazy-loading transactions per split again"
+        )

@@ -38,9 +38,17 @@ class TestManifestContract:
         """Every env var the server's bundle paths read must be set
         by the manifest — a server-side rename may not leave the
         manifest feeding a dead variable."""
-        from gnucash_mcp.server import _ENV_MODULE_TOGGLES
+        from gnucash_mcp.server import (
+            _ENV_MODULE_TOGGLES,
+            _RETIRED_ENV_TOGGLES,
+        )
         env = manifest["server"]["mcp_config"]["env"]
-        expected = set(_ENV_MODULE_TOGGLES) | {
+        # Retired toggles are honored from stored configs but are
+        # deliberately absent from the installer UI (finding 4:
+        # freelancer's surface never joined the always-on base).
+        expected = (
+            set(_ENV_MODULE_TOGGLES) - _RETIRED_ENV_TOGGLES
+        ) | {
             "GNUCASH_DEMO_BOOKS",
             "GNUCASH_DEMO_DIR",
             "GNUCASH_MCP_ADVANCED",

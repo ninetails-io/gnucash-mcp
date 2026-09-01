@@ -1557,6 +1557,36 @@ class TestRestartSafety:
             return _json({"status": "ok"})
         assert json.loads(fake_read()) == {"status": "ok"}
 
+    def test_transient_path_failure_does_not_cache_armed(
+        self, two_books, monkeypatch,
+    ):
+        """Release-review finding 6: a transiently unresolvable book
+        config must not permanently arm writes. The gate fails open
+        for the blind call but leaves the verdict undetermined; once
+        the config is visible again, the multi-book disarm engages."""
+        import gnucash_mcp.server as srv
+        alex, beast = two_books
+        # Fresh process state with an UNRESOLVABLE config: two paths,
+        # one missing (parse raises → _configured_paths returns []).
+        joined = f"{alex}{os.pathsep}{beast}"
+        monkeypatch.setenv(
+            "GNUCASH_BOOK_PATH",
+            f"{alex}{os.pathsep}{beast}.missing",
+        )
+        srv._book_paths = []
+        srv._book_paths_source = None
+        srv._book_registry = {}
+        srv._book = None
+        srv._current_path = None
+        srv._writes_armed = None
+        srv._startup_notice_pending = False
+        assert srv._write_gate_message() is None  # blind → fail open
+        assert srv._writes_armed is None  # …but NOT cached
+        # The "mount returns": config becomes visible, gate engages.
+        monkeypatch.setenv("GNUCASH_BOOK_PATH", joined)
+        out = json.loads(self._fake_write_tool()())
+        assert out["error_type"] == "active_book_unconfirmed"
+
     # ── Piece 3: the book stamp ────────────────────────────────────
 
     def test_write_stamp_names_active_book(self, two_books, monkeypatch):
@@ -1984,13 +2014,29 @@ class TestEnvModuleToggles:
 
     def test_retired_toggles_are_ignored(self, monkeypatch):
         """An old install's stored config (pre-unification manifest)
-        may still export the retired toggles; they must neither
-        trigger composition alone nor subtract from the base."""
+        may still export the retired PLANNING/INVESTMENTS toggles;
+        they must neither trigger composition alone nor subtract
+        from the base (their surfaces joined it)."""
         from gnucash_mcp.server import _modules_from_env_toggles
         monkeypatch.setenv("GNUCASH_ENABLE_INVESTMENTS", "false")
         monkeypatch.setenv("GNUCASH_ENABLE_PLANNING", "false")
         assert _modules_from_env_toggles() is None
         monkeypatch.setenv("GNUCASH_ENABLE_BUSINESS", "false")
+        assert (_modules_from_env_toggles()
+                == "reporting,budgets,scheduling,investor")
+
+    def test_retired_freelancer_toggle_still_honored(self, monkeypatch):
+        """Release-review finding 4: freelancer's surface did NOT
+        join the base, so an old install that answered
+        freelancer=yes, business=no must keep its invoicing tools —
+        ignoring the stored toggle would silently subtract them."""
+        from gnucash_mcp.server import _modules_from_env_toggles
+        monkeypatch.setenv("GNUCASH_ENABLE_BUSINESS", "false")
+        monkeypatch.setenv("GNUCASH_ENABLE_FREELANCER", "true")
+        assert (_modules_from_env_toggles()
+                == "reporting,budgets,scheduling,investor,freelancer")
+        # freelancer=false stays base-only (no accidental additions).
+        monkeypatch.setenv("GNUCASH_ENABLE_FREELANCER", "false")
         assert (_modules_from_env_toggles()
                 == "reporting,budgets,scheduling,investor")
 

@@ -2912,10 +2912,28 @@ class CoreMixin:
         - **Undated rows** can't anchor cadence or duplicate-window
           math.
         """
+        from sqlalchemy.orm import selectinload
+
+        from piecash.core.transaction import Transaction
+
         template_guids = self._template_account_guids(book)
+        # Bulk-load every transaction WITH its splits collection in
+        # two indexed queries — the voided-source filter below reads
+        # ``txn.splits`` for every row, and the lazy per-transaction
+        # collection load was one SELECT each: O(book transactions)
+        # round-trips per sweep, on exactly the large books this
+        # hoist exists for (release-review finding 8, second half).
+        # The swept list keeps the surviving rows (and their loaded
+        # splits) strongly referenced for the session — the identity
+        # map alone holds them weakly.
+        loaded = (
+            book.session.query(Transaction)
+            .options(selectinload(Transaction.splits))
+            .all()
+        )
         swept = [
             (txn, txn.description.lower())
-            for txn in book.transactions
+            for txn in loaded
             if txn.post_date is not None
             and not self._is_template_transaction(txn, template_guids)
             and not any(_is_voided(s) for s in txn.splits)
@@ -4325,6 +4343,29 @@ class CoreMixin:
 
             split_prefixes = self._split_prefix_map(book)
 
+            # Warm this account's transaction rows in ONE indexed
+            # query before the universe filter touches
+            # s.transaction.post_date per split — the lazy
+            # many-to-one was a SELECT per transaction, making the
+            # headline workflow O(account history) in round-trips on
+            # large books, paid by dry-run and commit alike
+            # (release-review finding 8). Account-scoped on purpose:
+            # _preload_split_graph loads the whole book, which a
+            # single-statement entry never needs. The strong
+            # reference is load-bearing — the identity map holds
+            # rows only weakly (same trap the preload documents).
+            from piecash.core.transaction import (
+                Split as _Split,
+                Transaction as _Txn,
+            )
+            _txn_keepalive = (  # noqa: F841 — keepalive, see above
+                book.session.query(_Txn)
+                .join(_Split, _Split.transaction_guid == _Txn.guid)
+                .filter(_Split.account_guid == account.guid)
+                .distinct()
+                .all()
+            )
+
             # Candidate universe: this account's splits within the
             # match window of any line. Ruling 1: window 31 days —
             # one day wider than the duplicate screen, so a monthly
@@ -4560,7 +4601,7 @@ class CoreMixin:
                 f"{s.quantity}, but the line says {ln['amount']} "
                 f"as printed ({book_amount} in book convention) — "
                 f"wrong split, or fix the book entry first "
-                f"(update_transaction), then claim it"
+                f"(update_transactions), then claim it"
             )
         if s.reconcile_state == "y":
             return s, "overlap"

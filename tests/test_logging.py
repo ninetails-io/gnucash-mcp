@@ -2017,6 +2017,26 @@ class TestRedactPaths:
         text = "Path: /Users/alice/secret.gnucash"
         assert self._rp(text) == text
 
+    def test_unparseable_value_fails_closed(self, monkeypatch):
+        """Release-review finding 7: a typo'd toggle must not
+        silently disable a privacy control. The toggle now parses
+        through the _parse_env_toggle chokepoint; unparseable
+        values fail CLOSED (redaction ON) and record an _env_error
+        so main()-run servers exit loudly at startup."""
+        from gnucash_mcp import _env as env_mod
+        monkeypatch.setenv("GNUCASH_REDACT_PATHS", "ture")
+        before = len(env_mod._env_errors)
+        text = "Path: /Users/alice/secret.gnucash"
+        result = self._rp(text)
+        assert "/Users/alice" not in result  # fail closed: redacted
+        assert "secret.gnucash" in result
+        assert len(env_mod._env_errors) == before + 1
+        assert "GNUCASH_REDACT_PATHS" in env_mod._env_errors[-1]
+        # Memoized: a second call must not re-record the error.
+        self._rp(text)
+        assert len(env_mod._env_errors) == before + 1
+        env_mod._env_errors.pop()  # leave global state clean
+
     def test_posix_path_redacted(self, monkeypatch):
         monkeypatch.setenv("GNUCASH_REDACT_PATHS", "1")
         text = "GnuCash book not found: /Users/stephen/Books/alex.gnucash"

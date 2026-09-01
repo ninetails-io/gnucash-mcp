@@ -74,7 +74,7 @@ DOUBLE-ENTRY SIGN CONVENTION:
 - Positive = debit (increases Asset/Expense, decreases Liability/Income/Equity).
 - Negative = credit (reverse).
 - Credit card payment: checking -200, card +200. Income: checking +3000, income -3000.
-INVESTMENT FLOW: create_lot → create_transaction (with quantity/cost) → assign_split_to_lot → create_price → calculate_lot_gain.
+INVESTMENT FLOW: create_lot → create_transactions (a one-row batch with qty/cost columns) → assign_split_to_lot → create_price → calculate_lot_gain.
 SLOTS: get_account_slots / set_account_slot store per-account metadata (APR, credit limit, statement day) as strings.
 OUTPUT: every tool's compact default is complete — verbose=true adds structure (JSON), not information. Compact is cheaper; prefer it unless you need machine-readable fields.
 SAFETY: Reconciled splits are protected (use force=true to override). Prefer void_transaction over delete for audit trail. delete_account is blocked if account has children or transactions.
@@ -731,10 +731,26 @@ def _configured_paths() -> list[Path]:
 
 
 def _determine_writes_armed() -> bool:
-    """Resolve (and cache) the disarm state on first use."""
+    """Resolve (and cache) the disarm state on first use.
+
+    Caches ONLY when the book config is actually visible
+    (release-review finding 6): _configured_paths() returns [] both
+    for an unset env and for a transiently unresolvable path (cloud
+    sync, unmounted volume), and permanently caching armed=True off
+    that blank would disable the multi-book disarm for the process —
+    a wrong-ledger write sailing through minutes later when the
+    mount returns. An empty view arms THIS call (there is nothing to
+    gate against) but leaves the verdict undetermined, so the gate
+    re-asks until the config can be seen. main()-run servers
+    fail-fast on bad paths before serving; this guards the entry
+    points that skip main() (mcp dev, tests, SDK embedding).
+    """
     global _writes_armed
     if _writes_armed is None:
-        _writes_armed = len(_configured_paths()) < 2
+        paths = _configured_paths()
+        if not paths:
+            return True  # fail open for this call, but don't cache
+        _writes_armed = len(paths) < 2
     return _writes_armed
 
 
@@ -1560,21 +1576,36 @@ def _parse_cli_argv(
     return book_args, debug_flag, noaudit_flag, modules_value
 
 
-# The MCPB bundle's only module interface: each manifest checkbox
-# lands as one of these env vars, rendered "true"/"false" by the
-# host app. Values map to module/group names in TOOL_MODULES /
-# MODULE_GROUPS ("planning" spans two leaf modules).
+# The MCPB bundle's module interface: each manifest checkbox lands
+# as one of these env vars, rendered "true"/"false" by the host app.
+# Values map to module/group names in TOOL_MODULES / MODULE_GROUPS.
+# GNUCASH_ENABLE_BUSINESS is the only var the CURRENT manifest sets
+# (the one question). GNUCASH_ENABLE_FREELANCER is retired from the
+# manifest but still HONORED: unlike planning/investments, the
+# freelancer surface did NOT join the always-on base, so ignoring a
+# stored freelancer=true would subtract the invoicing tools from an
+# old install (release-review finding 4 — a pre-#163 bundle install
+# that answered freelancer=yes, business=no must keep its surface).
 _ENV_MODULE_TOGGLES: dict[str, tuple[str, ...]] = {
     "GNUCASH_ENABLE_BUSINESS": ("business",),
+    "GNUCASH_ENABLE_FREELANCER": ("freelancer",),
 }
+
+# Honored when present in the environment, but deliberately absent
+# from the current manifest's installer UI. The manifest contract
+# test exempts these; everything else in _ENV_MODULE_TOGGLES must
+# appear in manifest.json.
+_RETIRED_ENV_TOGGLES: frozenset[str] = frozenset(
+    {"GNUCASH_ENABLE_FREELANCER"}
+)
 
 # The bundle base: what every install gets before the one question.
 # Planning and investments joined it 2026-08-31 (maintainer ruling:
 # too common a need to gate — even a 401(k) wants the portfolio
 # surface, and budgets/scheduling are too small a set to be worth an
 # installer decision). The retired GNUCASH_ENABLE_PLANNING /
-# _INVESTMENTS / _FREELANCER variables are ignored if present — an
-# old install's stored config must not subtract from the new base.
+# _INVESTMENTS variables are ignored if present — their surfaces are
+# in the base, so an old install's stored config cannot subtract.
 _ENV_TOGGLE_BASE = ("reporting", "budgets", "scheduling", "investor")
 
 
@@ -1696,8 +1727,11 @@ Environment variables:
                              When set, modules = core + reporting +
                              budgets + scheduling + investor, plus the
                              business suite when true. The retired
-                             _PLANNING/_INVESTMENTS/_FREELANCER toggles
-                             are ignored (that surface is now always on).
+                             _PLANNING/_INVESTMENTS toggles are ignored
+                             (their surface is now always on); the
+                             retired _FREELANCER toggle is still honored
+                             (its invoicing surface is NOT in the base,
+                             so old freelancer-only installs keep it).
                              --modules / GNUCASH_MCP_MODULES win when set.
   GNUCASH_MCP_DEBUG=true     Enable debug logging (true/1/yes/on)
   GNUCASH_MCP_NOAUDIT=true   Disable audit logging (true/1/yes/on)

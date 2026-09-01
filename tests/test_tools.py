@@ -1332,6 +1332,82 @@ class TestConsolidatedBusinessSurface:
         ))
         assert result["status"] == "deleted"
 
+    def test_create_document_refuses_inapplicable_params(
+        self, setup_book_env,
+    ):
+        """Release-review finding 3: applies_to_id and job_id are
+        declared for every document_type but only some branches
+        forward them — a supplied-but-inapplicable value must
+        refuse loudly, never silently evaporate."""
+        c = json.loads(server_module.create_party(
+            party_type="customer", name="Scoped Params LLC",
+        ))
+        e = json.loads(server_module.create_party(
+            party_type="employee", name="Casey Scoped",
+        ))
+        err = json.loads(server_module.create_document(
+            document_type="invoice", owner_id=c["id"],
+            applies_to_id="000001",
+        ))
+        assert err["error_type"] == "validation_error"
+        assert "credit_note" in err["error"]
+        err = json.loads(server_module.create_document(
+            document_type="voucher", owner_id=e["id"],
+            job_id="000001",
+        ))
+        assert err["error_type"] == "validation_error"
+        assert "job" in err["error"]
+        # The applicable combinations still work.
+        ok = json.loads(server_module.create_document(
+            document_type="invoice", owner_id=c["id"],
+        ))
+        assert ok.get("error") is None, ok
+
+    def test_delete_document_credit_note_id_collision(
+        self, setup_book_env,
+    ):
+        """Release-review finding 2: ID counters are per type, so a
+        customer credit note can share its ID with a vendor-side
+        document. delete_document must offer the disambiguation the
+        collision error demands — party_type — instead of a dead
+        end. A meaningless party_type on a typed species refuses
+        loudly (never silently ignored)."""
+        c = json.loads(server_module.create_party(
+            party_type="customer", name="Collide LLC",
+        ))
+        v = json.loads(server_module.create_party(
+            party_type="vendor", name="Collide Supplies",
+        ))
+        inv = json.loads(server_module.create_document(
+            document_type="invoice", owner_id=c["id"],
+        ))
+        cn = json.loads(server_module.create_document(
+            document_type="credit_note", owner_id=c["id"],
+            party_type="customer", applies_to_id=inv["id"],
+        ))
+        # Vendor-side documents until one collides with the credit
+        # note's ID (per-type counters run independently).
+        for _ in range(2):
+            bill = json.loads(server_module.create_document(
+                document_type="bill", owner_id=v["id"],
+            ))
+            if bill["id"] == cn["id"]:
+                break
+        assert bill["id"] == cn["id"], (cn["id"], bill["id"])
+        # Disambiguated delete succeeds.
+        result = json.loads(server_module.delete_document(
+            document_type="credit_note", id=cn["id"],
+            party_type="customer",
+        ))
+        assert result["status"] == "deleted"
+        # party_type on a typed species is refused, not ignored.
+        err = json.loads(server_module.delete_document(
+            document_type="bill", id=bill["id"],
+            party_type="vendor",
+        ))
+        assert err["error_type"] == "validation_error"
+        assert "credit_note" in err["error"]
+
     def test_list_documents_doc_type_filter(self, setup_book_env):
         c = json.loads(server_module.create_party(
             party_type="customer", name="Filter Co",

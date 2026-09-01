@@ -67,8 +67,8 @@ def _parse_transactions_tsv(tsv: str) -> list[dict]:
         if len(fields) <= fixed:
             # No split cells at all: an auto-fill request — the book
             # layer reproduces the most recent matching-description
-            # transaction (create_transaction's omitted-splits
-            # contract), or rejects the row when nothing matches.
+            # transaction (the omitted-splits contract), or rejects
+            # the row when nothing matches.
             splits: list[dict] = []
         else:
             try:
@@ -301,8 +301,8 @@ def register(mcp, get_book) -> None:
     ) -> str:
         """Create transactions in one atomic command (bulk entry) —
         the canonical entry tool for one transaction or many. A
-        single transaction is a one-row batch; the deprecated
-        ``create_transaction`` redirects here.
+        single transaction is a one-row batch (the former
+        ``create_transaction`` tool was removed; this replaces it).
 
         INPUT — ``transactions`` is a TSV block: a header row, then one
         row per transaction. The HEADER DECLARES THE LAYOUT. Base form:
@@ -381,8 +381,7 @@ def register(mcp, get_book) -> None:
         AUTO-FILL — a row with NO split cells at all (ends right
         after ``description``/``notes``) reproduces the most recent
         transaction with the same description — splits, memos, and
-        quantities included — exactly like calling
-        ``create_transaction`` without ``splits``::
+        quantities included::
 
             1<TAB>2026-07-01<TAB>Rent
             2<TAB>2026-07-01<TAB>Netflix
@@ -404,9 +403,9 @@ def register(mcp, get_book) -> None:
           STRINGS (never raw JSON numbers). Each transaction needs
           >=2 splits balancing to zero in the default currency. Rows
           may differ in width (2 splits vs 3).
-        - The transaction currency is always the book default — for
-          a transaction denominated in another currency, use
-          ``create_transaction`` with its ``currency`` parameter.
+        - The transaction currency is the book default unless the
+          row declares one via the ``cur`` column (see
+          PER-TRANSACTION CURRENCY above).
 
         BEHAVIOR — one book-open, one atomic save:
         - A STRUCTURAL error (unbalanced, unknown account, bad pairs)
@@ -414,7 +413,7 @@ def register(mcp, get_book) -> None:
           ``on_error="skip"`` to write the good rows and reject only the
           bad ones.
         - A duplicate rejects ONLY its row; ``force=True`` overrides all
-          blocking duplicates (as in ``create_transaction``).
+          blocking duplicates.
           ``dry_run=True`` validates + screens without writing.
 
         OUTPUT — a JSON envelope of two TSV tables joined by ``ref``:
@@ -849,10 +848,10 @@ def register(mcp, get_book) -> None:
         rejected per row unless ``force=true`` (they shift the
         transaction out of its reconciled statement period).
         Returns a results TSV keyed by your input guids. This is
-        the canonical update tool for one transaction or many; the
-        deprecated ``update_transaction`` redirects here (same
-        value across many transactions = the same cells repeated
-        per row).
+        the canonical update tool for one transaction or many (the
+        former ``update_transaction`` tool was removed; this
+        replaces it — same value across many transactions = the
+        same cells repeated per row).
         """
         book = get_book()
         rows = _parse_update_tsv(updates)

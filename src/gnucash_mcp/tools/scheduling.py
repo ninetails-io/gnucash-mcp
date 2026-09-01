@@ -32,7 +32,7 @@ def register(mcp, get_book) -> None:
         Args:
             name: Scheduled transaction name (e.g., "Monthly Rent").
             description: Transaction description at instantiation.
-            splits: Same format as create_transaction, e.g.
+            splits: List of split dicts, e.g.
                 ``[{"account": "Expenses:Rent", "amount": "1850.00"}, ...]``.
                 ``amount`` / ``quantity`` must be decimal strings;
                 ``quantity`` is required when an account's commodity
