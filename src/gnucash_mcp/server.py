@@ -731,10 +731,26 @@ def _configured_paths() -> list[Path]:
 
 
 def _determine_writes_armed() -> bool:
-    """Resolve (and cache) the disarm state on first use."""
+    """Resolve (and cache) the disarm state on first use.
+
+    Caches ONLY when the book config is actually visible
+    (release-review finding 6): _configured_paths() returns [] both
+    for an unset env and for a transiently unresolvable path (cloud
+    sync, unmounted volume), and permanently caching armed=True off
+    that blank would disable the multi-book disarm for the process —
+    a wrong-ledger write sailing through minutes later when the
+    mount returns. An empty view arms THIS call (there is nothing to
+    gate against) but leaves the verdict undetermined, so the gate
+    re-asks until the config can be seen. main()-run servers
+    fail-fast on bad paths before serving; this guards the entry
+    points that skip main() (mcp dev, tests, SDK embedding).
+    """
     global _writes_armed
     if _writes_armed is None:
-        _writes_armed = len(_configured_paths()) < 2
+        paths = _configured_paths()
+        if not paths:
+            return True  # fail open for this call, but don't cache
+        _writes_armed = len(paths) < 2
     return _writes_armed
 
 

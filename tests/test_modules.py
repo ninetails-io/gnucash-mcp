@@ -1557,6 +1557,36 @@ class TestRestartSafety:
             return _json({"status": "ok"})
         assert json.loads(fake_read()) == {"status": "ok"}
 
+    def test_transient_path_failure_does_not_cache_armed(
+        self, two_books, monkeypatch,
+    ):
+        """Release-review finding 6: a transiently unresolvable book
+        config must not permanently arm writes. The gate fails open
+        for the blind call but leaves the verdict undetermined; once
+        the config is visible again, the multi-book disarm engages."""
+        import gnucash_mcp.server as srv
+        alex, beast = two_books
+        # Fresh process state with an UNRESOLVABLE config: two paths,
+        # one missing (parse raises → _configured_paths returns []).
+        joined = f"{alex}{os.pathsep}{beast}"
+        monkeypatch.setenv(
+            "GNUCASH_BOOK_PATH",
+            f"{alex}{os.pathsep}{beast}.missing",
+        )
+        srv._book_paths = []
+        srv._book_paths_source = None
+        srv._book_registry = {}
+        srv._book = None
+        srv._current_path = None
+        srv._writes_armed = None
+        srv._startup_notice_pending = False
+        assert srv._write_gate_message() is None  # blind → fail open
+        assert srv._writes_armed is None  # …but NOT cached
+        # The "mount returns": config becomes visible, gate engages.
+        monkeypatch.setenv("GNUCASH_BOOK_PATH", joined)
+        out = json.loads(self._fake_write_tool()())
+        assert out["error_type"] == "active_book_unconfirmed"
+
     # ── Piece 3: the book stamp ────────────────────────────────────
 
     def test_write_stamp_names_active_book(self, two_books, monkeypatch):
