@@ -3514,8 +3514,9 @@ class TestTaxtableCrossCurrency:
     account's commodity differs from the invoice currency."""
 
     def _setup_eur_with_usd_gst(self, business_book, rate="1.10"):
-        """Wire up: EUR commodity, EUR/USD price, USD GST Payable
-        account (in the book's default USD), EUR-denominated
+        """Wire up: EUR commodity, EUR/USD price, EUR A/R (ruling 1:
+        the post account must match the document currency), USD GST
+        Payable account (in the book's default USD), EUR-denominated
         customer + invoice. Returns the GnuCashBook handle."""
         import piecash
         from datetime import date as date_cls
@@ -3527,6 +3528,13 @@ class TestTaxtableCrossCurrency:
             )
             bk.session.add(eur)
             bk.flush()
+            assets = next(
+                a for a in bk.accounts if a.fullname == "Assets"
+            )
+            bk.session.add(piecash.Account(
+                name="AR EUR", type="RECEIVABLE",
+                parent=assets, commodity=eur,
+            ))
             bk.session.add(piecash.Price(
                 commodity=eur, currency=bk.default_currency,
                 date=date_cls(2026, 5, 24),
@@ -3567,7 +3575,7 @@ class TestTaxtableCrossCurrency:
         )
         result = gb.post_invoice(
             invoice_id="000001",
-            post_account="Assets:Accounts Receivable",
+            post_account="Assets:AR EUR",
             # Pin to the price date so the FX freshness guard
             # doesn't fire — this test exercises tax conversion
             # math, not rate staleness.
@@ -3583,11 +3591,11 @@ class TestTaxtableCrossCurrency:
             s["account"]: (Decimal(s["value"]), Decimal(s["quantity"]))
             for s in txn["splits"]
         }
-        # A/R is RECEIVABLE in USD (fixture default). value is in
-        # EUR (transaction currency); quantity converts to USD.
-        ar_value, ar_quantity = by_acct["Assets:Accounts Receivable"]
+        # A/R matches the document currency (ruling 1), so value
+        # and quantity agree in EUR.
+        ar_value, ar_quantity = by_acct["Assets:AR EUR"]
         assert ar_value == Decimal("105.00")
-        assert ar_quantity == Decimal("115.50")  # 105 × 1.10
+        assert ar_quantity == Decimal("105.00")
         # Income split is in USD (fixture default).
         inc_value, inc_quantity = by_acct["Income:Sales"]
         assert inc_value == Decimal("-100.00")
@@ -3610,16 +3618,27 @@ class TestTaxtableCrossCurrency:
         """When no price is on file for the EUR/USD pair near
         post date, posting raises a clear error — the same
         rate-not-found path already exercised by non-tax
-        cross-currency posting."""
+        cross-currency posting. The EUR document posts to a
+        EUR-denominated A/R (ruling 1 refuses mismatched post
+        accounts); the conversion needing a rate is the USD tax
+        and income legs."""
         import piecash
         gb = GnuCashBook(str(business_book))
-        # Add EUR commodity but no price.
+        # Add EUR commodity + EUR A/R, but no price.
         with gb.open(readonly=False) as bk:
             eur = piecash.Commodity(
                 namespace="CURRENCY", mnemonic="EUR",
                 fullname="Euro", fraction=100,
             )
             bk.session.add(eur)
+            bk.flush()
+            assets = next(
+                a for a in bk.accounts if a.fullname == "Assets"
+            )
+            bk.session.add(piecash.Account(
+                name="AR EUR", type="RECEIVABLE",
+                parent=assets, commodity=eur,
+            ))
             bk.save()
         gb.create_account(
             name="GST Payable",
@@ -3644,7 +3663,7 @@ class TestTaxtableCrossCurrency:
         with pytest.raises(ValueError, match="exchange rate"):
             gb.post_invoice(
                 invoice_id="000001",
-                post_account="Assets:Accounts Receivable",
+                post_account="Assets:AR EUR",
             )
 
 
@@ -5734,13 +5753,15 @@ class TestCreditNotePr87ReviewFollowups:
         message that points at the per-currency A/R convention
         as the fix.
 
-        Setup uses raw piecash to engineer the cross-currency
-        post state directly (EUR/USD price via piecash.Price,
-        EUR customer + EUR credit note posted to USD A/R).
-        The full posting flow validates the cross-currency
-        guard fires at apply time, not at post."""
+        Setup engineers the mismatched state the way a real book
+        carries it: documents posted (matched) under the current
+        code, then their currency flipped to EUR via raw SQL —
+        simulating a book whose mismatched postings predate the
+        v1.5.0 post_invoice refusal (battery ruling 1). The guard
+        exists precisely for those historical lots."""
         import piecash
         from datetime import date as date_cls
+        from sqlalchemy import text as sql_text
         gb = GnuCashBook(str(business_book))
         # Add EUR + EUR/USD price via raw piecash (same pattern
         # the multi_currency tests use in test_book.py).
@@ -5760,8 +5781,9 @@ class TestCreditNotePr87ReviewFollowups:
             ))
             bk.save()
         gb.create_customer(name="Berlin GmbH", currency="EUR")
-        # Source invoice in EUR posted to USD A/R (cross-currency)
-        src = gb.create_invoice(customer_id="000001")
+        # Post both documents matched (USD invoice → USD A/R) —
+        # the only door the current code leaves open…
+        src = gb.create_invoice(customer_id="000001", currency="USD")
         gb.add_invoice_entry(
             invoice_id=src["id"], account="Income:Sales",
             description="x", quantity="1", price="500",
@@ -5770,13 +5792,11 @@ class TestCreditNotePr87ReviewFollowups:
             invoice_id=src["id"],
             post_account="Assets:Accounts Receivable",
             owner_type="customer",
-            # Pin to the price date; this test targets the apply-
-            # time cross-currency guard, not FX rate staleness.
             post_date="2026-05-24",
         )
         cn = gb.create_credit_note(
             owner_id="000001", owner_type="customer",
-            applies_to_invoice_id=src["id"],
+            applies_to_invoice_id=src["id"], currency="USD",
         )
         gb.add_credit_note_entry(
             credit_note_id=cn["id"], account="Income:Sales",
@@ -5788,6 +5808,16 @@ class TestCreditNotePr87ReviewFollowups:
             owner_type="customer",
             post_date="2026-05-24",
         )
+        # …then flip both documents' currency to EUR via raw SQL,
+        # reproducing a warning-era book's mismatched postings.
+        with gb.open(readonly=False) as bk:
+            eur_guid = bk.session.execute(sql_text(
+                "SELECT guid FROM commodities WHERE mnemonic = 'EUR'"
+            )).scalar_one()
+            bk.session.execute(sql_text(
+                "UPDATE invoices SET currency = :eur"
+            ), {"eur": eur_guid})
+            bk.save()
         with pytest.raises(
             ValueError, match="Cross-currency apply not supported",
         ):
@@ -8612,13 +8642,19 @@ class TestPayInvoice:
         invoice-currency units, leaving a residual balance the bank
         had already paid for.
 
-        Setup: USD-default book, USD A/R account, EUR invoice,
-        EUR/USD = 1.10. Post a €4,500 invoice → A/R debited 4,950
-        USD. Pay €4,500 from USD checking → A/R must credit 4,950
-        USD (not 4,500), leaving the A/R balance at exactly zero.
+        Setup: USD-default book, USD A/R account, EUR invoice
+        carried at EUR/USD = 1.10 → A/R holds 4,950 USD. Pay €4,500
+        from USD checking → A/R must credit 4,950 USD (not 4,500),
+        leaving the A/R balance at exactly zero.
+
+        post_invoice refuses this pairing since v1.5.0 (battery
+        ruling 1); the state is engineered via raw SQL the way
+        warning-era books still carry it — pay_invoice must relieve
+        those lots correctly forever.
         """
         import piecash
         from datetime import date as _date
+        from sqlalchemy import text as sql_text
 
         gb = GnuCashBook(str(business_book))
         # Add EUR commodity + price + a USD A/R account specifically.
@@ -8648,7 +8684,7 @@ class TestPayInvoice:
 
         gb.create_customer(name="Berlin Digital", currency="EUR")
         gb.create_invoice(
-            customer_id="000001", currency="EUR",
+            customer_id="000001", currency="USD",
             date_opened="2026-03-10",
         )
         gb.add_invoice_entry(
@@ -8657,15 +8693,37 @@ class TestPayInvoice:
             description="EUR services",
             quantity="1", price="4500.00",
         )
-        # Post into the USD A/R account — invoice in EUR, A/R in USD
+        # Post matched (USD → USD A/R), then flip document +
+        # transaction currency to EUR and scale quantities to the
+        # 1.10 carried rate — the warning-era mismatched state.
         gb.post_invoice(
             invoice_id="000001",
             post_account="Assets:A/R USD",
             post_date="2026-03-10",
         )
+        with gb.open(readonly=False) as bk:
+            eur_guid = bk.session.execute(sql_text(
+                "SELECT guid FROM commodities WHERE mnemonic='EUR'"
+            )).scalar_one()
+            tx_guid = bk.session.execute(sql_text(
+                "SELECT post_txn FROM invoices WHERE id='000001'"
+            )).scalar_one()
+            bk.session.execute(sql_text(
+                "UPDATE invoices SET currency=:eur WHERE id='000001'"
+            ), {"eur": eur_guid})
+            bk.session.execute(sql_text(
+                "UPDATE transactions SET currency_guid=:eur "
+                "WHERE guid=:tx"
+            ), {"eur": eur_guid, "tx": tx_guid})
+            bk.session.execute(sql_text(
+                "UPDATE splits SET "
+                "quantity_num = quantity_num * 11 / 10 "
+                "WHERE tx_guid=:tx"
+            ), {"tx": tx_guid})
+            bk.save()
 
         ar_after_post = gb.get_balance(account_name="Assets:A/R USD")
-        # Post correctly converts: €4500 × 1.10 = $4,950 USD debited
+        # Carried at 1.10: €4500 × 1.10 = $4,950 USD debited
         assert ar_after_post == Decimal("4950")
 
         gb.pay_invoice(
@@ -8950,12 +9008,16 @@ class TestPayInvoice:
         assert {s["action"] for s in pay_txn["splits"]} == \
             {"Payment"}
 
-    def test_cross_commodity_post_warns(self, business_book):
-        """Battery design ruling 1: posting a EUR document into the
-        USD A/R is allowed (Sabine's book has only one A/R) but
-        must warn loudly — the balance freezes at post-date FX, and
-        apply_credit_note will refuse netting against it. Matched
-        commodities post silently."""
+    def test_cross_commodity_post_refuses(self, business_book):
+        """Battery design ruling 1, sunset shipped (v1.5.0): posting
+        a EUR document into the USD A/R refuses outright — the
+        balance would freeze at post-date FX. Warned through v1.4.4;
+        the precondition for the refusal (no sample book depends on
+        the permissiveness) was confirmed by the bookkeeper loop
+        2026-08-31. The message points at the per-currency
+        subledger fix. Matched commodities post cleanly, and the
+        refused document stays open and postable to the right
+        account."""
         gb = GnuCashBook(str(business_book))
         self._add_eur_ar_and_price(gb, "2026-03-10", "1.10")
         gb.create_customer(name="Berlin Digital", currency="EUR")
@@ -8965,26 +9027,20 @@ class TestPayInvoice:
             invoice_id="000001", account="Income:Consulting",
             description="x", quantity="1", price="1000.00",
         )
-        mismatched = gb.post_invoice(
-            invoice_id="000001",
-            post_account="Assets:Accounts Receivable",  # USD
-            post_date="2026-03-10",
-        )
-        assert "warning" in mismatched
-        assert "apply_credit_note" in mismatched["warning"]
-        assert "per-currency" in mismatched["warning"]
-        # Matched pairing stays silent.
-        gb.create_invoice(customer_id="000001", currency="EUR",
-                          date_opened="2026-03-10")
-        gb.add_invoice_entry(
-            invoice_id="000002", account="Income:Consulting",
-            description="x", quantity="1", price="1000.00",
-        )
+        with pytest.raises(ValueError, match="per document currency"):
+            gb.post_invoice(
+                invoice_id="000001",
+                post_account="Assets:Accounts Receivable",  # USD
+                post_date="2026-03-10",
+            )
+        # Refusal happened before any mutation: the same document
+        # posts cleanly to the matched-commodity A/R.
         matched = gb.post_invoice(
-            invoice_id="000002",
+            invoice_id="000001",
             post_account="Assets:Accounts Receivable EUR",
             post_date="2026-03-10",
         )
+        assert matched["status"] == "posted"
         assert "warning" not in matched
 
     def test_credit_note_posting_stamps_credit_note_action(
@@ -10571,7 +10627,7 @@ class TestPhase4DVendorSpendingCompact:
         )
         assert "vendors" in result
         assert "totals" in result
-        # ``period`` was the input echo Abe flagged for removal — it
+        # ``period`` was the input echo the bookkeeper flagged for removal — it
         # duplicated the dates the caller already had.
         assert "period" not in result
 
@@ -10914,8 +10970,10 @@ class TestFXStaleRateGuard:
         self, business_book, *, price_date, rate="1.10",
     ):
         """USD-default book + one EUR/USD market price at
-        ``price_date`` + an unposted 1-line EUR invoice (id 000001,
-        EUR 100). Returns the GnuCashBook."""
+        ``price_date`` + a EUR A/R (ruling 1: the post account must
+        match the document currency; the guard's conversion now
+        fires on the USD income leg) + an unposted 1-line EUR
+        invoice (id 000001, EUR 100). Returns the GnuCashBook."""
         import piecash
         gb = GnuCashBook(str(business_book))
         with gb.open(readonly=False) as bk:
@@ -10925,6 +10983,13 @@ class TestFXStaleRateGuard:
             )
             bk.session.add(eur)
             bk.flush()
+            assets = next(
+                a for a in bk.accounts if a.fullname == "Assets"
+            )
+            bk.session.add(piecash.Account(
+                name="AR EUR", type="RECEIVABLE",
+                parent=assets, commodity=eur,
+            ))
             bk.session.add(piecash.Price(
                 commodity=eur, currency=bk.default_currency,
                 date=price_date, value=rate, type="last",
@@ -10946,7 +11011,7 @@ class TestFXStaleRateGuard:
         )
         result = gb.post_invoice(
             invoice_id="000001",
-            post_account="Assets:Accounts Receivable",
+            post_account="Assets:AR EUR",
             post_date="2026-06-03",  # 2 days
         )
         assert result["status"] == "posted"
@@ -10958,7 +11023,7 @@ class TestFXStaleRateGuard:
         )
         result = gb.post_invoice(
             invoice_id="000001",
-            post_account="Assets:Accounts Receivable",
+            post_account="Assets:AR EUR",
             post_date="2026-06-07",  # 6 days
         )
         assert result["status"] == "posted"
@@ -10974,7 +11039,7 @@ class TestFXStaleRateGuard:
         with pytest.raises(StaleFXRateError) as exc:
             gb.post_invoice(
                 invoice_id="000001",
-                post_account="Assets:Accounts Receivable",
+                post_account="Assets:AR EUR",
                 post_date="2026-06-20",  # 19 days
             )
         detail = exc.value.fx_detail
@@ -10991,7 +11056,7 @@ class TestFXStaleRateGuard:
         with pytest.raises(StaleFXRateError):
             gb.post_invoice(
                 invoice_id="000001",
-                post_account="Assets:Accounts Receivable",
+                post_account="Assets:AR EUR",
                 post_date="2026-06-09",  # 8 days
             )
 
@@ -11001,7 +11066,7 @@ class TestFXStaleRateGuard:
         )
         result = gb.post_invoice(
             invoice_id="000001",
-            post_account="Assets:Accounts Receivable",
+            post_account="Assets:AR EUR",
             post_date="2026-06-20",  # 19 days
             force=True,
         )
@@ -11021,7 +11086,7 @@ class TestFXStaleRateGuard:
         )
         result = gb.post_invoice(
             invoice_id="000001",
-            post_account="Assets:Accounts Receivable",
+            post_account="Assets:AR EUR",
             post_date="2026-06-03",  # 2 days
             force=True,
         )
@@ -11039,7 +11104,7 @@ class TestFXStaleRateGuard:
         )
         result = gb.post_invoice(
             invoice_id="000001",
-            post_account="Assets:Accounts Receivable",
+            post_account="Assets:AR EUR",
             post_date="2026-01-01",  # 1 day from the rate
         )
         assert result["status"] == "posted"
@@ -11055,7 +11120,7 @@ class TestFXStaleRateGuard:
         with pytest.raises(StaleFXRateError) as exc:
             gb.post_invoice(
                 invoice_id="000001",
-                post_account="Assets:Accounts Receivable",
+                post_account="Assets:AR EUR",
                 post_date="2026-06-01",  # rate is 19 days FORWARD
             )
         assert exc.value.fx_detail["age_days"] == 19
@@ -11071,7 +11136,7 @@ class TestFXStaleRateGuard:
         with pytest.raises(ValueError, match="no matching price"):
             gb.post_invoice(
                 invoice_id="000001",
-                post_account="Assets:Accounts Receivable",
+                post_account="Assets:AR EUR",
                 post_date="2026-10-15",  # 136 days > 90
                 force=True,
             )
@@ -11105,7 +11170,7 @@ class TestFXStaleRateGuard:
         )
         result = gb.post_invoice(
             invoice_id="000001",
-            post_account="Assets:Accounts Receivable",
+            post_account="Assets:AR EUR",
             post_date="2026-06-20",  # 19 days — would normally refuse
         )
         assert result["status"] == "posted"
@@ -11123,7 +11188,7 @@ class TestFXStaleRateGuard:
         )
         gb.post_invoice(
             invoice_id="000001",
-            post_account="Assets:Accounts Receivable",
+            post_account="Assets:AR EUR",
             post_date="2026-06-03",  # fresh post
         )
         # Pay 24 days after the only rate → stale at pay time.
@@ -11194,6 +11259,11 @@ class TestCrossCommodityArRelief:
     the lot at the rate the receivable was CARRIED at (post-date),
     not the pay-date rate. Pre-fix the post→pay drift landed twice —
     a permanent residual A/R quantity AND the explicit FX split.
+
+    post_invoice refuses this pairing since v1.5.0 (battery ruling
+    1), but warning-era books still carry mismatched lots and
+    pay_invoice must relieve them correctly forever — so the state
+    is engineered here the way those books hold it, via raw SQL.
     """
 
     def _add_eur_and_rates(self, gb: GnuCashBook) -> None:
@@ -11213,6 +11283,49 @@ class TestCrossCommodityArRelief:
             ))
             book.save()
 
+    def _post_carried_eur_on_usd_ar(self, gb: GnuCashBook) -> None:
+        """EUR 1,000 invoice carried on USD A/R at 1.10 (qty 1,100)
+        — the warning-era mismatched-posting state. Posted matched
+        in USD, then document + transaction currency flip to EUR
+        and split quantities scale to the carried rate (×11/10)."""
+        from sqlalchemy import text as sql_text
+
+        gb.create_invoice(
+            customer_id="000001", currency="USD",
+            date_opened="2026-03-10",
+        )
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="EUR consulting",
+            quantity="1", price="1000.00",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+            post_date="2026-03-10",
+        )
+        with gb.open(readonly=False) as bk:
+            eur_guid = bk.session.execute(sql_text(
+                "SELECT guid FROM commodities WHERE mnemonic='EUR'"
+            )).scalar_one()
+            tx_guid = bk.session.execute(sql_text(
+                "SELECT post_txn FROM invoices WHERE id='000001'"
+            )).scalar_one()
+            bk.session.execute(sql_text(
+                "UPDATE invoices SET currency=:eur WHERE id='000001'"
+            ), {"eur": eur_guid})
+            bk.session.execute(sql_text(
+                "UPDATE transactions SET currency_guid=:eur "
+                "WHERE guid=:tx"
+            ), {"eur": eur_guid, "tx": tx_guid})
+            bk.session.execute(sql_text(
+                "UPDATE splits SET "
+                "quantity_num = quantity_num * 11 / 10 "
+                "WHERE tx_guid=:tx"
+            ), {"tx": tx_guid})
+            bk.save()
+
     def test_settled_foreign_invoice_leaves_zero_ar(
         self, business_book,
     ):
@@ -11225,21 +11338,7 @@ class TestCrossCommodityArRelief:
         self._add_eur_and_rates(gb)
 
         gb.create_customer(name="Berlin Digital", currency="EUR")
-        gb.create_invoice(
-            customer_id="000001", currency="EUR",
-            date_opened="2026-03-10",
-        )
-        gb.add_invoice_entry(
-            invoice_id="000001",
-            account="Income:Sales",
-            description="EUR consulting",
-            quantity="1", price="1000.00",
-        )
-        gb.post_invoice(
-            invoice_id="000001",
-            post_account="Assets:Accounts Receivable",  # USD A/R
-            post_date="2026-03-10",
-        )
+        self._post_carried_eur_on_usd_ar(gb)
         assert gb.get_balance(
             account_name="Assets:Accounts Receivable"
         ) == Decimal("1100")
@@ -11268,21 +11367,7 @@ class TestCrossCommodityArRelief:
         gb = GnuCashBook(str(business_book))
         self._add_eur_and_rates(gb)
         gb.create_customer(name="Berlin Digital", currency="EUR")
-        gb.create_invoice(
-            customer_id="000001", currency="EUR",
-            date_opened="2026-03-10",
-        )
-        gb.add_invoice_entry(
-            invoice_id="000001",
-            account="Income:Sales",
-            description="EUR consulting",
-            quantity="1", price="1000.00",
-        )
-        gb.post_invoice(
-            invoice_id="000001",
-            post_account="Assets:Accounts Receivable",
-            post_date="2026-03-10",
-        )
+        self._post_carried_eur_on_usd_ar(gb)
         gb.pay_invoice(
             invoice_id="000001",
             payment_account="Assets:Checking",
@@ -11751,6 +11836,15 @@ class TestPayInvoiceDryRun:
             eur = piecash.factories.create_currency_from_ISO("EUR")
             book.session.add(eur)
             book.flush()
+            # Per-currency A/R (ruling 1: mismatched post accounts
+            # refuse, so the EUR document needs a EUR receivable).
+            assets = next(
+                a for a in book.accounts if a.fullname == "Assets"
+            )
+            book.session.add(piecash.Account(
+                name="AR EUR", type="RECEIVABLE",
+                parent=assets, commodity=eur,
+            ))
             book.session.add(piecash.Price(
                 commodity=eur, currency=usd,
                 date=date(2026, 3, 10),
@@ -11776,7 +11870,7 @@ class TestPayInvoiceDryRun:
         )
         gb.post_invoice(
             invoice_id="000001",
-            post_account="Assets:Accounts Receivable",
+            post_account="Assets:AR EUR",
             post_date="2026-03-10",
         )
         result = gb.pay_invoice(
@@ -11803,8 +11897,8 @@ class TestPayInvoiceDryRun:
         accounts = gb.list_accounts()
         assert "Foreign Exchange" not in str(accounts)
         assert gb.get_balance(
-            account_name="Assets:Accounts Receivable"
-        ) == Decimal("1100")
+            account_name="Assets:AR EUR"
+        ) == Decimal("1000")  # EUR quantity, untouched by dry-run
         # Rehearsal parity: the identical real call books it all.
         real = gb.pay_invoice(
             invoice_id="000001",

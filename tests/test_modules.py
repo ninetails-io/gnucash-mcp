@@ -1,5 +1,6 @@
 """Tests for tool module filtering and server configuration."""
 
+import json
 import os
 import re
 from pathlib import Path
@@ -1425,6 +1426,199 @@ class TestMultiBook:
         _apply_module_filter("all")
         summary = mcp._tool_manager._tools["get_book_summary"].fn()
         assert summary.split("\n", 1)[0].startswith("Book: alex.gnucash")
+
+
+class TestRestartSafety:
+    """Sabine battery ruling 6: a silent client-side process restart
+    resets the active book to the first configured entry — the next
+    write must not land in the wrong ledger. Piece 1: one startup
+    notice on the first tool result. Piece 2: 2+ book configs disarm
+    mutating tools until switch_book confirms. Piece 3: multi-book
+    mutating responses name the book they wrote to.
+
+    conftest neutralizes the guards suite-wide (they are process-
+    global, so outcomes would depend on test order); each test here
+    re-creates the fresh-process state explicitly."""
+
+    @pytest.fixture
+    def two_books(self, tmp_path: Path):
+        alex = _make_min_book(tmp_path / "alex.gnucash")
+        beast = _make_min_book(tmp_path / "beast-man.gnucash")
+        return alex, beast
+
+    @pytest.fixture(autouse=True)
+    def restore_state(self):
+        import gnucash_mcp.server as srv
+        import gnucash_mcp.logging_config as logcfg
+        saved = (
+            srv._book, list(srv._book_paths), srv._current_path,
+            srv._book_paths_source, dict(srv._book_registry),
+            srv._writes_armed, srv._startup_notice_pending,
+        )
+        log_saved = (
+            logcfg._book_path_str, logcfg._log_dir,
+            logcfg._get_book_func,
+        )
+        yield
+        (
+            srv._book, srv._book_paths, srv._current_path,
+            srv._book_paths_source, srv._book_registry,
+            srv._writes_armed, srv._startup_notice_pending,
+        ) = saved
+        (
+            logcfg._book_path_str, logcfg._log_dir,
+            logcfg._get_book_func,
+        ) = log_saved
+
+    @staticmethod
+    def _wire(srv, monkeypatch, paths):
+        """Simulate a fresh process start on the given book config."""
+        joined = os.pathsep.join(str(p) for p in paths)
+        monkeypatch.setenv("GNUCASH_BOOK_PATH", joined)
+        srv._book_paths = [p.resolve() for p in paths]
+        srv._book_paths_source = joined
+        srv._book_registry = {}
+        srv._book = None
+        srv._current_path = None
+        srv._writes_armed = None
+        srv._startup_notice_pending = False  # notice tested separately
+
+    @staticmethod
+    def _fake_write_tool():
+        """A write-classified tool through the real decorator stack —
+        the same safe_tool + @audit_log path every registered write
+        travels."""
+        from gnucash_mcp.tools._helpers import safe_tool, _json
+        from gnucash_mcp.logging_config import audit_log
+
+        @safe_tool
+        @audit_log(classification="write")
+        def fake_write():
+            return _json({"status": "ok"})
+        return fake_write
+
+    # ── Piece 2: the disarm gate ───────────────────────────────────
+
+    def test_multi_book_start_disarms_writes(self, two_books, monkeypatch):
+        import gnucash_mcp.server as srv
+        alex, beast = two_books
+        self._wire(srv, monkeypatch, [alex, beast])
+        out = json.loads(self._fake_write_tool()())
+        assert out["error_type"] == "active_book_unconfirmed"
+        assert "alex.gnucash" in out["error"]
+        assert "switch_book" in out["error"]
+        assert "beast-man.gnucash" in out["error"]  # available list
+
+    def test_single_book_start_writes_armed(self, two_books, monkeypatch):
+        import gnucash_mcp.server as srv
+        alex, _ = two_books
+        self._wire(srv, monkeypatch, [alex])
+        out = json.loads(self._fake_write_tool()())
+        assert out == {"status": "ok"}  # no gate, and no book stamp
+
+    def test_switch_book_arms_writes(self, two_books, monkeypatch):
+        import gnucash_mcp.server as srv
+        alex, beast = two_books
+        self._wire(srv, monkeypatch, [alex, beast])
+        srv._switch_book_impl("beast")
+        out = json.loads(self._fake_write_tool()())
+        assert "error" not in out
+        assert out["book"] == "beast-man.gnucash"
+
+    def test_noop_switch_counts_as_confirmation(self, two_books, monkeypatch):
+        import gnucash_mcp.server as srv
+        alex, beast = two_books
+        self._wire(srv, monkeypatch, [alex, beast])
+        srv._switch_book_impl("alex")
+        srv._writes_armed = False  # simulate a later restart, same book
+        result = srv._switch_book_impl("alex")
+        assert result.startswith("Already on: alex.gnucash")
+        assert srv._writes_armed is True
+
+    def test_failed_switch_does_not_arm(self, two_books, monkeypatch):
+        import gnucash_mcp.server as srv
+        alex, beast = two_books
+        self._wire(srv, monkeypatch, [alex, beast])
+        with pytest.raises(ValueError, match="No book matches"):
+            srv._switch_book_impl("nonexistent")
+        out = json.loads(self._fake_write_tool()())
+        assert out["error_type"] == "active_book_unconfirmed"
+
+    def test_reads_never_gated(self, two_books, monkeypatch):
+        import gnucash_mcp.server as srv
+        from gnucash_mcp.tools._helpers import safe_tool, _json
+        from gnucash_mcp.logging_config import audit_log
+        alex, beast = two_books
+        self._wire(srv, monkeypatch, [alex, beast])
+
+        @safe_tool
+        @audit_log(classification="read")
+        def fake_read():
+            return _json({"status": "ok"})
+        assert json.loads(fake_read()) == {"status": "ok"}
+
+    # ── Piece 3: the book stamp ────────────────────────────────────
+
+    def test_write_stamp_names_active_book(self, two_books, monkeypatch):
+        import gnucash_mcp.server as srv
+        alex, beast = two_books
+        self._wire(srv, monkeypatch, [alex, beast])
+        srv._switch_book_impl("alex")
+        out = json.loads(self._fake_write_tool()())
+        assert out["book"] == "alex.gnucash"
+
+    def test_error_responses_not_stamped(self, two_books, monkeypatch):
+        import gnucash_mcp.server as srv
+        from gnucash_mcp.tools._helpers import safe_tool
+        from gnucash_mcp.logging_config import audit_log
+        alex, beast = two_books
+        self._wire(srv, monkeypatch, [alex, beast])
+        srv._switch_book_impl("alex")
+
+        @safe_tool
+        @audit_log(classification="write")
+        def failing_write():
+            raise ValueError("boom")
+        out = json.loads(failing_write())
+        assert out["error_type"] == "validation_error"
+        assert "book" not in out
+
+    # ── Piece 1: the startup notice ────────────────────────────────
+
+    def test_startup_notice_fires_once(self, two_books, monkeypatch):
+        import gnucash_mcp.server as srv
+        from gnucash_mcp.tools._helpers import safe_tool, _json
+        from gnucash_mcp.logging_config import audit_log
+        alex, _ = two_books
+        self._wire(srv, monkeypatch, [alex])
+        srv._startup_notice_pending = True
+
+        @safe_tool
+        @audit_log(classification="read")
+        def fake_read():
+            return _json({"status": "ok"})
+
+        first = fake_read()
+        notice, _sep, body = first.partition("\n\n")
+        assert "(re)started" in notice
+        assert "alex.gnucash" in notice
+        assert json.loads(body) == {"status": "ok"}
+        # Second call: consumed, clean response.
+        assert json.loads(fake_read()) == {"status": "ok"}
+
+    def test_startup_notice_multi_book_announces_disarm(
+        self, two_books, monkeypatch,
+    ):
+        import gnucash_mcp.server as srv
+        alex, beast = two_books
+        self._wire(srv, monkeypatch, [alex, beast])
+        srv._startup_notice_pending = True
+        # First result is the refused write itself — notice rides it.
+        raw = self._fake_write_tool()()
+        notice, _sep, body = raw.partition("\n\n")
+        assert "disarmed" in notice
+        assert "alex.gnucash" in notice
+        assert json.loads(body)["error_type"] == "active_book_unconfirmed"
 
 
 class TestToolAnnotations:

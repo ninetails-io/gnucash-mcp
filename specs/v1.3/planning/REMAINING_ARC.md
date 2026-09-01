@@ -251,7 +251,7 @@ before release:**
 - **Predecessor letters:** `CLAUDE.local.md` (~10 letters from
   prior Claude sessions). The 4.7-comms-audit, code-review-night,
   and module-restructure letters are especially relevant. The
-  pantheon framing (Abe / bookkeeper / Yivo / Stephen) is real.
+  pantheon framing (the maintainer's Claude instances) is real.
 - **Project memory:** `~/.claude/projects/-Users-stephen-Projects-gnucash-mcp/memory/MEMORY.md`
   — feedback rules accreted over sessions. The most load-bearing
   for this arc: `feedback_pr_after_bookkeeper_loop.md`,

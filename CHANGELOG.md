@@ -1,5 +1,43 @@
 # Changelog
 
+## Unreleased (v1.5.0)
+
+**The Sabine battery's deferred rulings (bookkeeper battery, 2026-08-31) ship as
+code.** All three are safety promotions; the third is a deliberate
+behavior break at this version boundary.
+
+- **Restart safety (ruling 6).** A client config reload restarts
+  the server silently — and with several books configured, the
+  active book resets to the first one while the session may still
+  believe it's elsewhere. Three guards now close that hazard: the
+  first tool result of every process carries a one-line notice
+  naming the active book; with 2+ books configured, mutating tools
+  are disarmed after a (re)start until `switch_book` confirms the
+  target (a no-op "already on it" call counts — the point is that
+  the session names its ledger); and every mutating response in a
+  multi-book session names the book it wrote to. Reads are never
+  gated, and a refused write touches nothing — no rate-limit
+  token, no auto-backup, no audit entry.
+- **Discount-account auto-create refuses on localized books
+  (ruling 4b).** With no designated discount account and no
+  explicit `discount_account`, the resolver used to fall through
+  to creating the English default — an English leaf in a localized
+  chart, and wrong-sided on the sales side (textbook treatment is
+  contra-revenue, not expense). It now refuses at the create
+  boundary with the fix in the message; existing accounts remain
+  adoptable through every resolution layer. Role-based default
+  resolution (ruling 4a) remains the destination that lifts this
+  refusal.
+- **BEHAVIOR BREAK — currency-mismatch posting is now a refusal
+  (ruling 1 sunset).** Posting a document to an A/R or A/P account
+  held in a different commodity freezes the receivable at
+  post-date FX and drifts from the document's true value every day
+  after. v1.4.4 warned about this pairing; v1.5.0 refuses it
+  outright (desktop GnuCash refuses the same), pointing at the
+  per-currency subledger fix. Books that posted mismatched under
+  the warning era are unaffected: payments still settle those lots
+  via FX, and the downstream guards that protect them stay.
+
 ## v1.4.4 - The statement is the call
 
 The bulk-operations line closes with its capstone: a complete bank

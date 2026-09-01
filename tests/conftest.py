@@ -10,6 +10,20 @@ from datetime import date, timedelta
 from decimal import Decimal
 
 
+@pytest.fixture(autouse=True)
+def _quiet_restart_guards():
+    """Neutralize the ruling-6 restart guards for the suite.
+
+    The startup notice fires once per process and the multi-book
+    write disarm trips on fresh state — both would make test
+    outcomes depend on execution order. Tests that exercise the
+    guards re-arm these globals explicitly in their own bodies."""
+    import gnucash_mcp.server as _server
+    _server._startup_notice_pending = False
+    _server._writes_armed = True
+    yield
+
+
 @pytest.fixture
 def test_book(tmp_path: Path) -> Path:
     """Create a temporary GnuCash book with sample data.

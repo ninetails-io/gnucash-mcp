@@ -91,7 +91,7 @@ The SKR03 (Sabine Brenner) chart slice is locked in
 total). Also fixed in passing: a Python-3.10 GDATE due-date parse bug
 that silently dropped overdue invoice/bill warnings. **Remaining
 (optional):** the full `scripts/synthetic_book/` Sabine persona
-generator (Abe's build), and the §7 housekeeping (CLAUDE.md gotchas).
+generator (the bookkeeper's build), and the §7 housekeeping (CLAUDE.md gotchas).
 
 **A — Throws (hard failure):**
 - **LEAD ITEM (correctness-grade): resolve helper-account parents by

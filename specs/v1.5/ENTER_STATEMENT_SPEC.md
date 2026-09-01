@@ -588,7 +588,7 @@ ruling.
     — a reconciled candidate is entered AND tied, which is
     decisive for the duplicate call.
 
-### Signoff round (2026-08-24, Abe VI — certified for Statement
+### Signoff round (2026-08-24, the bookkeeper — certified for Statement
 ### Week)
 
 15. **Twin guard precedes counter-split validation** (the signoff's

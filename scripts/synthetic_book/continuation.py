@@ -476,7 +476,7 @@ def settle_documents(policy: PersonaPolicy, book_path: Path, cutoff: date,
 def reconcile_through(policy: PersonaPolicy, book_path: Path,
                       through: date) -> list[str]:
     """Reconcile every bank/cash/card account through the last FULL
-    month, leaving the current month open — Abe VI's posture ask
+    month, leaving the current month open — the bookkeeper's posture ask
     (BOOKKEEPER_REVIEW_DEMO_GENERATORS.md §1): the demo household of a
     reconciliation tool should not be seventeen months behind, and the
     open month leaves the natural first conversation ("this month's
@@ -550,7 +550,7 @@ def advance_sx(book_path: Path, through: date) -> dict:
     """Stamp every enabled SX's ``last_occur`` so its next occurrence
     is upcoming — with AT MOST ONE schedule per book left overdue, and
     only when its missed occurrence fell 3–7 days before ``through``
-    ("just came due", Abe VI's review §2). Books where no schedule
+    ("just came due", the bookkeeper's review §2). Books where no schedule
     lands in that window get zero overdue and rely on the due-soon
     line as the hook.
 

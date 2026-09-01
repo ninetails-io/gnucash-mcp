@@ -57,7 +57,7 @@ class TestToDecimalHelper:
         assert _to_decimal(42) == Decimal("42")
 
     def test_sum_of_non_dyadic_floats_balances(self):
-        """The exact scenario from Abe's report: three non-dyadic
+        """The exact scenario from the bookkeeper's report: three non-dyadic
         floats + one float negation sum to zero."""
         amounts = [6.25, 5.75, 3.87, -15.87]
         total = sum((_to_decimal(a) for a in amounts), Decimal("0"))

@@ -183,5 +183,5 @@ update_transaction(
 
 ---
 
-*Spec written by Abe Raham, The Accountant*
+*Spec written by the bookkeeper*
 *January 30, 2026*

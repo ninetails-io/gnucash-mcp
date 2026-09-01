@@ -434,6 +434,18 @@ def safe_tool(func: Callable) -> Callable:
 
     Catches all exceptions and returns them as JSON error responses instead of
     crashing the MCP server.
+
+    Also the restart-safety chokepoint (Sabine battery ruling 6):
+    every tool result passes through here, so this is where the
+    one-time startup notice attaches, where write-classified tools
+    hit the multi-book disarm gate, and where successful mutating
+    responses get their ``book`` stamp. Write-ness comes from the
+    ``__audit_meta__`` that @audit_log exposes and @wraps propagates
+    outward — the same single declaration the audit log and MCP
+    ToolAnnotations already trust. The gate runs BEFORE the wrapped
+    @audit_log layer, so a refused write never consumes rate-limit
+    tokens, never triggers auto-backup, and never logs an audit
+    entry (nothing happened to the book).
     """
 
     # Path redaction is applied at the MCP boundary (response
@@ -444,8 +456,68 @@ def safe_tool(func: Callable) -> Callable:
     # logging_config module is the foundational layer.
     from gnucash_mcp.logging_config import redact_paths
 
+    is_write = (
+        getattr(func, "__audit_meta__", None) or {}
+    ).get("classification") == "write"
+
+    def _restart_guards(invoke: Callable[[], str]) -> str:
+        """Run ``invoke`` behind the ruling-6 guards. Guard failures
+        must never break a tool — every server-state consultation is
+        wrapped; the degraded mode is simply pre-ruling behavior."""
+        # Lazy import: server imports this module at import time (the
+        # inline switch_book uses safe_tool); by the time any tool
+        # RUNS, the server module is fully loaded.
+        from gnucash_mcp import server as _server
+
+        if is_write:
+            try:
+                gate_msg = _server._write_gate_message()
+            except Exception:
+                gate_msg = None
+            if gate_msg:
+                logger.warning(
+                    f"Write refused (book unconfirmed): {func.__name__}"
+                )
+                result = _json({
+                    "error": gate_msg,
+                    "error_type": "active_book_unconfirmed",
+                    "suggestion": (
+                        "Call switch_book with the intended book, "
+                        "then retry."
+                    ),
+                })
+                return _attach_notice(_server, result)
+
+        result = invoke()
+
+        if is_write:
+            try:
+                stamp = _server._mutation_book_stamp()
+                if stamp:
+                    data = json.loads(result)
+                    if (
+                        isinstance(data, dict)
+                        and "error" not in data
+                        and "book" not in data
+                    ):
+                        data["book"] = stamp
+                        result = _json(data)
+            except Exception:
+                pass  # non-JSON write response — skip the stamp
+        return _attach_notice(_server, result)
+
+    def _attach_notice(_server, result: str) -> str:
+        try:
+            notice = _server._consume_startup_notice()
+        except Exception:
+            notice = None
+        return f"{notice}\n\n{result}" if notice else result
+
     @wraps(func)
     def wrapper(*args, **kwargs) -> str:
+        return _restart_guards(lambda: _invoke(*args, **kwargs))
+
+    def _invoke(*args, **kwargs) -> str:
         try:
             return func(*args, **kwargs)
         except GnuCashLockError as e:

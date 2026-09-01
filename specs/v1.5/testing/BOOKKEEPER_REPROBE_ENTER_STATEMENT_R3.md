@@ -2,7 +2,7 @@
 
 Status: **LOOP CLOSED 2026-08-26 — all probes PASS (P5 re-probe
 verified at `19f4a7f`); certification closed whole; Statement
-Week: GO. Signed: Abe VI.** The hang investigated mid-round was
+Week: GO. Signed: the bookkeeper.** The hang investigated mid-round was
 amended to a Claude Desktop dispatch-layer wedge (a second,
 unrelated MCP server hung identically); the gnucash server is
 exonerated — it answered every dispatched call in <500ms.

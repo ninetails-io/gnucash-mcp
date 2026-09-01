@@ -4404,12 +4404,12 @@ currency-arg rationale stays; cut 'Pre-fix this helper hardcoded $ and broke as 
 ```
 
 ### reporting.py:146-150 | CUT | rule 2
-'Replaces the verbose dict… the heaviest single response in Abe's audit' — provenance + diff narration
+'Replaces the verbose dict… the heaviest single response in the bookkeeper's audit' — provenance + diff narration
 
 ```
 
     Replaces the verbose dict (with multi-line YETI ``explanation`` per
-    account) that was the heaviest single response in Abe's audit.
+    account) that was the heaviest single response in the bookkeeper's audit.
     Verbose mode preserves the dict for programmatic consumers.
     """
 ```

@@ -198,7 +198,13 @@ module contributes zero tools to the MCP surface.
     catalog translation of "Income" is **"Ertrag"**. So a "look up the
     localized word and match it" fix is unsafe for template-created
     accounts. `_infer_book_locale` therefore *votes* across several
-    top-level type accounts rather than trusting any one.
+    top-level type accounts rather than trusting any one. And its
+    **None means undetermined, not English** — a numbered chart
+    (SKR03/DATEV "Aufwendungen 2/4") matches no locale's words at
+    all. Cosmetic callers (leaf naming) may fall back to English on
+    None; anything that CREATES accounts must require
+    `_book_reads_english`'s affirmative match instead (ruling 4(b);
+    the bookkeeper's Sabine live-loop repro, 2026-09-01).
   - **Designated accounts self-heal via a KVP slot.** The FX and
     discount resolvers store the resolved account's GUID on the root
     account (`gnc-mcp/fx-gain-loss-acct`, etc.) on first use, then
@@ -474,6 +480,18 @@ Three layers:
   (USD-default, full feature exercise), Lin Wei (CNY-default,
   zh_CN chart, multi-currency stress), and Sabine Brenner
   (EUR-default, German SKR03 chart — the i18n bug-class oracle).
+
+**Migrating tests across a behavior break.** When a change closes a
+creation path (e.g. the v1.5.0 currency-mismatch post refusal),
+migrate the affected tests by SUBJECT, not mechanically: tests
+whose subject survives the break re-route through the
+correct-practice path (the FX-staleness and tax-conversion tests
+moved to per-currency A/R); tests whose subject IS the
+now-uncreatable historical state engineer that state byte-faithfully
+via raw SQL (post through the still-open door, then flip the rows
+to what warning-era books actually hold). The state outlives the
+door that made it — real books carry it forever, so the guards that
+protect it need tests that can still construct it.
 
 Run with `uv run pytest`. Per-phase synthetic-book rebuild:
 `uv run python scripts/synthetic_book/phase_<N>.py` in order. Each
