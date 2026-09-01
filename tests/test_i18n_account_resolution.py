@@ -117,25 +117,49 @@ class TestLocalizedHelperAccounts:
             acct2, _ = gb._get_or_create_fx_account(b)
             assert acct2.fullname == "Erträge:Realisierter Gewinn/Verlust"
 
-    def test_discount_accounts_autocreate_under_localized_parents(
+    def test_discount_autocreate_refused_on_localized_book(
         self, localized_book
     ):
+        """Battery ruling 4(b): with no designation and no explicit
+        ``discount_account``, the resolver REFUSES on a non-English
+        book instead of auto-creating the English default (an
+        English leaf in a localized chart, wrong-sided on the sales
+        side). The hint names the fix. Both sides refuse; the
+        dry-run rehearsal refuses identically."""
         gb = GnuCashBook(str(localized_book))
         with gb.open(readonly=False) as b:
-            # Sales discount → EXPENSE side → German expense root.
-            sales, _ = gb._get_or_create_discount_account(
-                b, owner_type_is_bill=False
-            )
-            assert sales.type == "EXPENSE"
-            assert sales.parent.fullname == "Aufwand"
+            for is_bill in (False, True):
+                with pytest.raises(
+                    ValueError, match="discount_account"
+                ) as exc:
+                    gb._get_or_create_discount_account(
+                        b, owner_type_is_bill=is_bill
+                    )
+                assert "'de'" in str(exc.value)
+            with pytest.raises(ValueError, match="discount_account"):
+                gb._get_or_create_discount_account(
+                    b, owner_type_is_bill=False, dry_run=True
+                )
 
-            # Purchase discount → INCOME side → German income root.
-            purchase, _ = gb._get_or_create_discount_account(
-                b, owner_type_is_bill=True
+    def test_discount_explicit_account_works_on_localized_book(
+        self, localized_book
+    ):
+        """The refusal's own hint must work: an explicit
+        ``discount_account`` resolves on the localized book with no
+        create and no locale objection."""
+        gb = GnuCashBook(str(localized_book))
+        with gb.open(readonly=False) as b:
+            sales, notice = gb._get_or_create_discount_account(
+                b, owner_type_is_bill=False,
+                discount_account="Aufwand:Bürobedarf",
             )
-            assert purchase.type == "INCOME"
-            assert purchase.parent.fullname == "Erträge"
-            b.save()
+            assert sales.fullname == "Aufwand:Bürobedarf"
+            assert notice is None
+            purchase, _ = gb._get_or_create_discount_account(
+                b, owner_type_is_bill=True,
+                discount_account="Erträge:Umsatzerlöse",
+            )
+            assert purchase.fullname == "Erträge:Umsatzerlöse"
 
 
 class TestFxAccountCollisionSafety:
@@ -432,14 +456,19 @@ class TestDesignatedAccountSlotLayer0:
 
     def test_discount_sides_use_independent_slots(self, localized_book):
         # Sales (EXPENSE) and purchase (INCOME) designations are stored
-        # under separate slot keys and resolve independently.
+        # under separate slot keys and resolve independently. Stored
+        # directly — ruling 4(b) closed the auto-create path on
+        # localized books, and the explicit-arg layer deliberately
+        # does not designate.
         gb = GnuCashBook(str(localized_book))
         with gb.open(readonly=False) as b:
-            sales, _ = gb._get_or_create_discount_account(
-                b, owner_type_is_bill=False
+            sales = gb._find_account(b, "Aufwand:Bürobedarf")
+            purchase = gb._find_account(b, "Erträge:Umsatzerlöse")
+            gb._store_designated_account(
+                b, gb._SALES_DISCOUNT_SLOT_KEY, sales
             )
-            purchase, _ = gb._get_or_create_discount_account(
-                b, owner_type_is_bill=True
+            gb._store_designated_account(
+                b, gb._PURCHASE_DISCOUNT_SLOT_KEY, purchase
             )
             b.save()
             sales_guid, purchase_guid = sales.guid, purchase.guid

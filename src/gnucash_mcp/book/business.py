@@ -830,6 +830,28 @@ class BusinessMixin:
                 self._store_designated_account(book, slot_key, disc_acct)
             return disc_acct, _ambiguity_notice(disc_acct.fullname)
 
+        # Battery ruling 4(b): past this point the resolver CREATES.
+        # On a non-English-locale book, silently creating the English
+        # default misstates the ledger twice over — an English leaf
+        # in a localized chart, and (on the sales side) an EXPENSE
+        # account where the textbook treatment is contra-revenue.
+        # Refuse with the fix in hand; existing accounts remain
+        # adoptable through the explicit/slot/fuzzy/canonical layers
+        # above. Ruling 4(a) — resolve the default by ROLE — is the
+        # destination that lifts this refusal.
+        locale = self._infer_book_locale(book)
+        if locale is not None and locale != "en":
+            raise ValueError(
+                f"No {side_label} account is designated on this "
+                f"book, and auto-creating the English default "
+                f"({canonical_path!r}) on a book whose chart reads "
+                f"as locale {locale!r} would misstate the ledger. "
+                f"Pass discount_account with the account that "
+                f"should absorb the discount (path, %short GUID, "
+                f"or full 32-char GUID of a non-placeholder INCOME "
+                f"or EXPENSE account)."
+            )
+
         # Resolve the parent by TYPE (INCOME/EXPENSE), not the English
         # name "Income"/"Expenses" — locale-robust and rename-proof.
         # Fall back to creating the top-level account only if the book
