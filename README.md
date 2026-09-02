@@ -321,22 +321,31 @@ it works with any client that speaks MCP. Everywhere below,
 prints yours).
 
 - **ChatGPT desktop / Codex (the GUI form)** — likely your path
-  if this is your first time clicking "Codex." Settings →
-  Connectors → Add MCP server, type **STDIO**, name it
-  `gnucash`. The form is fill-in-the-blanks (nothing to break —
-  no config file involved):
-  - **Command to launch**: the full `gnucash-mcp` path from the
-    install step.
-  - **Arguments**: `--modules=all` — one argument per row (use
-    "+ Add argument" for each; don't space-join several into
-    one row).
-  - **Environment variables**: key `GNUCASH_BOOK_PATH`, value =
-    your book's full path. Several books? Join them with `:`
-    (Mac/Linux) or `;` (Windows) and switch between them
-    in-chat.
-  - **Passthrough** and **Working directory**: leave empty.
+  if this is your first time clicking "Codex." The whole setup
+  is fill-in-the-blanks; no config file is involved, so there's
+  nothing to break.
+  1. The app opens in ChatGPT mode — click the **∨** next to
+     "ChatGPT" (top left) and choose **Codex** ("Build, debug,
+     and ship").
+  2. Open **Settings** (the ChatGPT menu → Settings…, ⌘, on
+     Mac), and under **Integrations** pick **Plugins**.
+  3. Top right: **Add ∨** → **Add MCP server**. The "Connect to
+     a custom MCP" form appears. **Name** it `gnucash`; leave
+     **Type** on **STDIO** (the default).
+  4. **Command to launch**: the full `gnucash-mcp` path from
+     the install step.
+  5. **Arguments**: `--modules=all` — one argument per row
+     ("+ Add argument" for each; don't space-join several into
+     one row).
+  6. **Environment variables**: key `GNUCASH_BOOK_PATH`, value
+     = your book's full path. Several books? Join them with `:`
+     (Mac/Linux) or `;` (Windows) and switch between them
+     in-chat.
+  7. **Environment variable passthrough** and **Working
+     directory**: leave empty. **Save** — your server appears
+     under the **MCPs** tab.
 
-  Save, and ask Codex "how am I doing this month?"
+  Then ask Codex "how am I doing this month?"
 - **Claude Code**: `claude mcp add-json gnucash '{"command":"/Users/yourname/.local/bin/gnucash-mcp","args":["--modules=all"],"env":{"GNUCASH_BOOK_PATH":"/path/to/your/book.gnucash"}}'`
   Add `--scope user` for all projects, `--scope project` for
   this one only.
