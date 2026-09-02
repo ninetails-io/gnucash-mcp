@@ -323,7 +323,10 @@ prints yours).
 - **ChatGPT desktop / Codex (the GUI form)** — likely your path
   if this is your first time clicking "Codex." The whole setup
   is fill-in-the-blanks; no config file is involved, so there's
-  nothing to break.
+  nothing to break. One habit to unlearn: type every value
+  bare, **no quotes** — these fields aren't a terminal, so
+  quotes become literal characters in the value and the launch
+  silently fails.
   1. The app opens in ChatGPT mode — click the **∨** next to
      "ChatGPT" (top left) and choose **Codex** ("Build, debug,
      and ship").
@@ -334,7 +337,17 @@ prints yours).
      a custom MCP" form appears. **Name** it `gnucash`; leave
      **Type** on **STDIO** (the default).
   4. **Command to launch**: the full `gnucash-mcp` path from
-     the install step.
+     the install step (`uv tool dir --bin` prints the
+     directory).
+     *Cloned the repo but skipped the install step?* Then
+     there is no `gnucash-mcp` command — launch `uv` itself:
+     command = the full path to `uv` (`which uv` prints it),
+     and the first four argument rows become `run`,
+     `--directory`, `/path/to/your/clone`, `gnucash-mcp` —
+     ahead of the `--modules=all` row below. Run `uv sync`
+     once in the clone first, so the first launch isn't a
+     cold dependency install racing the app's startup
+     timeout.
   5. **Arguments**: `--modules=all` — one argument per row
      ("+ Add argument" for each; don't space-join several into
      one row).
