@@ -320,14 +320,26 @@ it works with any client that speaks MCP. Everywhere below,
 (`/Users/yourname/.local/bin/gnucash-mcp`; `uv tool dir --bin`
 prints yours).
 
+- **ChatGPT desktop / Codex (the GUI form)** — likely your path
+  if this is your first time clicking "Codex." Settings →
+  Connectors → Add MCP server, type **STDIO**, name it
+  `gnucash`. The form is fill-in-the-blanks (nothing to break —
+  no config file involved):
+  - **Command to launch**: the full `gnucash-mcp` path from the
+    install step.
+  - **Arguments**: `--modules=all` — one argument per row (use
+    "+ Add argument" for each; don't space-join several into
+    one row).
+  - **Environment variables**: key `GNUCASH_BOOK_PATH`, value =
+    your book's full path. Several books? Join them with `:`
+    (Mac/Linux) or `;` (Windows) and switch between them
+    in-chat.
+  - **Passthrough** and **Working directory**: leave empty.
+
+  Save, and ask Codex "how am I doing this month?"
 - **Claude Code**: `claude mcp add-json gnucash '{"command":"/Users/yourname/.local/bin/gnucash-mcp","args":["--modules=all"],"env":{"GNUCASH_BOOK_PATH":"/path/to/your/book.gnucash"}}'`
   Add `--scope user` for all projects, `--scope project` for
   this one only.
-- **ChatGPT (desktop app)**: Settings → Connectors →
-  Add MCP server. Name it `gnucash-mcp`, type **STDIO**,
-  "Command to launch" = the full `gnucash-mcp` path, one
-  argument `--modules=all`, and an environment variable
-  `GNUCASH_BOOK_PATH` = your book's path.
 - **Codex CLI**: one command, no config file to hand-edit:
   `codex mcp add gnucash --env GNUCASH_BOOK_PATH="/path/to/your/book.gnucash" -- /Users/yourname/.local/bin/gnucash-mcp --modules=all`
   (Codex stores it in `~/.codex/config.toml`; the same config
