@@ -11,18 +11,30 @@ Your data stays on your machine. Your audit log stays on your
 machine. Nothing is uploaded anywhere — the AI reads and writes
 your local GnuCash file, and that's it.
 
+**Install in one click:** on Claude Desktop, download the
+`.mcpb` bundle from the
+[latest release](https://github.com/ninetails-io/gnucash-mcp/releases/latest),
+double-click it, and you're running — no terminal, no config
+files. Every other MCP client — ChatGPT/Codex, Gemini,
+Antigravity, and the rest — connects with
+[a few lines of setup](#other-ai-clients). Either way, the AI
+subscription you already pay for becomes a bookkeeper that never
+sends a bill.
+
 Three real, populated sample books ship in this repo so you
 can try it before you commit anything. They're realistic — full
 years of activity, mixed currencies, customers, invoices,
 budgets, the works. Walk through one in five minutes; if it
 clicks, point the server at your own book and you're done.
 
-The samples are frozen snapshots, not living books — expect the
-dashboard to flag stale prices and pending scheduled transactions
-that have accumulated since their last regeneration. That's
-realistic too (it's what a book looks like after a vacation). To
-rebuild them fresh through today, run the deterministic generators
-in `scripts/synthetic_book/` (phase scripts, in order).
+The samples are living books: the committed copies are frozen at
+their last update, and the closed-loop updater
+(`scripts/synthetic_book/continue_book.py <persona>`) brings any
+of them current through today — statement payments from real
+balances, invoices settled, accounts reconciled. The bundle ships
+them current as of its build day. An un-updated copy just looks
+like a book after a vacation — stale prices, pending scheduled
+transactions — which is realistic too.
 
 ---
 
@@ -154,7 +166,7 @@ what's in each.
 
 ### The one-click way (Claude Desktop)
 
-Download **`gnucash-mcp.mcpb`** from the
+Download the **`.mcpb` bundle** from the
 [latest release](https://github.com/ninetails-io/gnucash-mcp/releases/latest)
 and double-click it. Claude Desktop installs the server — no
 terminal, no config file, no Python. The installer asks three
@@ -311,11 +323,16 @@ prints yours).
 - **Claude Code**: `claude mcp add-json gnucash '{"command":"/Users/yourname/.local/bin/gnucash-mcp","args":["--modules=all"],"env":{"GNUCASH_BOOK_PATH":"/path/to/your/book.gnucash"}}'`
   Add `--scope user` for all projects, `--scope project` for
   this one only.
-- **ChatGPT (desktop app / Codex)**: Settings → Connectors →
+- **ChatGPT (desktop app)**: Settings → Connectors →
   Add MCP server. Name it `gnucash-mcp`, type **STDIO**,
   "Command to launch" = the full `gnucash-mcp` path, one
   argument `--modules=all`, and an environment variable
   `GNUCASH_BOOK_PATH` = your book's path.
+- **Codex CLI**: one command, no config file to hand-edit:
+  `codex mcp add gnucash --env GNUCASH_BOOK_PATH="/path/to/your/book.gnucash" -- /Users/yourname/.local/bin/gnucash-mcp --modules=all`
+  (Codex stores it in `~/.codex/config.toml`; the same config
+  serves the Codex VS Code extension. `codex mcp list` confirms
+  registration.)
 - **Gemini CLI**: `gemini mcp add -e GNUCASH_BOOK_PATH="/path/to/your/book.gnucash" gnucash /Users/yourname/.local/bin/gnucash-mcp --modules=all`
   This writes a project `.gemini/settings.json` with the server
   registered; run `/mcp list` inside Gemini to confirm it shows
@@ -325,6 +342,23 @@ prints yours).
   [@hpuri](https://github.com/hpuri)'s testing in
   [#89](https://github.com/ninetails-io/gnucash-mcp/issues/89) —
   thanks.)
+- **Google Antigravity (IDE or CLI)**: add the server to
+  `~/.gemini/config/mcp_config.json` (global) or your
+  workspace's `.agents/mcp_config.json`:
+  ```json
+  {
+    "mcpServers": {
+      "gnucash": {
+        "command": "/home/yourname/.local/bin/gnucash-mcp",
+        "args": ["--modules=all"],
+        "env": { "GNUCASH_BOOK_PATH": "/path/to/your/book.gnucash" }
+      }
+    }
+  }
+  ```
+  Use the absolute command path. On Linux the same
+  `libdbd-sqlite3` note as the Gemini walkthrough applies if
+  GnuCash won't offer a SQLite3 save format.
 - **Anything else**: set `GNUCASH_BOOK_PATH` and run
   `gnucash-mcp`. No install at all? `uv run --directory
   /path/to/gnucash-mcp gnucash-mcp` and
@@ -336,7 +370,7 @@ prints yours).
 
 ## Choosing a module set
 
-`--modules=all` is the easy default — every tool, 88 of them.
+`--modules=all` is the easy default — every tool, 86 of them.
 For day-to-day use you'll probably want less. Pick the role that
 matches how you'll talk to the server. Each role is a *group*
 that expands to the underlying tool modules; you can also pick
