@@ -171,9 +171,16 @@ def main() -> int:
         # segment ("…/gnucash-mcp/scripts/…") is always followed by
         # "/". The bare-substring pattern matched THIS script's own
         # checkout path on CI runners — the guard vetoed itself.
-        probe = subprocess.run(["pgrep", "-f", "gnucash-mcp( |$)"],
-                               capture_output=True, text=True)
-        if probe.stdout.strip():
+        try:
+            probe = subprocess.run(["pgrep", "-f", "gnucash-mcp( |$)"],
+                                   capture_output=True, text=True)
+        except FileNotFoundError:
+            # No pgrep at all (minimal containers — the Glama image's
+            # bookworm-slim base ships without procps). Can't
+            # determine, so proceed: an environment this bare isn't
+            # running a desktop MCP client either.
+            probe = None
+        if probe is not None and probe.stdout.strip():
             raise SystemExit(
                 "A gnucash-mcp server appears to be running (pids: "
                 f"{' '.join(probe.stdout.split())}). It may be serving "

@@ -4,7 +4,12 @@
 tests
 specs
 docs
-scripts
+# The build runs the closed-loop updater (same as CI), so the
+# generator package ships in the context; the rest of scripts/
+# stays out.
+scripts/*
+!scripts/synthetic_book
+scripts/synthetic_book/__pycache__
 samples/*.generated.gnucash*
 samples/*.mcp
 samples/scratch.gnucash.mcp
