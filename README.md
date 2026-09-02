@@ -328,7 +328,8 @@ prints yours).
      "ChatGPT" (top left) and choose **Codex** ("Build, debug,
      and ship").
   2. Open **Settings** (the ChatGPT menu → Settings…, ⌘, on
-     Mac), and under **Integrations** pick **Plugins**.
+     Mac), and under **Integrations** pick **Plugins** — not
+     "Connections" under Coding, which is a different thing.
   3. Top right: **Add ∨** → **Add MCP server**. The "Connect to
      a custom MCP" form appears. **Name** it `gnucash`; leave
      **Type** on **STDIO** (the default).
