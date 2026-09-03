@@ -62,9 +62,11 @@ samples/*.gnucash.*.log
 .DS_Store
 Thumbs.db
 
-# Claude Code local-only notes (cross-session handoffs, personal context).
-# The committed CLAUDE.md is the public contributor guide.
-CLAUDE.local.md
+# Local-only notes (cross-session handoffs, personal context,
+# pre-release changelog drafts). The `.local.md` suffix marks any
+# markdown file as maintainer-private; the committed CLAUDE.md is
+# the public contributor guide.
+*.local.md
 
 # Local-only working files — IDE / client state, scratch notes,
 # local test scripts that shouldn't pollute the shared repo.
