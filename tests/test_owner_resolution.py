@@ -203,6 +203,32 @@ class TestDeleteGuardsAreJobAndVoucherAware:
         with pytest.raises(ValueError, match="with jobs"):
             gb.delete_vendor("000001")
 
+    def test_delete_refusal_names_every_blocker_at_once(
+        self, business_book,
+    ):
+        """A customer with a posted job-attached invoice AND the job
+        hears about both in one refusal — raising on the first guard
+        masked the job until the invoice was voided (bookkeeper,
+        PR #172)."""
+        gb, _iid, _ = _job_invoice_book(business_book)
+        with pytest.raises(ValueError) as exc:
+            gb.delete_customer("000001")
+        msg = str(exc.value)
+        assert "posted invoices: 000001" in msg
+        assert "jobs: 000001" in msg
+        assert "delete_job" in msg
+
+    def test_delete_employee_refusal_offers_no_credit_note(
+        self, business_book,
+    ):
+        """Credit notes are customer/vendor instruments; the employee
+        refusal must not point at a remedy that does not exist."""
+        gb, _vid = _voucher_book(business_book)
+        with pytest.raises(ValueError) as exc:
+            gb.delete_employee("000001")
+        assert "credit note" not in str(exc.value)
+        assert "Void the vouchers first" in str(exc.value)
+
     def test_delete_employee_refuses_with_voucher(self, business_book):
         gb, vid = _voucher_book(business_book)
         with pytest.raises(ValueError, match="posted vouchers"):
