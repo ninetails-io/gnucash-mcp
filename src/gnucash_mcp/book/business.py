@@ -301,6 +301,53 @@ class BusinessMixin:
             )
         return None
 
+    @staticmethod
+    def _document_owner_clause(
+        book, owner_type: int | None = None, owner_guid: str | None = None,
+    ):
+        """SQL filter matching every document owned by the given
+        side and/or party — DIRECTLY (``owner_type`` 2/4/5 on the
+        invoice row) or THROUGH A JOB (``owner_type=3`` whose Job
+        carries the requested side / party).
+
+        THE owner-filter chokepoint. ``invoices.owner_guid`` is a
+        polymorphic pointer: on a job-attached document it names the
+        Job, not the customer or vendor, so any site that filters on
+        ``Invoice.owner_type == N`` or ``Invoice.owner_guid == guid``
+        by hand silently drops every job-attached document — the
+        whole-tree review (2026-09-04) found six such sites, from the
+        collections list to the customer-delete guard. Every owner
+        filter routes here so the job indirection is handled once.
+
+        Employees (5) have no jobs, so their clause stays direct.
+        Both arguments ``None`` matches everything.
+        """
+        from sqlalchemy import and_, or_, true
+        from piecash.business.invoice import Invoice, Job
+
+        direct = []
+        via_job = []
+        if owner_type is not None:
+            direct.append(Invoice.owner_type == owner_type)
+            via_job.append(Job.owner_type == owner_type)
+        if owner_guid is not None:
+            direct.append(Invoice.owner_guid == owner_guid)
+            via_job.append(Job.owner_guid == owner_guid)
+        if not direct:
+            return true()
+        if owner_type == 5:
+            return and_(*direct)
+        job_guid_sq = book.session.query(Job.guid).filter(
+            *via_job
+        ).subquery()
+        return or_(
+            and_(*direct),
+            and_(
+                Invoice.owner_type == 3,
+                Invoice.owner_guid.in_(job_guid_sq),
+            ),
+        )
+
     # Path for the auto-created realized-FX-gain/loss income account.
     # Single credit-natural account: positive balance = net gain, negative
     # = net loss across the period. Named to match GAAP convention
@@ -1419,20 +1466,11 @@ class BusinessMixin:
             # fails "not found" on job-attached invoices. Employee
             # (owner_type=5) is exempt: piecash jobs are
             # customer/vendor only.
-            from sqlalchemy import and_, or_
-            from piecash.business.invoice import Job
-            if owner_type in (2, 4):
-                job_guid_sq = book.session.query(Job.guid).filter(
-                    Job.owner_type == owner_type
-                ).subquery()
-                return query.filter(or_(
-                    Invoice.owner_type == owner_type,
-                    and_(
-                        Invoice.owner_type == 3,
-                        Invoice.owner_guid.in_(job_guid_sq),
-                    ),
-                )).first()
-            return query.filter(Invoice.owner_type == owner_type).first()
+            return query.filter(
+                BusinessMixin._document_owner_clause(
+                    book, owner_type=owner_type,
+                )
+            ).first()
 
         # owner_type=None: pull all matches and fail loud on
         # collision rather than returning a row-order-dependent pick.
@@ -4907,7 +4945,11 @@ class BusinessMixin:
                     Invoice.owner_guid == job.guid,
                 )
             elif ot is not None:
-                query = query.filter(Invoice.owner_type == ot)
+                # Job-aware: a customer listing must include the
+                # customer's job-attached invoices (owner_type=3).
+                query = query.filter(
+                    self._document_owner_clause(book, owner_type=ot)
+                )
 
             invoices = query.order_by(Invoice.date_opened.desc()).all()
 
@@ -5413,13 +5455,15 @@ class BusinessMixin:
             # an explicit session.add would be redundant (see
             # the matching note in investments.py).
 
-            # GnuCash UI uses the customer/vendor name, not "Invoice NNNNNN"
-            if is_bill:
-                owner = self._find_vendor_by_guid(book, inv.owner_guid)
-            else:
-                owner = self._find_customer_by_guid(
-                    book, inv.owner_guid
-                )
+            # GnuCash UI uses the counterparty's name, not "Invoice
+            # NNNNNN". Resolved through the polymorphic finder: a
+            # side-keyed customer/vendor lookup returns None for
+            # vouchers (employee owner) and job-attached documents
+            # (owner_guid names the Job), which posted every such
+            # document as "Invoice NNN" (whole-tree review, 1a).
+            owner = self._find_invoice_owner_by_guid(
+                book, inv.owner_type, inv.owner_guid,
+            )
             owner_name = owner.name if owner else f"Invoice {inv.id}"
             # description=None falls back to the owner name (GnuCash
             # UI convention); an explicit "" deliberately blanks the
@@ -5894,15 +5938,15 @@ class BusinessMixin:
                         f"then retry payment."
                     )
 
-            if is_bill:
-                owner = self._find_vendor_by_guid(
-                    book, inv.owner_guid
-                )
-            else:
-                owner = self._find_customer_by_guid(
-                    book, inv.owner_guid
-                )
-            owner_name = owner.name if owner else ""
+            # Polymorphic owner lookup — the side-keyed finder
+            # returned None for vouchers and job-attached documents,
+            # and every such payment landed with an EMPTY description
+            # (whole-tree review, 1b). Same fallback as post_invoice
+            # so a dangling owner still yields a readable line.
+            owner = self._find_invoice_owner_by_guid(
+                book, inv.owner_type, inv.owner_guid,
+            )
+            owner_name = owner.name if owner else f"Invoice {inv.id}"
             # description: None → owner name; explicit "" blanks the
             # field deliberately. Same pattern as post_invoice.
             txn_desc = description if description is not None else owner_name
@@ -6991,30 +7035,53 @@ class BusinessMixin:
         delete: raises ValueError (posted/unposted-specific wording)
         if any Invoice rows match the owner_type.
         """
-        from piecash.business.invoice import Invoice
+        from piecash.business.invoice import Invoice, Job
 
         def check(book, entity_guid):
+            # Job-aware: a job-attached document's owner_guid names
+            # the Job, so a direct owner_guid match missed it and
+            # delete_customer succeeded with POSTED invoices on the
+            # books — leaving an owner that resolved to nothing
+            # forever (whole-tree review, 1g).
             invoices = book.session.query(Invoice).filter(
-                Invoice.owner_guid == entity_guid,
-                Invoice.owner_type == owner_type,
-            ).all()
-            if not invoices:
-                return
-            posted = [i for i in invoices if _is_invoice_posted(i)]
-            unposted = [i for i in invoices if not _is_invoice_posted(i)]
-            if posted:
-                posted_ids = ", ".join(i.id for i in posted)
-                raise ValueError(
-                    f"Cannot delete {entity_label.lower()} with posted "
-                    f"{doc_label}: {posted_ids}. "
-                    f"Void them or issue credit notes first."
+                BusinessMixin._document_owner_clause(
+                    book, owner_type=owner_type, owner_guid=entity_guid,
                 )
-            unposted_ids = ", ".join(i.id for i in unposted)
-            raise ValueError(
-                f"Cannot delete {entity_label.lower()} with "
-                f"{doc_label}: {unposted_ids}. "
-                f"Delete the {doc_label} first."
-            )
+            ).all()
+            if invoices:
+                posted = [i for i in invoices if _is_invoice_posted(i)]
+                unposted = [
+                    i for i in invoices if not _is_invoice_posted(i)
+                ]
+                if posted:
+                    posted_ids = ", ".join(i.id for i in posted)
+                    raise ValueError(
+                        f"Cannot delete {entity_label.lower()} with "
+                        f"posted {doc_label}: {posted_ids}. "
+                        f"Void them or issue credit notes first."
+                    )
+                unposted_ids = ", ".join(i.id for i in unposted)
+                raise ValueError(
+                    f"Cannot delete {entity_label.lower()} with "
+                    f"{doc_label}: {unposted_ids}. "
+                    f"Delete the {doc_label} first."
+                )
+            # The party's jobs reference it by GUID too; deleting
+            # underneath them leaves list_jobs / get_job_report
+            # rendering "?" for the owner with no way to repair it.
+            if owner_type in (2, 4):
+                jobs = book.session.query(Job).filter(
+                    Job.owner_guid == entity_guid,
+                    Job.owner_type == owner_type,
+                ).all()
+                if jobs:
+                    job_ids = ", ".join(j.id for j in jobs)
+                    raise ValueError(
+                        f"Cannot delete {entity_label.lower()} with "
+                        f"jobs: {job_ids}. Delete the jobs first "
+                        f"(delete_job), or retire the "
+                        f"{entity_label.lower()} with active=false."
+                    )
 
         return check
 
@@ -7071,12 +7138,13 @@ class BusinessMixin:
         )
 
     def delete_employee(self, employee_id: str) -> dict:
-        """Delete an employee.
+        """Delete an employee with no expense vouchers.
 
-        Employees in the 1.3.0 release have no associated documents —
-        expense vouchers (``counter_exp_voucher`` / ``owner_type=5``)
-        are out of scope. The delete proceeds unconditionally after
-        slot cleanup.
+        Employees with any vouchers (posted or unposted) cannot be
+        deleted — the same guard customers and vendors have had since
+        their documents existed. Vouchers arrived in v1.3 and the
+        guard did not follow until the whole-tree review (2026-09-04):
+        an employee could be deleted from under a posted voucher.
 
         Args:
             employee_id: Employee ID (e.g., '000001').
@@ -7085,13 +7153,17 @@ class BusinessMixin:
             Dict with id, name, type, status.
 
         Raises:
-            ValueError: If employee not found.
+            ValueError: If employee not found or has vouchers.
         """
         return self._delete_business_person(
             entity_id=employee_id,
             entity_label="Employee",
             find_entity_method="_find_employee",
-            # Employees own nothing in 1.3.0 — no dependency check.
+            dependency_check=self._invoice_dependency_check(
+                entity_label="Employee",
+                owner_type=5,
+                doc_label="vouchers",
+            ),
         )
 
     # ── Job CRUD ─────────────────────────────────────────────────
@@ -7500,8 +7572,14 @@ class BusinessMixin:
                 Invoice.date_posted.isnot(None)
             )
 
+            # Every owner filter is job-aware via the chokepoint —
+            # a plain owner_type / owner_guid match dropped every
+            # job-attached document from the collections list
+            # (whole-tree review, 1e).
             if ot is not None:
-                query = query.filter(Invoice.owner_type == ot)
+                query = query.filter(
+                    self._document_owner_clause(book, owner_type=ot)
+                )
 
             if customer_id:
                 customer = self._find_customer(book, customer_id)
@@ -7510,7 +7588,9 @@ class BusinessMixin:
                         f"Customer not found: {customer_id}"
                     )
                 query = query.filter(
-                    Invoice.owner_guid == customer.guid
+                    self._document_owner_clause(
+                        book, owner_type=2, owner_guid=customer.guid,
+                    )
                 )
 
             if vendor_id:
@@ -7520,7 +7600,9 @@ class BusinessMixin:
                         f"Vendor not found: {vendor_id}"
                     )
                 query = query.filter(
-                    Invoice.owner_guid == vendor.guid
+                    self._document_owner_clause(
+                        book, owner_type=4, owner_guid=vendor.guid,
+                    )
                 )
 
             invoices = query.order_by(
@@ -7962,7 +8044,9 @@ class BusinessMixin:
                 u["bill_count"] += 1
                 continue
 
-            v = self._find_vendor_by_guid(book, bill.owner_guid)
+            v = self._find_invoice_owner_by_guid(
+                book, bill.owner_type, bill.owner_guid,
+            )
             v_name = v.name if v else "Unknown"
             bucket = totals.setdefault(v_name, {})
             bucket[plabel] = bucket.get(plabel, Decimal(0)) + total
@@ -8048,20 +8132,23 @@ class BusinessMixin:
             default_currency = self._require_default_currency(book)
             default_currency_mnemonic = default_currency.mnemonic
 
-            query = book.session.query(Invoice).filter(
-                Invoice.owner_type == 4,
-                Invoice.date_posted.isnot(None),
-            )
-
+            # Job-aware (chokepoint): a vendor bill grouped under a
+            # job is owner_type=3 and was excluded from spend totals
+            # by the direct owner_type match (whole-tree review, 1f).
+            vendor_guid = None
             if vendor_id:
                 vendor = self._find_vendor(book, vendor_id)
                 if not vendor:
                     raise ValueError(
                         f"Vendor not found: {vendor_id}"
                     )
-                query = query.filter(
-                    Invoice.owner_guid == vendor.guid
-                )
+                vendor_guid = vendor.guid
+            query = book.session.query(Invoice).filter(
+                self._document_owner_clause(
+                    book, owner_type=4, owner_guid=vendor_guid,
+                ),
+                Invoice.date_posted.isnot(None),
+            )
 
             bills = query.all()
 
@@ -8094,8 +8181,8 @@ class BusinessMixin:
             # as a warning.
             unconverted: dict[str, dict] = {}
             for bill in bills:
-                v = self._find_vendor_by_guid(
-                    book, bill.owner_guid
+                v = self._find_invoice_owner_by_guid(
+                    book, bill.owner_type, bill.owner_guid,
                 )
                 v_name = v.name if v else "Unknown"
                 v_id = v.id if v else ""

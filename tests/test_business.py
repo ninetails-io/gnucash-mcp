@@ -327,9 +327,8 @@ class TestGetEmployee:
 class TestDeleteEmployee:
     """Tests for delete_employee.
 
-    Employees in the 1.3.0 release have no associated documents —
-    expense vouchers are out of scope. delete_employee proceeds
-    unconditionally after slot cleanup.
+    Voucher-bearing employees are guarded the same way customers and
+    vendors are — see tests/test_owner_resolution.py for those cases.
     """
 
     def test_delete_employee(self, business_book):

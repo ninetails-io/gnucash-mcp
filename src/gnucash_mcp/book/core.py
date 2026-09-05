@@ -883,11 +883,20 @@ class CoreMixin:
             try:
                 from piecash.business.invoice import Invoice
                 from sqlalchemy import text
-                find_customer_by_guid = getattr(
-                    self, "_find_customer_by_guid", None,
+                # Polymorphic owner + effective side (BusinessMixin
+                # chokepoints). The side-keyed finders rendered every
+                # overdue voucher and job-attached bill as "Past due
+                # invoice: #NNN" — wrong type, no name — while
+                # get_outstanding_documents named it correctly
+                # (whole-tree review, 1c).
+                find_owner = getattr(
+                    self, "_find_invoice_owner_by_guid", None,
                 )
-                find_vendor_by_guid = getattr(
-                    self, "_find_vendor_by_guid", None,
+                effective_owner_type = getattr(
+                    self, "_effective_owner_type", None,
+                )
+                type_labels = getattr(
+                    self, "_OWNER_TYPE_TO_RESPONSE_TYPE", {},
                 )
                 overdue_inv_entries: list[tuple[int, str]] = []
                 get_is_cn = getattr(
@@ -924,22 +933,19 @@ class CoreMixin:
                             continue
 
                         days_overdue = (today - due_date).days
-                        is_bill = (inv.owner_type == 4)
-                        doc_type = "bill" if is_bill else "invoice"
+                        eff_ot = (
+                            effective_owner_type(book, inv)
+                            if effective_owner_type is not None
+                            else inv.owner_type
+                        )
+                        doc_type = type_labels.get(eff_ot, "invoice")
 
-                        if is_bill and find_vendor_by_guid is not None:
-                            owner = find_vendor_by_guid(
-                                book, inv.owner_guid,
+                        owner = (
+                            find_owner(
+                                book, inv.owner_type, inv.owner_guid,
                             )
-                        elif (
-                            not is_bill
-                            and find_customer_by_guid is not None
-                        ):
-                            owner = find_customer_by_guid(
-                                book, inv.owner_guid,
-                            )
-                        else:
-                            owner = None
+                            if find_owner is not None else None
+                        )
                         owner_name = (
                             owner.name if owner
                             else f"#{inv.id}"

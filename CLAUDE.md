@@ -240,6 +240,11 @@ Established chokepoints and the rule each one owns:
 - `_upsert_price` — single/batch price writes can't diverge.
 - `_classify_reconciliation` — dashboard aggregates and the
   drill-down table bucket rows identically.
+- `_find_invoice_owner_by_guid` / `_document_owner_clause` — who a
+  document belongs to, by name and by SQL filter. `owner_guid` is
+  polymorphic (a Job on job-attached documents, an Employee on
+  vouchers); a hand-rolled `owner_type == 4` or `owner_guid ==
+  guid` silently drops both. Locked by `test_owner_resolution.py`.
 - `_parse_owner_type`, `_commodity_quantum`, `_is_market_price`,
   `_effective_owner_type` — same story, smaller surface.
 
