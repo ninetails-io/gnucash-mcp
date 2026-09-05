@@ -72,6 +72,17 @@ class TestBatchTsvParser:
         ]
         assert "notes" not in rows[0]
 
+    def test_empty_date_cell_rejects(self):
+        """A blank date cell is a format error, as it is for
+        enter_statement — never a silent default to today (the
+        results table carries no date to reveal the substitution)."""
+        tsv = (
+            "ref\tdate\tdescription\tamt1\tacct1\tamt2\tacct2\n"
+            "1\t\tNo date\t-10\tAssets:Checking\t10\tExpenses:Groceries"
+        )
+        with pytest.raises(ValueError, match="row 1.*not a valid YYYY-MM-DD"):
+            _parse_transactions_tsv(tsv)
+
     def test_unknown_header_columns_reject_by_name(self):
         """6c (bookkeeper finding): now that the header is load-
         bearing, unknown columns must fail on the FORMAT with the
