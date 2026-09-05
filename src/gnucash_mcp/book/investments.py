@@ -452,7 +452,7 @@ class InvestmentsMixin:
                         "type": p.get("price_type") or "nav",
                         "source": p.get("source") or "user:price",
                     })
-                except (ValueError, KeyError, ArithmeticError) as e:
+                except (ValueError, KeyError) as e:
                     by_ref[ref] = {
                         "ref": ref, "status": "rejected",
                         "reason": str(e),
@@ -1166,11 +1166,9 @@ class InvestmentsMixin:
                 raise ValueError(f"Lot not found: {guid}")
 
             # Split prefixes span the whole book — they feed back
-            # into table-wide _resolve_guid lookups.
-            all_split_guids = (
-                s.guid for txn in book.transactions for s in txn.splits
-            )
-            prefixes = _guid_prefix_map(all_split_guids)
+            # into table-wide _resolve_guid lookups. Cached, one
+            # indexed query (whole-tree review, class 4).
+            prefixes = self._split_prefix_map(book)
 
             splits = []
             for split in lot.splits:

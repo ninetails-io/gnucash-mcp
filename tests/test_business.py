@@ -327,9 +327,8 @@ class TestGetEmployee:
 class TestDeleteEmployee:
     """Tests for delete_employee.
 
-    Employees in the 1.3.0 release have no associated documents —
-    expense vouchers are out of scope. delete_employee proceeds
-    unconditionally after slot cleanup.
+    Voucher-bearing employees are guarded the same way customers and
+    vendors are — see tests/test_owner_resolution.py for those cases.
     """
 
     def test_delete_employee(self, business_book):
@@ -11912,3 +11911,103 @@ class TestPayInvoiceDryRun:
         )
         accounts = gb.list_accounts()
         assert "Foreign Exchange" in str(accounts)
+
+
+class TestCreditNoteUnpostKeepsAppliesTo:
+    """Whole-tree review (2026-09-04), class 3: deleting the posting
+    transaction sweeps the credit note's own slots. ``unpost_invoice``
+    restored the ``credit-note`` identity flag but not the
+    ``gnc-mcp/applies-to-invoice`` link, so every post/unpost
+    round-trip silently dropped the provenance the note was created
+    with. The link is a FRAME row plus a child row, so the restore
+    rebuilds both.
+    """
+
+    @staticmethod
+    def _linked_credit_note(business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        inv = gb.create_invoice(customer_id="000001", date_opened="2026-06-01")
+        gb.add_invoice_entry(
+            invoice_id=inv["id"], account="Income:Sales",
+            description="Work", quantity="1", price="500.00",
+        )
+        gb.post_invoice(
+            invoice_id=inv["id"], post_account="Assets:Accounts Receivable",
+            post_date="2026-06-01", owner_type="customer",
+        )
+        cn = gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+            applies_to_invoice_id=inv["id"], date_opened="2026-06-10",
+        )
+        gb.add_credit_note_entry(
+            credit_note_id=cn["id"], account="Income:Sales",
+            description="Refund", quantity="1", price="100.00",
+            owner_type="customer",
+        )
+        return gb, inv["id"], cn["id"]
+
+    def test_post_unpost_round_trip_keeps_the_link(self, business_book):
+        gb, inv_id, cn_id = self._linked_credit_note(business_book)
+        expected = {"id": inv_id, "type": "invoice"}
+        assert gb.get_invoice(cn_id, owner_type="customer")["applies_to"] \
+            == expected
+        gb.post_invoice(
+            invoice_id=cn_id, post_account="Assets:Accounts Receivable",
+            post_date="2026-06-10", owner_type="customer",
+        )
+        gb.unpost_invoice(invoice_id=cn_id, owner_type="customer")
+        after = gb.get_invoice(cn_id, owner_type="customer")
+        assert after["is_credit_note"] is True
+        assert after["applies_to"] == expected
+
+    def test_link_survives_repost_and_apply(self, business_book):
+        """The restored rows are real slots: a second post/unpost keeps
+        the link (no doubled frame), and apply_credit_note still
+        reads it for its provenance note."""
+        gb, inv_id, cn_id = self._linked_credit_note(business_book)
+        for _ in range(2):
+            gb.post_invoice(
+                invoice_id=cn_id, post_account="Assets:Accounts Receivable",
+                post_date="2026-06-10", owner_type="customer",
+            )
+            gb.unpost_invoice(invoice_id=cn_id, owner_type="customer")
+        gb.post_invoice(
+            invoice_id=cn_id, post_account="Assets:Accounts Receivable",
+            post_date="2026-06-10", owner_type="customer",
+        )
+        # Exactly one gnc-mcp frame on the credit note.
+        from sqlalchemy import text
+        from piecash.business.invoice import Invoice
+        with gb.open() as b:
+            guid = b.session.query(Invoice).filter_by(id=cn_id).first().guid
+            n = b.session.execute(
+                text("SELECT COUNT(*) FROM slots WHERE obj_guid=:g "
+                     "AND name='gnc-mcp'"), {"g": guid},
+            ).scalar()
+        assert n == 1
+        # Applying to the linked target produces no divergence note.
+        result = gb.apply_credit_note(
+            credit_note_id=cn_id, applies_to_invoice_id=inv_id,
+            owner_type="customer",
+        )
+        assert result["status"] == "applied"
+        assert "note" not in result
+
+    def test_unlinked_credit_note_unpost_unchanged(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        cn = gb.create_credit_note(owner_id="000001", owner_type="customer")
+        gb.add_credit_note_entry(
+            credit_note_id=cn["id"], account="Income:Sales",
+            description="Refund", quantity="1", price="100.00",
+            owner_type="customer",
+        )
+        gb.post_invoice(
+            invoice_id=cn["id"], post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        gb.unpost_invoice(invoice_id=cn["id"], owner_type="customer")
+        after = gb.get_invoice(cn["id"], owner_type="customer")
+        assert after["is_credit_note"] is True
+        assert "applies_to" not in after

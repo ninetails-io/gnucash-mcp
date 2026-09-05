@@ -18,7 +18,7 @@ import threading
 import time
 from contextlib import contextmanager
 from datetime import date
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Generator, Iterable
 
@@ -143,10 +143,30 @@ def _to_decimal(value) -> Decimal:
 
     Use everywhere user-supplied money hits ``Decimal(...)`` —
     direct callers (tests, scripts) bypass the pydantic coercion.
+
+    Raises ``ValueError`` — never ``decimal.InvalidOperation`` — on
+    text that isn't a number, and on NaN / infinity. InvalidOperation
+    is an ``ArithmeticError``, so it slipped past every ``except
+    ValueError`` on the write paths: one ``$10`` cell sank a whole
+    ``create_transactions`` batch as ``unexpected_error`` (and
+    ``on_error="skip"`` could not rescue it) while ``create_prices``
+    happened to catch ``ArithmeticError`` and rejected the same cell
+    per row (whole-tree review, 2026-09-04, class 2). Converting here
+    retires the class at every caller and lets ``safe_tool`` report
+    it as the ``validation_error`` it is.
     """
     if isinstance(value, Decimal):
-        return value
-    return Decimal(str(value))
+        d = value
+    else:
+        try:
+            d = Decimal(str(value))
+        except InvalidOperation:
+            raise ValueError(
+                f"not a valid decimal amount: {value!r}"
+            ) from None
+    if not d.is_finite():
+        raise ValueError(f"amount must be a finite number, got {value!r}")
+    return d
 
 
 def _verify_write(session, table, guid: str, label: str) -> None:
@@ -1853,6 +1873,43 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
             .all()
         )
         book._gnucash_mcp_split_graph = (accounts, transactions)
+
+    @staticmethod
+    def _preload_account_transactions(book, account) -> list:
+        """Warm ONE account's transaction rows (with their split
+        and slot collections) in three indexed queries, so a later walk over
+        ``account.splits`` that touches ``split.transaction`` or
+        ``txn.splits`` resolves in memory instead of one SELECT per
+        row. The account-scoped sibling of
+        ``_preload_split_graph`` (which loads the whole book and is
+        wrong for a single-account tool).
+
+        Returns the loaded rows; THE CALLER MUST HOLD THE RETURNED
+        LIST for as long as the walk runs — the identity map holds
+        rows only weakly, and without a strong reference they are
+        collected immediately and every access queries again. First
+        built inline for enter_statement (release-review finding 8);
+        hoisted when the whole-tree review found the reconciliation
+        tools paying the same per-split SELECT.
+        """
+        from piecash.core.transaction import Split, Transaction
+        from sqlalchemy.orm import selectinload
+
+        # selectinload: the register renderer and the statement
+        # candidate scan read txn.splits per transaction, and
+        # ``txn.notes`` is slot-backed (one slots SELECT per row) —
+        # two IN-queries here instead of two SELECTs per row there.
+        return (
+            book.session.query(Transaction)
+            .join(Split, Split.transaction_guid == Transaction.guid)
+            .filter(Split.account_guid == account.guid)
+            .options(
+                selectinload(Transaction.splits),
+                selectinload(Transaction.slots),
+            )
+            .distinct()
+            .all()
+        )
 
     @staticmethod
     def _is_template_transaction(txn, template_guids: set) -> bool:

@@ -15,7 +15,6 @@ from decimal import Decimal
 
 from gnucash_mcp.book._base import (
     _commodity_quantum,
-    _guid_prefix_map,
     _is_unreconciled,
     _is_voided,
     _split_to_compact_dict,
@@ -116,10 +115,10 @@ class ReconciliationMixin:
             # Short split prefix + context the LLM only had a GUID
             # for. The requested state is an echo — dropped;
             # reconcile_date stays (computed when not provided).
-            all_split_guids = (
-                s.guid for txn in book.transactions for s in txn.splits
-            )
-            short_guid = _unique_prefix(split.guid, all_split_guids)
+            # The cached table-wide map is one indexed query; the
+            # relationship walk it replaces lazy-loaded one splits
+            # collection per transaction (whole-tree review, class 4).
+            short_guid = self._split_prefix_map(book)[split.guid]
             return {
                 "split_guid": short_guid,
                 "account": split.account.fullname,
@@ -232,6 +231,14 @@ class ReconciliationMixin:
             cleared_total = Decimal("0")
             uncleared_total = Decimal("0")
 
+            # One indexed query for this account's transactions —
+            # the sort key below reads split.transaction per split,
+            # which lazy-loaded one SELECT each (whole-tree review,
+            # class 4's second head). Strong reference held for the
+            # walk; see the helper.
+            _txn_keepalive = (  # noqa: F841 — keepalive
+                self._preload_account_transactions(book, account)
+            )
             splits = sorted(
                 account.splits,
                 key=lambda s: (s.transaction.post_date, s.transaction.enter_date)
@@ -286,11 +293,9 @@ class ReconciliationMixin:
 
             if compact:
                 # Prefixes span every split in the book — the
-                # consuming tools resolve GUIDs table-wide.
-                all_split_guids = (
-                    s.guid for txn in book.transactions for s in txn.splits
-                )
-                prefixes = _guid_prefix_map(all_split_guids)
+                # consuming tools resolve GUIDs table-wide. Cached,
+                # one indexed query (whole-tree review, class 4).
+                prefixes = self._split_prefix_map(book)
                 lines = [indicator]
                 lines += [
                     _unreconciled_split_to_compact_line(s, prefixes=prefixes)
@@ -381,6 +386,13 @@ class ReconciliationMixin:
             account = self._resolve_account(book, account_name)
             if not account:
                 raise ValueError(f"Account not found: {account_name}")
+
+            # Bulk mode and the audit before-state both read
+            # split.transaction per split — warm the account's
+            # transactions once (strong reference held for the call).
+            _txn_keepalive = (  # noqa: F841 — keepalive
+                self._preload_account_transactions(book, account)
+            )
 
             reconciled_balance = Decimal("0")
             for split in account.splits:

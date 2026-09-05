@@ -883,11 +883,20 @@ class CoreMixin:
             try:
                 from piecash.business.invoice import Invoice
                 from sqlalchemy import text
-                find_customer_by_guid = getattr(
-                    self, "_find_customer_by_guid", None,
+                # Polymorphic owner + effective side (BusinessMixin
+                # chokepoints). The side-keyed finders rendered every
+                # overdue voucher and job-attached bill as "Past due
+                # invoice: #NNN" — wrong type, no name — while
+                # get_outstanding_documents named it correctly
+                # (whole-tree review, 1c).
+                find_owner = getattr(
+                    self, "_find_invoice_owner_by_guid", None,
                 )
-                find_vendor_by_guid = getattr(
-                    self, "_find_vendor_by_guid", None,
+                effective_owner_type = getattr(
+                    self, "_effective_owner_type", None,
+                )
+                type_labels = getattr(
+                    self, "_OWNER_TYPE_TO_RESPONSE_TYPE", {},
                 )
                 overdue_inv_entries: list[tuple[int, str]] = []
                 get_is_cn = getattr(
@@ -924,22 +933,19 @@ class CoreMixin:
                             continue
 
                         days_overdue = (today - due_date).days
-                        is_bill = (inv.owner_type == 4)
-                        doc_type = "bill" if is_bill else "invoice"
+                        eff_ot = (
+                            effective_owner_type(book, inv)
+                            if effective_owner_type is not None
+                            else inv.owner_type
+                        )
+                        doc_type = type_labels.get(eff_ot, "invoice")
 
-                        if is_bill and find_vendor_by_guid is not None:
-                            owner = find_vendor_by_guid(
-                                book, inv.owner_guid,
+                        owner = (
+                            find_owner(
+                                book, inv.owner_type, inv.owner_guid,
                             )
-                        elif (
-                            not is_bill
-                            and find_customer_by_guid is not None
-                        ):
-                            owner = find_customer_by_guid(
-                                book, inv.owner_guid,
-                            )
-                        else:
-                            owner = None
+                            if find_owner is not None else None
+                        )
                         owner_name = (
                             owner.name if owner
                             else f"#{inv.id}"
@@ -2730,6 +2736,15 @@ class CoreMixin:
                 # split.account.fullname, so a raw %short ref would
                 # silently fall through to the multi-split form.
                 focus_fullname = acct.fullname
+                # One indexed query for the account's transactions —
+                # the set comprehension below reads split.transaction
+                # per split, one lazy SELECT each (1,351 statements
+                # per register page on the Alex sample; whole-tree
+                # review, class 4). Strong reference held for the
+                # call; see the helper.
+                _txn_keepalive = (  # noqa: F841 — keepalive
+                    self._preload_account_transactions(book, acct)
+                )
                 transactions = {split.transaction for split in acct.splits}
             else:
                 # Hide scheduled-transaction template recipes — real
@@ -2864,7 +2879,7 @@ class CoreMixin:
             if acct.type not in self._FUNDING_ACCOUNT_TYPES:
                 try:
                     legs.append(_to_decimal(sp["amount"]))
-                except (InvalidOperation, ValueError):
+                except ValueError:
                     return None
         if not legs:
             return None
@@ -4266,7 +4281,7 @@ class CoreMixin:
             for ln in lines:
                 try:
                     amt = _to_decimal(ln["amount"])
-                except (InvalidOperation, ValueError):
+                except ValueError:
                     raise ValueError(
                         f"line {ln['ref']}: amount "
                         f"{ln['amount']!r} is not a decimal"
@@ -4345,25 +4360,11 @@ class CoreMixin:
 
             # Warm this account's transaction rows in ONE indexed
             # query before the universe filter touches
-            # s.transaction.post_date per split — the lazy
-            # many-to-one was a SELECT per transaction, making the
-            # headline workflow O(account history) in round-trips on
-            # large books, paid by dry-run and commit alike
-            # (release-review finding 8). Account-scoped on purpose:
-            # _preload_split_graph loads the whole book, which a
-            # single-statement entry never needs. The strong
-            # reference is load-bearing — the identity map holds
-            # rows only weakly (same trap the preload documents).
-            from piecash.core.transaction import (
-                Split as _Split,
-                Transaction as _Txn,
-            )
-            _txn_keepalive = (  # noqa: F841 — keepalive, see above
-                book.session.query(_Txn)
-                .join(_Split, _Split.transaction_guid == _Txn.guid)
-                .filter(_Split.account_guid == account.guid)
-                .distinct()
-                .all()
+            # s.transaction.post_date per split (release-review
+            # finding 8). The strong reference is load-bearing —
+            # see the helper.
+            _txn_keepalive = (  # noqa: F841 — keepalive, see helper
+                self._preload_account_transactions(book, account)
             )
 
             # Candidate universe: this account's splits within the
