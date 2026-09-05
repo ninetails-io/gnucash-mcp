@@ -2736,6 +2736,15 @@ class CoreMixin:
                 # split.account.fullname, so a raw %short ref would
                 # silently fall through to the multi-split form.
                 focus_fullname = acct.fullname
+                # One indexed query for the account's transactions —
+                # the set comprehension below reads split.transaction
+                # per split, one lazy SELECT each (1,351 statements
+                # per register page on the Alex sample; whole-tree
+                # review, class 4). Strong reference held for the
+                # call; see the helper.
+                _txn_keepalive = (  # noqa: F841 — keepalive
+                    self._preload_account_transactions(book, acct)
+                )
                 transactions = {split.transaction for split in acct.splits}
             else:
                 # Hide scheduled-transaction template recipes — real

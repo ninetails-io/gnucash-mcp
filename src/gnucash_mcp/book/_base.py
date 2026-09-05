@@ -1876,10 +1876,11 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
 
     @staticmethod
     def _preload_account_transactions(book, account) -> list:
-        """Warm ONE account's transaction rows in a single indexed
-        query, so a later walk over ``account.splits`` that touches
-        ``split.transaction`` resolves in memory instead of one
-        SELECT per split. The account-scoped sibling of
+        """Warm ONE account's transaction rows (with their split
+        and slot collections) in three indexed queries, so a later walk over
+        ``account.splits`` that touches ``split.transaction`` or
+        ``txn.splits`` resolves in memory instead of one SELECT per
+        row. The account-scoped sibling of
         ``_preload_split_graph`` (which loads the whole book and is
         wrong for a single-account tool).
 
@@ -1892,11 +1893,20 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         tools paying the same per-split SELECT.
         """
         from piecash.core.transaction import Split, Transaction
+        from sqlalchemy.orm import selectinload
 
+        # selectinload: the register renderer and the statement
+        # candidate scan read txn.splits per transaction, and
+        # ``txn.notes`` is slot-backed (one slots SELECT per row) —
+        # two IN-queries here instead of two SELECTs per row there.
         return (
             book.session.query(Transaction)
             .join(Split, Split.transaction_guid == Transaction.guid)
             .filter(Split.account_guid == account.guid)
+            .options(
+                selectinload(Transaction.splits),
+                selectinload(Transaction.slots),
+            )
             .distinct()
             .all()
         )

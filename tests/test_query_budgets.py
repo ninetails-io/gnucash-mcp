@@ -12,7 +12,7 @@ Each test seeds an account with N transactions and asserts the call
 stays well under N statements; the pre-fix shape scales with N, the
 fixed shape does not. Thresholds were calibrated by MEASURING the
 fixed and mutated counts with N=80 — get_unreconciled_splits 7 vs
-172 statements, set_reconcile_state 14 vs 96, get_lot 12 vs 92, and
+172 statements, list_transactions(account) 15 vs 179, set_reconcile_state 14 vs 96, get_lot 12 vs 92, and
 bulk reconcile_account 1 vs 82 SELECTs on the transactions table
 (its total is dominated by legitimate per-row writes and piecash's
 flush validation) — and sit between them. The structural test keeps the sites on the helpers.
@@ -124,6 +124,18 @@ class TestPerAccountQueryBudgets:
             f"are back (prefix walk or split.transaction sort key)"
         )
 
+    def test_list_transactions_register(self, test_book):
+        """The account-filtered register view."""
+        _seed(test_book, "Assets:Checking", "Expenses:Groceries")
+        gb = GnuCashBook(str(test_book))
+        with _Counter(gb) as c:
+            out = gb.list_transactions(account="Assets:Checking", limit=250)
+        assert out.count("\n") >= N
+        assert len(c) < N, (
+            f"{len(c)} statements for list_transactions(account) on a "
+            f"{N}-transaction account — split.transaction is lazy again"
+        )
+
     def test_set_reconcile_state(self, test_book):
         _seed(test_book, "Assets:Checking", "Expenses:Groceries")
         gb = GnuCashBook(str(test_book))
@@ -192,6 +204,7 @@ class TestPrefixAndPreloadChokepoints:
             reconciliation.ReconciliationMixin.get_unreconciled_splits,
             reconciliation.ReconciliationMixin.reconcile_account,
             core.CoreMixin.enter_statement,
+            core.CoreMixin.list_transactions,
         ):
             assert "_preload_account_transactions" in inspect.getsource(
                 method
