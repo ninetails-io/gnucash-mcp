@@ -1875,6 +1875,33 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         book._gnucash_mcp_split_graph = (accounts, transactions)
 
     @staticmethod
+    def _preload_account_transactions(book, account) -> list:
+        """Warm ONE account's transaction rows in a single indexed
+        query, so a later walk over ``account.splits`` that touches
+        ``split.transaction`` resolves in memory instead of one
+        SELECT per split. The account-scoped sibling of
+        ``_preload_split_graph`` (which loads the whole book and is
+        wrong for a single-account tool).
+
+        Returns the loaded rows; THE CALLER MUST HOLD THE RETURNED
+        LIST for as long as the walk runs — the identity map holds
+        rows only weakly, and without a strong reference they are
+        collected immediately and every access queries again. First
+        built inline for enter_statement (release-review finding 8);
+        hoisted when the whole-tree review found the reconciliation
+        tools paying the same per-split SELECT.
+        """
+        from piecash.core.transaction import Split, Transaction
+
+        return (
+            book.session.query(Transaction)
+            .join(Split, Split.transaction_guid == Transaction.guid)
+            .filter(Split.account_guid == account.guid)
+            .distinct()
+            .all()
+        )
+
+    @staticmethod
     def _is_template_transaction(txn, template_guids: set) -> bool:
         """True iff ``txn`` is a scheduled-transaction template recipe.
 

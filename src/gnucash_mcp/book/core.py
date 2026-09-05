@@ -4351,25 +4351,11 @@ class CoreMixin:
 
             # Warm this account's transaction rows in ONE indexed
             # query before the universe filter touches
-            # s.transaction.post_date per split — the lazy
-            # many-to-one was a SELECT per transaction, making the
-            # headline workflow O(account history) in round-trips on
-            # large books, paid by dry-run and commit alike
-            # (release-review finding 8). Account-scoped on purpose:
-            # _preload_split_graph loads the whole book, which a
-            # single-statement entry never needs. The strong
-            # reference is load-bearing — the identity map holds
-            # rows only weakly (same trap the preload documents).
-            from piecash.core.transaction import (
-                Split as _Split,
-                Transaction as _Txn,
-            )
-            _txn_keepalive = (  # noqa: F841 — keepalive, see above
-                book.session.query(_Txn)
-                .join(_Split, _Split.transaction_guid == _Txn.guid)
-                .filter(_Split.account_guid == account.guid)
-                .distinct()
-                .all()
+            # s.transaction.post_date per split (release-review
+            # finding 8). The strong reference is load-bearing —
+            # see the helper.
+            _txn_keepalive = (  # noqa: F841 — keepalive, see helper
+                self._preload_account_transactions(book, account)
             )
 
             # Candidate universe: this account's splits within the
