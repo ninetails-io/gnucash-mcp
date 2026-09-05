@@ -26,6 +26,7 @@ from gnucash_mcp.book._base import (
     _to_decimal,
     _unique_prefix,
     _verify_composite_write,
+    _verify_delete,
     _verify_write,
 )
 from gnucash_mcp._format import (
@@ -1986,6 +1987,84 @@ class BusinessMixin:
             book.session, Slot.__table__,
             {"obj_guid": frame_guid, "name": "invoice"},
             f"gncInvoice ref slot for frame {frame_guid[:8]}",
+        )
+
+    @staticmethod
+    def _write_applies_to_slot(book, invoice_guid: str, source_guid: str):
+        """Write the ``gnc-mcp/applies-to-invoice`` link via Core.
+
+        piecash stores a path-style key as two rows: a FRAME slot on
+        the invoice named ``gnc-mcp`` (``guid_val`` = a fresh frame
+        guid) and the string value on the frame's guid under the full
+        path name. This is the raw-SQL twin of the ORM write in
+        ``_set_applies_to_invoice_guid``, for the one caller
+        (``unpost_invoice``) that must write after the posting-
+        transaction delete has swept the invoice's own slots — the
+        ORM accessors are unreliable in that state. Any leftover
+        ``gnc-mcp`` frame on the invoice is removed first so the key
+        never doubles.
+        """
+        import uuid
+        from piecash.kvp import KVP_Type, Slot
+
+        stale = book.session.execute(
+            Slot.__table__.select().where(
+                (Slot.__table__.c.obj_guid == invoice_guid)
+                & (Slot.__table__.c.name == "gnc-mcp")
+            )
+        ).fetchall()
+        for row in stale:
+            if row.guid_val:
+                book.session.execute(
+                    Slot.__table__.delete().where(
+                        Slot.__table__.c.obj_guid == row.guid_val
+                    )
+                )
+                _verify_delete(
+                    book.session, Slot.__table__,
+                    {"obj_guid": row.guid_val},
+                    f"stale gnc-mcp frame children for {invoice_guid[:8]}",
+                )
+        if stale:
+            book.session.execute(
+                Slot.__table__.delete().where(
+                    (Slot.__table__.c.obj_guid == invoice_guid)
+                    & (Slot.__table__.c.name == "gnc-mcp")
+                )
+            )
+            _verify_delete(
+                book.session, Slot.__table__,
+                {"obj_guid": invoice_guid, "name": "gnc-mcp"},
+                f"stale gnc-mcp frame for {invoice_guid[:8]}",
+            )
+
+        frame_guid = uuid.uuid4().hex
+        book.session.execute(
+            Slot.__table__.insert().values(
+                obj_guid=invoice_guid,
+                name="gnc-mcp",
+                slot_type=KVP_Type.KVP_TYPE_FRAME,
+                guid_val=frame_guid,
+            )
+        )
+        _verify_composite_write(
+            book.session, Slot.__table__,
+            {"obj_guid": invoice_guid, "name": "gnc-mcp"},
+            f"gnc-mcp frame slot for {invoice_guid[:8]}",
+        )
+        book.session.execute(
+            Slot.__table__.insert().values(
+                obj_guid=frame_guid,
+                name=BusinessMixin._APPLIES_TO_SLOT_KEY,
+                slot_type=KVP_Type.KVP_TYPE_STRING,
+                string_val=source_guid,
+            )
+        )
+        _verify_composite_write(
+            book.session, Slot.__table__,
+            {"obj_guid": frame_guid,
+             "name": BusinessMixin._APPLIES_TO_SLOT_KEY},
+            f"applies-to slot for frame {frame_guid[:8]}",
         )
 
     @staticmethod
@@ -5737,11 +5816,16 @@ class BusinessMixin:
             inv.post_account = None
             book.flush()
 
-            # Read the credit-note flag BEFORE deleting: slot reads
-            # can flake ("Multiple rows returned with uselist=False")
-            # while lots/transactions are being deleted in the same
-            # session.
+            # Read the credit-note flag AND the applies-to link
+            # BEFORE deleting: slot reads can flake ("Multiple rows
+            # returned with uselist=False") while lots/transactions
+            # are being deleted in the same session, and the delete
+            # sweeps both slots (see below).
             is_credit_note = self._get_is_credit_note(inv)
+            applies_to_guid = (
+                self._get_applies_to_invoice_guid(inv)
+                if is_credit_note else None
+            )
             inv_id_snapshot = inv.id
             owner_type_snapshot = inv.owner_type
             inv_guid_snapshot = inv.guid
@@ -5784,6 +5868,16 @@ class BusinessMixin:
                      "name": "credit-note"},
                     "credit-note flag restore",
                 )
+                # The applies-to link rides the same sweep. It is
+                # stored as a FRAME row on the invoice (``gnc-mcp``)
+                # with the value hung off the frame's guid, so the
+                # restore rebuilds both rows — the identity flag alone
+                # came back and the link silently vanished on every
+                # unpost (whole-tree review, 2026-09-04, class 3).
+                if applies_to_guid:
+                    self._write_applies_to_slot(
+                        book, inv_guid_snapshot, applies_to_guid,
+                    )
 
             book.save()
 
