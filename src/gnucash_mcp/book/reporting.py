@@ -1072,7 +1072,7 @@ class ReportingMixin:
             if account:
                 target_account = self._resolve_account(book, account)
                 if not target_account:
-                    raise ValueError(f"Account not found: {account}")
+                    raise self._account_not_found_error(book, account)
                 rows = self._query_filtered_splits(
                     book,
                     start_date=start_date,

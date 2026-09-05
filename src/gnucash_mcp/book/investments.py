@@ -1043,7 +1043,7 @@ class InvestmentsMixin:
         with self.open(readonly=False) as book:
             acct = self._resolve_account(book, account)
             if not acct:
-                raise ValueError(f"Account not found: {account}")
+                raise self._account_not_found_error(book, account)
 
             lot = Lot(
                 title=title,
@@ -1099,7 +1099,7 @@ class InvestmentsMixin:
         with self.open(readonly=True) as book:
             acct = self._resolve_account(book, account)
             if not acct:
-                raise ValueError(f"Account not found: {account}")
+                raise self._account_not_found_error(book, account)
 
             default_ccy = self._require_default_currency(book)
             results = []

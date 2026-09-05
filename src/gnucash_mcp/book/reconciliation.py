@@ -225,7 +225,7 @@ class ReconciliationMixin:
         with self.open(readonly=True) as book:
             account = self._resolve_account(book, account_name)
             if not account:
-                raise ValueError(f"Account not found: {account_name}")
+                raise self._account_not_found_error(book, account_name)
 
             all_unreconciled = []
             cleared_total = Decimal("0")
@@ -385,7 +385,7 @@ class ReconciliationMixin:
         with self.open(readonly=False) as book:
             account = self._resolve_account(book, account_name)
             if not account:
-                raise ValueError(f"Account not found: {account_name}")
+                raise self._account_not_found_error(book, account_name)
 
             # Bulk mode and the audit before-state both read
             # split.transaction per split — warm the account's

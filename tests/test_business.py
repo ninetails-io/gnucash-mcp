@@ -1652,6 +1652,23 @@ class TestDeleteVendor:
             gb.delete_vendor(vendor_id="999999")
 
 
+class TestEntryAccountMissSuggests:
+    """A wrong account guess on an entry tool answers with
+    candidates, the same as batch entry and statements — the bare
+    'Account not found' cost a list_accounts round-trip (bookkeeper,
+    PR #172)."""
+
+    def test_add_invoice_entry_near_miss(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        inv = gb.create_invoice(customer_id="000001")
+        with pytest.raises(ValueError, match="Did you mean: 'Income:Consulting'"):
+            gb.add_invoice_entry(
+                invoice_id=inv["id"], account="Income:Consulting Income",
+                description="Work", quantity="1", price="100.00",
+            )
+
+
 class TestCreateBillterm:
     """Tests for create_billterm."""
 
