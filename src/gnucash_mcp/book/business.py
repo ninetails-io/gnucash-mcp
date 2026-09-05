@@ -3013,6 +3013,19 @@ class BusinessMixin:
             disc_denom = 1
 
         with self.open(readonly=False) as book:
+            # Billterms are addressed by name everywhere else
+            # (``term=`` on the document tools resolves the first
+            # visible match) — a second row with the same name
+            # would make every lookup silently ambiguous.
+            existing = book.session.query(Billterm).filter(
+                Billterm.name == name, Billterm.invisible == 0
+            ).first()
+            if existing is not None:
+                raise ValueError(
+                    f"Billterm already exists: '{name}' "
+                    f"(due in {existing.duedays} days)"
+                )
+
             bt_guid = uuid.uuid4().hex
 
             book.session.execute(

@@ -1677,6 +1677,17 @@ class TestCreateBillterm:
         )
         assert result["status"] == "created"
 
+    def test_duplicate_name_refused(self, business_book):
+        """Billterms are addressed by name; a second 'Net 30' would
+        make every term= lookup silently ambiguous."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_billterm(name="Net 30", due_days=30)
+        with pytest.raises(ValueError, match="already exists: 'Net 30'"):
+            gb.create_billterm(name="Net 30", due_days=45)
+        terms = gb.list_billterms(compact=False)["billterms"]
+        assert [t["name"] for t in terms] == ["Net 30"]
+        assert terms[0]["due_days"] == 30
+
     def test_read_back_via_list(self, business_book):
         gb = GnuCashBook(str(business_book))
         gb.create_billterm(name="Net 30")
