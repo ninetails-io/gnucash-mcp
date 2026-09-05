@@ -2870,7 +2870,7 @@ class CoreMixin:
             if acct.type not in self._FUNDING_ACCOUNT_TYPES:
                 try:
                     legs.append(_to_decimal(sp["amount"]))
-                except (InvalidOperation, ValueError):
+                except ValueError:
                     return None
         if not legs:
             return None
@@ -4272,7 +4272,7 @@ class CoreMixin:
             for ln in lines:
                 try:
                     amt = _to_decimal(ln["amount"])
-                except (InvalidOperation, ValueError):
+                except ValueError:
                     raise ValueError(
                         f"line {ln['ref']}: amount "
                         f"{ln['amount']!r} is not a decimal"

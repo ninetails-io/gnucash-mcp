@@ -452,7 +452,7 @@ class InvestmentsMixin:
                         "type": p.get("price_type") or "nav",
                         "source": p.get("source") or "user:price",
                     })
-                except (ValueError, KeyError, ArithmeticError) as e:
+                except (ValueError, KeyError) as e:
                     by_ref[ref] = {
                         "ref": ref, "status": "rejected",
                         "reason": str(e),

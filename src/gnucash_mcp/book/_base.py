@@ -18,7 +18,7 @@ import threading
 import time
 from contextlib import contextmanager
 from datetime import date
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Generator, Iterable
 
@@ -143,10 +143,30 @@ def _to_decimal(value) -> Decimal:
 
     Use everywhere user-supplied money hits ``Decimal(...)`` —
     direct callers (tests, scripts) bypass the pydantic coercion.
+
+    Raises ``ValueError`` — never ``decimal.InvalidOperation`` — on
+    text that isn't a number, and on NaN / infinity. InvalidOperation
+    is an ``ArithmeticError``, so it slipped past every ``except
+    ValueError`` on the write paths: one ``$10`` cell sank a whole
+    ``create_transactions`` batch as ``unexpected_error`` (and
+    ``on_error="skip"`` could not rescue it) while ``create_prices``
+    happened to catch ``ArithmeticError`` and rejected the same cell
+    per row (whole-tree review, 2026-09-04, class 2). Converting here
+    retires the class at every caller and lets ``safe_tool`` report
+    it as the ``validation_error`` it is.
     """
     if isinstance(value, Decimal):
-        return value
-    return Decimal(str(value))
+        d = value
+    else:
+        try:
+            d = Decimal(str(value))
+        except InvalidOperation:
+            raise ValueError(
+                f"not a valid decimal amount: {value!r}"
+            ) from None
+    if not d.is_finite():
+        raise ValueError(f"amount must be a finite number, got {value!r}")
+    return d
 
 
 def _verify_write(session, table, guid: str, label: str) -> None:

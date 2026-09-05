@@ -526,3 +526,110 @@ class TestIsMarketPriceHelper:
         class _Price:
             pass
         assert _is_market_price(_Price()) is True
+
+
+# ── Non-numeric input raises ValueError, never InvalidOperation ──────
+#
+# Whole-tree review (2026-09-04), class 2: ``decimal.InvalidOperation``
+# is an ArithmeticError, so it escaped every ``except ValueError`` on
+# the write paths. One ``$10`` cell sank a whole batch as
+# ``unexpected_error`` while ``create_prices`` happened to catch it
+# per row. ``_to_decimal`` now converts, so every caller and
+# ``safe_tool``'s ``validation_error`` mapping see one exception type.
+
+
+class TestToDecimalRejectsNonNumeric:
+
+    @pytest.mark.parametrize("bad", ["$10", "10x", "", "abc", "1,000"])
+    def test_text_raises_value_error_naming_the_input(self, bad):
+        with pytest.raises(ValueError, match="not a valid decimal") as exc:
+            _to_decimal(bad)
+        assert repr(bad) in str(exc.value)
+
+    @pytest.mark.parametrize("bad", ["NaN", "Infinity", "-inf", float("nan")])
+    def test_non_finite_raises_value_error(self, bad):
+        with pytest.raises(ValueError, match="finite"):
+            _to_decimal(bad)
+
+    def test_never_leaks_invalid_operation(self):
+        from decimal import InvalidOperation
+        try:
+            _to_decimal("$10")
+        except InvalidOperation:  # pragma: no cover — the bug shape
+            pytest.fail("InvalidOperation escaped _to_decimal")
+        except ValueError:
+            pass
+
+
+class TestBadAmountCellRejectsPerRow:
+    """The batch surfaces: a typo'd amount is a ROW rejection with a
+    readable reason, and ``on_error="skip"`` keeps the good rows."""
+
+    _TSV = (
+        "ref\tdate\tdescription\tamt1\tacct1\tamt2\tacct2\n"
+        "1\t2024-02-01\tGood row\t-10\tAssets:Checking\t10\tExpenses:Groceries\n"
+        "2\t2024-02-02\tBad row\t-$10\tAssets:Checking\t10\tExpenses:Groceries\n"
+    )
+
+    def _rows(self, results_tsv: str) -> dict:
+        lines = results_tsv.splitlines()
+        header = lines[0].split("\t")
+        return {r.split("\t")[0]: dict(zip(header, r.split("\t")))
+                for r in lines[1:]}
+
+    def test_create_transactions_skip_keeps_the_good_row(self, test_book):
+        from gnucash_mcp.tools.core import _parse_transactions_tsv
+        gb = GnuCashBook(str(test_book))
+        out = gb.create_transactions(
+            _parse_transactions_tsv(self._TSV), on_error="skip",
+        )
+        rows = self._rows(out["results"])
+        assert rows["1"]["status"] == "created"
+        assert rows["2"]["status"] == "rejected"
+        assert "not a valid decimal" in rows["2"]["reason"]
+        assert "$10" in rows["2"]["reason"]
+
+    def test_create_transactions_abort_names_the_bad_row(self, test_book):
+        from gnucash_mcp.tools.core import _parse_transactions_tsv
+        gb = GnuCashBook(str(test_book))
+        out = gb.create_transactions(_parse_transactions_tsv(self._TSV))
+        rows = self._rows(out["results"])
+        assert rows["1"]["reason"] == "batch_aborted"
+        assert "not a valid decimal" in rows["2"]["reason"]
+
+    def test_enter_statement_counter_split_typo_is_a_row_error(
+        self, test_book,
+    ):
+        """Counter-split cells flow through the shared validator; the
+        dispositions pass must catch them as row errors, not crash."""
+        from datetime import date
+        gb = GnuCashBook(str(test_book))
+        lines = [{
+            "ref": "1", "date": date(2024, 2, 1), "amount": "-10",
+            "description": "Bad counter",
+            "splits": [{"account": "Expenses:Groceries", "amount": "1O"}],
+        }]
+        out = gb.enter_statement(
+            "Assets:Checking", date(2024, 2, 28),
+            opening_balance="2850", closing_balance="2840",
+            lines=lines, dry_run=True,
+        )
+        assert "not a valid decimal" in out["warnings"]
+        assert "1 row(s) this payload would refuse" in out["tie"]
+
+    def test_tool_layer_reports_validation_error(self, test_book, monkeypatch):
+        """End to end through safe_tool: the error_type is
+        validation_error, not unexpected_error."""
+        import json
+        from gnucash_mcp.tools._helpers import safe_tool
+        gb = GnuCashBook(str(test_book))
+
+        @safe_tool
+        def replace():
+            return gb.replace_splits("deadbeef", [
+                {"account": "Assets:Checking", "amount": "ten"},
+                {"account": "Expenses:Groceries", "amount": "-10"},
+            ])
+        out = json.loads(replace())
+        assert out["error_type"] == "validation_error"
+        assert "ten" in out["error"]
