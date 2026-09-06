@@ -617,7 +617,7 @@ class BudgetsMixin:
 
             acct = self._resolve_account(book, account)
             if not acct:
-                raise ValueError(f"Account not found: {account}")
+                raise self._account_not_found_error(book, account)
 
             periods = self._resolve_periods(budget, period)
 
@@ -760,7 +760,7 @@ class BudgetsMixin:
             if account:
                 filter_acct = self._resolve_account(book, account)
                 if not filter_acct:
-                    raise ValueError(f"Account not found: {account}")
+                    raise self._account_not_found_error(book, account)
 
                 if include_children:
                     target_accounts = set()

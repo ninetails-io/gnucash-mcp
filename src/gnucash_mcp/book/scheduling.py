@@ -315,7 +315,16 @@ class SchedulingMixin:
             # reject here anything instantiation couldn't book.
             # Pre-fix, an all-foreign-leg template created fine
             # and then failed at every instantiation forever.
-            self._validate_transaction_splits(book, splits, frame)
+            validated = self._validate_transaction_splits(
+                book, splits, frame,
+            )
+            # A placeholder leg passes the split contract (it
+            # resolves, it sums) and then fails at every
+            # instantiation forever — refuse it here, the same
+            # gate create_transactions applies in phase 1.
+            for v in validated:
+                if v["account"].placeholder:
+                    raise self._placeholder_error(v["account"])
 
             for sx in book.session.query(
                 ScheduledTransaction

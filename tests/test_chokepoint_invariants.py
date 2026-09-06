@@ -19,6 +19,7 @@ the chokepoint, the bug class is open again.
 
 from datetime import date, timedelta
 from decimal import Decimal
+import re
 from pathlib import Path
 
 import piecash
@@ -1312,3 +1313,24 @@ class TestHistoricalAnchorChainRates:
             fund_row["default_currency_value"]
         ) == Decimal("1045.00")
         assert Decimal(bs["assets"]["total"]) == Decimal("10045.00")
+
+
+class TestAccountNotFoundGoesThroughSuggestions:
+    """``_account_not_found_error`` is the one place an account miss
+    is worded; a bare ``f"Account not found: {ref}"`` at a call site
+    drops the did-you-mean candidates and costs the caller a
+    list_accounts round-trip (bookkeeper, PR #172: seven sites)."""
+
+    def test_no_bare_account_not_found_literal_outside_base(self):
+        import gnucash_mcp.book as pkg
+        bare = re.compile(r'f"Account not found: \{')
+        offenders = []
+        for path in sorted(Path(pkg.__file__).parent.glob("*.py")):
+            if path.name == "_base.py":
+                continue
+            for lineno, line in enumerate(
+                path.read_text().splitlines(), start=1,
+            ):
+                if bare.search(line):
+                    offenders.append(f"{path.name}:{lineno}")
+        assert not offenders, offenders

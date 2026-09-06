@@ -2730,7 +2730,7 @@ class CoreMixin:
             if account:
                 acct = self._resolve_account(book, account)
                 if not acct:
-                    raise ValueError(f"Account not found: {account}")
+                    raise self._account_not_found_error(book, account)
                 # Canonical fullname for register-form rendering —
                 # _transaction_to_compact_line compares against
                 # split.account.fullname, so a raw %short ref would
@@ -5580,7 +5580,7 @@ class CoreMixin:
         with self.open(readonly=False) as book:
             account = self._resolve_account(book, name)
             if not account:
-                raise ValueError(f"Account not found: {name}")
+                raise self._account_not_found_error(book, name)
 
             # Stage pre-mutation state for the audit log so the decorator
             # doesn't have to reopen the book to capture it.
@@ -5674,7 +5674,7 @@ class CoreMixin:
         with self.open(readonly=False) as book:
             account = self._resolve_account(book, name)
             if not account:
-                raise ValueError(f"Account not found: {name}")
+                raise self._account_not_found_error(book, name)
 
             # Stage pre-move state (fullname derives old parent for log).
             self._stage_audit_before(_account_to_dict(account))
@@ -5727,7 +5727,7 @@ class CoreMixin:
         with self.open(readonly=False) as book:
             account = self._resolve_account(book, name)
             if not account:
-                raise ValueError(f"Account not found: {name}")
+                raise self._account_not_found_error(book, name)
 
             # Safeguard: Check for children
             if account.children:

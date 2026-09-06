@@ -32,6 +32,27 @@ class TestCreateScheduled:
         assert result["frequency"] == "monthly"
         assert result["guid"]
 
+    def test_placeholder_leg_refused_at_create(self, scheduled_book):
+        """A template leg on a placeholder account passes the split
+        contract and then fails at every instantiation forever —
+        creation must refuse it, naming the placeholder, exactly as
+        create_transactions phase 1 does."""
+        gb = GnuCashBook(str(scheduled_book))
+        with pytest.raises(ValueError, match="placeholder"):
+            gb.create_scheduled_transaction(
+                name="Bad template",
+                description="Rent",
+                splits=[
+                    {"account": "Expenses", "amount": "5.00"},
+                    {"account": "Assets:Checking", "amount": "-5.00"},
+                ],
+                start_date="2026-01-01",
+                frequency="monthly",
+            )
+        assert gb.list_scheduled_transactions(compact=False)[
+            "scheduled_transactions"
+        ] == []
+
     def test_biweekly_paycheck(self, scheduled_book):
         gb = GnuCashBook(str(scheduled_book))
         result = gb.create_scheduled_transaction(

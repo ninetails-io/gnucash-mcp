@@ -75,9 +75,19 @@ def _parse_transactions_tsv(tsv: str) -> list[dict]:
                 splits = _batch_row_splits(fields[fixed:], group)
             except ValueError as e:
                 raise ValueError(f"row {i} (ref {ref!r}): {e}")
+        # Same contract as enter_statement: a blank date cell is
+        # a format error, never a silent default to today — the
+        # results table carries no date, so a defaulted row would
+        # leave no trace of what it was booked on.
+        trans_date = _parse_iso_date(dt)
+        if trans_date is None:
+            raise ValueError(
+                f"row {i} (ref {ref!r}): date {dt!r} is not a valid "
+                f"YYYY-MM-DD date"
+            )
         txn = {
             "ref": ref,
-            "date": _parse_iso_date(dt) or date.today(),
+            "date": trans_date,
             "description": desc,
             "splits": splits,
         }

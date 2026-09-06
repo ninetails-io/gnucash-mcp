@@ -1765,7 +1765,14 @@ def run_business(book: GnuCashBook, through: date,
             post_date=date_open.isoformat(), owner_type="customer",
             force=cross,
         )
-        if paid:
+        # The horizon clamp lives HERE, not at the callers: a stream
+        # whose open date is inside ``through`` but whose pay date is
+        # not (the quarterly bill opened on the 5th, paid on the
+        # 20th) leaked a future-dated payment and failed every CI
+        # build from the 5th to the 19th. Left open, the document
+        # is settled by the continuation's aging pass on a later
+        # run — the closed loop's job.
+        if paid and date_pay <= through:
             book.pay_invoice(
                 invoice_id=inv["id"], payment_account=CHECKING,
                 amount=amount, payment_date=date_pay.isoformat(),
@@ -1921,7 +1928,8 @@ def run_business(book: GnuCashBook, through: date,
             invoice_id=bill["id"], post_account=AP,
             post_date=date_open.isoformat(), owner_type="vendor",
         )
-        if paid:
+        # Same horizon clamp as run_invoice, for the same reason.
+        if paid and date_pay <= through:
             book.pay_invoice(
                 invoice_id=bill["id"], payment_account=payment_account,
                 amount=amount, payment_date=date_pay.isoformat(),

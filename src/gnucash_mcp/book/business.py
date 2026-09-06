@@ -3013,6 +3013,19 @@ class BusinessMixin:
             disc_denom = 1
 
         with self.open(readonly=False) as book:
+            # Billterms are addressed by name everywhere else
+            # (``term=`` on the document tools resolves the first
+            # visible match) — a second row with the same name
+            # would make every lookup silently ambiguous.
+            existing = book.session.query(Billterm).filter(
+                Billterm.name == name, Billterm.invisible == 0
+            ).first()
+            if existing is not None:
+                raise ValueError(
+                    f"Billterm already exists: '{name}' "
+                    f"(due in {existing.duedays} days)"
+                )
+
             bt_guid = uuid.uuid4().hex
 
             book.session.execute(
@@ -4729,7 +4742,7 @@ class BusinessMixin:
 
             acct = self._resolve_account(book, account)
             if not acct:
-                raise ValueError(f"Account not found: {account}")
+                raise self._account_not_found_error(book, account)
             if acct.type not in cfg["allowed_types"]:
                 raise ValueError(
                     cfg["type_error_msg"].format(
@@ -5488,9 +5501,7 @@ class BusinessMixin:
 
             post_acct = self._resolve_account(book, post_account)
             if not post_acct:
-                raise ValueError(
-                    f"Account not found: {post_account}"
-                )
+                raise self._account_not_found_error(book, post_account)
             expected_type = "PAYABLE" if is_bill else "RECEIVABLE"
             if post_acct.type != expected_type:
                 raise ValueError(
@@ -5989,9 +6000,7 @@ class BusinessMixin:
 
             pay_acct = self._resolve_account(book, payment_account)
             if not pay_acct:
-                raise ValueError(
-                    f"Account not found: {payment_account}"
-                )
+                raise self._account_not_found_error(book, payment_account)
 
             post_acc_guid = inv.post_acc_guid
             post_acct = book.session.query(
@@ -7142,24 +7151,33 @@ class BusinessMixin:
                     book, owner_type=owner_type, owner_guid=entity_guid,
                 )
             ).all()
-            if invoices:
-                posted = [i for i in invoices if _is_invoice_posted(i)]
-                unposted = [
-                    i for i in invoices if not _is_invoice_posted(i)
-                ]
-                if posted:
-                    posted_ids = ", ".join(i.id for i in posted)
-                    raise ValueError(
-                        f"Cannot delete {entity_label.lower()} with "
-                        f"posted {doc_label}: {posted_ids}. "
-                        f"Void them or issue credit notes first."
-                    )
-                unposted_ids = ", ".join(i.id for i in unposted)
-                raise ValueError(
-                    f"Cannot delete {entity_label.lower()} with "
-                    f"{doc_label}: {unposted_ids}. "
-                    f"Delete the {doc_label} first."
+            # Every blocker in ONE refusal. Raising on the first
+            # match masked the rest — a customer with a posted
+            # job-attached invoice AND the job was told only about
+            # the invoice, voided it, and hit the job guard on the
+            # retry (bookkeeper, PR #172).
+            label = entity_label.lower()
+            blockers: list[str] = []
+            remedies: list[str] = []
+            posted = [i for i in invoices if _is_invoice_posted(i)]
+            unposted = [i for i in invoices if not _is_invoice_posted(i)]
+            if posted:
+                blockers.append(
+                    f"posted {doc_label}: "
+                    + ", ".join(i.id for i in posted)
                 )
+                # Credit notes are customer/vendor instruments; an
+                # employee's only remedy is the void.
+                credit = (
+                    " or issue credit notes" if owner_type in (2, 4)
+                    else ""
+                )
+                remedies.append(f"Void the {doc_label}{credit} first.")
+            if unposted:
+                blockers.append(
+                    f"{doc_label}: " + ", ".join(i.id for i in unposted)
+                )
+                remedies.append(f"Delete the {doc_label} first.")
             # The party's jobs reference it by GUID too; deleting
             # underneath them leaves list_jobs / get_job_report
             # rendering "?" for the owner with no way to repair it.
@@ -7169,13 +7187,18 @@ class BusinessMixin:
                     Job.owner_type == owner_type,
                 ).all()
                 if jobs:
-                    job_ids = ", ".join(j.id for j in jobs)
-                    raise ValueError(
-                        f"Cannot delete {entity_label.lower()} with "
-                        f"jobs: {job_ids}. Delete the jobs first "
-                        f"(delete_job), or retire the "
-                        f"{entity_label.lower()} with active=false."
+                    blockers.append(
+                        "jobs: " + ", ".join(j.id for j in jobs)
                     )
+                    remedies.append(
+                        f"Delete the jobs first (delete_job), or "
+                        f"retire the {label} with active=false."
+                    )
+            if blockers:
+                raise ValueError(
+                    f"Cannot delete {label} with "
+                    + "; ".join(blockers) + ". " + " ".join(remedies)
+                )
 
         return check
 
