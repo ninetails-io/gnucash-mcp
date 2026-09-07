@@ -673,7 +673,7 @@ def register(mcp, get_book) -> None:
         applies_to_invoice_id: str,
         amount: str | None = None,
         apply_date: str | None = None,
-        owner_type: str | None = None,
+        party_type: str | None = None,
     ) -> str:
         """Net a posted credit note against a posted invoice or
         bill from the same owner. No cash moves — the credit
@@ -702,7 +702,7 @@ def register(mcp, get_book) -> None:
                 as possible.
             apply_date: ISO date for the netting transaction.
                 Defaults to today.
-            owner_type: Optional 'customer' or 'vendor'
+            party_type: Optional 'customer' or 'vendor'
                 disambiguator for ID collisions.
         """
         book = get_book()
@@ -711,7 +711,7 @@ def register(mcp, get_book) -> None:
             applies_to_invoice_id=applies_to_invoice_id,
             amount=amount,
             apply_date=apply_date,
-            owner_type=owner_type,
+            owner_type=party_type,
         )
         return _json(result)
 
@@ -1033,7 +1033,7 @@ def register(mcp, get_book) -> None:
     @audit_log(classification="write", operation="create", entity_type="job")
     def create_job(
         owner_id: str,
-        owner_type: str,
+        party_type: str,
         name: str,
         reference: str = "",
     ) -> str:
@@ -1047,7 +1047,7 @@ def register(mcp, get_book) -> None:
 
         Args:
             owner_id: Customer or vendor ID (e.g., "000001").
-            owner_type: "customer" or "vendor". Employees are
+            party_type: "customer" or "vendor". Employees are
                 not supported (no GnuCash desktop UI for
                 employee jobs).
             name: Human-readable job name (e.g., "API Rewrite").
@@ -1057,7 +1057,7 @@ def register(mcp, get_book) -> None:
         book = get_book()
         result = book.create_job(
             owner_id=owner_id,
-            owner_type=owner_type,
+            owner_type=party_type,
             name=name,
             reference=reference,
         )
@@ -1068,7 +1068,7 @@ def register(mcp, get_book) -> None:
     @audit_log(classification="read")
     def list_jobs(
         id: str | None = None,
-        owner_type: str | None = None,
+        party_type: str | None = None,
         owner_id: str | None = None,
         active_only: bool = True,
         verbose: bool = False,
@@ -1087,10 +1087,10 @@ def register(mcp, get_book) -> None:
         Args:
             id: Job ID for a single-job detail lookup (e.g.,
                 "000001"). All other filters are ignored.
-            owner_type: Filter by "customer" or "vendor". Omit
+            party_type: Filter by "customer" or "vendor". Omit
                 for all.
             owner_id: Filter by specific customer or vendor ID
-                (requires owner_type).
+                (requires party_type).
             active_only: If True (default), exclude inactive jobs.
             verbose: If false (default), compact text output — optimized
                 for reading and token efficiency. If true, structured
@@ -1103,7 +1103,7 @@ def register(mcp, get_book) -> None:
         if id is not None:
             return _json(book.get_job(job_id=id))
         result = book.list_jobs(
-            owner_type=owner_type,
+            owner_type=party_type,
             owner_id=owner_id,
             active_only=active_only,
             compact=not verbose,

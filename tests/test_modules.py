@@ -374,6 +374,24 @@ class TestApplyModuleFilter:
             assert set(self._tool_names()) == full, retired
             assert is_module_enabled("business")
 
+    def test_no_business_tool_exposes_owner_type(self):
+        """Every business tool names the party side ``party_type``.
+        ``owner_type`` is the book-layer (piecash) name; three tools
+        leaked it to the MCP surface and, with unknown kwargs
+        rejected at the schema, a model that learned party_type from
+        the other twenty-two got a schema error on create_job. Lock:
+        the name never reaches a tool signature again.
+        """
+        import inspect
+        _apply_module_filter("business")
+        leaks = {
+            name for name in TOOL_MODULES["business"]
+            if "owner_type" in inspect.signature(
+                mcp._tool_manager._tools[name].fn
+            ).parameters
+        }
+        assert not leaks, sorted(leaks)
+
     def test_unknown_module_alongside_all_still_fails(self, capsys):
         """``all`` is a loading instruction, not a validation bypass.
 

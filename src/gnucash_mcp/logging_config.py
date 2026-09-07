@@ -1299,8 +1299,13 @@ def _fmt_job_create(entry: dict) -> list[str]:
     after = entry.get("after_state") or {}
     job_id = after.get("id", "")
     name = after.get("name", params.get("name", ""))
+    # create_job's tool parameter is party_type (unified with the
+    # document tools); owner_type is the book-layer name and what
+    # older log entries carry.
     owner_type = (
-        after.get("owner_type") or params.get("owner_type", "")
+        after.get("owner_type")
+        or params.get("party_type")
+        or params.get("owner_type", "")
     )
     owner_id = params.get("owner_id", "")
     ref = after.get("reference") or params.get("reference", "")

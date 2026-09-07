@@ -1495,10 +1495,8 @@ class BusinessMixin:
         raise ValueError(
             f"Found {len(matches)} documents with ID {invoice_id!r}: "
             f"{', '.join(candidates)}. Narrow the lookup with "
-            f"document_type ('invoice', 'bill', or 'voucher') or the "
-            f"party side ('customer', 'vendor', or 'employee' via "
-            f"party_type; owner_type on apply_credit_note and the job "
-            f"tools)."
+            f"document_type ('invoice', 'bill', or 'voucher') or "
+            f"party_type ('customer', 'vendor', or 'employee')."
         )
 
     @staticmethod
