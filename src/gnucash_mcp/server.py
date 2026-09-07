@@ -44,7 +44,13 @@ from gnucash_mcp._env import (
     _parse_env_toggle,
 )
 
-from gnucash_mcp.book import GnuCashBook, build_book_class, extracted_modules
+from gnucash_mcp._format import _parse_book_url
+from gnucash_mcp.book import (
+    BookSource,
+    GnuCashBook,
+    build_book_class,
+    extracted_modules,
+)
 from gnucash_mcp.logging_config import audit_log, debug_log, setup_logging
 from gnucash_mcp.tools._helpers import _json, safe_tool
 
@@ -695,6 +701,19 @@ _book = None
 # validated path containing os.pathsep and re-stat every book.
 _book_paths_source: str | None = None
 
+# ── Database-backed books ─────────────────────────────────────────
+# GNUCASH_BOOK_URI / --book-uri serve a book GnuCash keeps in a
+# database (PostgreSQL, MySQL) instead of a SQLite file. It is
+# mutually exclusive with the path interface and holds exactly ONE
+# book: multi-book is an os.pathsep list of FILES, and switch_book
+# matches on filenames, neither of which a connection string has. So
+# ``_book_paths`` stays empty in URI mode — which is also what keeps
+# multi_book_active() False, switch_book unregistered, and the
+# ruling-6 write disarm inactive, with no special-casing in any of
+# them.
+_BOOK_URI_ENV = "GNUCASH_BOOK_URI"
+_book_uri: str | None = None
+
 # ── Restart safety (Sabine battery ruling 6, 2026-08-31) ──────────
 # A client config reload restarts this process SILENTLY mid-session:
 # the LLM may still believe it is on the book it switched to, while
@@ -949,6 +968,76 @@ def _validate_book_paths(
     return paths
 
 
+def _parse_book_uri(
+    value: str | None, *, source: str = _BOOK_URI_ENV
+) -> str:
+    """Validate a database connection string for use as the book.
+
+    The chokepoint both interfaces (the env var and --book-uri) land
+    on, so their acceptance rules cannot drift. Returns the stripped
+    URI.
+
+    Raises:
+        _BookPathError: unset, empty, or not a parseable SQLAlchemy
+            URL.
+    """
+    if not value or not value.strip():
+        raise _BookPathError(f"Invalid {source}: no connection string given")
+    try:
+        _parse_book_url(value)
+    except ValueError as e:
+        raise _BookPathError(f"Invalid {source}: {e}") from None
+    return value.strip()
+
+
+def _book_uri_warnings(uri: str) -> list[str]:
+    """Non-fatal notes about a URI config, for stderr at startup.
+
+    A ``sqlite:`` URI is accepted rather than rejected — it is a real
+    SQLAlchemy URL and refusing it would be arbitrary — but it costs
+    the user every file-shaped feature (automatic and manual backups
+    above all) for no gain, because GNUCASH_BOOK_PATH serves the same
+    file with them. Saying so once at startup is cheaper than the
+    support question later.
+    """
+    try:
+        backend = _parse_book_url(uri).get_backend_name()
+    except ValueError:
+        return []
+    if backend != "sqlite":
+        return []
+    return [
+        f"Note: {_BOOK_URI_ENV} names a SQLite file, which disables "
+        f"automatic and manual backups (they snapshot files, and a "
+        f"URI book is treated as a database). To keep backups, serve "
+        f"the same file with GNUCASH_BOOK_PATH instead."
+    ]
+
+
+def _install_book_uri(uri: str, *, activate: bool) -> None:
+    """Install ``uri`` as the single active book.
+
+    The URI-mode counterpart of ``_install_book_list``, owning the
+    same invariant set: the globals, the env mirror get_book() reads
+    back, and (when ``activate``) logging activation.
+    """
+    global _book_uri, _book, _book_paths, _current_path, _book_paths_source
+    _book_uri = uri
+    _book_paths = []
+    _current_path = None
+    _book = None
+    _book_paths_source = None
+    os.environ[_BOOK_URI_ENV] = uri
+    # Clear the path mirror too. main() has already decided the URI
+    # wins (and said so on stderr); leaving GNUCASH_BOOK_PATH set
+    # would make the environment describe a config that isn't
+    # running, and any later re-entry would read it as the
+    # both-are-set error.
+    os.environ.pop("GNUCASH_BOOK_PATH", None)
+    if activate:
+        _activate_logging(BookSource.from_uri(uri))
+
+
 def _install_book_list(paths: list[Path], *, activate: bool) -> None:
     """Install ``paths`` as the active book list.
 
@@ -975,7 +1064,7 @@ def _install_book_list(paths: list[Path], *, activate: bool) -> None:
     (the import-time logging block never saw them), pure demo mode,
     or CLI logging flags changing the effective modes.
     """
-    global _book_paths, _current_path, _book, _book_paths_source
+    global _book_paths, _current_path, _book, _book_paths_source, _book_uri
     _book_paths = list(paths)
     if _current_path not in _book_paths:
         _current_path = _book_paths[0]
@@ -983,6 +1072,11 @@ def _install_book_list(paths: list[Path], *, activate: bool) -> None:
     mirrored = os.pathsep.join(str(p) for p in _book_paths)
     os.environ["GNUCASH_BOOK_PATH"] = mirrored
     _book_paths_source = mirrored
+    # Symmetric to _install_book_uri clearing the path mirror: the
+    # installed mode owns the environment, so get_book()'s URI branch
+    # cannot fire off a variable this config isn't using.
+    _book_uri = None
+    os.environ.pop(_BOOK_URI_ENV, None)
     if activate:
         _activate_logging(_current_path)
 
@@ -999,6 +1093,39 @@ def _apply_book_args(book_args: list[str]) -> None:
     _install_book_list(
         _validate_book_paths(book_args, source="--book"),
         activate=True,
+    )
+
+
+def _require_log_dir_for_uri() -> None:
+    """Refuse to serve a DB book with logging on but nowhere to put it.
+
+    Audit and debug files live beside the book: ``resolve_mcp_dir``
+    derives ``{book}.mcp`` from the book file's own directory. A
+    connection string has no directory, and defaulting to the process
+    CWD would scatter a bookkeeping audit trail into whatever folder
+    the MCP host happened to launch from — findable by nobody, and
+    different on the next launch.
+
+    GNUCASH_LOG_DIR already supplies exactly the missing piece (it
+    resolves to a per-book ``{log_dir}/{name}.mcp`` subdirectory), so
+    URI mode requires it whenever either log is enabled. With both
+    disabled there is nothing to place and the check is skipped.
+
+    Raises:
+        _BookPathError: logging enabled and GNUCASH_LOG_DIR unset.
+    """
+    if not (_logging_audit or _logging_debug):
+        return
+    if os.environ.get("GNUCASH_LOG_DIR", "").strip():
+        return
+    raise _BookPathError(
+        f"{_BOOK_URI_ENV} needs GNUCASH_LOG_DIR. A database book has "
+        f"no directory to keep its audit and debug logs beside, and "
+        f"defaulting to the working directory would hide the audit "
+        f"trail somewhere different on every launch. Set "
+        f"GNUCASH_LOG_DIR to a directory you keep (for example "
+        f"~/gnucash-mcp-logs), or start with --noaudit and "
+        f"GNUCASH_MCP_DEBUG unset to run without logs."
     )
 
 
@@ -1052,6 +1179,12 @@ def _append_demo_books() -> None:
     List installation (globals, env mirror, activation) is
     _install_book_list's job.
     """
+    if _book_uri:
+        # Nothing to append to: URI mode holds one book and
+        # get_book() never consults _book_paths. Silent rather than a
+        # note — a bundle install that leaves the demo checkbox on
+        # while pointing at a database hasn't done anything wrong.
+        return
     demos = _demo_book_paths()
     if not demos:
         return
@@ -1119,12 +1252,35 @@ def _book_format_error(path: Path) -> str | None:
     )
 
 
-def _book_for(path: Path) -> GnuCashBook:
-    """Get-or-create the cached book instance for a resolved path."""
-    key = str(path)
+def _registry_key(source) -> str:
+    """The ``_book_registry`` key for a Path or BookSource.
+
+    The single derivation — ``_book_for`` writes it and
+    ``_switch_book_impl``'s already-on-this-book check reads it, and
+    they must not drift. (They did, briefly: the key became the
+    source URI while the reader still built ``str(path)``, so every
+    no-op switch took the full context-reset path instead of the
+    cheap "Already on" one.)
+    """
+    if isinstance(source, BookSource):
+        return source.uri
+    return BookSource.from_path(source).uri
+
+
+def _book_for(source) -> GnuCashBook:
+    """Get-or-create the cached book instance for a book source.
+
+    Accepts a resolved Path (every pre-existing caller, tests
+    included) or a :class:`BookSource`. Keyed by ``_registry_key``,
+    which is 1:1 with the path for file books and is the only
+    available identity for database books.
+    """
+    if not isinstance(source, BookSource):
+        source = BookSource.from_path(source)
+    key = _registry_key(source)
     inst = _book_registry.get(key)
     if inst is None:
-        inst = _book_class(key)
+        inst = _book_class(source)
         _book_registry[key] = inst
     return inst
 
@@ -1148,7 +1304,17 @@ def get_book():
     forces re-initialization from the environment — the reset point
     tests rely on.
     """
-    global _book, _current_path, _book_paths, _book_paths_source
+    global _book, _current_path, _book_paths, _book_paths_source, _book_uri
+    if _book is None and (_book_uri or os.environ.get(_BOOK_URI_ENV)):
+        # URI mode short-circuits the whole path pipeline: one book,
+        # no list to select from, nothing to re-stat. The env re-read
+        # mirrors the path branch below so a test that swaps
+        # GNUCASH_BOOK_URI and resets _book picks up the new value.
+        _book_uri = _parse_book_uri(
+            os.environ.get(_BOOK_URI_ENV) or _book_uri
+        )
+        _book = _book_for(BookSource.from_uri(_book_uri))
+        return _book
     if _book is None:
         # Re-read the env so a test that swapped GNUCASH_BOOK_PATH and
         # reset _book picks up the new value — but ONLY when the value
@@ -1165,8 +1331,14 @@ def get_book():
     return _book
 
 
-def _activate_logging(path: Path) -> None:
-    """(Re-)point audit/debug logging at ``path``.
+def _activate_logging(target) -> None:
+    """(Re-)point audit/debug logging at ``target``.
+
+    Takes a Path (file books, and every pre-existing caller) or a
+    :class:`BookSource`. A DB book has no path, so it supplies a
+    synthetic ``log_name`` — ``{database}.gnucash`` — which
+    ``resolve_mcp_dir`` turns into the same ``{name}.mcp``
+    subdirectory layout file books get under GNUCASH_LOG_DIR.
 
     Used on book switch so each book's writes land in its own
     .mcp/audit trail. setup_logging clears its handlers on every call,
@@ -1176,7 +1348,10 @@ def _activate_logging(path: Path) -> None:
     import-time block already installed, not skip past them.
     """
     setup_logging(
-        book_path=str(path),
+        book_path=(
+            target.log_name if isinstance(target, BookSource)
+            else str(target)
+        ),
         debug=_logging_debug,
         audit=_logging_audit,
         get_book=get_book,
@@ -1260,7 +1435,7 @@ def _switch_book_impl(name: str) -> str:
         previous is not None
         and target == previous
         and _book is not None
-        and _book is _book_registry.get(str(target))
+        and _book is _book_registry.get(_registry_key(target))
     ):
         # Debug-visible, not audited: retries after client timeouts
         # are exactly what incident forensics needs to see, and this
@@ -1443,6 +1618,15 @@ def _get_server_config_impl() -> str:
             f"Current book: {_server_state.get('current_book', 'unknown')}"
         )
         lines.append(f"Available books: {', '.join(book_paths)}")
+    # Named explicitly rather than left for the model to infer from
+    # the URI: "is this book backed up?" is the one question whose
+    # wrong answer costs data, and create_backup only reports its
+    # refusal once someone calls it.
+    if _server_state.get("book_is_uri"):
+        lines.append(
+            "Backend: database — MCP backups unavailable "
+            "(snapshot with pg_dump or your DB's own tooling)"
+        )
     dc_ok = _server_state.get("default_currency_ok")
     if dc_ok is False:
         lines.append("Warning: Book has no default currency set")
@@ -1510,12 +1694,17 @@ class _CliParseError(ValueError):
 
 def _parse_cli_argv(
     argv: list[str],
-) -> tuple[list[str], bool, bool, str | None]:
-    """Parse CLI arguments: (book_args, debug, noaudit, modules_value).
+) -> tuple[list[str], str | None, bool, bool, str | None]:
+    """Parse CLI arguments:
+    (book_args, book_uri, debug, noaudit, modules_value).
 
     ``--book`` consumes every following token up to the next option
     (the MCPB manifest expands a multi-file picker to ``--book A B``);
-    it also repeats, and accepts the ``--book=PATH`` form. Unrecognized
+    it also repeats, and accepts the ``--book=PATH`` form.
+    ``--book-uri`` takes exactly one connection string and is
+    mutually exclusive with ``--book`` (checked in main(), alongside
+    the env-var pair, so both interfaces report it identically).
+    Unrecognized
     tokens are fatal: a silently ignored flag means the server runs
     with the wrong tool surface (``--modules all`` once passed
     unnoticed and served core-only while looking configured). Same
@@ -1526,6 +1715,7 @@ def _parse_cli_argv(
     noaudit_flag = False
     modules_value: str | None = None
     book_args: list[str] = []
+    book_uri_arg: str | None = None
     unknown_args: list[str] = []
     i = 0
     while i < len(argv):
@@ -1536,6 +1726,24 @@ def _parse_cli_argv(
             noaudit_flag = True
         elif arg.startswith("--modules="):
             modules_value = arg.split("=", 1)[1]
+        elif arg.startswith("--book-uri="):
+            value = arg.split("=", 1)[1]
+            if value.strip():
+                book_uri_arg = value
+        elif arg == "--book-uri":
+            # Single-valued, unlike --book: one connection string is
+            # one book. An empty token is consumed and dropped for
+            # the same reason --book drops empties (an MCPB host can
+            # expand an unset field to ""), a missing one is a typo.
+            if i + 1 >= len(argv) or argv[i + 1].startswith("--"):
+                raise _CliParseError(
+                    "--book-uri requires a connection string, e.g. "
+                    "--book-uri postgresql://user:pw@host:5432/gnucash"
+                )
+            if argv[i + 1].strip():
+                book_uri_arg = argv[i + 1]
+            i += 2
+            continue
         elif arg.startswith("--book="):
             value = arg.split("=", 1)[1]
             if value.strip():
@@ -1570,10 +1778,10 @@ def _parse_cli_argv(
             )
         lines.append(
             "Accepted options: --modules=MODULES, --book PATH ..., "
-            "--debug, --noaudit, --help"
+            "--book-uri URI, --debug, --noaudit, --help"
         )
         raise _CliParseError("\n".join(lines))
-    return book_args, debug_flag, noaudit_flag, modules_value
+    return book_args, book_uri_arg, debug_flag, noaudit_flag, modules_value
 
 
 # The MCPB bundle's module interface: each manifest checkbox lands
@@ -1661,6 +1869,18 @@ Options:
                        paths may follow one flag. Two or more books
                        add the switch_book tool. Filename stems must
                        be unique (switch_book matches by name).
+  --book-uri URI       Serve a book GnuCash keeps in a DATABASE
+                       instead of a file, as a SQLAlchemy connection
+                       string:
+                         postgresql://user:pw@host:5432/gnucash
+                       Overrides GNUCASH_BOOK_URI, and is mutually
+                       exclusive with --book. Exactly one book — a
+                       connection string has no filename for
+                       switch_book to match. Requires the driver
+                       (`pip install "gnucash-mcp[postgres]"`) and
+                       GNUCASH_LOG_DIR. Backups are the server's
+                       one unavailable feature there: snapshot the
+                       database with pg_dump instead.
   --modules=MODULES    Tool modules to load (comma-separated).
                        Default: core ({core} tools, always-on). Use "all"
                        for every module ({total} tools; configuring
@@ -1720,6 +1940,16 @@ Environment variables:
                              and switch_book changes the active one
                              in-session. Filenames must be unique
                              (switch_book matches by name).
+  GNUCASH_BOOK_URI           Connection string for a database-backed
+                             book, as an alternative to
+                             GNUCASH_BOOK_PATH — see --book-uri.
+                             Setting both is an error.
+  GNUCASH_LOG_DIR            Directory for audit and debug logs, each
+                             book in its own "{{name}}.mcp" subdirectory.
+                             Optional for file books (they default to
+                             a subdirectory beside the book); REQUIRED
+                             with GNUCASH_BOOK_URI, which has no
+                             directory of its own.
   GNUCASH_MCP_MODULES        Tool modules to load — same values as
                              --modules (e.g. "bookkeeper" or "core,reporting")
   GNUCASH_ENABLE_BUSINESS    Boolean (true/false) — the MCPB bundle's one
@@ -1790,7 +2020,7 @@ def main() -> None:
     # Parse CLI flags first — --book must win over GNUCASH_BOOK_PATH
     # below. Fail-fast rationale lives on _parse_cli_argv.
     try:
-        book_args, debug_flag, noaudit_flag, modules_value = (
+        book_args, book_uri_arg, debug_flag, noaudit_flag, modules_value = (
             _parse_cli_argv(sys.argv[1:])
         )
     except _CliParseError as exc:
@@ -1815,7 +2045,67 @@ def main() -> None:
     # behavior). ``book_path`` below is the CURRENT book, used for
     # logging / health / display.
     raw_book_path = os.environ.get("GNUCASH_BOOK_PATH")
-    if book_args or (raw_book_path and raw_book_path.strip()):
+    raw_book_uri = os.environ.get(_BOOK_URI_ENV)
+    has_env_path = bool(raw_book_path and raw_book_path.strip())
+    has_env_uri = bool(raw_book_uri and raw_book_uri.strip())
+
+    # A book is a file OR a database, never both — picking silently
+    # would put writes in whichever ledger won a coin toss, the exact
+    # wrong-book class the restart guards exist to prevent. Two
+    # explicit CLI flags, or two env vars, are equally ambiguous and
+    # both fail fast. A CLI flag beating the OTHER interface's env
+    # var is not ambiguous, though: that is the same "args win over
+    # the environment" rule --book already has, so it proceeds — with
+    # a note, because the ignored variable is exactly the kind of
+    # leftover config that makes a wrong-book scare.
+    if book_args and book_uri_arg:
+        print(
+            "--book and --book-uri are mutually exclusive: a book is "
+            "either a SQLite file or a database, not both.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    if has_env_path and has_env_uri and not (book_args or book_uri_arg):
+        print(
+            f"GNUCASH_BOOK_PATH and {_BOOK_URI_ENV} are both set, and "
+            f"they are mutually exclusive: a book is either a SQLite "
+            f"file or a database, not both. Unset whichever one this "
+            f"server should not use.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
+    use_uri = bool(book_uri_arg) or (has_env_uri and not book_args)
+    if use_uri and (book_args or has_env_path):
+        ignored = "--book" if book_args else "GNUCASH_BOOK_PATH"
+        print(
+            f"Note: serving the database book; {ignored} is ignored.",
+            file=sys.stderr,
+        )
+    elif book_args and has_env_uri:
+        print(
+            f"Note: serving the book file(s) named by --book; "
+            f"{_BOOK_URI_ENV} is ignored.",
+            file=sys.stderr,
+        )
+
+    if use_uri:
+        try:
+            uri = _parse_book_uri(
+                book_uri_arg or raw_book_uri,
+                source="--book-uri" if book_uri_arg else _BOOK_URI_ENV,
+            )
+            _require_log_dir_for_uri()
+        except _BookPathError as exc:
+            print(str(exc), file=sys.stderr)
+            raise SystemExit(2) from None
+        for note in _book_uri_warnings(uri):
+            print(note, file=sys.stderr)
+        # Always activate: the import-time logging block only ever
+        # looks at GNUCASH_BOOK_PATH, so a URI book has no handlers
+        # installed yet regardless of which flags were passed.
+        _install_book_uri(uri, activate=True)
+    elif book_args or has_env_path:
         try:
             if book_args:
                 _apply_book_args(book_args)
@@ -1856,7 +2146,14 @@ def main() -> None:
         print(str(exc), file=sys.stderr)
         raise SystemExit(2) from None
 
-    book_path = str(_current_path) if _book_paths else None
+    # The book identity the health check and get_server_config
+    # report. For a DB book this is the raw URI — every consumer
+    # renders it through _book_display_name, which masks the
+    # password; nothing may print this value directly.
+    if _book_uri:
+        book_path = _book_uri
+    else:
+        book_path = str(_current_path) if _book_paths else None
 
     # Module selection precedence: --modules, then GNUCASH_MCP_MODULES,
     # then the MCPB bundle's GNUCASH_ENABLE_* checkbox toggles.
@@ -1934,6 +2231,7 @@ def main() -> None:
         # display as "Debug mode: false".
         "debug": _logging_debug,
         "default_currency_ok": currency_ok,
+        "book_is_uri": bool(_book_uri),
     })
 
     if debug_flag or _debug_mode:
