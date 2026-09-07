@@ -7,6 +7,9 @@ Entries are terse by design: what changed, one line each, PR numbers where they 
 ### Changed
 - `--modules=bookkeeper` is everything except business: `tax_lots` and `portfolio` join `reporting`, `budgets`, and `scheduling`. The MCPB bundle's always-on base is now defined as this group rather than a parallel list. `investor` remains selectable on its own.
 - `--modules=business` is one module. The `freelancer` / `business_complete` split reduced to a runtime gate on `owner_type` plus one report once the party and document tools went polymorphic; both halves merged into the single `business` leaf and the gate is gone. The retired names are still accepted on `--modules` / `GNUCASH_MCP_MODULES` and resolve to `business`, so existing config files keep starting the server. A stored `GNUCASH_ENABLE_FREELANCER=true` from a pre-#163 bundle install now unlocks the whole business suite.
+- `get_document` carries `status` (open / posted / paid) and, once posted, `amount_paid` and `amount_due`; a paid document keeps its amounts after leaving the unpaid list. `pay_document` reports the per-call `payment` beside a cumulative `total_paid` (the old `amount_paid` read as the only payment on a second partial). One chokepoint, `_document_settlement`, now feeds both and `get_outstanding_documents`.
+- `apply_credit_note`, `create_job`, and `list_jobs` take `party_type`, the name the other twenty-two business tools use; `owner_type` no longer appears on any tool.
+- The document ID-collision error names `document_type` and `party_type`; it used to coach a parameter no tool exposes.
 
 ## v1.4.4 - The statement is the call
 
