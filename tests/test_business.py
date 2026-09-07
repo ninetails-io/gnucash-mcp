@@ -372,7 +372,7 @@ class TestCreateJob:
         )
         assert result["status"] == "created"
         assert result["name"] == "API Rewrite"
-        assert result["owner_type"] == "customer"
+        assert result["party_type"] == "customer"
         assert result["active"] is True
         # counter_job advances independently from invoice/bill
         assert result["id"] == "000001"
@@ -384,7 +384,7 @@ class TestCreateJob:
             owner_id="000001", owner_type="vendor",
             name="Q3 supply contract",
         )
-        assert result["owner_type"] == "vendor"
+        assert result["party_type"] == "vendor"
         assert result["name"] == "Q3 supply contract"
 
     def test_create_job_with_reference(self, business_book):
@@ -472,7 +472,7 @@ class TestListJobs:
         assert isinstance(result, list)
         assert len(result) == 1
         assert result[0]["name"] == "X"
-        assert result[0]["owner_type"] == "customer"
+        assert result[0]["party_type"] == "customer"
         assert result[0]["owner_name"] == "Acme Co"
 
     def test_filter_by_owner_type(self, business_book):
@@ -537,7 +537,7 @@ class TestGetJob:
         result = gb.get_job(job_id=job["id"])
         assert result["name"] == "API Rewrite"
         assert result["reference"] == "PO-001"
-        assert result["owner_type"] == "customer"
+        assert result["party_type"] == "customer"
         assert result["owner_name"] == "Acme Co"
         # No linked invoices yet
         assert result["linked_invoices"]["count"] == 0
@@ -867,7 +867,7 @@ class TestGetJobReport:
             owner_type="vendor",
         )
         result = gb.get_job_report(job_id=job["id"])
-        assert result["owner_type"] == "vendor"
+        assert result["party_type"] == "vendor"
         assert result["owner_name"] == "Office Depot"
         usd = result["totals_by_currency"]["USD"]
         assert Decimal(usd["billed"]) == Decimal("150")
@@ -5403,6 +5403,24 @@ class TestApplyCreditNote:
         ar_after = gb.get_balance("Assets:Accounts Receivable")
         assert ar_after == ar_before
 
+    def test_fully_applied_credit_note_reads_applied(self, business_book):
+        """A credit note settles by being applied, never by cash;
+        get_invoice says ``applied`` at zero balance where an invoice
+        would say ``paid`` (round-two bookkeeper ruling). Until then
+        it is ``posted`` like any other booked document."""
+        gb = GnuCashBook(str(business_book))
+        src_id, cn_id = self._setup_pair(gb)
+        assert gb.get_invoice(cn_id)["status"] == "posted"
+        gb.apply_credit_note(
+            credit_note_id=cn_id,
+            applies_to_invoice_id=src_id,
+        )
+        cn = gb.get_invoice(cn_id)
+        assert cn["status"] == "applied"
+        assert Decimal(cn["amount_due"]) == Decimal("0")
+        # The target is an invoice: cash vocabulary stays.
+        assert gb.get_invoice(src_id)["status"] == "posted"
+
     def test_apply_partial_amount(self, business_book):
         """Explicit amount, smaller than credit_note_remaining,
         partially applies and leaves both lots open."""
@@ -6582,7 +6600,12 @@ class TestInvoiceBillIdCollision:
         assert "'000001'" in msg
         assert "customer invoice" in msg
         assert "vendor bill" in msg
-        assert "owner_type" in msg
+        # The coaching must name parameters the document tools
+        # actually expose. The bookkeeper followed an earlier
+        # version that said "pass owner_type" into a schema
+        # rejection: those tools take party_type / document_type.
+        assert "document_type" in msg
+        assert "party_type" in msg
 
     def test_get_invoice_with_owner_type_filter(self, business_book):
         """get_invoice with owner_type disambiguates colliding IDs."""
@@ -12039,3 +12062,123 @@ class TestCreditNoteUnpostKeepsAppliesTo:
         after = gb.get_invoice(cn["id"], owner_type="customer")
         assert after["is_credit_note"] is True
         assert "applies_to" not in after
+
+
+# ============== Document payment state ==============
+
+
+class TestDocumentPaymentState:
+    """``get_invoice`` carries ``status`` / ``amount_paid`` /
+    ``amount_due`` and ``pay_invoice`` reports the per-call
+    ``payment`` beside a cumulative ``total_paid``. Both read the
+    ``_document_settlement`` chokepoint that ``get_outstanding_invoices``
+    uses, so the surfaces agree by construction. (Bookkeeper
+    findings on the business-module probe: a paid bill and a
+    half-paid voucher both read as a bare total, and the second
+    payment's ``amount_paid`` reported 250 with 450 paid.)
+    """
+
+    def _post_invoice(self, gb, amount="500.00"):
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="Consulting",
+            quantity="1",
+            price=amount,
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+        )
+        return "000001"
+
+    def test_open_document_reports_open_without_amounts(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        doc = gb.get_invoice("000001")
+        assert doc["status"] == "open"
+        # Nothing is owed until posting books it.
+        assert "amount_paid" not in doc
+        assert "amount_due" not in doc
+
+    def test_posted_unpaid_reports_posted_with_full_balance_due(
+        self, business_book,
+    ):
+        gb = GnuCashBook(str(business_book))
+        self._post_invoice(gb, "500.00")
+        doc = gb.get_invoice("000001")
+        assert doc["status"] == "posted"
+        assert Decimal(doc["amount_paid"]) == Decimal("0")
+        assert Decimal(doc["amount_due"]) == Decimal("500")
+        assert "overpaid" not in doc
+
+    def test_partial_payment_amounts_agree_with_unpaid_list(
+        self, business_book,
+    ):
+        gb = GnuCashBook(str(business_book))
+        self._post_invoice(gb, "500.00")
+        gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="200",
+        )
+        doc = gb.get_invoice("000001")
+        assert doc["status"] == "posted"
+        assert Decimal(doc["amount_paid"]) == Decimal("200")
+        assert Decimal(doc["amount_due"]) == Decimal("300")
+        row = gb.get_outstanding_invoices(compact=False)["invoices"][0]
+        # Agreement lock: one chokepoint, two surfaces, same strings.
+        assert row["amount_paid"] == doc["amount_paid"]
+        assert row["amount_due"] == doc["amount_due"]
+        # Precision lock: every amount at the commodity quantum, so
+        # 250.00 sits beside 200.00 (round-two finding: due/remaining
+        # were unpadded next to padded paid totals).
+        assert doc["amount_due"] == "300.00"
+        assert doc["amount_paid"] == "200.00"
+
+    def test_paid_document_keeps_amounts_after_leaving_unpaid_list(
+        self, business_book,
+    ):
+        gb = GnuCashBook(str(business_book))
+        self._post_invoice(gb, "500.00")
+        gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="500",
+        )
+        assert gb.get_outstanding_invoices(compact=False)["invoices"] == []
+        doc = gb.get_invoice("000001")
+        assert doc["status"] == "paid"
+        assert Decimal(doc["amount_paid"]) == Decimal("500")
+        assert Decimal(doc["amount_due"]) == Decimal("0")
+
+    def test_pay_invoice_reports_payment_and_cumulative_total(
+        self, business_book,
+    ):
+        gb = GnuCashBook(str(business_book))
+        self._post_invoice(gb, "450.00")
+        first = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="200",
+        )
+        assert Decimal(first["payment"]) == Decimal("200")
+        assert Decimal(first["total_paid"]) == Decimal("200")
+        assert Decimal(first["remaining_balance"]) == Decimal("250")
+        assert first["remaining_balance"] == "250.00"
+        assert first["total_paid"] == "200.00"
+        assert first["status"] == "partial"
+        second = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="250",
+        )
+        assert Decimal(second["payment"]) == Decimal("250")
+        assert Decimal(second["total_paid"]) == Decimal("450")
+        assert Decimal(second["remaining_balance"]) == Decimal("0")
+        assert second["remaining_balance"] == "0.00"
+        assert second["status"] == "paid"
+        assert "amount_paid" not in second

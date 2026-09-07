@@ -2,6 +2,19 @@
 
 Entries are terse by design: what changed, one line each, PR numbers where they exist. Rationale lives in the PRs, the specs, and the bookkeeper rulings recorded under `specs/`.
 
+## Unreleased
+
+### Changed
+- `--modules=bookkeeper` is everything except business: `tax_lots` and `portfolio` join `reporting`, `budgets`, and `scheduling`. The MCPB bundle's always-on base is now defined as this group rather than a parallel list. `investor` remains selectable on its own.
+- `--modules=business` is one module. The `freelancer` / `business_complete` split reduced to a runtime gate on `owner_type` plus one report once the party and document tools went polymorphic; both halves merged into the single `business` leaf and the gate is gone. The retired names are still accepted on `--modules` / `GNUCASH_MCP_MODULES` and resolve to `business`, so existing config files keep starting the server. A stored `GNUCASH_ENABLE_FREELANCER=true` from a pre-#163 bundle install now unlocks the whole business suite.
+- `get_document` carries `status` (open / posted / paid) and, once posted, `amount_paid` and `amount_due`; a paid document keeps its amounts after leaving the unpaid list. `pay_document` reports the per-call `payment` beside a cumulative `total_paid` (the old `amount_paid` read as the only payment on a second partial). One chokepoint, `_document_settlement`, now feeds both and `get_outstanding_documents`.
+- `apply_credit_note`, `create_job`, and `list_jobs` take `party_type`, the name the other twenty-two business tools use; `owner_type` no longer appears on any tool.
+- The document ID-collision error names `document_type` and `party_type`; it used to coach a parameter no tool exposes.
+- Every amount on `get_document`, `pay_document`, and `get_outstanding_documents` leaves at the commodity's quantum (250.00 beside 200.00, not 250); the pay audit line inherits it.
+- `create_job`, `list_jobs`, and `get_job_report` answer `party_type`, the same name they accept, so the field a client is handed round-trips.
+- Audit CREATE lines for invoices, bills, vouchers, credit notes, and jobs render the counterparty as `Name (id)`; older entries keep the bare id.
+- A credit note at zero balance reports `status: applied` on `get_document`; it settles by application, not cash.
+
 ## v1.4.4 - The statement is the call
 
 A complete bank statement enters, claims its matches, and reconciles in one atomic call; every consequential write now rehearses before it books; a one-click Claude Desktop bundle ships from the project's first CI. (v1.4.3 was never released on GitHub — that number belongs to a registry-side rebuild.)

@@ -7,12 +7,9 @@ from gnucash_mcp.logging_config import audit_log
 from gnucash_mcp.tools._helpers import (
     DocumentType,
     PartyType,
-    _gate_document_type,
-    _gate_party_type,
     BusinessAddressInput,
     BusinessNotes,
     BusinessNotesOptional,
-    _gate_owner_type,
     _json,
     _resolve_id_alias,
     safe_tool,
@@ -53,7 +50,6 @@ def register(mcp, get_book) -> None:
                 addr3, addr4, phone, fax, email. Each sub-field
                 capped at 1024 characters.
         """
-        party_type = _gate_party_type(party_type)
         book = get_book()
         addr = address.model_dump() if address else None
         if party_type == "employee":
@@ -106,7 +102,6 @@ def register(mcp, get_book) -> None:
             limit: Page size per type (default 50, max 250). 0 = count only.
             offset: 0-indexed first row to return (default 0).
         """
-        party_type = _gate_party_type(party_type)
         book = get_book()
         routes = {
             "customer": book.list_customers,
@@ -148,7 +143,6 @@ def register(mcp, get_book) -> None:
             id: Party ID (e.g., "000001"). This is the human-readable
                 ID shown in GnuCash, not the internal GUID.
         """
-        party_type = _gate_party_type(party_type)
         book = get_book()
         if party_type == "employee":
             result = book.get_employee(employee_id=id)
@@ -188,7 +182,6 @@ def register(mcp, get_book) -> None:
                 default listings but keep their history).
             address: Full replacement address (see create_party).
         """
-        party_type = _gate_party_type(party_type)
         book = get_book()
         addr = address.model_dump() if address else None
         if party_type == "employee":
@@ -234,7 +227,6 @@ def register(mcp, get_book) -> None:
                 counters collide across types — always required).
             id: Party ID (e.g., "000001").
         """
-        party_type = _gate_party_type(party_type)
         book = get_book()
         if party_type == "employee":
             result = book.delete_employee(employee_id=id)
@@ -488,7 +480,6 @@ def register(mcp, get_book) -> None:
                 response notes the divergence when the applied
                 target differs from this link).
         """
-        document_type = _gate_document_type(document_type)
         # Type-scoped parameters refuse loudly when inapplicable.
         # These are DECLARED parameters, so extra="forbid" can't
         # catch them — without this check a supplied value would be
@@ -517,7 +508,6 @@ def register(mcp, get_book) -> None:
                     "party_type='customer' (reduces a receivable) "
                     "or party_type='vendor' (reduces a payable)."
                 )
-            party_type = _gate_party_type(party_type)
             if party_type == "employee":
                 raise ValueError(
                     "party_type='employee' is not valid for credit "
@@ -591,7 +581,6 @@ def register(mcp, get_book) -> None:
             notes: Optional entry notes.
             action: Optional entry action label (e.g., "Hours").
         """
-        document_type = _gate_document_type(document_type)
         book = get_book()
         if document_type == "credit_note":
             result = book.add_credit_note_entry(
@@ -651,7 +640,6 @@ def register(mcp, get_book) -> None:
                 same ID on the other side (ID counters are per
                 type).
         """
-        document_type = _gate_document_type(document_type)
         # The typed species imply their side; only credit notes
         # exist on both sides and can collide. Refuse a meaningless
         # party_type loudly rather than silently ignoring it.
@@ -666,8 +654,7 @@ def register(mcp, get_book) -> None:
         if document_type == "credit_note":
             result = book.delete_credit_note(
                 credit_note_id=id,
-                owner_type=_gate_owner_type(party_type)
-                if party_type else None,
+                owner_type=party_type or None,
             )
         elif document_type == "bill":
             result = book.delete_bill(bill_id=id)
@@ -686,7 +673,7 @@ def register(mcp, get_book) -> None:
         applies_to_invoice_id: str,
         amount: str | None = None,
         apply_date: str | None = None,
-        owner_type: str | None = None,
+        party_type: str | None = None,
     ) -> str:
         """Net a posted credit note against a posted invoice or
         bill from the same owner. No cash moves — the credit
@@ -715,17 +702,16 @@ def register(mcp, get_book) -> None:
                 as possible.
             apply_date: ISO date for the netting transaction.
                 Defaults to today.
-            owner_type: Optional 'customer' or 'vendor'
+            party_type: Optional 'customer' or 'vendor'
                 disambiguator for ID collisions.
         """
-        owner_type = _gate_owner_type(owner_type)
         book = get_book()
         result = book.apply_credit_note(
             credit_note_id=credit_note_id,
             applies_to_invoice_id=applies_to_invoice_id,
             amount=amount,
             apply_date=apply_date,
-            owner_type=owner_type,
+            owner_type=party_type,
         )
         return _json(result)
 
@@ -753,7 +739,9 @@ def register(mcp, get_book) -> None:
         **open** = created and editable, not yet booked to A/R//A/P —
         not payable. **posted** = booked to A/R//A/P with a lot
         tracking its balance — payable. **paid** = posted with a zero
-        remaining balance (lot closed). **outstanding** = posted with
+        remaining balance (lot closed); a credit note at zero balance
+        reads **applied** instead, since it settles by application,
+        not cash. **outstanding** = posted with
         a remaining balance — the unpaid subset; get it directly from
         ``get_outstanding_documents`` rather than deriving it here.
         The ``status`` filter below covers document state
@@ -779,8 +767,7 @@ def register(mcp, get_book) -> None:
         owner_type = party_type if party_type else {
             "invoice": "customer", "bill": "vendor",
             "voucher": "employee",
-        }.get(_gate_document_type(document_type) if document_type else None)
-        owner_type = _gate_owner_type(owner_type)
+        }.get(document_type)
         book = get_book()
         result = book.list_invoices(
             doc_type=document_type,
@@ -809,10 +796,14 @@ def register(mcp, get_book) -> None:
         Returns all entries with quantities, prices, and totals;
         the response's ``type`` field names the document kind.
 
-        Status vocabulary: open = editable, not yet booked; posted =
-        on the books, payable; paid = remaining balance zero. The
-        full definitions live on ``list_documents``; the unpaid list
-        is ``get_outstanding_documents``.
+        The response carries ``status`` (open = editable, not yet
+        booked; posted = on the books, balance owed; paid = balance
+        zero; applied = a credit note fully consumed against its
+        target) and, once posted, ``amount_paid`` and ``amount_due``
+        from the same lot arithmetic ``get_outstanding_documents``
+        uses; ``overpaid: true`` marks a negative balance. A paid
+        document keeps its amounts here after it leaves the unpaid
+        list.
 
         Args:
             id: Document ID (e.g., "000001"). This is the
@@ -826,8 +817,7 @@ def register(mcp, get_book) -> None:
         owner_type = party_type if party_type else {
             "invoice": "customer", "bill": "vendor",
             "voucher": "employee",
-        }.get(_gate_document_type(document_type) if document_type else None)
-        owner_type = _gate_owner_type(owner_type)
+        }.get(document_type)
         book = get_book()
         result = book.get_invoice(invoice_id=id, owner_type=owner_type)
         return _json(result)
@@ -876,8 +866,7 @@ def register(mcp, get_book) -> None:
         owner_type = party_type if party_type else {
             "invoice": "customer", "bill": "vendor",
             "voucher": "employee",
-        }.get(_gate_document_type(document_type) if document_type else None)
-        owner_type = _gate_owner_type(owner_type)
+        }.get(document_type)
         book = get_book()
         result = book.post_invoice(
             invoice_id=id,
@@ -917,8 +906,7 @@ def register(mcp, get_book) -> None:
         owner_type = party_type if party_type else {
             "invoice": "customer", "bill": "vendor",
             "voucher": "employee",
-        }.get(_gate_document_type(document_type) if document_type else None)
-        owner_type = _gate_owner_type(owner_type)
+        }.get(document_type)
         book = get_book()
         result = book.unpost_invoice(
             invoice_id=id,
@@ -948,7 +936,11 @@ def register(mcp, get_book) -> None:
         vendor bill, employee voucher, or credit note.
 
         Creates a payment transaction from the specified bank/cash account
-        to the document's A/R or A/P account. Partial payments are supported.
+        to the document's A/R or A/P account. Partial payments are supported:
+        the response's ``payment`` is this call's amount, ``total_paid``
+        is cumulative across all payments, and ``remaining_balance`` is
+        what is still owed; ``status`` is ``partial`` until the balance
+        reaches zero, then ``paid``.
 
         ``dry_run=true`` rehearses the payment without booking it:
         the full validation, conversion, discount, and FX pipeline
@@ -1028,8 +1020,7 @@ def register(mcp, get_book) -> None:
         owner_type = party_type if party_type else {
             "invoice": "customer", "bill": "vendor",
             "voucher": "employee",
-        }.get(_gate_document_type(document_type) if document_type else None)
-        owner_type = _gate_owner_type(owner_type)
+        }.get(document_type)
         book = get_book()
         result = book.pay_invoice(
             invoice_id=id,
@@ -1052,7 +1043,7 @@ def register(mcp, get_book) -> None:
     @audit_log(classification="write", operation="create", entity_type="job")
     def create_job(
         owner_id: str,
-        owner_type: str,
+        party_type: str,
         name: str,
         reference: str = "",
     ) -> str:
@@ -1066,18 +1057,17 @@ def register(mcp, get_book) -> None:
 
         Args:
             owner_id: Customer or vendor ID (e.g., "000001").
-            owner_type: "customer" or "vendor". Employees are
+            party_type: "customer" or "vendor". Employees are
                 not supported (no GnuCash desktop UI for
                 employee jobs).
             name: Human-readable job name (e.g., "API Rewrite").
             reference: Optional reference string (PO number,
                 project code).
         """
-        owner_type = _gate_owner_type(owner_type)
         book = get_book()
         result = book.create_job(
             owner_id=owner_id,
-            owner_type=owner_type,
+            owner_type=party_type,
             name=name,
             reference=reference,
         )
@@ -1088,7 +1078,7 @@ def register(mcp, get_book) -> None:
     @audit_log(classification="read")
     def list_jobs(
         id: str | None = None,
-        owner_type: str | None = None,
+        party_type: str | None = None,
         owner_id: str | None = None,
         active_only: bool = True,
         verbose: bool = False,
@@ -1107,10 +1097,10 @@ def register(mcp, get_book) -> None:
         Args:
             id: Job ID for a single-job detail lookup (e.g.,
                 "000001"). All other filters are ignored.
-            owner_type: Filter by "customer" or "vendor". Omit
+            party_type: Filter by "customer" or "vendor". Omit
                 for all.
             owner_id: Filter by specific customer or vendor ID
-                (requires owner_type).
+                (requires party_type).
             active_only: If True (default), exclude inactive jobs.
             verbose: If false (default), compact text output — optimized
                 for reading and token efficiency. If true, structured
@@ -1122,9 +1112,8 @@ def register(mcp, get_book) -> None:
         book = get_book()
         if id is not None:
             return _json(book.get_job(job_id=id))
-        owner_type = _gate_owner_type(owner_type)
         result = book.list_jobs(
-            owner_type=owner_type,
+            owner_type=party_type,
             owner_id=owner_id,
             active_only=active_only,
             compact=not verbose,
@@ -1257,24 +1246,7 @@ def register(mcp, get_book) -> None:
             limit: Page size (default 50, max 250). 0 = count only.
             offset: 0-indexed first row to return (default 0).
         """
-        owner_type = _gate_owner_type(party_type)
-        # When Business isn't loaded, vendor_id is also a vendor-only
-        # surface — reject it the same way an explicit
-        # owner_type='vendor' is rejected. _gate_owner_type already
-        # handled owner_type; vendor_id needs its own check.
-        if vendor_id is not None:
-            from gnucash_mcp.server import is_module_enabled
-            # Check the leaf (``business_complete``) rather than the
-            # ``business`` group alias, so a user who explicitly
-            # picked the vendor-side carve-out also gets vendor_id
-            # filtering. See _gate_owner_type for the rationale.
-            if not is_module_enabled("business_complete"):
-                raise ValueError(
-                    "vendor_id filtering requires the business module. "
-                    "Restart with --modules=business (or add "
-                    "business_complete to your current selection) to "
-                    "access vendor bills."
-                )
+        owner_type = party_type
         book = get_book()
         result = book.get_outstanding_invoices(
             owner_type=owner_type,

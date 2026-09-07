@@ -2522,3 +2522,70 @@ class TestAuditInjectionEscaping:
         blob = out["params"]["updates"]
         assert "\t" in blob and "\n" in blob
         assert "\\u202e" in blob and "‮" not in blob
+
+
+class TestPayRenderingCumulativeTotal:
+    """A ``pay`` entry written with the v1.5 keys renders the
+    per-call payment AND the cumulative total; entries written with
+    the older ``amount_paid`` key still render (fallback)."""
+
+    def test_new_keys_render_total_paid(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        entry = {
+            "classification": "write",
+            "entity_type": "voucher",
+            "operation": "pay",
+            "timestamp": "2026-09-07T10:00:00",
+            "params": {"id": "000001", "payment_account": "Assets:Checking"},
+            "after_state": {
+                "type": "voucher", "payment": "250.00",
+                "total_paid": "450.00", "remaining_balance": "0.00",
+                "transaction_guid": "abc12345",
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert "PAY VOUCHER" in rendered
+        assert "paid: 250.00  total paid: 450.00  remaining: 0.00" in rendered
+
+
+class TestCreateLinesCarryCounterpartyName:
+    """CREATE lines for jobs and documents render the counterparty as
+    ``Name (id)`` when the after-state carries ``owner_name``; entries
+    without it (written before v1.5) fall back to the bare id."""
+
+    def _render(self, entity_type, after, params):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        return _format_audit_entry_text({
+            "classification": "write",
+            "entity_type": entity_type,
+            "operation": "create",
+            "timestamp": "2026-09-07T10:00:00",
+            "params": params,
+            "after_state": after,
+        })
+
+    def test_job_create_names_the_customer(self):
+        rendered = self._render(
+            "job",
+            {"id": "000004", "name": "Probe job", "party_type": "customer",
+             "owner_name": "Emerald Analytics"},
+            {"owner_id": "000001", "name": "Probe job"},
+        )
+        assert 'customer: Emerald Analytics (000001)' in rendered
+
+    def test_bill_create_names_the_vendor(self):
+        rendered = self._render(
+            "bill",
+            {"id": "000010", "vendor_id": "000003",
+             "owner_name": "Cascade Cloud Services"},
+            {"document_type": "bill", "owner_id": "000003"},
+        )
+        assert "vendor: Cascade Cloud Services (000003)" in rendered
+
+    def test_missing_name_falls_back_to_bare_id(self):
+        rendered = self._render(
+            "voucher", {"id": "000010", "employee_id": "000001"},
+            {"document_type": "voucher", "owner_id": "000001"},
+        )
+        assert "employee: 000001" in rendered
+        assert "(" not in rendered.split("employee:")[1].split("\n")[0]

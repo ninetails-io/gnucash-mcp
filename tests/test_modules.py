@@ -96,12 +96,11 @@ class TestToolModulesMapping:
         assert len(_core_tool_names()) == 29
 
     def test_total_tool_count(self):
-        """Total tools across all sub-modules should be 111 —
-        88 post-module-restructure + 3 voucher tools +
-        4 credit-note tools + 5 job CRUD tools +
-        1 get_job_report + 5 taxtable CRUD tools added in v1.3 +
-        1 enter_statement added in v1.4.4, minus list_backups +
-        prune_backups (removed v1.4.4 — append-only backup store)."""
+        """Total tools across all sub-modules: 86 as of v1.4.4
+        (111 tools consolidated to 88, minus list_backups +
+        prune_backups). Merging freelancer + business_complete
+        into one ``business`` leaf moved tools between keys
+        without adding or removing any."""
         total = sum(len(tools) for tools in TOOL_MODULES.values())
         assert total == 86
 
@@ -118,15 +117,15 @@ class TestToolModulesMapping:
             "reporting", "budgets", "scheduling",
             # Investor-cluster leaves
             "portfolio", "tax_lots",
-            # Business-cluster leaves (``business`` is now a group
-            # alias expanding to these two; the standalone of the
-            # same name was the pre-v1.3 design, retired because it
-            # left small-business users without invoice tools).
-            "freelancer", "business_complete",
+            # The whole business surface, one leaf. The
+            # freelancer / business_complete halves merged once the
+            # party/document tools went polymorphic; the retired
+            # names survive as MODULE_ALIASES.
+            "business",
         }
         assert set(TOOL_MODULES.keys()) == expected
-        # Group aliases — ``core`` always-on plus the three role
-        # groups (bookkeeper, investor, business) landing in v1.3.
+        # Group aliases — ``core`` always-on plus the two role
+        # groups (bookkeeper, investor); ``business`` is a leaf.
         # core grew to 9 in v1.3.1 — reconciliation moved here
         # from bookkeeper so it loads in every configuration that
         # handles money (which is all of them).
@@ -137,13 +136,17 @@ class TestToolModulesMapping:
         }
         assert set(MODULE_GROUPS["bookkeeper"]) == {
             "reporting", "budgets", "scheduling",
+            "tax_lots", "portfolio",
         }
+        # bookkeeper is everything but business: every leaf outside
+        # core and business is a member.
+        assert set(MODULE_GROUPS["bookkeeper"]) == (
+            set(TOOL_MODULES) - set(MODULE_GROUPS["core"]) - {"business"}
+        )
         assert set(MODULE_GROUPS["investor"]) == {
             "tax_lots", "portfolio",
         }
-        assert set(MODULE_GROUPS["business"]) == {
-            "freelancer", "business_complete",
-        }
+        assert "business" not in MODULE_GROUPS
 
     def test_validate_tool_modules_passes(self):
         """Validation should pass with the current mapping."""
@@ -352,38 +355,42 @@ class TestApplyModuleFilter:
             _apply_module_filter("bookeeper,investor")
         assert exc_info.value.code == 2
 
-    def test_freelancer_carries_jobs_credit_notes_billterms(self):
-        """v1.3.1 redistribution: billterms, jobs, and credit notes
-        moved from business_complete to freelancer.
-
-        Principle: polymorphic-on-owner_type tools + shared
-        infrastructure live in freelancer; vendor-specific surface
-        stays in business_complete. A solo freelancer setting
-        payment terms on customer invoices, running per-project
-        P&L, or issuing customer refunds needs these without
-        pulling in vendor management. The polymorphic gate in
-        _gate_owner_type still restricts vendor-side use of the
-        polymorphic tools (jobs / credit notes) to business mode.
+    def test_retired_business_names_alias_to_business(self):
+        """``freelancer`` and ``business_complete`` were the two
+        halves of the business surface until the party/document
+        tools went polymorphic. Both names still resolve, to the
+        whole ``business`` module, so a config file written for an
+        earlier release neither fails fast nor loads a partial
+        surface.
         """
-        _apply_module_filter("freelancer")
-        remaining = self._tool_names()
-        # Billterms (shared infrastructure).
-        assert "create_billterm" in remaining
-        assert "list_billterms" in remaining
-        # Jobs (polymorphic; customer-side usable in freelancer).
-        assert "create_job" in remaining
-        assert "list_jobs" in remaining
-        assert "get_job_report" in remaining
-        # Credit notes ride the consolidated document tools
-        # (document_type="credit_note"); apply stays standalone.
-        assert "create_document" in remaining
-        assert "apply_credit_note" in remaining
-        # Vendor-specific surface must remain absent.
-        assert "create_vendor" not in remaining
-        assert "create_bill" not in remaining
-        assert "create_employee" not in remaining
-        assert "create_voucher" not in remaining
-        assert "vendor_spending_report" not in remaining
+        from gnucash_mcp.server import MODULE_ALIASES, is_module_enabled
+        _apply_module_filter("business")
+        full = set(self._tool_names())
+        assert "create_document" in full
+        assert "vendor_spending_report" in full
+        for retired in ("freelancer", "business_complete"):
+            assert MODULE_ALIASES[retired] == "business"
+            _apply_module_filter(retired)
+            assert set(self._tool_names()) == full, retired
+            assert is_module_enabled("business")
+
+    def test_no_business_tool_exposes_owner_type(self):
+        """Every business tool names the party side ``party_type``.
+        ``owner_type`` is the book-layer (piecash) name; three tools
+        leaked it to the MCP surface and, with unknown kwargs
+        rejected at the schema, a model that learned party_type from
+        the other twenty-two got a schema error on create_job. Lock:
+        the name never reaches a tool signature again.
+        """
+        import inspect
+        _apply_module_filter("business")
+        leaks = {
+            name for name in TOOL_MODULES["business"]
+            if "owner_type" in inspect.signature(
+                mcp._tool_manager._tools[name].fn
+            ).parameters
+        }
+        assert not leaks, sorted(leaks)
 
     def test_unknown_module_alongside_all_still_fails(self, capsys):
         """``all`` is a loading instruction, not a validation bypass.
@@ -482,23 +489,25 @@ class TestApplyModuleFilter:
         assert "list_commodities" in remaining
         assert "create_price" in remaining
 
-    def test_bookkeeper_group_bundles_three_modules(self):
-        """``--modules=bookkeeper`` loads reporting + budgets +
-        scheduling — the personal-finance management cluster.
-        Reconciliation moved to core in v1.3.1 and is now
-        always-on regardless of group selection."""
+    def test_bookkeeper_group_is_everything_but_business(self):
+        """``--modules=bookkeeper`` loads every module except
+        business: the persona that wants the whole ledger, reports,
+        planning, and investment surface but never invoices anyone.
+        Reconciliation is always-on via core regardless."""
         _apply_module_filter("bookkeeper")
         remaining = self._tool_names()
         # One probe per bookkeeper member module.
         assert "spending_by_category" in remaining    # reporting
         assert "create_budget" in remaining           # budgets
         assert "create_scheduled_transaction" in remaining
+        assert "create_lot" in remaining              # tax_lots
+        assert "create_price" in remaining            # portfolio
         # reconciliation is now always-on via core.
         assert "reconcile_account" in remaining
-        # Core always loaded; non-bookkeeper modules absent.
         assert "list_accounts" in remaining
-        assert "create_invoice" not in remaining      # freelancer
-        assert "create_lot" not in remaining          # tax_lots
+        # The one thing bookkeeper excludes.
+        assert "create_document" not in remaining     # business
+        assert "vendor_spending_report" not in remaining
 
     def test_reconciliation_loads_with_core_by_default(self):
         """v1.3.1 invariant: any configuration loads reconciliation.
@@ -720,97 +729,6 @@ class TestGetServerConfig:
         assert "get_server_config" in TOOL_MODULES["diagnostic"]
         assert "get_server_config" in mcp._tool_manager._tools
 
-
-class TestOwnerTypeGating:
-    """The Freelancer module hosts the shared-lifecycle invoice
-    tools (post/unpost/pay_invoice, list/get_invoice,
-    get_outstanding_invoices). Those tools dispatch on owner_type to
-    handle both customer invoices AND vendor bills — but the Business
-    module owns vendor management. Runtime gating in
-    ``_gate_owner_type`` enforces the split: a Freelancer-only user
-    can't reach vendor bills through the shared tools.
-    """
-
-    @pytest.fixture(autouse=True)
-    def save_and_restore_modules(self):
-        from gnucash_mcp.server import _LOADED_MODULES
-        original = set(_LOADED_MODULES)
-        yield
-        _LOADED_MODULES.clear()
-        _LOADED_MODULES.update(original)
-
-    def test_business_loaded_passes_through(self):
-        """With business_complete enabled (whether explicitly or via
-        the ``business`` group alias), _gate_owner_type returns its
-        input unchanged — both halves of the polymorphic dispatch work.
-        """
-        from gnucash_mcp.server import _LOADED_MODULES
-        from gnucash_mcp.tools._helpers import _gate_owner_type
-
-        _LOADED_MODULES.clear()
-        _LOADED_MODULES.update({
-            "core", "freelancer", "business_complete", "business",
-        })
-        assert _gate_owner_type("customer") == "customer"
-        assert _gate_owner_type("vendor") == "vendor"
-        assert _gate_owner_type(None) is None
-
-    def test_business_absent_coerces_to_customer(self):
-        """Without business, omitted or 'customer' owner_type is
-        coerced to 'customer' explicitly so the book-layer lookup
-        filters out vendor bills."""
-        from gnucash_mcp.server import _LOADED_MODULES
-        from gnucash_mcp.tools._helpers import _gate_owner_type
-
-        _LOADED_MODULES.clear()
-        _LOADED_MODULES.update({"core", "freelancer"})
-        assert _gate_owner_type(None) == "customer"
-        assert _gate_owner_type("customer") == "customer"
-
-    def test_business_absent_rejects_explicit_vendor(self):
-        """Without business, an explicit owner_type='vendor' raises
-        a clear error rather than silently coercing or returning
-        not-found from the book layer."""
-        import pytest
-        from gnucash_mcp.server import _LOADED_MODULES
-        from gnucash_mcp.tools._helpers import _gate_owner_type
-
-        _LOADED_MODULES.clear()
-        _LOADED_MODULES.update({"core", "freelancer"})
-        with pytest.raises(ValueError, match="requires the business module"):
-            _gate_owner_type("vendor")
-
-    def test_business_absent_rejects_explicit_employee(self):
-        """Symmetric with the vendor rejection — employee gating
-        was added with vouchers (v1.3) and needs the same
-        guardrail. Without business, owner_type='employee' raises
-        with the Business-module-required message. (Copilot PR
-        #86 review found this coverage gap.)"""
-        import pytest
-        from gnucash_mcp.server import _LOADED_MODULES
-        from gnucash_mcp.tools._helpers import _gate_owner_type
-
-        _LOADED_MODULES.clear()
-        _LOADED_MODULES.update({"core", "freelancer"})
-        with pytest.raises(ValueError, match="requires the business module"):
-            _gate_owner_type("employee")
-
-    def test_business_absent_rejects_typo(self):
-        """Without business, a typo like 'venddor' must fail fast
-        — pre-fix the gate silently coerced unknown strings to
-        'customer', masking the typo behind a confusing "invoice
-        not found" downstream error. The gate now rejects anything
-        outside {None, 'customer'} (or the two business-gated
-        names which raise their own messages). (Copilot PR #86
-        review.)"""
-        import pytest
-        from gnucash_mcp.server import _LOADED_MODULES
-        from gnucash_mcp.tools._helpers import _gate_owner_type
-
-        _LOADED_MODULES.clear()
-        _LOADED_MODULES.update({"core", "freelancer"})
-        with pytest.raises(ValueError, match="Invalid owner_type"):
-            _gate_owner_type("venddor")
 
 
 class TestJsonDumpsForbiddenInTools:
@@ -2004,13 +1922,13 @@ class TestEnvModuleToggles:
         from gnucash_mcp.server import _modules_from_env_toggles
         monkeypatch.setenv("GNUCASH_ENABLE_BUSINESS", "false")
         assert (_modules_from_env_toggles()
-                == "reporting,budgets,scheduling,investor")
+                == "bookkeeper")
 
     def test_business_true_adds_the_suite(self, monkeypatch):
         from gnucash_mcp.server import _modules_from_env_toggles
         monkeypatch.setenv("GNUCASH_ENABLE_BUSINESS", "true")
         assert (_modules_from_env_toggles()
-                == "reporting,budgets,scheduling,investor,business")
+                == "bookkeeper,business")
 
     def test_retired_toggles_are_ignored(self, monkeypatch):
         """An old install's stored config (pre-unification manifest)
@@ -2023,22 +1941,23 @@ class TestEnvModuleToggles:
         assert _modules_from_env_toggles() is None
         monkeypatch.setenv("GNUCASH_ENABLE_BUSINESS", "false")
         assert (_modules_from_env_toggles()
-                == "reporting,budgets,scheduling,investor")
+                == "bookkeeper")
 
     def test_retired_freelancer_toggle_still_honored(self, monkeypatch):
-        """Release-review finding 4: freelancer's surface did NOT
-        join the base, so an old install that answered
-        freelancer=yes, business=no must keep its invoicing tools —
-        ignoring the stored toggle would silently subtract them."""
+        """Release-review finding 4: the invoicing surface is not
+        in the base, so an old install that answered freelancer=yes,
+        business=no must keep it — ignoring the stored toggle would
+        silently subtract it. Since the freelancer/business_complete
+        merge the toggle unlocks the whole business module."""
         from gnucash_mcp.server import _modules_from_env_toggles
         monkeypatch.setenv("GNUCASH_ENABLE_BUSINESS", "false")
         monkeypatch.setenv("GNUCASH_ENABLE_FREELANCER", "true")
         assert (_modules_from_env_toggles()
-                == "reporting,budgets,scheduling,investor,freelancer")
+                == "bookkeeper,business")
         # freelancer=false stays base-only (no accidental additions).
         monkeypatch.setenv("GNUCASH_ENABLE_FREELANCER", "false")
         assert (_modules_from_env_toggles()
-                == "reporting,budgets,scheduling,investor")
+                == "bookkeeper")
 
     def test_invalid_value_fails_fast(self, monkeypatch):
         from gnucash_mcp.server import _modules_from_env_toggles
@@ -2387,7 +2306,7 @@ class TestHelpTextCounts:
         text = _build_help_text()
         assert f"core ({_module_tool_count('core')} tools" in text
         assert f"({_module_tool_count('all')} tools" in text
-        for group in ("bookkeeper", "investor", "freelancer", "business"):
+        for group in ("bookkeeper", "investor", "business"):
             assert f"{_module_tool_count(group)} tools." in text
 
     def test_help_text_mentions_conditional_switch_book(self):
