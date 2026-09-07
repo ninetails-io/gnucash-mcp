@@ -633,6 +633,14 @@ class TestBackendPortabilityChokepoints:
             "there.\n" + "\n".join(f"  {o}" for o in offenders)
         )
 
+    # Every INTEGER flag column GnuCash's schema carries that this
+    # codebase writes. Extend when a new one is written.
+    _FLAG_COLUMNS = frozenset({
+        "placeholder", "hidden", "enabled", "is_closed", "active",
+        "invisible", "i_taxable", "i_taxincluded", "b_taxable",
+        "b_taxincluded",
+    })
+
     def test_flag_columns_are_written_as_integers(self):
         """GnuCash types every flag column as INTEGER, so writes must
         go through ``_gnc_bool``.
@@ -642,33 +650,21 @@ class TestBackendPortabilityChokepoints:
         integer but expression is of type boolean``. Assigning a
         Python bool therefore worked for as long as SQLite was the
         only backend, and broke ``create_account(placeholder=True)``
-        outright on the new one.
+        and ``update_party(active=False)`` outright on the new one.
         """
-        flag_attrs = ("placeholder", "hidden", "enabled", "is_closed")
         offenders = []
         for path in self._book_sources():
             tree = ast.parse(path.read_text())
             for node in ast.walk(tree):
-                targets = []
-                if isinstance(node, ast.Assign):
-                    targets = [
-                        t.attr for t in node.targets
-                        if isinstance(t, ast.Attribute)
-                    ]
-                    value = node.value
-                elif isinstance(node, ast.keyword) and node.arg in flag_attrs:
-                    targets = [node.arg]
-                    value = node.value
-                else:
-                    continue
-                if not any(t in flag_attrs for t in targets):
-                    continue
-                if _is_integer_literal(value) or _is_gnc_bool_call(value):
-                    continue
-                offenders.append(
-                    f"{path.name}:{node.lineno}: "
-                    f"{ast.unparse(value)[:60]}"
-                )
+                for column, value in _flag_column_writes(
+                    node, self._FLAG_COLUMNS
+                ):
+                    if _is_integer_literal(value) or _is_gnc_bool_call(value):
+                        continue
+                    offenders.append(
+                        f"{path.name}:{node.lineno}: "
+                        f"{column}={ast.unparse(value)[:60]}"
+                    )
         assert not offenders, (
             "Flag column written from something other than an integer "
             "literal or _gnc_bool(...). PostgreSQL rejects a Python "
@@ -682,6 +678,7 @@ class TestBackendPortabilityChokepoints:
         base = (self._BOOK_DIR / "_base.py").read_text()
         assert base.count("st_mtime_ns") >= 1
         assert "_gnc_bool" in (self._BOOK_DIR / "core.py").read_text()
+        assert "_gnc_bool" in (self._BOOK_DIR / "business.py").read_text()
 
 
 def _enclosing_def(path: Path, lineno: int) -> str:
@@ -694,6 +691,37 @@ def _enclosing_def(path: Path, lineno: int) -> str:
         if node.lineno <= lineno <= (node.end_lineno or node.lineno):
             best = node.name
     return best
+
+
+def _flag_column_writes(node: ast.AST, columns: frozenset):
+    """Yield ``(column, value)`` for each flag column ``node`` writes.
+
+    Two shapes reach storage: ``obj.column = value`` on an ORM object,
+    and ``column=value`` inside a row-shaped call — ``.values(...)``
+    on a Core insert/update, a ``dict(...)`` that builds one, or an
+    ORM constructor (CamelCase callee). A keyword on an ordinary
+    function is NOT a write: ``self._update_business_person(
+    active=active)`` hands a Python value along, and the write it
+    reaches is scanned where it happens.
+    """
+    if isinstance(node, ast.Assign):
+        for target in node.targets:
+            if isinstance(target, ast.Attribute) and target.attr in columns:
+                yield target.attr, node.value
+    elif isinstance(node, ast.Call) and _is_row_shaped_call(node.func):
+        for kw in node.keywords:
+            if kw.arg in columns:
+                yield kw.arg, kw.value
+
+
+def _is_row_shaped_call(func: ast.expr) -> bool:
+    if isinstance(func, ast.Attribute):
+        name = func.attr
+    elif isinstance(func, ast.Name):
+        name = func.id
+    else:
+        return False
+    return name in ("values", "dict") or name[:1].isupper()
 
 
 def _is_integer_literal(value: ast.expr) -> bool:
