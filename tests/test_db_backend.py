@@ -228,7 +228,7 @@ class TestCacheToken:
 
 class TestBackupDegradation:
     def test_create_backup_refuses_with_an_actionable_message(self, uri_book):
-        with pytest.raises(RuntimeError) as exc:
+        with pytest.raises(ValueError) as exc:
             uri_book.create_backup()
         msg = str(exc.value)
         assert "pg_dump" in msg
@@ -238,7 +238,7 @@ class TestBackupDegradation:
         book = GnuCashBook(
             BookSource.from_uri("postgresql://u:hunter2@h:5432/ledger")
         )
-        with pytest.raises(RuntimeError) as exc:
+        with pytest.raises(ValueError) as exc:
             book.create_backup()
         assert "hunter2" not in str(exc.value)
 
@@ -561,6 +561,51 @@ class TestPercentInFilename:
         assert book._resolve_guid("accounts", guid[:8]) == guid
 
 
+class TestEngineDisposal:
+    """``open()`` disposes piecash's engine after close.
+
+    piecash binds a fresh engine to every ``open_book`` and never
+    disposes it, so its pool keeps a connection checked in after
+    ``close()``. On PostgreSQL that is one server slot per tool call
+    until the cyclic GC happens to reclaim the engine — measured at
+    15 opens, 15 live connections with GC paused. The PostgreSQL job
+    counts real connections (``TestPostgresBackend``); this is the
+    hermetic half.
+    """
+
+    def test_engine_is_disposed_after_close(self, test_book: Path, monkeypatch):
+        from unittest.mock import MagicMock
+
+        real_open = piecash.open_book
+        engines = []
+
+        def spying_open(*args, **kwargs):
+            book = real_open(*args, **kwargs)
+            engine = book.session.get_bind()
+            engine.dispose = MagicMock(wraps=engine.dispose)
+            engines.append(engine)
+            return book
+
+        monkeypatch.setattr(piecash, "open_book", spying_open)
+        gb = GnuCashBook(test_book)
+        with gb.open(readonly=True) as opened:
+            assert opened.default_currency is not None
+        assert len(engines) == 1
+        engines[0].dispose.assert_called_once()
+
+    def test_startup_breadcrumb_masks_the_book(self):
+        """The one place main() logs the raw book value routes it
+        through ``_book_display_name`` — in URI mode that value
+        carries the database password."""
+        import inspect
+
+        import gnucash_mcp.server as srv
+
+        src = inspect.getsource(srv.main)
+        assert "Book: {_book_display_name(book_path)}" in src
+        assert "Book: {book_path}" not in src
+
+
 # ── PostgreSQL ────────────────────────────────────────────────────
 
 
@@ -620,6 +665,10 @@ class TestPostgresBackend:
         )
         book.save()
         book.close()
+        # create_book's engine would otherwise hold a connection and
+        # make the drop below fail with ObjectInUse — the same leak
+        # open() disposes for the server.
+        book.session.get_bind().dispose()
         yield GnuCashBook(BookSource.from_uri(_PG_URI))
 
         # Drop the worker's database so a local run doesn't leave one
@@ -662,7 +711,7 @@ class TestPostgresBackend:
         assert pg_book.get_book_summary()
 
     def test_backups_refuse(self, pg_book):
-        with pytest.raises(RuntimeError, match="pg_dump"):
+        with pytest.raises(ValueError, match="pg_dump"):
             pg_book.create_backup()
 
     def test_placeholder_account_creation(self, pg_book):
@@ -684,3 +733,24 @@ class TestPostgresBackend:
         )
         pg_book.update_account("Expenses:Toggle", placeholder=True)
         assert "Expenses:Toggle [PLACEHOLDER]" in pg_book.list_accounts()
+
+    def test_open_close_releases_the_connection(self, pg_book):
+        """Five open/close cycles leave the server's connection count
+        where it started — the engine is disposed, not pooled."""
+        from sqlalchemy import create_engine, text
+        from sqlalchemy.pool import NullPool
+
+        probe = create_engine(_PG_URI, poolclass=NullPool)
+
+        def live() -> int:
+            with probe.connect() as conn:
+                return conn.execute(text(
+                    "SELECT count(*) FROM pg_stat_activity "
+                    "WHERE datname = current_database()"
+                )).scalar()
+
+        before = live()
+        for _ in range(5):
+            with pg_book.open(readonly=True) as opened:
+                assert opened.default_currency is not None
+        assert live() == before

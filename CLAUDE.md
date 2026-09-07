@@ -194,7 +194,8 @@ module contributes zero tools to the MCP surface.
   unconditionally (not behind `GNUCASH_REDACT_PATHS` — a path is a
   privacy preference, a credential is a leak).
 - **GnuCash's flag columns are INTEGER, not BOOLEAN.**
-  `placeholder`, `hidden`, `enabled`, `is_closed`. SQLite has no
+  `placeholder`, `hidden`, `enabled`, `is_closed`, `active`,
+  `invisible`, the entry `*_taxable` / `*_taxincluded` pair. SQLite has no
   boolean type and coerces silently, so a Python `bool` worked by
   accident for as long as SQLite was the only backend; PostgreSQL
   raises `DatatypeMismatch`. Write them through `_gnc_bool`, locked

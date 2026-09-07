@@ -402,7 +402,11 @@ class BackupMixin:
         """
         if self.source.is_file:
             return
-        raise RuntimeError(
+        # ValueError, not RuntimeError: safe_tool renders ValueError as
+        # a validation_error the caller can act on; RuntimeError is
+        # logged as an unexpected error with a traceback, which a
+        # deliberate refusal is not.
+        raise ValueError(
             f"Cannot {action}: this book is served from a database "
             f"({self.source.display_name}), not a file. The MCP "
             f"backup store snapshots SQLite files only. Back the "

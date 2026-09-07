@@ -1213,6 +1213,14 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         finally:
             close_start = time.time()
             book.close()
+            # piecash binds a fresh engine to every open_book and
+            # never disposes it, so the pool keeps a connection
+            # checked in after close. On PostgreSQL that is one
+            # server slot per tool call until the cyclic GC happens
+            # to reclaim the engine (measured: 15 opens, 15 open
+            # connections). Dispose explicitly; the engine is
+            # single-use by construction here.
+            book.session.get_bind().dispose()
             close_elapsed = (time.time() - close_start) * 1000
             debug_logger.debug(f"Book closed in {close_elapsed:.0f}ms")
 

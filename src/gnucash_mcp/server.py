@@ -44,7 +44,7 @@ from gnucash_mcp._env import (
     _parse_env_toggle,
 )
 
-from gnucash_mcp._format import _parse_book_url
+from gnucash_mcp._format import _book_display_name, _parse_book_url
 from gnucash_mcp.book import (
     BookSource,
     GnuCashBook,
@@ -2158,7 +2158,11 @@ def main() -> None:
     # Logging was activated (or torn down) by the book-list install
     # above with the flag-merged modes; only the breadcrumbs remain.
     if book_path and _logging_debug:
-        debug_log(f"Server starting via CLI. Book: {book_path}")
+        # Through _book_display_name, never raw: in URI mode this
+        # value carries the database password.
+        debug_log(
+            f"Server starting via CLI. Book: {_book_display_name(book_path)}"
+        )
         debug_log(
             "Debug logging enabled, audit="
             f"{'enabled' if _logging_audit else 'disabled'}"
