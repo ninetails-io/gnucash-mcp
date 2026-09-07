@@ -22,6 +22,13 @@ Two contracts the codebase claimed but did not enforce:
   implicitly verified by SQLAlchemy's commit — they don't need
   explicit verification.
 
+- ``TestBackendPortabilityChokepoints`` — two rules the DB backend
+  introduced, both of the "an invariant exists but is enforced at
+  only some sites" shape this file exists to close. A book may now
+  be a PostgreSQL database rather than a SQLite file, so code must
+  not assume a file (``_cache_token``) and must not lean on
+  SQLite's silent bool→int coercion (``_gnc_bool``).
+
 If any of these tests fails without an intentional change to the
 contract, the bug class is open again.
 """
@@ -583,3 +590,154 @@ class TestWriteVerificationCoverage:
             f"Scanner found only {len(sites)} DML sites — "
             f"likely the regex regressed or a refactor hid them"
         )
+
+
+class TestBackendPortabilityChokepoints:
+    """Two rules that only hold as long as every site routes through
+    one helper — the bug class this file exists to close, applied to
+    the SQLite-file assumptions the database backend broke.
+    """
+
+    _BOOK_DIR = _REPO_ROOT / "src" / "gnucash_mcp" / "book"
+
+    def _book_sources(self) -> list[Path]:
+        return sorted(self._BOOK_DIR.glob("*.py"))
+
+    def test_no_site_stats_the_book_outside_cache_token(self):
+        """``_cache_token`` is the only place that may ask the book
+        file for its mtime.
+
+        The GUID-prefix caches key on ``st_mtime_ns``, which a
+        database-backed book has no equivalent for — ``_cache_token``
+        returns None there, and its callers read that as "always
+        rebuild". A new cache that stats the book directly would
+        crash on a DB book (``book_path`` is None) or, worse, quietly
+        serve a stale prefix map whose short GUIDs collide.
+        """
+        offenders = []
+        for path in self._book_sources():
+            for lineno, line in enumerate(
+                path.read_text().splitlines(), start=1
+            ):
+                if "st_mtime_ns" not in line:
+                    continue
+                if path.name == "_base.py" and "_cache_token" in _enclosing_def(
+                    path, lineno
+                ):
+                    continue
+                offenders.append(f"{path.name}:{lineno}: {line.strip()}")
+        assert not offenders, (
+            "st_mtime_ns read outside _cache_token. A database-backed "
+            "book has no file to stat — route the invalidation through "
+            "_cache_token, which returns None to disable caching "
+            "there.\n" + "\n".join(f"  {o}" for o in offenders)
+        )
+
+    # Every INTEGER flag column GnuCash's schema carries that this
+    # codebase writes. Extend when a new one is written.
+    _FLAG_COLUMNS = frozenset({
+        "placeholder", "hidden", "enabled", "is_closed", "active",
+        "invisible", "i_taxable", "i_taxincluded", "b_taxable",
+        "b_taxincluded",
+    })
+
+    def test_flag_columns_are_written_as_integers(self):
+        """GnuCash types every flag column as INTEGER, so writes must
+        go through ``_gnc_bool``.
+
+        SQLite has no boolean type and coerces silently; PostgreSQL
+        raises ``DatatypeMismatch: column "placeholder" is of type
+        integer but expression is of type boolean``. Assigning a
+        Python bool therefore worked for as long as SQLite was the
+        only backend, and broke ``create_account(placeholder=True)``
+        and ``update_party(active=False)`` outright on the new one.
+        """
+        offenders = []
+        for path in self._book_sources():
+            tree = ast.parse(path.read_text())
+            for node in ast.walk(tree):
+                for column, value in _flag_column_writes(
+                    node, self._FLAG_COLUMNS
+                ):
+                    if _is_integer_literal(value) or _is_gnc_bool_call(value):
+                        continue
+                    offenders.append(
+                        f"{path.name}:{node.lineno}: "
+                        f"{column}={ast.unparse(value)[:60]}"
+                    )
+        assert not offenders, (
+            "Flag column written from something other than an integer "
+            "literal or _gnc_bool(...). PostgreSQL rejects a Python "
+            "bool in an INTEGER column.\n"
+            + "\n".join(f"  {o}" for o in offenders)
+        )
+
+    def test_the_scanners_are_not_vacuous(self):
+        """Both scans above pass trivially if their patterns stop
+        matching anything. Pin the sites we know exist."""
+        base = (self._BOOK_DIR / "_base.py").read_text()
+        assert base.count("st_mtime_ns") >= 1
+        assert "_gnc_bool" in (self._BOOK_DIR / "core.py").read_text()
+        assert "_gnc_bool" in (self._BOOK_DIR / "business.py").read_text()
+
+
+def _enclosing_def(path: Path, lineno: int) -> str:
+    """Name of the function containing ``lineno``, or ""."""
+    tree = ast.parse(path.read_text())
+    best = ""
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if node.lineno <= lineno <= (node.end_lineno or node.lineno):
+            best = node.name
+    return best
+
+
+def _flag_column_writes(node: ast.AST, columns: frozenset):
+    """Yield ``(column, value)`` for each flag column ``node`` writes.
+
+    Two shapes reach storage: ``obj.column = value`` on an ORM object,
+    and ``column=value`` inside a row-shaped call — ``.values(...)``
+    on a Core insert/update, a ``dict(...)`` that builds one, or an
+    ORM constructor (CamelCase callee). A keyword on an ordinary
+    function is NOT a write: ``self._update_business_person(
+    active=active)`` hands a Python value along, and the write it
+    reaches is scanned where it happens.
+    """
+    if isinstance(node, ast.Assign):
+        for target in node.targets:
+            if isinstance(target, ast.Attribute) and target.attr in columns:
+                yield target.attr, node.value
+    elif isinstance(node, ast.Call) and _is_row_shaped_call(node.func):
+        for kw in node.keywords:
+            if kw.arg in columns:
+                yield kw.arg, kw.value
+
+
+def _is_row_shaped_call(func: ast.expr) -> bool:
+    if isinstance(func, ast.Attribute):
+        name = func.attr
+    elif isinstance(func, ast.Name):
+        name = func.id
+    else:
+        return False
+    return name in ("values", "dict") or name[:1].isupper()
+
+
+def _is_integer_literal(value: ast.expr) -> bool:
+    if isinstance(value, ast.Constant) and isinstance(value.value, int):
+        return not isinstance(value.value, bool)
+    # ``-1`` parses as a unary op, not a constant.
+    return (
+        isinstance(value, ast.UnaryOp)
+        and isinstance(value.op, ast.USub)
+        and _is_integer_literal(value.operand)
+    )
+
+
+def _is_gnc_bool_call(value: ast.expr) -> bool:
+    return (
+        isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Name)
+        and value.func.id == "_gnc_bool"
+    )

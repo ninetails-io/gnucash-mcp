@@ -22,6 +22,7 @@ import piecash
 
 from gnucash_mcp.book._base import (
     _commodity_quantum,
+    _gnc_bool,
     _slot_value_str,
     _to_decimal,
     _unique_prefix,
@@ -2667,7 +2668,7 @@ class BusinessMixin:
                 changed["notes"] = notes
 
         if active is not None and bool(active) != bool(entity.active):
-            entity.active = bool(active)
+            entity.active = _gnc_bool(active)
             changed["active"] = bool(active)
 
         if address is not None:
@@ -4834,8 +4835,6 @@ class BusinessMixin:
                         f"Taxtable not found: {taxtable!r}"
                     )
 
-            taxable_int = 1 if taxtable else 0
-            taxincl_int = 1 if tax_included else 0
             tt_guid = tt_obj.guid if tt_obj else None
 
             # Parallel ``i_*`` / ``b_*`` column groups: exactly one
@@ -4848,8 +4847,8 @@ class BusinessMixin:
                     b_acct=acct.guid, b_price_num=p_num,
                     b_price_denom=p_denom, bill=inv.guid,
                     i_taxable=0, i_taxincluded=0, i_taxtable=None,
-                    b_taxable=taxable_int,
-                    b_taxincluded=taxincl_int,
+                    b_taxable=_gnc_bool(taxtable),
+                    b_taxincluded=_gnc_bool(tax_included),
                     b_taxtable=tt_guid,
                 )
             else:
@@ -4858,8 +4857,8 @@ class BusinessMixin:
                     i_price_denom=p_denom, invoice=inv.guid,
                     b_acct=None, b_price_num=0, b_price_denom=1,
                     bill=None,
-                    i_taxable=taxable_int,
-                    i_taxincluded=taxincl_int,
+                    i_taxable=_gnc_bool(taxtable),
+                    i_taxincluded=_gnc_bool(tax_included),
                     i_taxtable=tt_guid,
                     b_taxable=0, b_taxincluded=0, b_taxtable=None,
                 )
@@ -7682,7 +7681,7 @@ class BusinessMixin:
                 job.reference = reference
                 changed["reference"] = reference
             if active is not None and bool(job.active) != active:
-                job.active = 1 if active else 0
+                job.active = _gnc_bool(active)
                 changed["active"] = active
 
             book.save()

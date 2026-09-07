@@ -385,6 +385,37 @@ class BackupMixin:
         from gnucash_mcp.logging_config import resolve_mcp_dir
         return resolve_mcp_dir(self.book_path) / "backups"
 
+    def _require_file_backed(self, action: str) -> None:
+        """Refuse a file-shaped backup operation on a DB-backed book.
+
+        The whole module is built on the book being a file: snapshots
+        go through SQLite's online-backup API, the change anchor is a
+        sha256 of the file's bytes, retention is keyed on the
+        filename stem, and restore is a documented ``mv``. None of
+        that has a meaning for a book living in PostgreSQL, and a
+        half-working backup is worse than an honest refusal — the
+        store exists to survive mistakes, so it must never report
+        success it can't deliver.
+
+        Called by the module's two entry points; every other helper
+        here is reachable only through them.
+        """
+        if self.source.is_file:
+            return
+        # ValueError, not RuntimeError: safe_tool renders ValueError as
+        # a validation_error the caller can act on; RuntimeError is
+        # logged as an unexpected error with a traceback, which a
+        # deliberate refusal is not.
+        raise ValueError(
+            f"Cannot {action}: this book is served from a database "
+            f"({self.source.display_name}), not a file. The MCP "
+            f"backup store snapshots SQLite files only. Back the "
+            f"database up with your server's own tooling — for "
+            f"PostgreSQL, `pg_dump <database> > backup.sql` — and "
+            f"schedule it outside this server. See "
+            f"docs/RESTORE_FROM_BACKUP.md."
+        )
+
     def _resolve_backup_path(self, entry: dict) -> Path:
         """Absolute on-disk path for a backup listing entry.
 
@@ -470,6 +501,8 @@ class BackupMixin:
                 deleted before raising).
             OSError: Backup directory not creatable/writable.
         """
+        self._require_file_backed("create a backup")
+
         if stage not in _ALL_STAGE_NAMES:
             raise ValueError(
                 f"Unknown backup stage: {stage!r}. "
@@ -785,6 +818,12 @@ class BackupMixin:
         Safe to call repeatedly (``_backup_checked_in_process``
         gates it).
         """
+        # DB-backed books have no snapshot store. Return before the
+        # process gate flips so the check stays cheap and idempotent
+        # rather than recording a phantom "checked" state.
+        if not self.source.is_file:
+            return
+
         # Lock so concurrent first-writes can't both pass the gate
         # and collide on the same backup filename.
         with self._backup_check_lock:
