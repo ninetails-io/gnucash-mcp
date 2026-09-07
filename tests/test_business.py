@@ -5403,6 +5403,24 @@ class TestApplyCreditNote:
         ar_after = gb.get_balance("Assets:Accounts Receivable")
         assert ar_after == ar_before
 
+    def test_fully_applied_credit_note_reads_applied(self, business_book):
+        """A credit note settles by being applied, never by cash;
+        get_invoice says ``applied`` at zero balance where an invoice
+        would say ``paid`` (round-two bookkeeper ruling). Until then
+        it is ``posted`` like any other booked document."""
+        gb = GnuCashBook(str(business_book))
+        src_id, cn_id = self._setup_pair(gb)
+        assert gb.get_invoice(cn_id)["status"] == "posted"
+        gb.apply_credit_note(
+            credit_note_id=cn_id,
+            applies_to_invoice_id=src_id,
+        )
+        cn = gb.get_invoice(cn_id)
+        assert cn["status"] == "applied"
+        assert Decimal(cn["amount_due"]) == Decimal("0")
+        # The target is an invoice: cash vocabulary stays.
+        assert gb.get_invoice(src_id)["status"] == "posted"
+
     def test_apply_partial_amount(self, business_book):
         """Explicit amount, smaller than credit_note_remaining,
         partially applies and leaves both lots open."""

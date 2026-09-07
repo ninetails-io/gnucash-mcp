@@ -4259,6 +4259,8 @@ class BusinessMixin:
             return {
                 "id": doc_id,
                 config["owner_id_key"]: owner_id,
+                # The audit CREATE line renders ``Name (id)`` from this.
+                "owner_name": getattr(owner, "name", None),
                 "date_opened": str(open_date.date()),
                 "status": "created",
             }
@@ -5347,7 +5349,13 @@ class BusinessMixin:
                     result["status"] = "posted"
                 else:
                     due = settlement["amount_due"]
-                    result["status"] = "paid" if due <= 0 else "posted"
+                    # A credit note settles by being applied, never
+                    # by cash: "applied" is the truer word for it.
+                    settled = (
+                        "applied" if self._get_is_credit_note(inv)
+                        else "paid"
+                    )
+                    result["status"] = settled if due <= 0 else "posted"
                     result["amount_paid"] = str(settlement["amount_paid"])
                     result["amount_due"] = str(due)
                     if settlement["overpaid"]:
@@ -7487,6 +7495,7 @@ class BusinessMixin:
                 "reference": reference,
                 "active": True,
                 "party_type": owner_type,
+                "owner_name": owner.name,
                 "status": "created",
             }
 

@@ -739,7 +739,9 @@ def register(mcp, get_book) -> None:
         **open** = created and editable, not yet booked to A/R//A/P —
         not payable. **posted** = booked to A/R//A/P with a lot
         tracking its balance — payable. **paid** = posted with a zero
-        remaining balance (lot closed). **outstanding** = posted with
+        remaining balance (lot closed); a credit note at zero balance
+        reads **applied** instead, since it settles by application,
+        not cash. **outstanding** = posted with
         a remaining balance — the unpaid subset; get it directly from
         ``get_outstanding_documents`` rather than deriving it here.
         The ``status`` filter below covers document state
@@ -796,7 +798,8 @@ def register(mcp, get_book) -> None:
 
         The response carries ``status`` (open = editable, not yet
         booked; posted = on the books, balance owed; paid = balance
-        zero) and, once posted, ``amount_paid`` and ``amount_due``
+        zero; applied = a credit note fully consumed against its
+        target) and, once posted, ``amount_paid`` and ``amount_due``
         from the same lot arithmetic ``get_outstanding_documents``
         uses; ``overpaid: true`` marks a negative balance. A paid
         document keeps its amounts here after it leaves the unpaid
