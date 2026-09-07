@@ -15,6 +15,12 @@ Entries are terse by design: what changed, one line each, PR numbers where they 
 - Audit CREATE lines for invoices, bills, vouchers, credit notes, and jobs render the counterparty as `Name (id)`; older entries keep the bare id.
 - A credit note at zero balance reports `status: applied` on `get_document`; it settles by application, not cash.
 
+### Fixed
+- Scheduled transactions: every surface now answers "which occurrence is next" from one rule, `_sx_next_due` — the oldest occurrence not yet entered, GnuCash's own Since-Last-Run semantics. The dashboard already did; `list_scheduled_transactions`, `get_upcoming_transactions`, the Scheduled summary line, and the default date on `create_transaction_from_scheduled` searched from today and skipped missed periods, so a schedule flagged "overdue, due July 15" would post October 15 by default and then refuse July forever behind the backfill guard. Overdue occurrences now lead `get_upcoming_transactions` (`N days overdue`), the compact list marks them `overdue:`, and repeated default instantiation walks the missed periods forward. Agreement lock across all five surfaces.
+- Scheduled templates store account GUIDs, not the caller's path; an account rename or move no longer breaks the schedule on its due date. Readers render paths. Templates written before this keep working while their path lives.
+- Finite schedules (`num_occur > 0`) honor `rem_occur`: instantiation counts it down and a schedule at zero remaining has no next occurrence, matching desktop creation. `remaining_occurrences` is reported where it applies.
+- A failure late in `create_scheduled_transaction` rolls the session back instead of deleting the template account and saving, which committed the half-written rows and only looked clean because of a piecash cascade.
+
 ## v1.4.4 - The statement is the call
 
 A complete bank statement enters, claims its matches, and reconciles in one atomic call; every consequential write now rehearses before it books; a one-click Claude Desktop bundle ships from the project's first CI. (v1.4.3 was never released on GitHub — that number belongs to a registry-side rebuild.)
