@@ -1303,7 +1303,8 @@ def _fmt_job_create(entry: dict) -> list[str]:
     # document tools); owner_type is the book-layer name and what
     # older log entries carry.
     owner_type = (
-        after.get("owner_type")
+        after.get("party_type")
+        or after.get("owner_type")
         or params.get("party_type")
         or params.get("owner_type", "")
     )

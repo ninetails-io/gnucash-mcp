@@ -1611,7 +1611,9 @@ class BusinessMixin:
             "name": job.name,
             "reference": job.reference or "",
             "active": bool(job.active),
-            "owner_type": (
+            # ``party_type``: the tool-surface name (create_job takes
+            # party_type), so the field a client is handed round-trips.
+            "party_type": (
                 "customer" if job.owner_type == 2 else "vendor"
             ),
             "owner_name": owner_name,
@@ -1753,9 +1755,9 @@ class BusinessMixin:
         underlying counterparty via ``_find_invoice_owner_by_guid``.
         """
         if invoice.owner_type == 3 and job is not None:
-            # job['owner_type'] is the string form from the caller.
+            # job['party_type'] is the string form from the caller.
             type_field = (
-                "invoice" if job.get("owner_type") == "customer"
+                "invoice" if job.get("party_type") == "customer"
                 else "bill"
             )
         else:
@@ -2264,11 +2266,17 @@ class BusinessMixin:
         if lot_obj is None:
             return None
         balance = self._calculate_lot_balance(lot_obj)
-        amount_due = -balance if (is_bill ^ is_credit_note) else balance
+        # Every amount leaves here at the lot commodity's quantum, so
+        # paid/due/total read alike (250.00, not 250 beside 200.00)
+        # on every surface and in the audit line that echoes them.
+        quantum = _commodity_quantum(post_acct.commodity)
+        amount_due = (
+            -balance if (is_bill ^ is_credit_note) else balance
+        ).quantize(quantum)
         try:
             grand_total = self._get_invoice_entries_and_total(
                 book, inv,
-            )["grand_total"]
+            )["grand_total"].quantize(quantum)
         except ValueError:
             grand_total = max(amount_due, Decimal("0"))
         # Signed arithmetic keeps amount_paid honest when overpaid:
@@ -6527,7 +6535,7 @@ class BusinessMixin:
             if dry_run:
                 remaining_after = (
                     remaining_before_pay - full_settle_amount
-                )
+                ).quantize(_commodity_quantum(inv.currency))
                 result = {
                     "dry_run": True,
                     "id": inv.id,
@@ -6603,16 +6611,19 @@ class BusinessMixin:
             # abs() a lot balance — if some other path left it
             # negative, a credit must surface as negative rather
             # than masquerade as money owed.
+            quantum = _commodity_quantum(lot_obj.account.commodity)
             remaining_directional = (
                 -remaining if effective_is_bill else remaining
-            )
+            ).quantize(quantum)
             # Cumulative, from the document total: a second partial
             # payment must not read as the only one (the per-call
             # amount is ``payment``).
             try:
-                total_paid = self._get_invoice_entries_and_total(
-                    book, inv,
-                )["grand_total"] - remaining_directional
+                total_paid = (
+                    self._get_invoice_entries_and_total(
+                        book, inv,
+                    )["grand_total"] - remaining_directional
+                ).quantize(quantum)
             except ValueError:
                 total_paid = None
 
@@ -7475,7 +7486,7 @@ class BusinessMixin:
                 "name": name,
                 "reference": reference,
                 "active": True,
-                "owner_type": owner_type,
+                "party_type": owner_type,
                 "status": "created",
             }
 
@@ -8057,7 +8068,7 @@ class BusinessMixin:
             return {
                 "job_id": job.id,
                 "job_name": job.name,
-                "owner_type": owner_type,
+                "party_type": owner_type,
                 "owner_name": owner_name,
                 "linked_invoices_count": len(invoices),
                 "posted_count": posted_count,

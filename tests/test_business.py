@@ -372,7 +372,7 @@ class TestCreateJob:
         )
         assert result["status"] == "created"
         assert result["name"] == "API Rewrite"
-        assert result["owner_type"] == "customer"
+        assert result["party_type"] == "customer"
         assert result["active"] is True
         # counter_job advances independently from invoice/bill
         assert result["id"] == "000001"
@@ -384,7 +384,7 @@ class TestCreateJob:
             owner_id="000001", owner_type="vendor",
             name="Q3 supply contract",
         )
-        assert result["owner_type"] == "vendor"
+        assert result["party_type"] == "vendor"
         assert result["name"] == "Q3 supply contract"
 
     def test_create_job_with_reference(self, business_book):
@@ -472,7 +472,7 @@ class TestListJobs:
         assert isinstance(result, list)
         assert len(result) == 1
         assert result[0]["name"] == "X"
-        assert result[0]["owner_type"] == "customer"
+        assert result[0]["party_type"] == "customer"
         assert result[0]["owner_name"] == "Acme Co"
 
     def test_filter_by_owner_type(self, business_book):
@@ -537,7 +537,7 @@ class TestGetJob:
         result = gb.get_job(job_id=job["id"])
         assert result["name"] == "API Rewrite"
         assert result["reference"] == "PO-001"
-        assert result["owner_type"] == "customer"
+        assert result["party_type"] == "customer"
         assert result["owner_name"] == "Acme Co"
         # No linked invoices yet
         assert result["linked_invoices"]["count"] == 0
@@ -867,7 +867,7 @@ class TestGetJobReport:
             owner_type="vendor",
         )
         result = gb.get_job_report(job_id=job["id"])
-        assert result["owner_type"] == "vendor"
+        assert result["party_type"] == "vendor"
         assert result["owner_name"] == "Office Depot"
         usd = result["totals_by_currency"]["USD"]
         assert Decimal(usd["billed"]) == Decimal("150")
@@ -12115,6 +12115,11 @@ class TestDocumentPaymentState:
         # Agreement lock: one chokepoint, two surfaces, same strings.
         assert row["amount_paid"] == doc["amount_paid"]
         assert row["amount_due"] == doc["amount_due"]
+        # Precision lock: every amount at the commodity quantum, so
+        # 250.00 sits beside 200.00 (round-two finding: due/remaining
+        # were unpadded next to padded paid totals).
+        assert doc["amount_due"] == "300.00"
+        assert doc["amount_paid"] == "200.00"
 
     def test_paid_document_keeps_amounts_after_leaving_unpaid_list(
         self, business_book,
@@ -12145,6 +12150,8 @@ class TestDocumentPaymentState:
         assert Decimal(first["payment"]) == Decimal("200")
         assert Decimal(first["total_paid"]) == Decimal("200")
         assert Decimal(first["remaining_balance"]) == Decimal("250")
+        assert first["remaining_balance"] == "250.00"
+        assert first["total_paid"] == "200.00"
         assert first["status"] == "partial"
         second = gb.pay_invoice(
             invoice_id="000001",
@@ -12154,5 +12161,6 @@ class TestDocumentPaymentState:
         assert Decimal(second["payment"]) == Decimal("250")
         assert Decimal(second["total_paid"]) == Decimal("450")
         assert Decimal(second["remaining_balance"]) == Decimal("0")
+        assert second["remaining_balance"] == "0.00"
         assert second["status"] == "paid"
         assert "amount_paid" not in second
