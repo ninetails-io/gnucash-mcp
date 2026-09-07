@@ -83,9 +83,10 @@ SAFETY: Reconciled splits are protected (use force=true to override). Prefer voi
 
 # ---------------------------------------------------------------------------
 # MODULE_GROUPS — composition aliases expanding to underlying module
-# keys; the role-aligned partition (core / bookkeeper / investor /
-# business). Expansion is single-pass — groups don't reference other
-# groups; add cycle detection if nesting ever lands.
+# keys; the role-aligned partition (core / bookkeeper / investor;
+# ``business`` is a single leaf). Expansion is single-pass — groups
+# don't reference other groups; add cycle detection if nesting ever
+# lands.
 # ---------------------------------------------------------------------------
 MODULE_GROUPS: dict[str, list[str]] = {
     # ``core`` is always-on (force-added in _apply_module_filter).
@@ -107,13 +108,18 @@ MODULE_GROUPS: dict[str, list[str]] = {
     "investor": [
         "tax_lots", "portfolio",
     ],
-    # Small-business persona. The group must stay the SUPERSET of
-    # both halves — loading only the vendor half would give
-    # "small business workflow" users vendor management without the
-    # ability to create or post a customer invoice.
-    "business": [
-        "freelancer", "business_complete",
-    ],
+}
+
+# Retired module names, accepted on --modules / GNUCASH_MCP_MODULES
+# so a config file written for an earlier release keeps starting the
+# server. ``freelancer`` and ``business_complete`` were the two halves
+# of the business surface until the party/document tools went
+# polymorphic; the split then reduced to a runtime gate on
+# ``owner_type`` plus one report, and was merged into the single
+# ``business`` leaf. Both names resolve to the whole business surface.
+MODULE_ALIASES: dict[str, str] = {
+    "freelancer": "business",
+    "business_complete": "business",
 }
 
 
@@ -138,11 +144,7 @@ MODULE_BACKED_BY: dict[str, set[str]] = {
     "diagnostic": set(),
     "portfolio": {"investments"},
     "tax_lots": {"investments"},
-    # freelancer / business_complete are subsets of one underlying
-    # tools/business.py registration. The ``business`` group alias
-    # doesn't appear here — groups resolve via their members.
-    "freelancer": {"business"},
-    "business_complete": {"business"},
+    # ``business`` is 1:1 with tools/business.py (the default).
 }
 
 
@@ -247,16 +249,11 @@ TOOL_MODULES: dict[str, list[str]] = {
         "calculate_lot_gain",
         "close_lot",
     ],
-    # Placement rule for the freelancer/business_complete split:
-    # polymorphic and shared-registry tools (invoice lifecycle,
-    # taxtables, billterms, jobs, credit notes) live in freelancer
-    # because the customer side is the dominant solo-consultant use
-    # case; vendor-side use of the same tools is rejected at runtime
-    # by _gate_owner_type (tools/_helpers.py) when
-    # business_complete isn't loaded. business_complete owns the
-    # vendor/employee ENTITIES and the workflows that don't make
-    # sense without them.
-    "freelancer": [
+    # The whole business surface. Party and document tools are
+    # polymorphic (customer / vendor / employee; invoice / bill /
+    # voucher / credit note), so there is no customer-only half to
+    # carve out — see MODULE_ALIASES for the retired split.
+    "business": [
         "create_party",
         "list_parties",
         "get_party",
@@ -275,7 +272,6 @@ TOOL_MODULES: dict[str, list[str]] = {
         "list_taxtables",
         "update_taxtable",
         "delete_taxtable",
-        # Billterms, jobs, credit notes — placement rule above.
         "create_billterm",
         "list_billterms",
         "create_job",
@@ -284,11 +280,6 @@ TOOL_MODULES: dict[str, list[str]] = {
         "delete_job",
         "get_job_report",
         "apply_credit_note",
-    ],
-    # Vendor + employee surface — see the placement rule above.
-    "business_complete": [
-        # Voucher lifecycle (post/unpost/pay) flows through the
-        # polymorphic invoice tools with owner_type='employee'.
         "vendor_spending_report",
     ],
 }
@@ -404,10 +395,8 @@ def _reset_lazy_load_state() -> None:
 
 
 # Snapshot of which public module names are enabled in the current
-# run. Populated by ``_apply_module_filter``; read by tool wrappers
-# that need to gate behavior on module availability (e.g., the
-# Freelancer-side shared-lifecycle invoice tools reject
-# ``owner_type='vendor'`` when ``business`` isn't loaded).
+# run. Populated by ``_apply_module_filter``; read by anything that
+# needs to gate behavior on module availability.
 _LOADED_MODULES: set[str] = set()
 
 
@@ -455,6 +444,9 @@ def _apply_module_filter(modules_str: str | None) -> list[str]:
         requested = {"core"}
     else:
         requested = {m.strip() for m in modules_str.split(",")}
+    # Retired names map to their successor before validation, so an
+    # old config file neither fails fast nor loads a partial surface.
+    requested = {MODULE_ALIASES.get(m, m) for m in requested}
 
     # Fail fast on unknown names — a stderr warning + partial load
     # is silent in practice (Claude Desktop buries MCP stderr), so
@@ -1581,14 +1573,15 @@ def _parse_cli_argv(
 # Values map to module/group names in TOOL_MODULES / MODULE_GROUPS.
 # GNUCASH_ENABLE_BUSINESS is the only var the CURRENT manifest sets
 # (the one question). GNUCASH_ENABLE_FREELANCER is retired from the
-# manifest but still HONORED: unlike planning/investments, the
-# freelancer surface did NOT join the always-on base, so ignoring a
-# stored freelancer=true would subtract the invoicing tools from an
-# old install (release-review finding 4 — a pre-#163 bundle install
-# that answered freelancer=yes, business=no must keep its surface).
+# manifest but still HONORED: the invoicing surface is not in the
+# always-on base, so ignoring a stored freelancer=true would subtract
+# it from a pre-#163 bundle install that answered freelancer=yes,
+# business=no. Since the freelancer/business_complete merge the
+# toggle unlocks the whole business surface (the customer-only half
+# no longer exists).
 _ENV_MODULE_TOGGLES: dict[str, tuple[str, ...]] = {
     "GNUCASH_ENABLE_BUSINESS": ("business",),
-    "GNUCASH_ENABLE_FREELANCER": ("freelancer",),
+    "GNUCASH_ENABLE_FREELANCER": ("business",),
 }
 
 # Honored when present in the environment, but deliberately absent
@@ -1643,13 +1636,11 @@ def _build_help_text() -> str:
     core = _module_tool_count("core")
     bookkeeper = _module_tool_count("bookkeeper")
     investor = _module_tool_count("investor")
-    freelancer = _module_tool_count("freelancer")
     business = _module_tool_count("business")
     total = _module_tool_count("all")
     n_core = len(MODULE_GROUPS["core"])
     n_bookkeeper = len(MODULE_GROUPS["bookkeeper"])
     n_investor = len(MODULE_GROUPS["investor"])
-    n_business = len(MODULE_GROUPS["business"])
     return f"""GnuCash MCP Server
 
 Usage: gnucash-mcp [OPTIONS]
@@ -1666,25 +1657,22 @@ Options:
                        for every module ({total} tools; configuring
                        multiple books adds switch_book on top).
 
-                       Role-based selections (group aliases that
-                       expand to underlying modules — start here):
+                       Role-based selections (start here; the first
+                       three are group aliases that expand to
+                       underlying modules, business is one module):
                          core         Ledger primitives + reconciliation.
                                       Always on regardless. {core} tools.
                          bookkeeper   Reporting + budgets + scheduling.
                                       {bookkeeper} tools.
                          investor     tax_lots + portfolio (cost basis
                                       + prices). {investor} tools.
-                         freelancer   Customer invoicing + sales tax,
-                                      plus billterms (payment terms),
-                                      jobs (per-project P&L), and
-                                      credit notes (customer refunds).
-                                      The full solo-consultant
-                                      toolkit. {freelancer} tools.
-                         business     Full small-business package:
-                                      freelancer (invoicing) +
-                                      business_complete (vendors,
-                                      employees, bills, vouchers,
-                                      vendor reports). {business} tools.
+                         business     Customers, vendors, employees;
+                                      invoices, bills, vouchers, credit
+                                      notes; sales tax, payment terms,
+                                      jobs, vendor reports.
+                                      {business} tools. (freelancer and
+                                      business_complete are accepted as
+                                      retired names for this module.)
 
                        Leaf modules (pick individually for finer
                        control, or as members of the groups above):
@@ -1698,16 +1686,10 @@ Options:
 
                        Investor members ({n_investor}): tax_lots, portfolio.
 
-                       Business members ({n_business}): freelancer,
-                       business_complete.
-
-                       Example: --modules=freelancer for a solo
-                       invoicer with no vendor activity;
-                       --modules=bookkeeper for personal finance;
-                       --modules=business for a complete small-
-                       business workflow (invoices + vendor + employee
-                       management). ``core`` is always added
-                       regardless.
+                       Example: --modules=bookkeeper for personal
+                       finance; --modules=business for invoicing and
+                       vendor/employee management; --modules=all for
+                       everything. ``core`` is always added regardless.
   --debug              Enable debug logging (MCP protocol traffic, timing)
   --noaudit            Disable audit logging
   -h, --help           Show this help message
@@ -1730,8 +1712,9 @@ Environment variables:
                              _PLANNING/_INVESTMENTS toggles are ignored
                              (their surface is now always on); the
                              retired _FREELANCER toggle is still honored
-                             (its invoicing surface is NOT in the base,
-                             so old freelancer-only installs keep it).
+                             and now unlocks the whole business suite
+                             (its surface is NOT in the base, so old
+                             freelancer-only installs keep invoicing).
                              --modules / GNUCASH_MCP_MODULES win when set.
   GNUCASH_MCP_DEBUG=true     Enable debug logging (true/1/yes/on)
   GNUCASH_MCP_NOAUDIT=true   Disable audit logging (true/1/yes/on)

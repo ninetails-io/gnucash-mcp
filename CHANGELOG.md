@@ -2,6 +2,11 @@
 
 Entries are terse by design: what changed, one line each, PR numbers where they exist. Rationale lives in the PRs, the specs, and the bookkeeper rulings recorded under `specs/`.
 
+## Unreleased
+
+### Changed
+- `--modules=business` is one module. The `freelancer` / `business_complete` split reduced to a runtime gate on `owner_type` plus one report once the party and document tools went polymorphic; both halves merged into the single `business` leaf and the gate is gone. The retired names are still accepted on `--modules` / `GNUCASH_MCP_MODULES` and resolve to `business`, so existing config files keep starting the server. A stored `GNUCASH_ENABLE_FREELANCER=true` from a pre-#163 bundle install now unlocks the whole business suite.
+
 ## v1.4.4 - The statement is the call
 
 A complete bank statement enters, claims its matches, and reconciles in one atomic call; every consequential write now rehearses before it books; a one-click Claude Desktop bundle ships from the project's first CI. (v1.4.3 was never released on GitHub — that number belongs to a registry-side rebuild.)
