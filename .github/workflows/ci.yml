@@ -7,6 +7,13 @@
 #             of date with pyproject.toml, which is exactly the
 #             stale-lockfile mistake v1.4.1 shipped with.
 #
+#   postgres — the same suite plus the PostgreSQL integration tests,
+#             against a real server in a service container. Only the
+#             DB-backend tests need it, and they SKIP when
+#             GNUCASH_TEST_PG_URI is unset, so the job above stays
+#             fast and dependency-free while this one proves the
+#             second dialect actually round-trips.
+#
 #   bundle  — validates manifest.json and packs the MCPB via the same
 #             script humans run (scripts/build_bundle.sh), then
 #             uploads the .mcpb as a build artifact: every PR gets a
@@ -39,6 +46,36 @@ jobs:
         run: uv sync --locked --extra dev --python ${{ matrix.python }}
       - name: Run test suite
         run: uv run --locked --extra dev --python ${{ matrix.python }} pytest -q
+
+  postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: gnucash
+          POSTGRES_PASSWORD: gnucash
+          POSTGRES_DB: gnucash
+        ports:
+          - 5432:5432
+        # Without the healthcheck the job races the server's first
+        # startup and fails on connection-refused roughly one run in
+        # three.
+        options: >-
+          --health-cmd "pg_isready -U gnucash"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+      - name: Install dependencies (locked, with the postgres driver)
+        run: uv sync --locked --extra dev --extra postgres
+      - name: Run the suite against PostgreSQL
+        env:
+          GNUCASH_TEST_PG_URI: postgresql://gnucash:gnucash@localhost:5432/gnucash
+        run: uv run --locked --extra dev --extra postgres pytest -q
 
   bundle:
     runs-on: ubuntu-latest

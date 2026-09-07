@@ -30,6 +30,14 @@ build-backend = "hatchling.build"
 packages = ["src/gnucash_mcp"]
 
 [project.optional-dependencies]
+# Driver for GNUCASH_BOOK_URI / --book-uri against PostgreSQL.
+# Optional because the file backend — still the default, and what
+# every bundle install uses — needs nothing beyond piecash. The
+# -binary build ships wheels for every supported Python, so
+# installing it never asks the user for a compiler.
+postgres = [
+    "psycopg2-binary>=2.9.9",
+]
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
