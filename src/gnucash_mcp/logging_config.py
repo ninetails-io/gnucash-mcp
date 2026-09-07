@@ -1287,6 +1287,16 @@ def _fmt_employee_delete(entry: dict) -> list[str]:
     return _fmt_person_delete(entry, "employee", "employee_id")
 
 
+def _party_label(name, party_id) -> str:
+    """``Emerald Analytics (000004)`` when the after-state carries the
+    counterparty's name, bare ``000004`` when it doesn't (entries
+    written before v1.5 have only the id). The audit log is the
+    human-readable surface; an id alone sends the reader to a lookup.
+    """
+    name = (name or "").strip()
+    return f"{name} ({party_id})" if name and party_id else str(party_id)
+
+
 # ── Job formatters ───────────────────────────────────────────
 # Jobs aren't business-persons (no currency/address), so they get
 # their own formatters; the owner surfaces so a reviewer sees the
@@ -1299,14 +1309,20 @@ def _fmt_job_create(entry: dict) -> list[str]:
     after = entry.get("after_state") or {}
     job_id = after.get("id", "")
     name = after.get("name", params.get("name", ""))
+    # create_job's tool parameter is party_type (unified with the
+    # document tools); owner_type is the book-layer name and what
+    # older log entries carry.
     owner_type = (
-        after.get("owner_type") or params.get("owner_type", "")
+        after.get("party_type")
+        or after.get("owner_type")
+        or params.get("party_type")
+        or params.get("owner_type", "")
     )
-    owner_id = params.get("owner_id", "")
+    owner = _party_label(after.get("owner_name"), params.get("owner_id", ""))
     ref = after.get("reference") or params.get("reference", "")
     lines = [
         f"{time_part}  CREATE JOB  id:{job_id}",
-        f'{_INDENT}name: "{name}"  {owner_type}: {owner_id}',
+        f'{_INDENT}name: "{name}"  {owner_type}: {owner}',
     ]
     if ref:
         lines.append(f"{_INDENT}reference: {ref}")
@@ -1451,7 +1467,8 @@ def _fmt_invoice_create(entry: dict) -> list[str]:
     customer_id = after.get("customer_id", params.get("customer_id", ""))
     return [
         f"{time_part}  CREATE INVOICE  id:{inv_id}",
-        f"{_INDENT}customer: {customer_id}",
+        f"{_INDENT}customer: "
+        f"{_party_label(after.get('owner_name'), customer_id)}",
     ]
 
 
@@ -1698,10 +1715,19 @@ def _fmt_invoice_pay(entry: dict) -> list[str]:
 
     lines = [f"{time_part}  PAY INVOICE  id:{params.get('id', '')}"]
     if after:
-        amount = after.get("amount_paid", "")
+        # ``payment`` is the per-call amount (``amount_paid`` in
+        # entries written before v1.5); ``total_paid`` is cumulative.
+        amount = after.get("payment") or after.get("amount_paid", "")
+        total_paid = after.get("total_paid")
         remaining = after.get("remaining_balance", "")
         txn_guid = after.get("transaction_guid") or ""
-        lines.append(f"{_INDENT}paid: {amount}  remaining: {remaining}")
+        if total_paid:
+            lines.append(
+                f"{_INDENT}paid: {amount}  total paid: {total_paid}"
+                f"  remaining: {remaining}"
+            )
+        else:
+            lines.append(f"{_INDENT}paid: {amount}  remaining: {remaining}")
         lines.append(
             f"{_INDENT}from: {params.get('payment_account', '')}  txn:{txn_guid}"
         )
@@ -1747,7 +1773,8 @@ def _fmt_bill_create(entry: dict) -> list[str]:
     vendor_id = after.get("vendor_id", params.get("vendor_id", ""))
     return [
         f"{time_part}  CREATE BILL  id:{bill_id}",
-        f"{_INDENT}vendor: {vendor_id}",
+        f"{_INDENT}vendor: "
+        f"{_party_label(after.get('owner_name'), vendor_id)}",
     ]
 
 
@@ -1801,7 +1828,8 @@ def _fmt_voucher_create(entry: dict) -> list[str]:
     employee_id = after.get("employee_id", params.get("employee_id", ""))
     return [
         f"{time_part}  CREATE VOUCHER  id:{voucher_id}",
-        f"{_INDENT}employee: {employee_id}",
+        f"{_INDENT}employee: "
+        f"{_party_label(after.get('owner_name'), employee_id)}",
     ]
 
 
@@ -1925,7 +1953,10 @@ def _fmt_credit_note_create(entry: dict) -> list[str]:
         or params.get("owner_id", "")
     )
     lines = [f"{time_part}  CREATE CREDIT NOTE  id:{cn_id}"]
-    detail = f"{_INDENT}{owner_type}: {owner_id}"
+    detail = (
+        f"{_INDENT}{owner_type}: "
+        f"{_party_label(after.get('owner_name'), owner_id)}"
+    )
     applies_to = after.get("applies_to")
     if applies_to:
         detail += f"  applies to: {applies_to.get('id', '')}"

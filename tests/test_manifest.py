@@ -45,7 +45,7 @@ class TestManifestContract:
         env = manifest["server"]["mcp_config"]["env"]
         # Retired toggles are honored from stored configs but are
         # deliberately absent from the installer UI (finding 4:
-        # freelancer's surface never joined the always-on base).
+        # the business surface is not in the always-on base).
         expected = (
             set(_ENV_MODULE_TOGGLES) - _RETIRED_ENV_TOGGLES
         ) | {

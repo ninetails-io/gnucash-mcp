@@ -1494,8 +1494,9 @@ class BusinessMixin:
             candidates.append(f"{label} (currency={currency})")
         raise ValueError(
             f"Found {len(matches)} documents with ID {invoice_id!r}: "
-            f"{', '.join(candidates)}. Pass owner_type='customer', "
-            f"'vendor', or 'employee' to disambiguate."
+            f"{', '.join(candidates)}. Narrow the lookup with "
+            f"document_type ('invoice', 'bill', or 'voucher') or "
+            f"party_type ('customer', 'vendor', or 'employee')."
         )
 
     @staticmethod
@@ -1610,7 +1611,9 @@ class BusinessMixin:
             "name": job.name,
             "reference": job.reference or "",
             "active": bool(job.active),
-            "owner_type": (
+            # ``party_type``: the tool-surface name (create_job takes
+            # party_type), so the field a client is handed round-trips.
+            "party_type": (
                 "customer" if job.owner_type == 2 else "vendor"
             ),
             "owner_name": owner_name,
@@ -1752,9 +1755,9 @@ class BusinessMixin:
         underlying counterparty via ``_find_invoice_owner_by_guid``.
         """
         if invoice.owner_type == 3 and job is not None:
-            # job['owner_type'] is the string form from the caller.
+            # job['party_type'] is the string form from the caller.
             type_field = (
-                "invoice" if job.get("owner_type") == "customer"
+                "invoice" if job.get("party_type") == "customer"
                 else "bill"
             )
         else:
@@ -2223,6 +2226,70 @@ class BusinessMixin:
         if isinstance(posted, datetime):
             posted = posted.date()
         return posted + timedelta(days=30), True
+
+    def _document_settlement(
+        self, book, inv, *, is_bill=None, is_credit_note=None,
+    ) -> dict | None:
+        """Payment state of a POSTED document, read from its A/R or
+        A/P lot. ``None`` when the document is unposted or its lot
+        cannot be found.
+
+        This is the one place paid/due are derived. ``get_invoice``
+        and ``get_outstanding_invoices`` both read from here so the
+        two surfaces agree by construction; ``pay_invoice`` derives
+        ``total_paid`` from the same seam. Callers that already
+        resolved the side may pass ``is_bill`` / ``is_credit_note``
+        to save a Job query.
+
+        Returns a dict of ``post_account``, ``lot``, ``balance``
+        (signed lot balance), ``grand_total``, ``amount_paid``,
+        ``amount_due`` (direction-normalized: positive = still owed,
+        NEGATIVE = overpaid, never abs()'d), and ``overpaid``.
+        """
+        if not _is_invoice_posted(inv):
+            return None
+        if is_credit_note is None:
+            is_credit_note = self._get_is_credit_note(inv)
+        if is_bill is None:
+            is_bill = self._is_bill_side(
+                self._effective_owner_type(book, inv)
+            )
+        post_acct = book.session.query(
+            piecash.Account
+        ).filter_by(guid=inv.post_acc_guid).first()
+        if not post_acct:
+            return None
+        lot_obj = next(
+            (l for l in post_acct.lots if l.guid == inv.post_lot_guid),
+            None,
+        )
+        if lot_obj is None:
+            return None
+        balance = self._calculate_lot_balance(lot_obj)
+        # Every amount leaves here at the lot commodity's quantum, so
+        # paid/due/total read alike (250.00, not 250 beside 200.00)
+        # on every surface and in the audit line that echoes them.
+        quantum = _commodity_quantum(post_acct.commodity)
+        amount_due = (
+            -balance if (is_bill ^ is_credit_note) else balance
+        ).quantize(quantum)
+        try:
+            grand_total = self._get_invoice_entries_and_total(
+                book, inv,
+            )["grand_total"].quantize(quantum)
+        except ValueError:
+            grand_total = max(amount_due, Decimal("0"))
+        # Signed arithmetic keeps amount_paid honest when overpaid:
+        # grand 3500, due -1000 -> paid 4500.
+        return {
+            "post_account": post_acct,
+            "lot": lot_obj,
+            "balance": balance,
+            "grand_total": grand_total,
+            "amount_paid": grand_total - amount_due,
+            "amount_due": amount_due,
+            "overpaid": amount_due < 0 and not is_credit_note,
+        }
 
     def _get_invoice_entries_and_total(self, book, inv):
         """Query entries for an invoice/bill and compute totals,
@@ -4192,6 +4259,8 @@ class BusinessMixin:
             return {
                 "id": doc_id,
                 config["owner_id_key"]: owner_id,
+                # The audit CREATE line renders ``Name (id)`` from this.
+                "owner_name": getattr(owner, "name", None),
                 "date_opened": str(open_date.date()),
                 "status": "created",
             }
@@ -5267,6 +5336,30 @@ class BusinessMixin:
                 tax_summary=tax_summary,
             )
             result["total"] = str(total)
+
+            # Payment state from the same lot arithmetic the unpaid
+            # list uses, so the two surfaces agree by construction.
+            # open = not yet booked; posted = booked, balance owed;
+            # paid = balance zero (or below: ``overpaid`` flags it).
+            if not _is_invoice_posted(inv):
+                result["status"] = "open"
+            else:
+                settlement = self._document_settlement(book, inv)
+                if settlement is None:
+                    result["status"] = "posted"
+                else:
+                    due = settlement["amount_due"]
+                    # A credit note settles by being applied, never
+                    # by cash: "applied" is the truer word for it.
+                    settled = (
+                        "applied" if self._get_is_credit_note(inv)
+                        else "paid"
+                    )
+                    result["status"] = settled if due <= 0 else "posted"
+                    result["amount_paid"] = str(settlement["amount_paid"])
+                    result["amount_due"] = str(due)
+                    if settlement["overpaid"]:
+                        result["overpaid"] = True
 
             # Forward signal: surface available (or just-expired)
             # early-payment discount so get_invoice is actionable
@@ -6450,7 +6543,7 @@ class BusinessMixin:
             if dry_run:
                 remaining_after = (
                     remaining_before_pay - full_settle_amount
-                )
+                ).quantize(_commodity_quantum(inv.currency))
                 result = {
                     "dry_run": True,
                     "id": inv.id,
@@ -6526,9 +6619,21 @@ class BusinessMixin:
             # abs() a lot balance — if some other path left it
             # negative, a credit must surface as negative rather
             # than masquerade as money owed.
+            quantum = _commodity_quantum(lot_obj.account.commodity)
             remaining_directional = (
                 -remaining if effective_is_bill else remaining
-            )
+            ).quantize(quantum)
+            # Cumulative, from the document total: a second partial
+            # payment must not read as the only one (the per-call
+            # amount is ``payment``).
+            try:
+                total_paid = (
+                    self._get_invoice_entries_and_total(
+                        book, inv,
+                    )["grand_total"] - remaining_directional
+                ).quantize(quantum)
+            except ValueError:
+                total_paid = None
 
             result = {
                 "id": inv.id,
@@ -6539,7 +6644,7 @@ class BusinessMixin:
                 "status": (
                     "partial" if remaining_directional > 0 else "paid"
                 ),
-                "amount_paid": str(payment_amount),
+                "payment": str(payment_amount),
                 "remaining_balance": str(remaining_directional),
                 # Transaction GUID emitted as a short prefix —
                 # consumers (e.g. get_transaction lookup) accept
@@ -6551,6 +6656,8 @@ class BusinessMixin:
                 "payment_account": pay_acct.fullname,
                 "payment_date": str(parsed_date),
             }
+            if total_paid is not None:
+                result["total_paid"] = str(total_paid)
             _attach_extras(result)
 
         return result
@@ -7387,7 +7494,8 @@ class BusinessMixin:
                 "name": name,
                 "reference": reference,
                 "active": True,
-                "owner_type": owner_type,
+                "party_type": owner_type,
+                "owner_name": owner.name,
                 "status": "created",
             }
 
@@ -7740,44 +7848,20 @@ class BusinessMixin:
                 )
                 is_bill = self._is_bill_side(effective_ot)
 
-                post_acc_guid = inv.post_acc_guid
-                post_acct = book.session.query(
-                    piecash.Account
-                ).filter_by(guid=post_acc_guid).first()
-                if not post_acct:
+                settlement = self._document_settlement(
+                    book, inv, is_bill=is_bill,
+                    is_credit_note=is_credit_note,
+                )
+                # Unposted, lot missing, or settled: not outstanding.
+                if settlement is None or settlement["balance"] == Decimal(0):
                     continue
-
-                lot_obj = None
-                for lot in post_acct.lots:
-                    if lot.guid == inv.post_lot_guid:
-                        lot_obj = lot
-                        break
-                if not lot_obj:
-                    continue
-
-                balance = self._calculate_lot_balance(lot_obj)
-                if balance == Decimal(0):
-                    continue
-
-                # Direction-normalize the signed lot balance to
-                # "amount still owed" (credit notes: credit still
-                # available). NEGATIVE means overpaid — never abs()
-                # it, or an overpaid invoice renders as money owed
-                # and invites double-collection.
-                amount_due = -balance if (is_bill ^ is_credit_note) else balance
-                overpaid = amount_due < 0 and not is_credit_note
-
-                try:
-                    grand_total = self._get_invoice_entries_and_total(
-                        book, inv,
-                    )["grand_total"]
-                except ValueError:
-                    grand_total = max(amount_due, Decimal("0"))
-
-                # Signed arithmetic keeps amount_paid honest in the
-                # overpaid case: grand 3500, due −1000 → paid 4500
-                # (an abs() derivation would show paid 2500).
-                amount_paid = grand_total - amount_due
+                post_acct = settlement["post_account"]
+                lot_obj = settlement["lot"]
+                balance = settlement["balance"]
+                amount_due = settlement["amount_due"]
+                overpaid = settlement["overpaid"]
+                grand_total = settlement["grand_total"]
+                amount_paid = settlement["amount_paid"]
 
                 # Polymorphic owner dispatch — the direct finders
                 # return None on job-attached invoices (owner_guid
@@ -7993,7 +8077,7 @@ class BusinessMixin:
             return {
                 "job_id": job.id,
                 "job_name": job.name,
-                "owner_type": owner_type,
+                "party_type": owner_type,
                 "owner_name": owner_name,
                 "linked_invoices_count": len(invoices),
                 "posted_count": posted_count,

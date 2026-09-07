@@ -14,6 +14,15 @@ Entries are terse by design: what changed, one line each, PR numbers where they 
 - Connection URIs are password-masked everywhere a book is named — tool results, the dashboard header, and the audit log — unconditionally, not behind `GNUCASH_REDACT_PATHS`.
 - `GNUCASH_LOG_DIR` is required in URI mode: a connection string has no directory to keep `.mcp` beside.
 - GUID-prefix lookups run through one SQLAlchemy engine instead of a raw `sqlite3` connection, so a single query text serves both dialects.
+- `--modules=bookkeeper` is everything except business: `tax_lots` and `portfolio` join `reporting`, `budgets`, and `scheduling`. The MCPB bundle's always-on base is now defined as this group rather than a parallel list. `investor` remains selectable on its own.
+- `--modules=business` is one module. The `freelancer` / `business_complete` split reduced to a runtime gate on `owner_type` plus one report once the party and document tools went polymorphic; both halves merged into the single `business` leaf and the gate is gone. The retired names are still accepted on `--modules` / `GNUCASH_MCP_MODULES` and resolve to `business`, so existing config files keep starting the server. A stored `GNUCASH_ENABLE_FREELANCER=true` from a pre-#163 bundle install now unlocks the whole business suite.
+- `get_document` carries `status` (open / posted / paid) and, once posted, `amount_paid` and `amount_due`; a paid document keeps its amounts after leaving the unpaid list. `pay_document` reports the per-call `payment` beside a cumulative `total_paid` (the old `amount_paid` read as the only payment on a second partial). One chokepoint, `_document_settlement`, now feeds both and `get_outstanding_documents`.
+- `apply_credit_note`, `create_job`, and `list_jobs` take `party_type`, the name the other twenty-two business tools use; `owner_type` no longer appears on any tool.
+- The document ID-collision error names `document_type` and `party_type`; it used to coach a parameter no tool exposes.
+- Every amount on `get_document`, `pay_document`, and `get_outstanding_documents` leaves at the commodity's quantum (250.00 beside 200.00, not 250); the pay audit line inherits it.
+- `create_job`, `list_jobs`, and `get_job_report` answer `party_type`, the same name they accept, so the field a client is handed round-trips.
+- Audit CREATE lines for invoices, bills, vouchers, credit notes, and jobs render the counterparty as `Name (id)`; older entries keep the bare id.
+- A credit note at zero balance reports `status: applied` on `get_document`; it settles by application, not cash.
 
 ### Fixed
 - `create_account(placeholder=True)` and `update_account(placeholder=True)` wrote a Python bool into an INTEGER column — silently coerced on SQLite, a hard `DatatypeMismatch` on PostgreSQL.
