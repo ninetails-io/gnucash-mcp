@@ -136,7 +136,13 @@ class TestToolModulesMapping:
         }
         assert set(MODULE_GROUPS["bookkeeper"]) == {
             "reporting", "budgets", "scheduling",
+            "tax_lots", "portfolio",
         }
+        # bookkeeper is everything but business: every leaf outside
+        # core and business is a member.
+        assert set(MODULE_GROUPS["bookkeeper"]) == (
+            set(TOOL_MODULES) - set(MODULE_GROUPS["core"]) - {"business"}
+        )
         assert set(MODULE_GROUPS["investor"]) == {
             "tax_lots", "portfolio",
         }
@@ -465,23 +471,25 @@ class TestApplyModuleFilter:
         assert "list_commodities" in remaining
         assert "create_price" in remaining
 
-    def test_bookkeeper_group_bundles_three_modules(self):
-        """``--modules=bookkeeper`` loads reporting + budgets +
-        scheduling — the personal-finance management cluster.
-        Reconciliation moved to core in v1.3.1 and is now
-        always-on regardless of group selection."""
+    def test_bookkeeper_group_is_everything_but_business(self):
+        """``--modules=bookkeeper`` loads every module except
+        business: the persona that wants the whole ledger, reports,
+        planning, and investment surface but never invoices anyone.
+        Reconciliation is always-on via core regardless."""
         _apply_module_filter("bookkeeper")
         remaining = self._tool_names()
         # One probe per bookkeeper member module.
         assert "spending_by_category" in remaining    # reporting
         assert "create_budget" in remaining           # budgets
         assert "create_scheduled_transaction" in remaining
+        assert "create_lot" in remaining              # tax_lots
+        assert "create_price" in remaining            # portfolio
         # reconciliation is now always-on via core.
         assert "reconcile_account" in remaining
-        # Core always loaded; non-bookkeeper modules absent.
         assert "list_accounts" in remaining
+        # The one thing bookkeeper excludes.
         assert "create_document" not in remaining     # business
-        assert "create_lot" not in remaining          # tax_lots
+        assert "vendor_spending_report" not in remaining
 
     def test_reconciliation_loads_with_core_by_default(self):
         """v1.3.1 invariant: any configuration loads reconciliation.
@@ -1896,13 +1904,13 @@ class TestEnvModuleToggles:
         from gnucash_mcp.server import _modules_from_env_toggles
         monkeypatch.setenv("GNUCASH_ENABLE_BUSINESS", "false")
         assert (_modules_from_env_toggles()
-                == "reporting,budgets,scheduling,investor")
+                == "bookkeeper")
 
     def test_business_true_adds_the_suite(self, monkeypatch):
         from gnucash_mcp.server import _modules_from_env_toggles
         monkeypatch.setenv("GNUCASH_ENABLE_BUSINESS", "true")
         assert (_modules_from_env_toggles()
-                == "reporting,budgets,scheduling,investor,business")
+                == "bookkeeper,business")
 
     def test_retired_toggles_are_ignored(self, monkeypatch):
         """An old install's stored config (pre-unification manifest)
@@ -1915,7 +1923,7 @@ class TestEnvModuleToggles:
         assert _modules_from_env_toggles() is None
         monkeypatch.setenv("GNUCASH_ENABLE_BUSINESS", "false")
         assert (_modules_from_env_toggles()
-                == "reporting,budgets,scheduling,investor")
+                == "bookkeeper")
 
     def test_retired_freelancer_toggle_still_honored(self, monkeypatch):
         """Release-review finding 4: the invoicing surface is not
@@ -1927,11 +1935,11 @@ class TestEnvModuleToggles:
         monkeypatch.setenv("GNUCASH_ENABLE_BUSINESS", "false")
         monkeypatch.setenv("GNUCASH_ENABLE_FREELANCER", "true")
         assert (_modules_from_env_toggles()
-                == "reporting,budgets,scheduling,investor,business")
+                == "bookkeeper,business")
         # freelancer=false stays base-only (no accidental additions).
         monkeypatch.setenv("GNUCASH_ENABLE_FREELANCER", "false")
         assert (_modules_from_env_toggles()
-                == "reporting,budgets,scheduling,investor")
+                == "bookkeeper")
 
     def test_invalid_value_fails_fast(self, monkeypatch):
         from gnucash_mcp.server import _modules_from_env_toggles

@@ -98,9 +98,13 @@ MODULE_GROUPS: dict[str, list[str]] = {
         "audit", "backup", "balance_sheet", "diagnostic",
         "reconciliation",
     ],
-    # Personal-finance cluster; members stay separately selectable.
+    # Everything except business: the persona that wants the whole
+    # ledger, reports, planning, and investment surface but never
+    # invoices anyone. Members stay separately selectable, and
+    # ``investor`` remains its own group for the subset.
     "bookkeeper": [
         "reporting", "budgets", "scheduling",
+        "tax_lots", "portfolio",
     ],
     # Both halves of the legacy ``investments`` module — tax-lot
     # accounting is meaningless without prices, but a multi-currency
@@ -1593,13 +1597,14 @@ _RETIRED_ENV_TOGGLES: frozenset[str] = frozenset(
 )
 
 # The bundle base: what every install gets before the one question.
+# It is the ``bookkeeper`` group — everything except business.
 # Planning and investments joined it 2026-08-31 (maintainer ruling:
 # too common a need to gate — even a 401(k) wants the portfolio
 # surface, and budgets/scheduling are too small a set to be worth an
 # installer decision). The retired GNUCASH_ENABLE_PLANNING /
 # _INVESTMENTS variables are ignored if present — their surfaces are
 # in the base, so an old install's stored config cannot subtract.
-_ENV_TOGGLE_BASE = ("reporting", "budgets", "scheduling", "investor")
+_ENV_TOGGLE_BASE = ("bookkeeper",)
 
 
 def _modules_from_env_toggles() -> str | None:
@@ -1608,7 +1613,7 @@ def _modules_from_env_toggles() -> str | None:
     Returns None when no toggle variable is present at all, so CLI
     and GNUCASH_MCP_MODULES users (and the core-only default) are
     untouched. When a toggle is present, the selection is the bundle
-    base (reporting + planning + investor) plus every enabled
+    base (``bookkeeper``: everything but business) plus every enabled
     toggle's modules — core is force-added downstream by
     _apply_module_filter, matching the bundle design where the base
     surface is always on and business is the one question.
@@ -1662,8 +1667,9 @@ Options:
                        underlying modules, business is one module):
                          core         Ledger primitives + reconciliation.
                                       Always on regardless. {core} tools.
-                         bookkeeper   Reporting + budgets + scheduling.
-                                      {bookkeeper} tools.
+                         bookkeeper   Everything except business:
+                                      reporting, budgets, scheduling,
+                                      prices, tax lots. {bookkeeper} tools.
                          investor     tax_lots + portfolio (cost basis
                                       + prices). {investor} tools.
                          business     Customers, vendors, employees;
@@ -1682,7 +1688,7 @@ Options:
                        balance_sheet, diagnostic, reconciliation.
 
                        Bookkeeper members ({n_bookkeeper}): reporting, budgets,
-                       scheduling.
+                       scheduling, tax_lots, portfolio.
 
                        Investor members ({n_investor}): tax_lots, portfolio.
 
@@ -1706,8 +1712,8 @@ Environment variables:
                              --modules (e.g. "bookkeeper" or "core,reporting")
   GNUCASH_ENABLE_BUSINESS    Boolean (true/false) — the MCPB bundle's one
                              module question ("Do you invoice clients?").
-                             When set, modules = core + reporting +
-                             budgets + scheduling + investor, plus the
+                             When set, modules = core + bookkeeper
+                             (everything but business), plus the
                              business suite when true. The retired
                              _PLANNING/_INVESTMENTS toggles are ignored
                              (their surface is now always on); the
