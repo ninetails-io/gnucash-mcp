@@ -17,12 +17,16 @@ import sqlite3
 import threading
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Generator, Iterable
+from urllib.parse import quote
 
 import piecash
+from piecash._common import GnucashException
+from sqlalchemy import exc as sa_exc
 
 # Re-exported for callers that still import these from ``_base``.
 # Canonical definitions live in ``_currency`` alongside the
@@ -34,6 +38,7 @@ from gnucash_mcp.book._currency import (  # noqa: F401
     _to_date,
 )
 from gnucash_mcp.book._query import QueryMixin
+from gnucash_mcp._format import _book_display_name, _parse_book_url
 
 # GnuCash stores GUIDs as lowercase hex (via uuid4().hex). We accept both
 # cases on input for ergonomics — users pasting from external tools may
@@ -130,6 +135,26 @@ def _looks_like_guid_ref(value) -> bool:
         except ValueError:
             return False
     return False
+
+
+def _gnc_bool(value) -> int:
+    """Render a Python truth value as GnuCash stores it: an integer.
+
+    GnuCash's schema types every flag column — ``accounts.placeholder``
+    and ``.hidden``, ``schedxactions.enabled``, ``lots.is_closed`` — as
+    INTEGER, never BOOLEAN. SQLite has no boolean type and silently
+    coerces, so passing a Python ``bool`` worked by accident for as
+    long as SQLite was the only backend. PostgreSQL is strictly typed
+    and rejects it:
+
+        DatatypeMismatch: column "placeholder" is of type integer
+        but expression is of type boolean
+
+    Every write to one of those columns goes through here, so the
+    coercion can't be remembered at some sites and forgotten at
+    others (locked by ``TestBackendPortabilityChokepoints``).
+    """
+    return 1 if value else 0
 
 
 def _to_decimal(value) -> Decimal:
@@ -327,6 +352,44 @@ class GnuCashLockError(Exception):
     """Raised when the GnuCash book is locked by another process."""
 
     pass
+
+
+# Errors ``open()`` retries through. Three shapes, because a locked
+# book announces itself differently per backend:
+#
+#   sqlite3.OperationalError       — "database is locked", raised by
+#                                    the DBAPI on a file book.
+#   sqlalchemy.exc.OperationalError — the same, wrapped, plus every
+#                                    PostgreSQL connection failure.
+#   GnucashException                — piecash's own check of the
+#                                    ``gnclock`` table, which GnuCash
+#                                    populates on BOTH backends. This
+#                                    is what a book open in GnuCash
+#                                    desktop raises; before it was
+#                                    mapped here it surfaced as a bare
+#                                    "Lock on the file" with no hint
+#                                    that closing GnuCash fixes it.
+#
+# Non-lock members of these classes are re-raised untouched — see
+# ``_is_lock_error``.
+_OPEN_ERRORS: tuple[type[Exception], ...] = (
+    sqlite3.OperationalError,
+    sa_exc.OperationalError,
+    GnucashException,
+)
+
+
+def _is_lock_error(exc: Exception) -> bool:
+    """True when ``exc`` means "someone else has this book open".
+
+    Message-shape matching is the only option available: piecash
+    raises a bare ``GnucashException`` and the DBAPIs don't carry a
+    portable "locked" code. Kept narrow on purpose — a PostgreSQL
+    connection refusal is an OperationalError too, and retrying it
+    three times just delays the real error.
+    """
+    msg = str(exc).lower()
+    return "lock" in msg or "busy" in msg
 
 
 class StaleFXRateError(ValueError):
@@ -780,6 +843,121 @@ def _upcoming_to_compact_line(
     return f"{short}\t{name}\t{occ_date}\t{days} days\t{amount}"
 
 
+# ── Book source ────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class BookSource:
+    """Where a book lives, and what that implies about its features.
+
+    A GnuCash book reaches this server one of two ways: as a SQLite
+    FILE (the only shape this server accepted before the DB backend)
+    or as a SQLAlchemy CONNECTION URI naming a Postgres/MySQL
+    database GnuCash itself wrote. Everything downstream of
+    :meth:`BaseGnuCashBook.open` is backend-agnostic — piecash maps
+    the same schema either way — but four things genuinely are not,
+    and all four ask this object instead of testing for a path
+    themselves (the chokepoint rule from CLAUDE.md, applied to a new
+    axis):
+
+      1. Backups — SQLite's online-backup API copies a *file*.
+      2. The GUID-prefix caches — keyed on the file's mtime.
+      3. The audit/backup directory — derived from the book's parent.
+      4. The startup format sniff — reads the file's magic bytes.
+
+    ``is_file`` is the question all four ask. Nothing else in the
+    codebase should branch on ``path is not None``.
+
+    Attributes:
+        path: The book file, or None for a URI-backed book.
+        uri: SQLAlchemy URL for the read-only GUID engine. For file
+            books this is the read-only ``file:`` form; for URI books
+            it's the user's connection string verbatim.
+        display_name: What a human sees. Filename for file books; the
+            password-redacted URI for DB books.
+        log_name: The name audit/debug/backup storage keys on. Ends in
+            the usual filename for file books so existing ``.mcp``
+            directories keep working untouched.
+    """
+
+    path: Path | None
+    uri: str
+    display_name: str
+    log_name: str
+
+    @property
+    def is_file(self) -> bool:
+        """True when a real file backs this book.
+
+        The single question the file-shaped features ask. Backups,
+        the mtime cache token, and the startup format check are all
+        gated on it.
+        """
+        return self.path is not None
+
+    @classmethod
+    def from_path(cls, book_path: str | Path) -> "BookSource":
+        """Build a source for a SQLite book file.
+
+        Resolves to an absolute path: audit/debug/backup dirs derive
+        from ``path.parent``, and an unresolved ``..`` would write
+        them outside the intended directory. ``resolve(strict=True)``
+        also covers the existence check.
+
+        Raises:
+            FileNotFoundError: missing, or not a regular file.
+        """
+        try:
+            resolved = Path(book_path).resolve(strict=True)
+        except FileNotFoundError:
+            raise FileNotFoundError(f"GnuCash book not found: {book_path}")
+        if not resolved.is_file():
+            raise FileNotFoundError(
+                f"GnuCash book path is not a regular file: {book_path}"
+            )
+        # ``quote`` matters, and fixes a real bug: sqlite3 URI mode
+        # percent-DECODES the path, so the pre-DB-backend
+        # ``f"file:{path}?mode=ro"`` looked for
+        # ``budget 100%25 final.gnucash`` under the name
+        # ``budget 100% final.gnucash`` and every GUID-prefix lookup
+        # died with "unable to open database file" — on a book
+        # piecash otherwise opens fine. Encoding it is also what lets
+        # one URI form serve both backends. (A ``?`` or ``#`` in the
+        # name is unreachable here: piecash's own build_uri
+        # interpolates the path unescaped, so such a book never opens
+        # at all.)
+        return cls(
+            path=resolved,
+            uri=f"sqlite:///file:{quote(str(resolved))}?mode=ro&uri=true",
+            display_name=_book_display_name(str(resolved)),
+            log_name=resolved.name,
+        )
+
+    @classmethod
+    def from_uri(cls, uri: str) -> "BookSource":
+        """Build a source for a database-backed book.
+
+        ``log_name`` is derived from the URI's database name rather
+        than a file, so ``GNUCASH_LOG_DIR`` gives DB books the same
+        per-book audit/debug subdirectory layout file books get.
+        Falls back to ``"book"`` for a URI with no database component.
+
+        Raises:
+            ValueError: the URI doesn't parse as a SQLAlchemy URL.
+        """
+        url = _parse_book_url(uri)
+        db_name = (url.database or "").strip("/") or "book"
+        # Same ``.gnucash`` suffix file books carry: resolve_mcp_dir
+        # appends ``.mcp``, so a DB book's storage reads
+        # ``mybook.gnucash.mcp`` exactly like a file book's.
+        return cls(
+            path=None,
+            uri=uri,
+            display_name=_book_display_name(uri),
+            log_name=f"{db_name}.gnucash",
+        )
+
+
 # ── Base class ─────────────────────────────────────────────────────
 
 
@@ -801,53 +979,64 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
     # future table skips re-validation; no entry → no lookup).
     # ``slots`` is intentionally absent: slots have no primary GUID,
     # only ``obj_guid`` + name.
+    #
+    # ``:prefix`` rather than ``?``: these run through SQLAlchemy so
+    # one query text serves SQLite and PostgreSQL alike (the DBAPIs
+    # disagree on positional paramstyle — psycopg2 wants ``%s``).
     _GUID_TABLE_QUERIES: dict[str, str] = {
-        "transactions": "SELECT guid FROM transactions WHERE guid LIKE ?",
-        "splits": "SELECT guid FROM splits WHERE guid LIKE ?",
-        "accounts": "SELECT guid FROM accounts WHERE guid LIKE ?",
-        "lots": "SELECT guid FROM lots WHERE guid LIKE ?",
-        "schedxactions": "SELECT guid FROM schedxactions WHERE guid LIKE ?",
-        "commodities": "SELECT guid FROM commodities WHERE guid LIKE ?",
-        "budgets": "SELECT guid FROM budgets WHERE guid LIKE ?",
-        "customers": "SELECT guid FROM customers WHERE guid LIKE ?",
-        "vendors": "SELECT guid FROM vendors WHERE guid LIKE ?",
-        "invoices": "SELECT guid FROM invoices WHERE guid LIKE ?",
-        "prices": "SELECT guid FROM prices WHERE guid LIKE ?",
-        "entries": "SELECT guid FROM entries WHERE guid LIKE ?",
+        "transactions": "SELECT guid FROM transactions WHERE guid LIKE :prefix",
+        "splits": "SELECT guid FROM splits WHERE guid LIKE :prefix",
+        "accounts": "SELECT guid FROM accounts WHERE guid LIKE :prefix",
+        "lots": "SELECT guid FROM lots WHERE guid LIKE :prefix",
+        "schedxactions": "SELECT guid FROM schedxactions WHERE guid LIKE :prefix",
+        "commodities": "SELECT guid FROM commodities WHERE guid LIKE :prefix",
+        "budgets": "SELECT guid FROM budgets WHERE guid LIKE :prefix",
+        "customers": "SELECT guid FROM customers WHERE guid LIKE :prefix",
+        "vendors": "SELECT guid FROM vendors WHERE guid LIKE :prefix",
+        "invoices": "SELECT guid FROM invoices WHERE guid LIKE :prefix",
+        "prices": "SELECT guid FROM prices WHERE guid LIKE :prefix",
+        "entries": "SELECT guid FROM entries WHERE guid LIKE :prefix",
     }
     _GUID_TABLES = frozenset(_GUID_TABLE_QUERIES.keys())
 
-    def __init__(self, book_path: str):
-        """Initialize with path to GnuCash SQLite book.
+    def __init__(self, book: "str | Path | BookSource"):
+        """Initialize from a book file path or a :class:`BookSource`.
+
+        A bare string or Path still means a SQLite file, so every
+        pre-existing caller — ``_book_for``, the test fixtures, any
+        embedding of ``GnuCashBook(path)`` — keeps working unchanged.
+        Database-backed books are constructed by passing
+        ``BookSource.from_uri(...)``.
 
         Args:
-            book_path: Path to the GnuCash SQLite file.
+            book: Path to the GnuCash SQLite file, or a BookSource.
 
         Raises:
-            FileNotFoundError: If the book path doesn't exist.
+            FileNotFoundError: If a file book's path doesn't exist.
         """
-        # Resolve to an absolute path: audit/debug/backup dirs derive
-        # from book_path.parent, and an unresolved ``..`` would write
-        # them outside the intended directory. resolve(strict=True)
-        # also covers the existence check.
-        try:
-            self.book_path = Path(book_path).resolve(strict=True)
-        except FileNotFoundError:
-            raise FileNotFoundError(f"GnuCash book not found: {book_path}")
-        if not self.book_path.is_file():
-            raise FileNotFoundError(
-                f"GnuCash book path is not a regular file: {book_path}"
-            )
+        self.source = (
+            book if isinstance(book, BookSource)
+            else BookSource.from_path(book)
+        )
+        # ``book_path`` stays the name the whole codebase reads, and
+        # stays a Path for file books. It is None for a DB book —
+        # but nothing should test it for None: ask
+        # ``self.source.is_file`` instead, so the "does this book
+        # have a file?" rule lives in exactly one place.
+        self.book_path = self.source.path
         # Thread-local staging buffer for audit-log before_state:
         # write methods stage on their open session; @audit_log
         # consumes after the tool returns — no second book open.
         self._audit_tls = threading.local()
-        # GUID-prefix-map caches, ``(mtime_ns, dict)`` — SQLite
-        # touches the file on every commit, so mtime_ns invalidates
-        # on any write by this server or another process.
-        self._txn_prefix_cache: tuple[int, dict[str, str]] | None = None
-        self._split_prefix_cache: tuple[int, dict[str, str]] | None = None
-        self._lot_prefix_cache: tuple[int, dict[str, str]] | None = None
+        # GUID-prefix-map caches, ``(token, dict)`` — see
+        # ``_cache_token`` for what the token is and why DB-backed
+        # books don't get one.
+        self._txn_prefix_cache: tuple[int | None, dict[str, str]] | None = None
+        self._split_prefix_cache: tuple[int | None, dict[str, str]] | None = None
+        self._lot_prefix_cache: tuple[int | None, dict[str, str]] | None = None
+        # Read-only engine for GUID-prefix lookups, built on first use
+        # and reused for the life of the book instance.
+        self._guid_engine = None
 
     def _stage_audit_before(self, state: dict | None) -> None:
         """Stage a before-state dict for the next audit-log consume.
@@ -879,8 +1068,9 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         """Resolve a partial GUID prefix to a full 32-character GUID.
 
         Validates (length min_len..32, hex only, uppercase
-        normalized) before touching the database. Raw read-only
-        SQLite — no piecash session needed.
+        normalized) before touching the database. Read-only, and
+        session-independent — callers reach it both inside and
+        outside an open book.
 
         ``min_len`` defaults to 8; the accounts table uses 7 (paired
         with the ``%`` marker; ~1k accounts keeps 7-char collisions
@@ -919,14 +1109,7 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         if n == 32:
             return partial
 
-        conn = sqlite3.connect(f"file:{self.book_path}?mode=ro", uri=True)
-        try:
-            rows = conn.execute(
-                self._GUID_TABLE_QUERIES[table],
-                (partial + "%",),
-            ).fetchall()
-        finally:
-            conn.close()
+        rows = self._guid_prefix_rows(table, partial)
 
         if len(rows) == 0:
             raise ValueError(f"No {table[:-1]} found matching GUID prefix: {partial}")
@@ -937,6 +1120,37 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
                 f"{', '.join(m[:12] + '...' for m in matches)}"
             )
         return rows[0][0]
+
+    def _guid_prefix_rows(self, table: str, partial: str) -> list:
+        """Run one allowlisted GUID-prefix query, read-only.
+
+        The single place a GUID lookup reaches storage, for both
+        backends. File books connect through SQLite's ``mode=ro`` URI
+        so the query cannot write even in principle; DB books use the
+        book's own connection string, where read-only-ness is the
+        server's grant to make.
+
+        ``NullPool`` is deliberate: the pre-DB-backend code opened and
+        closed a ``sqlite3`` connection per call, and a pooled handle
+        lingering on the book file would change behavior GnuCash
+        desktop and the documented restore procedure depend on.
+
+        ``table`` is assumed already validated against
+        ``_GUID_TABLES`` — ``_resolve_guid`` is the only caller and
+        checks first.
+        """
+        from sqlalchemy import create_engine, text
+        from sqlalchemy.pool import NullPool
+
+        if self._guid_engine is None:
+            self._guid_engine = create_engine(
+                self.source.uri, poolclass=NullPool
+            )
+        with self._guid_engine.connect() as conn:
+            return conn.execute(
+                text(self._GUID_TABLE_QUERIES[table]),
+                {"prefix": partial + "%"},
+            ).fetchall()
 
     @contextmanager
     def open(
@@ -956,27 +1170,28 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
             GnuCashLockError: If the book is locked after all retries.
             FileNotFoundError: If the book file doesn't exist.
         """
-        last_error = None
+        # Only the OPEN is retried. The yield sits outside the retry
+        # loop deliberately: a lock-shaped error raised by the *body*
+        # used to re-enter the loop and yield a second time, which
+        # @contextmanager turns into "generator didn't stop after
+        # throw()" — the real error replaced by a confusing one. The
+        # DB backend widens the catch (below), so the hazard had to
+        # close before it could bite more often.
+        book = None
         for attempt in range(max_retries):
             try:
                 start_time = time.time()
-                book = piecash.open_book(str(self.book_path), readonly=readonly, do_backup=False)
+                book = piecash.open_book(
+                    readonly=readonly, do_backup=False,
+                    **self.source_open_kwargs()
+                )
                 open_elapsed = (time.time() - start_time) * 1000
                 debug_logger.debug(
                     f"Book opened (readonly={readonly}) in {open_elapsed:.0f}ms"
                 )
-                try:
-                    yield book
-                    return
-                finally:
-                    close_start = time.time()
-                    book.close()
-                    close_elapsed = (time.time() - close_start) * 1000
-                    debug_logger.debug(f"Book closed in {close_elapsed:.0f}ms")
-            except sqlite3.OperationalError as e:
-                last_error = e
-                error_msg = str(e).lower()
-                if "locked" in error_msg or "busy" in error_msg:
+                break
+            except _OPEN_ERRORS as e:
+                if _is_lock_error(e):
                     if attempt < max_retries - 1:
                         time.sleep(retry_delay * (attempt + 1))
                         continue
@@ -986,8 +1201,34 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
                     ) from e
                 raise
 
-        if last_error:
-            raise last_error
+        if book is None:
+            # Unreachable with the default max_retries: the loop
+            # either breaks with a book or raises. Guards a caller
+            # passing max_retries=0, which would otherwise yield None
+            # and fail somewhere far from the cause.
+            raise ValueError("max_retries must be at least 1")
+
+        try:
+            yield book
+        finally:
+            close_start = time.time()
+            book.close()
+            close_elapsed = (time.time() - close_start) * 1000
+            debug_logger.debug(f"Book closed in {close_elapsed:.0f}ms")
+
+    def source_open_kwargs(self) -> dict:
+        """The piecash ``open_book`` argument naming this book.
+
+        File books pass ``sqlite_file`` — the bare path, exactly as
+        before the DB backend existed. piecash's ``build_uri``
+        interpolates that into a URI unescaped, so handing it a
+        pre-built URI instead would change behavior for any path it
+        mangles; the read-only GUID engine builds its own escaped URI
+        and leaves this one alone.
+        """
+        if self.source.is_file:
+            return {"sqlite_file": str(self.source.path)}
+        return {"uri_conn": self.source.uri}
 
     def _find_account(self, book: piecash.Book, fullname: str) -> piecash.Account | None:
         """Find an account by its full name path.
@@ -1449,6 +1690,31 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         )
         return {g: self._SHORT_ACCOUNT_GUID_PREFIX + p for g, p in raw.items()}
 
+    def _cache_token(self) -> int | None:
+        """Invalidation token for the GUID-prefix caches, or None to
+        disable caching for this book.
+
+        The ONLY place a prefix cache may decide it is still valid —
+        a new cached map must call this rather than stat the book
+        itself (locked by ``TestCacheTokenChokepoint``).
+
+        File books: the file's ``st_mtime_ns``. SQLite touches the
+        file on every commit, so it invalidates on any write by this
+        server or another process — GnuCash desktop included.
+
+        DB books: None, which every caller reads as "always rebuild".
+        A shared database has no equivalent cheap, universally-bumped
+        token: ``pg_stat`` counters aren't durable across restarts
+        and a ``max(...)`` probe is its own query. Since another
+        client can commit between two of our reads, a stale map here
+        would emit short GUIDs that collide — wrong output, not just
+        slow output. Rebuilding costs one indexed GUID scan per call;
+        correctness wins.
+        """
+        if not self.source.is_file:
+            return None
+        return self.source.path.stat().st_mtime_ns
+
     def _transaction_prefix_map(
         self, book: piecash.Book
     ) -> dict[str, str]:
@@ -1457,18 +1723,17 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         Several read paths emit short prefixes that must be
         collision-safe against ``_resolve_guid``'s table-wide LIKE
         lookup; this shares one build. Cache invariant: correct
-        until any transaction mutates — SQLite bumps the file mtime
-        on every commit, so ``st_mtime_ns`` is a sufficient proxy
-        for writes by this process or any other.
+        until any transaction mutates — see ``_cache_token``.
         """
-        mtime_ns = self.book_path.stat().st_mtime_ns
+        token = self._cache_token()
         if (
-            self._txn_prefix_cache is not None
-            and self._txn_prefix_cache[0] == mtime_ns
+            token is not None
+            and self._txn_prefix_cache is not None
+            and self._txn_prefix_cache[0] == token
         ):
             return self._txn_prefix_cache[1]
         prefix_map = _guid_prefix_map(t.guid for t in book.transactions)
-        self._txn_prefix_cache = (mtime_ns, prefix_map)
+        self._txn_prefix_cache = (token, prefix_map)
         return prefix_map
 
     def _split_prefix_map(
@@ -1478,10 +1743,11 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
 
         Same mtime-keyed pattern as ``_transaction_prefix_map``.
         """
-        mtime_ns = self.book_path.stat().st_mtime_ns
+        token = self._cache_token()
         if (
-            self._split_prefix_cache is not None
-            and self._split_prefix_cache[0] == mtime_ns
+            token is not None
+            and self._split_prefix_cache is not None
+            and self._split_prefix_cache[0] == token
         ):
             return self._split_prefix_cache[1]
         # One indexed query for the guid column — the relationship
@@ -1493,7 +1759,7 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         prefix_map = _guid_prefix_map(
             guid for (guid,) in book.session.query(Split.guid)
         )
-        self._split_prefix_cache = (mtime_ns, prefix_map)
+        self._split_prefix_cache = (token, prefix_map)
         return prefix_map
 
     def _lot_prefix_map(
@@ -1503,16 +1769,17 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
 
         Same mtime-keyed pattern as ``_transaction_prefix_map``.
         """
-        mtime_ns = self.book_path.stat().st_mtime_ns
+        token = self._cache_token()
         if (
-            self._lot_prefix_cache is not None
-            and self._lot_prefix_cache[0] == mtime_ns
+            token is not None
+            and self._lot_prefix_cache is not None
+            and self._lot_prefix_cache[0] == token
         ):
             return self._lot_prefix_cache[1]
         prefix_map = _guid_prefix_map(
             lot.guid for acct in book.accounts for lot in acct.lots
         )
-        self._lot_prefix_cache = (mtime_ns, prefix_map)
+        self._lot_prefix_cache = (token, prefix_map)
         return prefix_map
 
     def _resolve_account(
