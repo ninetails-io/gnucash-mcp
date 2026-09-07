@@ -312,6 +312,60 @@ point at your own SQLite-format book. Restart Claude Desktop.
 > Windows: `C:\\Users\\yourname\\Documents\\mybook.gnucash`
 > (note the doubled backslashes — that's a JSON requirement).
 
+### Or: keep the book in PostgreSQL
+
+GnuCash can also keep a book in a database instead of a file, and
+the server serves one of those too. Point it at a connection
+string instead of a path:
+
+```json
+{
+  "command": "/Users/yourname/.local/bin/gnucash-mcp",
+  "args": ["--modules=all"],
+  "env": {
+    "GNUCASH_BOOK_URI": "postgresql://user:password@localhost:5432/gnucash",
+    "GNUCASH_LOG_DIR": "/Users/yourname/gnucash-mcp-logs"
+  }
+}
+```
+
+Install the driver alongside the server:
+
+```bash
+uv tool install "gnucash-mcp[postgres]"
+```
+
+To move an existing book across: open it in GnuCash,
+**File → Save As**, pick **postgres**, and fill in the connection
+details. (On Debian/Ubuntu that entry needs `sudo apt install
+libdbd-pgsql`, the same way SQLite3 needs `libdbd-sqlite3`.) **Keep
+the file** — it stays a perfectly good backup of everything up to
+the moment you switched.
+
+Worth knowing before you switch:
+
+- **`GNUCASH_BOOK_PATH` and `GNUCASH_BOOK_URI` are mutually
+  exclusive** — a book is a file or a database, and setting both
+  is a startup error rather than a coin toss over which ledger
+  your writes land in.
+- **`GNUCASH_LOG_DIR` becomes required.** Audit and debug logs
+  normally live in a folder beside the book file; a connection
+  string has no "beside".
+- **One book per server.** `switch_book` matches on filenames, so
+  multi-book stays a file feature.
+- **The server stops taking backups.** This is the real trade-off:
+  the automatic safety net exists because it can snapshot a file,
+  and it can't snapshot your database. `create_backup` says so
+  rather than pretending. Set up `pg_dump` on a schedule before
+  you move a real book over — see
+  [`docs/RESTORE_FROM_BACKUP.md`](docs/RESTORE_FROM_BACKUP.md).
+- Your password is masked wherever the server names the book — in
+  tool results, in the dashboard header, and in the audit log.
+
+MySQL/MariaDB should work the same way with a driver installed
+(`GNUCASH_BOOK_URI=mysql+pymysql://...`), but PostgreSQL is what
+the test suite and CI actually exercise.
+
 ### Other AI clients
 
 This is an [MCP](https://modelcontextprotocol.io/) server, so

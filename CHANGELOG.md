@@ -2,6 +2,23 @@
 
 Entries are terse by design: what changed, one line each, PR numbers where they exist. Rationale lives in the PRs, the specs, and the bookkeeper rulings recorded under `specs/`.
 
+## Unreleased
+
+### Added
+- **Database-backed books** — `GNUCASH_BOOK_URI` / `--book-uri` serve a book GnuCash keeps in PostgreSQL (or any SQLAlchemy-addressable backend) instead of a SQLite file. Every read and write tool works unchanged. Install the driver with `pip install "gnucash-mcp[postgres]"`. Closes the v1.5 roadmap's "DB backend" item.
+- `_gnc_bool` — one coercion for GnuCash's INTEGER flag columns (`placeholder`, `hidden`, `enabled`, `is_closed`), with a contract test. PostgreSQL rejects a Python bool where SQLite coerced it silently.
+
+### Changed
+- URI mode is single-book by construction: `switch_book`, demo books, and the multi-book write disarm are all governed by the (empty) path list, so none of them needed a special case. Setting both `GNUCASH_BOOK_PATH` and `GNUCASH_BOOK_URI` is a startup error.
+- Backups are the one feature that degrades on a database book: `create_backup` refuses with a message naming `pg_dump`, and the auto-backup hook no-ops. `docs/RESTORE_FROM_BACKUP.md` gains a PostgreSQL section.
+- Connection URIs are password-masked everywhere a book is named — tool results, the dashboard header, and the audit log — unconditionally, not behind `GNUCASH_REDACT_PATHS`.
+- `GNUCASH_LOG_DIR` is required in URI mode: a connection string has no directory to keep `.mcp` beside.
+- GUID-prefix lookups run through one SQLAlchemy engine instead of a raw `sqlite3` connection, so a single query text serves both dialects.
+
+### Fixed
+- `create_account(placeholder=True)` and `update_account(placeholder=True)` wrote a Python bool into an INTEGER column — silently coerced on SQLite, a hard `DatatypeMismatch` on PostgreSQL.
+- Short-GUID resolution failed on a book whose filename contains a percent escape (`budget 100%25 final.gnucash`): the lookup URI was built unescaped and sqlite3 percent-decoded the path back to a filename that doesn't exist. The path is percent-encoded now.
+
 ## v1.4.4 - The statement is the call
 
 A complete bank statement enters, claims its matches, and reconciles in one atomic call; every consequential write now rehearses before it books; a one-click Claude Desktop bundle ships from the project's first CI. (v1.4.3 was never released on GitHub — that number belongs to a registry-side rebuild.)

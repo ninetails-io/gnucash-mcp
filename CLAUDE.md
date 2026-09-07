@@ -11,14 +11,16 @@ Local working notes specific to the maintainer live in `CLAUDE.local.md`
 
 ## Project at a glance
 
-An MCP server that exposes a GnuCash SQLite book to AI assistants as a
+An MCP server that exposes a GnuCash book — a SQLite file, or a
+database GnuCash keeps the same schema in — to AI assistants as a
 set of typed tools. Read and write transactions, run reports, manage
 scheduled transactions, budgets, investment lots, and a full business
 module (customers, vendors, employees, invoices, bills).
 
 **Tech stack:**
 - Python 3.10+
-- [piecash](https://github.com/sdementen/piecash) — GnuCash SQLite ORM
+- [piecash](https://github.com/sdementen/piecash) — GnuCash ORM
+  (SQLite; PostgreSQL/MySQL via `uri_conn`)
 - [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk) (`mcp[cli]`)
 - SQLAlchemy under piecash; direct Core access where the ORM blocks us
 - pytest for unit + integration coverage
@@ -178,6 +180,25 @@ module contributes zero tools to the MCP surface.
   (case-insensitively — stems are validated unique at startup).
   Anything new that persists per-book state under the log dir must
   follow the same scoping or two books will share it.
+- **A book may not be a file.** `GNUCASH_BOOK_URI` / `--book-uri`
+  serves a book from PostgreSQL (or any SQLAlchemy URL). Ask
+  `self.source.is_file` — never `book_path is not None` — before
+  doing anything file-shaped. `BookSource` (`book/_base.py`) owns
+  that question, and exactly four things ask it: backups, the
+  GUID-prefix cache token, the audit/backup directory, and the
+  startup format sniff. URI mode is single-book by construction —
+  `_book_paths` stays empty, which is what keeps `switch_book`
+  unregistered, `multi_book_active()` False and the ruling-6 write
+  disarm inactive without any of them knowing DB books exist.
+  Connection URIs are password-masked wherever a book is named,
+  unconditionally (not behind `GNUCASH_REDACT_PATHS` — a path is a
+  privacy preference, a credential is a leak).
+- **GnuCash's flag columns are INTEGER, not BOOLEAN.**
+  `placeholder`, `hidden`, `enabled`, `is_closed`. SQLite has no
+  boolean type and coerces silently, so a Python `bool` worked by
+  accident for as long as SQLite was the only backend; PostgreSQL
+  raises `DatatypeMismatch`. Write them through `_gnc_bool`, locked
+  by `TestBackendPortabilityChokepoints`.
 - **`owner_type` is validated at the entry point**, not pattern-
   matched inline. All six business tools that take it call
   `_parse_owner_type(value)`, which returns the piecash int code or
@@ -245,6 +266,13 @@ Established chokepoints and the rule each one owns:
   polymorphic (a Job on job-attached documents, an Employee on
   vouchers); a hand-rolled `owner_type == 4` or `owner_guid ==
   guid` silently drops both. Locked by `test_owner_resolution.py`.
+- `_cache_token` — the only read of the book file's mtime; returns
+  None for a DB book, which every prefix cache reads as "always
+  rebuild".
+- `_gnc_bool` — the one coercion for GnuCash's INTEGER flag
+  columns.
+- `_book_display_name` — how a book is named to anyone, path
+  basenamed and URI password-masked.
 - `_parse_owner_type`, `_commodity_quantum`, `_is_market_price`,
   `_effective_owner_type` — same story, smaller surface.
 
@@ -288,7 +316,17 @@ Hard-won rules. Many were invisible failures before the test coverage
 existed.
 
 - **Books must be closed after use.** Use the `open()` context
-  manager; it handles the SQLite file lock with retry backoff.
+  manager; it handles the lock with retry backoff. Only the OPEN
+  retries — the `yield` sits outside the loop, because a
+  lock-shaped error raised by the *body* used to re-enter it and
+  yield twice, which `@contextmanager` turns into "generator didn't
+  stop after throw()" with the real error lost.
+- **A locked book announces itself three ways** —
+  `sqlite3.OperationalError`, `sqlalchemy.exc.OperationalError`, and
+  piecash's bare `GnucashException("Lock on the file")` off the
+  `gnclock` table (which GnuCash populates on both backends).
+  `_is_lock_error` decides; non-lock members of those classes
+  re-raise untouched.
 - **`book.flush()` persists pending changes; `book.cancel()` reverts.**
   Don't call `flush()` mid-transaction-build — orphan `Split` objects
   lack `tx_guid` and will raise NOT NULL `IntegrityError`. Let the
@@ -504,6 +542,24 @@ phase backs up the book before running.
 
 For live verification against a personal GnuCash book, ensure
 `GNUCASH_BOOK_PATH` points at a test copy, not production data.
+
+**PostgreSQL coverage.** `tests/test_db_backend.py` runs almost
+entirely without a database: a `sqlite:///` URI is a real
+SQLAlchemy URL, so it exercises every DB code path that isn't
+dialect-specific. The genuinely PostgreSQL-shaped assertions sit in
+`TestPostgresBackend` and skip unless `GNUCASH_TEST_PG_URI` names a
+reachable server. Locally:
+
+```bash
+docker run -d --name gnucash-mcp-pg -e POSTGRES_PASSWORD=gnucash \
+  -e POSTGRES_USER=gnucash -e POSTGRES_DB=gnucash -p 55432:5432 postgres:16
+GNUCASH_TEST_PG_URI=postgresql://gnucash:gnucash@localhost:55432/gnucash \
+  uv run --extra dev --extra postgres pytest -q tests/test_db_backend.py
+```
+
+CI's `postgres` job does the same against a `postgres:16` service
+container. A dialect bug that SQLite hides — the bool-in-an-INTEGER-
+column class above — only ever shows up there.
 
 ---
 

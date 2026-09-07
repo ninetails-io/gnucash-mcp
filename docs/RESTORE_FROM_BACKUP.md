@@ -26,6 +26,10 @@ You'll need:
   environment variable in your MCP client config. Example:
   `/Users/stephen/Finances/books.gnucash`.
 
+If your book lives in a database rather than a file
+(`GNUCASH_BOOK_URI`), this procedure does not apply — skip to
+[If your book lives in PostgreSQL](#if-your-book-lives-in-postgresql).
+
 ---
 
 ## Step 1: Stop the MCP server
@@ -118,6 +122,36 @@ If something's still off:
 - Go back to Step 2, mv the current (now-restored) file aside
   again, and try a different backup. Multiple restores are cheap
   because backups are files, not stateful operations.
+
+---
+
+## If your book lives in PostgreSQL
+
+Everything above assumes a book in a SQLite file, which is what the
+MCP backup store snapshots. A database-backed book
+(`GNUCASH_BOOK_URI`) has no such store — `create_backup` refuses,
+and the automatic session/weekly/monthly snapshots never run.
+
+**That means backups are yours to arrange before you put a real
+book in a database.** The database's own tooling does the job:
+
+```bash
+# Back up (schedule this — cron, systemd timer, your host's snapshots)
+pg_dump --format=custom gnucash > gnucash-$(date -u +%Y%m%dT%H%M%SZ).dump
+
+# Restore, with the MCP server and GnuCash both stopped (Step 1 above)
+dropdb gnucash && createdb gnucash
+pg_restore --dbname=gnucash gnucash-20260907T101500Z.dump
+```
+
+Steps 1, 4 and 5 of the file procedure still apply as written: stop
+the server first, restart it after, and verify with
+`get_book_summary` that the transaction count and balances match
+what you expected to restore.
+
+If the book is stuck because GnuCash desktop still holds it, that is
+the `gnclock` table, not a corrupt restore — close GnuCash and
+retry. The server reports it as a lock error with that advice.
 
 ---
 
