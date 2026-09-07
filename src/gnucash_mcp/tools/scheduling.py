@@ -115,8 +115,12 @@ def register(mcp, get_book) -> None:
 
         This is the "what bills are coming up?" query. Leads with a
         ``Showing X-Y of Z upcoming transactions (date range)`` line,
-        soonest first. Page with ``offset``; ``limit=0`` returns the
-        count only.
+        soonest first. Overdue occurrences (due date passed, never
+        entered) lead the list, marked ``N days overdue``; each
+        schedule appears once, at its oldest un-entered date, which
+        is the date ``create_transaction_from_scheduled`` posts by
+        default. Page with ``offset``; ``limit=0`` returns the count
+        only.
 
         Args:
             days: Look ahead window in days. Default 14.
@@ -149,7 +153,10 @@ def register(mcp, get_book) -> None:
 
         Args:
             guid: Scheduled transaction GUID (or 8+ char prefix).
-            transaction_date: Date for the transaction. Defaults to next occurrence.
+            transaction_date: Date for the transaction. Defaults to
+                the oldest occurrence not yet entered — the overdue
+                one if the dashboard reports one, else the next due.
+                Call again to walk forward through missed periods.
         """
         book = get_book()
         result = book.create_transaction_from_scheduled(

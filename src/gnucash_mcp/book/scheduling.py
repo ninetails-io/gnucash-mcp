@@ -25,6 +25,7 @@ from piecash.kvp import KVP_Type, Slot
 from sqlalchemy import text
 
 from gnucash_mcp.book._base import (
+    _HEX_GUID_RE,
     _guid_prefix_map,
     _sx_to_compact_line,
     _to_decimal,
@@ -120,6 +121,60 @@ class SchedulingMixin:
             return None
         return occurrence
 
+    def _sx_schedule(
+        self, sx,
+    ) -> tuple[str | None, date, date | None, date | None]:
+        """Normalized schedule fields for a ScheduledTransaction:
+        ``(frequency, start_date, end_date, last_occur)``.
+
+        ``frequency`` is None for recurrence shapes this module
+        doesn't model (daily, semiannual, end-of-month, nth-weekday,
+        composite schedules) — callers skip those. The date columns
+        arrive as date or datetime depending on the piecash column
+        path; normalized here once instead of at every reader.
+        """
+        rec = sx.recurrence
+        frequency = None
+        if rec is not None:
+            frequency = self.RECURRENCE_TO_FREQUENCY.get(
+                (rec.recurrence_period_type, rec.recurrence_mult)
+            )
+
+        def _d(v):
+            return v.date() if isinstance(v, datetime) else v
+
+        return frequency, _d(sx.start_date), _d(sx.end_date), _d(sx.last_occur)
+
+    def _sx_next_due(self, sx) -> date | None:
+        """The oldest occurrence this schedule has not yet produced —
+        GnuCash's own Since-Last-Run rule.
+
+        One rule for every surface: the dashboard's overdue warning,
+        ``next_occurrence`` on list/upcoming, the Scheduled summary
+        line, and the default instantiation date all read this, so
+        an overdue period can't be flagged by one and skipped by
+        another. Searching from ``last_occur`` (or the start date)
+        rather than from today is the whole point: a schedule that
+        missed July answers July. Searching from today answers the
+        next date after today — a future-dated posting that moves
+        ``last_occur`` past July and, through the backfill guard,
+        locks July out for good.
+
+        None when the recurrence shape is unmodeled, the end date has
+        passed, or a finite schedule (``num_occur > 0``) has no
+        occurrences remaining — the same three stops GnuCash applies
+        in xaccSchedXactionGetNextInstance.
+        """
+        frequency, start, end, last = self._sx_schedule(sx)
+        if frequency is None:
+            return None
+        if sx.num_occur > 0 and sx.rem_occur <= 0:
+            return None
+        return self._next_occurrence(
+            start, frequency, after=start - timedelta(days=1),
+            end_date=end, last_occur=last,
+        )
+
     def _sx_to_dict(self, sx, frequency: str | None = None) -> dict:
         """Serialize a ScheduledTransaction to a dict.
 
@@ -128,29 +183,12 @@ class SchedulingMixin:
             frequency: Pre-computed frequency string. If None, derived
                        from recurrence.
         """
+        freq, start, end, last = self._sx_schedule(sx)
         if frequency is None:
-            rec = sx.recurrence
-            key = (rec.recurrence_period_type, rec.recurrence_mult)
-            frequency = self.RECURRENCE_TO_FREQUENCY.get(key, "unknown")
+            frequency = freq or "unknown"
+        next_occ = self._sx_next_due(sx)
 
-        start = sx.start_date
-        if isinstance(start, datetime):
-            start = start.date()
-
-        end = sx.end_date
-        if isinstance(end, datetime):
-            end = end.date()
-
-        last = sx.last_occur
-        if isinstance(last, datetime):
-            last = last.date()
-
-        next_occ = self._next_occurrence(
-            start, frequency, after=date.today() - timedelta(days=1),
-            end_date=end, last_occur=last,
-        ) if frequency != "unknown" else None
-
-        return {
+        d = {
             "guid": sx.guid,
             "name": sx.name,
             "enabled": bool(sx.enabled),
@@ -164,6 +202,9 @@ class SchedulingMixin:
             "instance_count": sx.instance_count,
             "auto_create": bool(sx.auto_create),
         }
+        if sx.num_occur > 0:
+            d["remaining_occurrences"] = sx.rem_occur
+        return d
 
     def _get_sx_slot_string(
         self, book, obj_guid: str, name: str,
@@ -194,6 +235,30 @@ class SchedulingMixin:
         if raw:
             return json.loads(raw)
         return []
+
+    def _sx_splits_for_display(
+        self, book, splits: list[dict],
+    ) -> list[dict]:
+        """Stored split refs rendered for a reader: GUID-stored
+        accounts become full paths; a GUID whose account is gone
+        stays as-is with ``account_missing: True`` so the reader
+        sees why the next instantiation will fail. Path-stored rows
+        (templates from before GUID storage) pass through untouched.
+        """
+        out = []
+        for s in splits:
+            ref = s.get("account", "")
+            if len(ref) == 32 and _HEX_GUID_RE.fullmatch(ref):
+                acct = book.session.query(
+                    piecash.Account
+                ).filter_by(guid=ref).first()
+                s = dict(s)
+                if acct is not None:
+                    s["account"] = acct.fullname
+                else:
+                    s["account_missing"] = True
+            out.append(s)
+        return out
 
     def _get_sx_description(self, book, sx) -> str:
         """Instantiation description for a scheduled transaction.
@@ -397,9 +462,18 @@ class SchedulingMixin:
                 # persisted JSON is a clean decimal string — a float
                 # surviving json.dumps would replay its IEEE-754
                 # epsilon on every future instantiation.
+                # Account stored by GUID, never by the caller's ref:
+                # GnuCash's own template splits carry the GUID, and
+                # a path stored here breaks at the first rename —
+                # instantiation fails "Account not found" on the due
+                # date. _resolve_account takes the 32-hex form, so
+                # instantiation passes it straight through; readers
+                # map it back to a path via _sx_splits_for_display.
+                # Pre-GUID rows hold paths and resolve while the
+                # path lives.
                 splits_json = json.dumps([
                     {
-                        "account": s["account"],
+                        "account": v["account"].guid,
                         "amount": str(_to_decimal(s["amount"])),
                         "memo": s.get("memo", ""),
                         # Cross-commodity legs replay their stored
@@ -415,7 +489,7 @@ class SchedulingMixin:
                             if s.get("action") else {}
                         ),
                     }
-                    for s in splits
+                    for s, v in zip(splits, validated)
                 ])
                 book.session.execute(
                     Slot.__table__.insert().values(
@@ -488,13 +562,14 @@ class SchedulingMixin:
 
                 book.save()
             except Exception:
-                # Clean up the orphan template; swallow cleanup
-                # failures — the original error is what matters.
-                try:
-                    book.session.delete(template_acct)
-                    book.save()
-                except Exception:
-                    pass
+                # Roll back everything staged in this session: the
+                # flushed template account and any SX / recurrence /
+                # slot rows the raw inserts already landed. A
+                # delete-then-save here would COMMIT those partial
+                # rows; it only ever looked clean because piecash's
+                # Account.scheduled_transaction cascade happened to
+                # sweep them out with the account.
+                book.cancel()
                 raise
 
             next_occ = self._next_occurrence(
@@ -572,7 +647,9 @@ class SchedulingMixin:
                     )
                     if sx_cur:
                         d["currency"] = sx_cur
-                    d["splits"] = self._get_sx_splits(book, sx)
+                    d["splits"] = self._sx_splits_for_display(
+                        book, self._get_sx_splits(book, sx),
+                    )
                 results.append(d)
 
             page, indicator = _paginate(
@@ -628,30 +705,11 @@ class SchedulingMixin:
             if not sx.enabled:
                 continue
 
-            rec = sx.recurrence
-            if rec is None:
-                continue
-            key = (rec.recurrence_period_type, rec.recurrence_mult)
-            frequency = self.RECURRENCE_TO_FREQUENCY.get(key)
-            if not frequency:
-                continue
-
-            start = sx.start_date
-            if isinstance(start, datetime):
-                start = start.date()
-            end = sx.end_date
-            if isinstance(end, datetime):
-                end = end.date()
-            last = sx.last_occur
-            if isinstance(last, datetime):
-                last = last.date()
-
-            next_occ = self._next_occurrence(
-                start, frequency,
-                after=today - timedelta(days=1),
-                end_date=end, last_occur=last,
-            )
-            if not next_occ or next_occ > window_end:
+            # An overdue occurrence belongs to the dashboard's
+            # overdue bucket (same _sx_next_due), not to "due in
+            # next N days" — counting it here too would double it.
+            next_occ = self._sx_next_due(sx)
+            if not next_occ or next_occ < today or next_occ > window_end:
                 continue
 
             count += 1
@@ -687,6 +745,11 @@ class SchedulingMixin:
 
         Leads with a ``Showing X-Y of Z upcoming transactions (date
         range)`` indicator, soonest first; page with ``offset``.
+        Overdue occurrences — due date passed, never entered — lead
+        the list with a negative ``days_until``; each schedule
+        appears once, at its oldest un-entered date (``_sx_next_due``),
+        which is also the date ``create_transaction_from_scheduled``
+        posts by default.
 
         Args:
             days: Look ahead window in days. Default 14.
@@ -709,35 +772,7 @@ class SchedulingMixin:
                 if not sx.enabled:
                     continue
 
-                rec = sx.recurrence
-                key = (
-                    rec.recurrence_period_type,
-                    rec.recurrence_mult,
-                )
-                frequency = self.RECURRENCE_TO_FREQUENCY.get(
-                    key, None
-                )
-                if not frequency:
-                    continue
-
-                start = sx.start_date
-                if isinstance(start, datetime):
-                    start = start.date()
-
-                end = sx.end_date
-                if isinstance(end, datetime):
-                    end = end.date()
-
-                last = sx.last_occur
-                if isinstance(last, datetime):
-                    last = last.date()
-
-                next_occ = self._next_occurrence(
-                    start, frequency,
-                    after=today - timedelta(days=1),
-                    end_date=end, last_occur=last,
-                )
-
+                next_occ = self._sx_next_due(sx)
                 if next_occ and next_occ <= window_end:
                     splits = self._get_sx_splits(book, sx)
 
@@ -766,7 +801,9 @@ class SchedulingMixin:
                     if sx_cur:
                         entry["currency"] = sx_cur
                     if not compact:
-                        entry["splits"] = splits
+                        entry["splits"] = self._sx_splits_for_display(
+                            book, splits,
+                        )
                     upcoming.append(entry)
 
             upcoming.sort(key=lambda x: x["occurrence_date"])
@@ -820,7 +857,9 @@ class SchedulingMixin:
         re-run skips the period.
 
         Args:
-            transaction_date: Defaults to the next occurrence date.
+            transaction_date: Defaults to the oldest occurrence not
+                yet entered (``_sx_next_due``) — overdue first, the
+                same date the dashboard reports.
 
         Returns:
             ``{transaction_guid, scheduled_transaction,
@@ -846,38 +885,24 @@ class SchedulingMixin:
                     "Scheduled transaction is disabled"
                 )
 
-            rec = sx.recurrence
-            key = (
-                rec.recurrence_period_type,
-                rec.recurrence_mult,
-            )
-            frequency = self.RECURRENCE_TO_FREQUENCY.get(key)
+            frequency, _start, _end, last = self._sx_schedule(sx)
             if not frequency:
                 raise ValueError("Unknown recurrence frequency")
-
-            start = sx.start_date
-            if isinstance(start, datetime):
-                start = start.date()
-
-            end = sx.end_date
-            if isinstance(end, datetime):
-                end = end.date()
-
-            last = sx.last_occur
-            if isinstance(last, datetime):
-                last = last.date()
 
             if transaction_date:
                 txn_date = date.fromisoformat(transaction_date)
             else:
-                txn_date = self._next_occurrence(
-                    start, frequency,
-                    after=date.today() - timedelta(days=1),
-                    end_date=end, last_occur=last,
-                )
+                # Oldest un-entered occurrence — the date the
+                # dashboard calls overdue, if one is. Never "the next
+                # date after today": that posts a future transaction
+                # and strands every missed period behind the guard
+                # below.
+                txn_date = self._sx_next_due(sx)
                 if not txn_date:
                     raise ValueError(
-                        "No upcoming occurrence (past end date)"
+                        "No occurrence due (past end date, or a "
+                        "finite schedule has no occurrences "
+                        "remaining)"
                     )
 
             # Refuse dates on or before last_occur — desktop's
@@ -926,6 +951,7 @@ class SchedulingMixin:
                 # transaction exists; respond cleanly rather than
                 # crash. Practically unreachable single-threaded.
                 instance_count = None
+                remaining = None
             else:
                 current_last = sx.last_occur
                 if isinstance(current_last, datetime):
@@ -938,8 +964,14 @@ class SchedulingMixin:
                 if current_last is None or txn_date > current_last:
                     sx.last_occur = txn_date
                     sx.instance_count += 1
+                    # Finite schedules count down, as GnuCash's
+                    # own creation does; at zero _sx_next_due
+                    # answers None and the schedule is finished.
+                    if sx.num_occur > 0 and sx.rem_occur > 0:
+                        sx.rem_occur -= 1
                     book.save()
                 instance_count = sx.instance_count
+                remaining = sx.rem_occur if sx.num_occur > 0 else None
 
         # ── Build response. ─────────────────────────────────────
         response = {
@@ -950,6 +982,8 @@ class SchedulingMixin:
             "instance_count": instance_count,
             "status": txn_result.get("status", "created"),
         }
+        if remaining is not None:
+            response["remaining_occurrences"] = remaining
         if txn_result.get("status") == "rejected":
             # Evidence that the rejection is the CORRECT outcome —
             # without it, the natural retry instinct re-triggers the

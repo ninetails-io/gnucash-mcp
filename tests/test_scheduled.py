@@ -2,6 +2,7 @@
 
 from datetime import date, timedelta
 from decimal import Decimal
+from dateutil.relativedelta import relativedelta
 from unittest.mock import patch
 
 import pytest
@@ -1130,3 +1131,227 @@ class TestScheduledSplitAction:
             if s["account"] == "Assets:Euro Savings"
         )
         assert eur["action"] == "Buy"
+
+
+# ── Occurrence agreement (the _sx_next_due chokepoint) ─────────
+
+
+def _rent(gb, start, name="Rent", **kw):
+    return gb.create_scheduled_transaction(
+        name=name,
+        description=name,
+        splits=[
+            {"account": "Expenses:Rent", "amount": "1850.00"},
+            {"account": "Assets:Checking", "amount": "-1850.00"},
+        ],
+        start_date=start.isoformat(),
+        frequency="monthly",
+        **kw,
+    )
+
+
+class TestOccurrenceAgreement:
+    """Every surface that answers "which occurrence is next" reads
+    _sx_next_due: the dashboard overdue warning, list and upcoming
+    next_occurrence, the Scheduled summary line, and the default
+    instantiation date. Pre-fix, four of the five searched from
+    today and skipped missed periods; the fifth (dashboard) did
+    not, so the dashboard flagged July while instantiation posted
+    October and then refused July forever."""
+
+    def test_missed_periods_agree_across_surfaces(self, scheduled_book):
+        gb = GnuCashBook(str(scheduled_book))
+        start = date.today() - timedelta(days=70)  # three missed
+        sx = _rent(gb, start)
+
+        with gb.open(readonly=True) as book:
+            overdue = gb._overdue_scheduled_warnings(book, date.today())
+        assert len(overdue) == 1
+        assert overdue[0]["msg"].endswith(f"due {start.isoformat()}")
+
+        listed = gb.list_scheduled_transactions(compact=False)
+        assert listed["scheduled_transactions"][0]["next_occurrence"] == start.isoformat()
+
+        up = gb.get_upcoming_transactions(days=14, compact=False)
+        assert up["upcoming_transactions"][0]["occurrence_date"] == start.isoformat()
+        assert up["upcoming_transactions"][0]["days_until"] == -70
+
+        created = gb.create_transaction_from_scheduled(guid=sx["guid"])
+        assert created["transaction_date"] == start.isoformat()
+
+    def test_default_date_walks_missed_periods_forward(self, scheduled_book):
+        gb = GnuCashBook(str(scheduled_book))
+        start = date.today() - timedelta(days=70)
+        sx = _rent(gb, start)
+        expected = [
+            start,
+            start + relativedelta(months=1),
+            start + relativedelta(months=2),
+        ]
+        for i, exp in enumerate(expected, start=1):
+            r = gb.create_transaction_from_scheduled(guid=sx["guid"])
+            assert r["transaction_date"] == exp.isoformat()
+            assert r["instance_count"] == i
+        # Everything missed is entered; the next default is ahead.
+        r = gb.create_transaction_from_scheduled(guid=sx["guid"])
+        assert date.fromisoformat(r["transaction_date"]) > date.today()
+
+    def test_compact_lines_mark_overdue(self, scheduled_book):
+        gb = GnuCashBook(str(scheduled_book))
+        start = date.today() - timedelta(days=10)
+        _rent(gb, start)
+        assert f"overdue:{start.isoformat()}" in gb.list_scheduled_transactions()
+        assert "10 days overdue" in gb.get_upcoming_transactions(days=14)
+
+    def test_summary_week_excludes_overdue(self, scheduled_book):
+        """An overdue schedule is in the overdue bucket, not in "due
+        in next 7 days" — the Scheduled line would double-count."""
+        gb = GnuCashBook(str(scheduled_book))
+        _rent(gb, date.today() - timedelta(days=10))
+        _rent(gb, date.today() + timedelta(days=3), name="Soon")
+        with gb.open(readonly=True) as book:
+            week = gb._upcoming_within_days(book, days=7)
+            overdue = gb._overdue_scheduled_warnings(book, date.today())
+        assert week["count"] == 1
+        assert [e["name"] for e in overdue] == ["Rent"]
+
+    def test_today_is_due_not_overdue(self, scheduled_book):
+        gb = GnuCashBook(str(scheduled_book))
+        _rent(gb, date.today())
+        with gb.open(readonly=True) as book:
+            assert gb._overdue_scheduled_warnings(book, date.today()) == []
+            assert gb._upcoming_within_days(book, days=7)["count"] == 1
+        assert "0 days" in gb.get_upcoming_transactions(days=7)
+
+
+class TestFiniteSchedules:
+    """num_occur / rem_occur are GnuCash's occurrence limit; a
+    schedule at zero remaining has no next instance (its
+    xaccSchedXactionGetNextInstance rule) and instantiation counts
+    it down like desktop creation does."""
+
+    def _make_finite(self, gb, n):
+        from sqlalchemy import text
+        sx = _rent(gb, date.today() - timedelta(days=100))
+        with gb.open(readonly=False) as book:
+            book.session.execute(
+                text(
+                    "UPDATE schedxactions SET num_occur=:n, "
+                    "rem_occur=:n WHERE name='Rent'"
+                ),
+                {"n": n},
+            )
+            book.save()
+        return sx
+
+    def test_counts_down_and_stops(self, scheduled_book):
+        gb = GnuCashBook(str(scheduled_book))
+        sx = self._make_finite(gb, 2)
+        r1 = gb.create_transaction_from_scheduled(guid=sx["guid"])
+        assert r1["remaining_occurrences"] == 1
+        r2 = gb.create_transaction_from_scheduled(guid=sx["guid"])
+        assert r2["remaining_occurrences"] == 0
+        with pytest.raises(ValueError, match="no occurrences remaining"):
+            gb.create_transaction_from_scheduled(guid=sx["guid"])
+        listed = gb.list_scheduled_transactions(compact=False)
+        row = listed["scheduled_transactions"][0]
+        assert row["next_occurrence"] is None
+        assert row["remaining_occurrences"] == 0
+        assert gb.get_upcoming_transactions(days=14, compact=False)["total"] == 0
+
+    def test_unlimited_schedule_reports_no_remaining(self, scheduled_book):
+        gb = GnuCashBook(str(scheduled_book))
+        sx = _rent(gb, date.today())
+        r = gb.create_transaction_from_scheduled(guid=sx["guid"])
+        assert "remaining_occurrences" not in r
+        row = gb.list_scheduled_transactions(compact=False)["scheduled_transactions"][0]
+        assert "remaining_occurrences" not in row
+
+
+class TestSplitRefStorage:
+    """Template splits store the account GUID, as GnuCash's own
+    template splits do. Pre-fix they stored the caller's path, and
+    the first rename broke instantiation with "Account not found"
+    on the due date."""
+
+    def test_survives_account_rename(self, scheduled_book):
+        gb = GnuCashBook(str(scheduled_book))
+        sx = _rent(gb, date.today())
+        gb.update_account("Expenses:Rent", new_name="Housing Rent")
+        r = gb.create_transaction_from_scheduled(guid=sx["guid"])
+        assert r["status"] == "created"
+        txn = gb.get_transaction(r["transaction_guid"])
+        assert {s["account"] for s in txn["splits"]} == {
+            "Expenses:Housing Rent", "Assets:Checking",
+        }
+
+    def test_readers_render_paths_not_guids(self, scheduled_book):
+        gb = GnuCashBook(str(scheduled_book))
+        _rent(gb, date.today())
+        from sqlalchemy import text
+        with gb.open(readonly=True) as book:
+            raw = book.session.execute(
+                text("SELECT string_val FROM slots WHERE name='splits-json'")
+            ).scalar()
+        assert "Expenses:Rent" not in raw  # stored as GUID
+        listed = gb.list_scheduled_transactions(compact=False)
+        paths = {s["account"] for s in listed["scheduled_transactions"][0]["splits"]}
+        assert paths == {"Expenses:Rent", "Assets:Checking"}
+        up = gb.get_upcoming_transactions(days=7, compact=False)
+        paths = {s["account"] for s in up["upcoming_transactions"][0]["splits"]}
+        assert paths == {"Expenses:Rent", "Assets:Checking"}
+
+    def test_path_stored_legacy_rows_still_instantiate(self, scheduled_book):
+        """Templates written before GUID storage hold paths; they
+        keep working while the path lives."""
+        gb = GnuCashBook(str(scheduled_book))
+        sx = _rent(gb, date.today())
+        import json
+        from sqlalchemy import text
+        legacy = json.dumps([
+            {"account": "Expenses:Rent", "amount": "1850.00", "memo": ""},
+            {"account": "Assets:Checking", "amount": "-1850.00", "memo": ""},
+        ])
+        with gb.open(readonly=False) as book:
+            book.session.execute(
+                text("UPDATE slots SET string_val=:v WHERE name='splits-json'"),
+                {"v": legacy},
+            )
+            book.save()
+        r = gb.create_transaction_from_scheduled(guid=sx["guid"])
+        assert r["status"] == "created"
+        listed = gb.list_scheduled_transactions(compact=False)
+        assert listed["scheduled_transactions"][0]["splits"][0]["account"] == "Expenses:Rent"
+
+
+class TestTornWriteLate:
+    def test_late_failure_persists_nothing(self, scheduled_book):
+        """A failure AFTER the SX / recurrence / splits rows landed
+        (here: the description-slot insert) must leave no SX row
+        and no template account. Pre-fix the cleanup was
+        delete-template-then-save, which commits the partial rows;
+        it only looked clean because piecash's
+        Account.scheduled_transaction cascade swept them out."""
+        from sqlalchemy import text
+        from piecash.kvp import Slot
+        gb = GnuCashBook(str(scheduled_book))
+        real_insert = Slot.__table__.insert
+        calls = {"n": 0}
+
+        def flaky(*a, **k):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise RuntimeError("simulated late failure")
+            return real_insert(*a, **k)
+
+        with patch.object(Slot.__table__, "insert", side_effect=flaky):
+            with pytest.raises(RuntimeError, match="late"):
+                _rent(gb, date.today(), name="TornLate")
+
+        with gb.open(readonly=True) as book:
+            rows = book.session.execute(
+                text("SELECT COUNT(*) FROM schedxactions WHERE name='TornLate'")
+            ).scalar()
+            names = [a.name for a in book.root_template.children]
+        assert rows == 0
+        assert "TornLate" not in names
