@@ -6582,7 +6582,12 @@ class TestInvoiceBillIdCollision:
         assert "'000001'" in msg
         assert "customer invoice" in msg
         assert "vendor bill" in msg
-        assert "owner_type" in msg
+        # The coaching must name parameters the document tools
+        # actually expose. The bookkeeper followed an earlier
+        # version that said "pass owner_type" into a schema
+        # rejection: those tools take party_type / document_type.
+        assert "document_type" in msg
+        assert "party_type" in msg
 
     def test_get_invoice_with_owner_type_filter(self, business_book):
         """get_invoice with owner_type disambiguates colliding IDs."""

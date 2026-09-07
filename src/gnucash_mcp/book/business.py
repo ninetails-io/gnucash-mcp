@@ -1494,8 +1494,11 @@ class BusinessMixin:
             candidates.append(f"{label} (currency={currency})")
         raise ValueError(
             f"Found {len(matches)} documents with ID {invoice_id!r}: "
-            f"{', '.join(candidates)}. Pass owner_type='customer', "
-            f"'vendor', or 'employee' to disambiguate."
+            f"{', '.join(candidates)}. Narrow the lookup with "
+            f"document_type ('invoice', 'bill', or 'voucher') or the "
+            f"party side ('customer', 'vendor', or 'employee' via "
+            f"party_type; owner_type on apply_credit_note and the job "
+            f"tools)."
         )
 
     @staticmethod
