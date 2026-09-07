@@ -10,6 +10,10 @@ Entries are terse by design: what changed, one line each, PR numbers where they 
 - `get_document` carries `status` (open / posted / paid) and, once posted, `amount_paid` and `amount_due`; a paid document keeps its amounts after leaving the unpaid list. `pay_document` reports the per-call `payment` beside a cumulative `total_paid` (the old `amount_paid` read as the only payment on a second partial). One chokepoint, `_document_settlement`, now feeds both and `get_outstanding_documents`.
 - `apply_credit_note`, `create_job`, and `list_jobs` take `party_type`, the name the other twenty-two business tools use; `owner_type` no longer appears on any tool.
 - The document ID-collision error names `document_type` and `party_type`; it used to coach a parameter no tool exposes.
+- Every amount on `get_document`, `pay_document`, and `get_outstanding_documents` leaves at the commodity's quantum (250.00 beside 200.00, not 250); the pay audit line inherits it.
+- `create_job`, `list_jobs`, and `get_job_report` answer `party_type`, the same name they accept, so the field a client is handed round-trips.
+- Audit CREATE lines for invoices, bills, vouchers, credit notes, and jobs render the counterparty as `Name (id)`; older entries keep the bare id.
+- A credit note at zero balance reports `status: applied` on `get_document`; it settles by application, not cash.
 
 ## v1.4.4 - The statement is the call
 
