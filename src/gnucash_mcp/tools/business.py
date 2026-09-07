@@ -794,10 +794,13 @@ def register(mcp, get_book) -> None:
         Returns all entries with quantities, prices, and totals;
         the response's ``type`` field names the document kind.
 
-        Status vocabulary: open = editable, not yet booked; posted =
-        on the books, payable; paid = remaining balance zero. The
-        full definitions live on ``list_documents``; the unpaid list
-        is ``get_outstanding_documents``.
+        The response carries ``status`` (open = editable, not yet
+        booked; posted = on the books, balance owed; paid = balance
+        zero) and, once posted, ``amount_paid`` and ``amount_due``
+        from the same lot arithmetic ``get_outstanding_documents``
+        uses; ``overpaid: true`` marks a negative balance. A paid
+        document keeps its amounts here after it leaves the unpaid
+        list.
 
         Args:
             id: Document ID (e.g., "000001"). This is the
@@ -930,7 +933,11 @@ def register(mcp, get_book) -> None:
         vendor bill, employee voucher, or credit note.
 
         Creates a payment transaction from the specified bank/cash account
-        to the document's A/R or A/P account. Partial payments are supported.
+        to the document's A/R or A/P account. Partial payments are supported:
+        the response's ``payment`` is this call's amount, ``total_paid``
+        is cumulative across all payments, and ``remaining_balance`` is
+        what is still owed; ``status`` is ``partial`` until the balance
+        reaches zero, then ``paid``.
 
         ``dry_run=true`` rehearses the payment without booking it:
         the full validation, conversion, discount, and FX pipeline

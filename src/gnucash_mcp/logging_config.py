@@ -1703,10 +1703,19 @@ def _fmt_invoice_pay(entry: dict) -> list[str]:
 
     lines = [f"{time_part}  PAY INVOICE  id:{params.get('id', '')}"]
     if after:
-        amount = after.get("amount_paid", "")
+        # ``payment`` is the per-call amount (``amount_paid`` in
+        # entries written before v1.5); ``total_paid`` is cumulative.
+        amount = after.get("payment") or after.get("amount_paid", "")
+        total_paid = after.get("total_paid")
         remaining = after.get("remaining_balance", "")
         txn_guid = after.get("transaction_guid") or ""
-        lines.append(f"{_INDENT}paid: {amount}  remaining: {remaining}")
+        if total_paid:
+            lines.append(
+                f"{_INDENT}paid: {amount}  total paid: {total_paid}"
+                f"  remaining: {remaining}"
+            )
+        else:
+            lines.append(f"{_INDENT}paid: {amount}  remaining: {remaining}")
         lines.append(
             f"{_INDENT}from: {params.get('payment_account', '')}  txn:{txn_guid}"
         )

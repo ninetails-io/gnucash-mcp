@@ -2522,3 +2522,27 @@ class TestAuditInjectionEscaping:
         blob = out["params"]["updates"]
         assert "\t" in blob and "\n" in blob
         assert "\\u202e" in blob and "‮" not in blob
+
+
+class TestPayRenderingCumulativeTotal:
+    """A ``pay`` entry written with the v1.5 keys renders the
+    per-call payment AND the cumulative total; entries written with
+    the older ``amount_paid`` key still render (fallback)."""
+
+    def test_new_keys_render_total_paid(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        entry = {
+            "classification": "write",
+            "entity_type": "voucher",
+            "operation": "pay",
+            "timestamp": "2026-09-07T10:00:00",
+            "params": {"id": "000001", "payment_account": "Assets:Checking"},
+            "after_state": {
+                "type": "voucher", "payment": "250.00",
+                "total_paid": "450.00", "remaining_balance": "0.00",
+                "transaction_guid": "abc12345",
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert "PAY VOUCHER" in rendered
+        assert "paid: 250.00  total paid: 450.00  remaining: 0.00" in rendered
