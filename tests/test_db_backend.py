@@ -620,7 +620,18 @@ class TestPostgresBackend:
         )
         book.save()
         book.close()
-        return GnuCashBook(BookSource.from_uri(_PG_URI))
+        yield GnuCashBook(BookSource.from_uri(_PG_URI))
+
+        # Drop the worker's database so a local run doesn't leave one
+        # behind per worker. Best-effort: a failure here is litter,
+        # never a test result, and the next run recreates it anyway
+        # (create_book overwrites).
+        try:
+            from sqlalchemy_utils import drop_database
+
+            drop_database(_PG_URI)
+        except Exception:
+            pass
 
     def test_accounts_read_back(self, pg_book):
         listing = pg_book.list_accounts()

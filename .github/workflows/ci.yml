@@ -72,10 +72,16 @@ jobs:
         uses: astral-sh/setup-uv@v10.0.1
       - name: Install dependencies (locked, with the postgres driver)
         run: uv sync --locked --extra dev --extra postgres
-      - name: Run the suite against PostgreSQL
+      # Just the DB-backend file: it is the only one that reads
+      # GNUCASH_TEST_PG_URI, so running the whole suite here would
+      # re-run 2,200 SQLite tests the job above already covered on
+      # two Python versions.
+      - name: Run the PostgreSQL tests
         env:
           GNUCASH_TEST_PG_URI: postgresql://gnucash:gnucash@localhost:5432/gnucash
-        run: uv run --locked --extra dev --extra postgres pytest -q
+        run: >-
+          uv run --locked --extra dev --extra postgres
+          pytest -q tests/test_db_backend.py
 
   bundle:
     runs-on: ubuntu-latest

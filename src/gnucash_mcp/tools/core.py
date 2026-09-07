@@ -122,8 +122,12 @@ def register(mcp, get_book) -> None:
         # is added here, not in get_book_summary itself.
         from gnucash_mcp import server as _server
         if _server.multi_book_active():
-            from gnucash_mcp._format import _book_display_name
-            name = _book_display_name(book.book_path)
+            # source.display_name, not book_path: unreachable for a
+            # DB book today (multi_book_active() is False in URI
+            # mode) but this is the naming rule, and the trap it
+            # avoids — "not set" for a pathless book — is exactly
+            # what a future multi-book-over-URI would hit.
+            name = book.source.display_name
             count = len(_server._book_paths)
             summary = (
                 f"Current book: {name} ({count} books available — "
