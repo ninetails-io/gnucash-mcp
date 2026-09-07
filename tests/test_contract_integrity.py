@@ -22,6 +22,13 @@ Two contracts the codebase claimed but did not enforce:
   implicitly verified by SQLAlchemy's commit — they don't need
   explicit verification.
 
+- ``TestBackendPortabilityChokepoints`` — two rules the DB backend
+  introduced, both of the "an invariant exists but is enforced at
+  only some sites" shape this file exists to close. A book may now
+  be a PostgreSQL database rather than a SQLite file, so code must
+  not assume a file (``_cache_token``) and must not lean on
+  SQLite's silent bool→int coercion (``_gnc_bool``).
+
 If any of these tests fails without an intentional change to the
 contract, the bug class is open again.
 """
@@ -583,3 +590,126 @@ class TestWriteVerificationCoverage:
             f"Scanner found only {len(sites)} DML sites — "
             f"likely the regex regressed or a refactor hid them"
         )
+
+
+class TestBackendPortabilityChokepoints:
+    """Two rules that only hold as long as every site routes through
+    one helper — the bug class this file exists to close, applied to
+    the SQLite-file assumptions the database backend broke.
+    """
+
+    _BOOK_DIR = _REPO_ROOT / "src" / "gnucash_mcp" / "book"
+
+    def _book_sources(self) -> list[Path]:
+        return sorted(self._BOOK_DIR.glob("*.py"))
+
+    def test_no_site_stats_the_book_outside_cache_token(self):
+        """``_cache_token`` is the only place that may ask the book
+        file for its mtime.
+
+        The GUID-prefix caches key on ``st_mtime_ns``, which a
+        database-backed book has no equivalent for — ``_cache_token``
+        returns None there, and its callers read that as "always
+        rebuild". A new cache that stats the book directly would
+        crash on a DB book (``book_path`` is None) or, worse, quietly
+        serve a stale prefix map whose short GUIDs collide.
+        """
+        offenders = []
+        for path in self._book_sources():
+            for lineno, line in enumerate(
+                path.read_text().splitlines(), start=1
+            ):
+                if "st_mtime_ns" not in line:
+                    continue
+                if path.name == "_base.py" and "_cache_token" in _enclosing_def(
+                    path, lineno
+                ):
+                    continue
+                offenders.append(f"{path.name}:{lineno}: {line.strip()}")
+        assert not offenders, (
+            "st_mtime_ns read outside _cache_token. A database-backed "
+            "book has no file to stat — route the invalidation through "
+            "_cache_token, which returns None to disable caching "
+            "there.\n" + "\n".join(f"  {o}" for o in offenders)
+        )
+
+    def test_flag_columns_are_written_as_integers(self):
+        """GnuCash types every flag column as INTEGER, so writes must
+        go through ``_gnc_bool``.
+
+        SQLite has no boolean type and coerces silently; PostgreSQL
+        raises ``DatatypeMismatch: column "placeholder" is of type
+        integer but expression is of type boolean``. Assigning a
+        Python bool therefore worked for as long as SQLite was the
+        only backend, and broke ``create_account(placeholder=True)``
+        outright on the new one.
+        """
+        flag_attrs = ("placeholder", "hidden", "enabled", "is_closed")
+        offenders = []
+        for path in self._book_sources():
+            tree = ast.parse(path.read_text())
+            for node in ast.walk(tree):
+                targets = []
+                if isinstance(node, ast.Assign):
+                    targets = [
+                        t.attr for t in node.targets
+                        if isinstance(t, ast.Attribute)
+                    ]
+                    value = node.value
+                elif isinstance(node, ast.keyword) and node.arg in flag_attrs:
+                    targets = [node.arg]
+                    value = node.value
+                else:
+                    continue
+                if not any(t in flag_attrs for t in targets):
+                    continue
+                if _is_integer_literal(value) or _is_gnc_bool_call(value):
+                    continue
+                offenders.append(
+                    f"{path.name}:{node.lineno}: "
+                    f"{ast.unparse(value)[:60]}"
+                )
+        assert not offenders, (
+            "Flag column written from something other than an integer "
+            "literal or _gnc_bool(...). PostgreSQL rejects a Python "
+            "bool in an INTEGER column.\n"
+            + "\n".join(f"  {o}" for o in offenders)
+        )
+
+    def test_the_scanners_are_not_vacuous(self):
+        """Both scans above pass trivially if their patterns stop
+        matching anything. Pin the sites we know exist."""
+        base = (self._BOOK_DIR / "_base.py").read_text()
+        assert base.count("st_mtime_ns") >= 1
+        assert "_gnc_bool" in (self._BOOK_DIR / "core.py").read_text()
+
+
+def _enclosing_def(path: Path, lineno: int) -> str:
+    """Name of the function containing ``lineno``, or ""."""
+    tree = ast.parse(path.read_text())
+    best = ""
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if node.lineno <= lineno <= (node.end_lineno or node.lineno):
+            best = node.name
+    return best
+
+
+def _is_integer_literal(value: ast.expr) -> bool:
+    if isinstance(value, ast.Constant) and isinstance(value.value, int):
+        return not isinstance(value.value, bool)
+    # ``-1`` parses as a unary op, not a constant.
+    return (
+        isinstance(value, ast.UnaryOp)
+        and isinstance(value.op, ast.USub)
+        and _is_integer_literal(value.operand)
+    )
+
+
+def _is_gnc_bool_call(value: ast.expr) -> bool:
+    return (
+        isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Name)
+        and value.func.id == "_gnc_bool"
+    )

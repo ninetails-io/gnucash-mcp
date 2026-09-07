@@ -1840,7 +1840,7 @@ class TestBookCliArg:
 
     def test_multi_value_form(self):
         from gnucash_mcp.server import _parse_cli_argv
-        books, debug, noaudit, modules = _parse_cli_argv(
+        books, _uri, debug, noaudit, modules = _parse_cli_argv(
             ["--book", "/a.gnucash", "/b.gnucash", "--debug"]
         )
         assert books == ["/a.gnucash", "/b.gnucash"]
