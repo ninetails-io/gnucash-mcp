@@ -225,3 +225,33 @@ dash after "recurring" was kept as a comma to match the line's
 existing separators. Re-probe on the committed Alex (carrying the
 July catch-up): `Scheduled: 17 recurring, 13 overdue ⚠ (oldest 47
 days), none further due in next 7 days`.
+
+### Re-probe, 2026-09-09 — bookkeeper, four calls after a bounce
+
+1. Scheduled line renders `Scheduled: 17 recurring, 14 overdue ⚠
+   (oldest 56 days), none further due in next 7 days` (14 not 13:
+   Alex at HEAD, July catch-up gone). The comma carries; "further"
+   does the work and the parenthetical saves the scroll. Approved
+   as rendered.
+2. Lin Wei: 15000.00, 850.00, 14800.00, 2400.00 — padded to the
+   commodity's fraction, matching Alex.
+3. Create response: scratch schedule from 2026-07-01 answered
+   `next_occurrence: 2026-07-01`; the list one call later
+   `overdue:2026-07-01`. Closed with the bookkeeper's own eyes —
+   the number that had explicit dates going to production on
+   Saturday.
+4. Refusal copy: with end date = start date and nothing entered,
+   the first no-date call correctly posted July 1 (the occurrence
+   on the end date is still due); the second refused with
+   `No occurrence due: 'BK Reprobe' ended 2026-07-01 (last entered
+   2026-07-01). Clear the end date with
+   update_scheduled_transaction(end_date="") to resume, or
+   delete_scheduled_transaction if it's finished.` Names the
+   schedule, the end date, the last entered date, both tools, and
+   what each is for.
+
+Probe transaction and schedule deleted; Alex back at 1,940,
+HEAD-clean. All three sample books at their committed hashes with
+the skip-worktree bit cleared.
+
+**PR word: merge.** Maintainer: "I agree, merge."
