@@ -26,6 +26,7 @@ from sqlalchemy import text
 
 from gnucash_mcp.book._base import (
     _HEX_GUID_RE,
+    _gnc_bool,
     _guid_prefix_map,
     _sx_to_compact_line,
     _to_decimal,
@@ -424,7 +425,7 @@ class SchedulingMixin:
                     ScheduledTransaction.__table__.insert().values(
                         guid=sx_guid,
                         name=name,
-                        enabled=1 if enabled else 0,
+                        enabled=_gnc_bool(enabled),
                         start_date=parsed_start,
                         end_date=parsed_end,
                         last_occur=None,
@@ -1039,7 +1040,7 @@ class SchedulingMixin:
             })
 
             if enabled is not None:
-                sx.enabled = 1 if enabled else 0
+                sx.enabled = _gnc_bool(enabled)
 
             if end_date is not None:
                 if end_date == "":

@@ -33,14 +33,15 @@ from gnucash_mcp._format import (
 _debug_logger = logging.getLogger(DEBUG_LOGGER_NAME)
 
 from gnucash_mcp.book._base import (
-    _slot_bool,
     _account_to_compact_line,
     _account_to_dict,
     _commodity_quantum,
+    _gnc_bool,
     _guid_prefix_map,
     _is_market_price,
     _is_unreconciled,
     _is_voided,
+    _slot_bool,
     _slot_value_str,
     _split_to_compact_dict,
     _split_to_dict,
@@ -2042,10 +2043,11 @@ class CoreMixin:
         - ``= 1``  → yesterday.
         - ``> 1``  → N days behind. ⚠ past ``_LAST_ENTRY_WARN_DAYS``.
         """
-        from gnucash_mcp._format import _book_display_name
-
         lines = [
-            f"Book: {_book_display_name(self.book_path)}",
+            # ``source.display_name`` rather than ``book_path``: a
+            # DB-backed book has no path, and its URI must reach the
+            # header with the password already masked.
+            f"Book: {self.source.display_name}",
             f"Currency: {currency}",
         ]
         if first_date and last_date:
@@ -5483,7 +5485,7 @@ class CoreMixin:
                 parent=parent_account,
                 commodity=account_commodity,
                 description=description,
-                placeholder=placeholder,
+                placeholder=_gnc_bool(placeholder),
             )
             if notes:
                 new_account["notes"] = notes
@@ -5587,7 +5589,7 @@ class CoreMixin:
                 changed["description"] = description
 
             if placeholder is not None and bool(placeholder) != bool(account.placeholder):
-                account.placeholder = placeholder
+                account.placeholder = _gnc_bool(placeholder)
                 changed["placeholder"] = bool(placeholder)
 
             if notes is not None:

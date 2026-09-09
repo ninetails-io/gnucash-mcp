@@ -18,6 +18,7 @@ Two pieces:
 
 import calendar
 import os
+import re
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import TypeVar
@@ -789,8 +790,49 @@ def _format_number(
 # ── Path display ───────────────────────────────────────────────────
 
 
+def _parse_book_url(uri: str):
+    """Parse ``uri`` into a SQLAlchemy URL, or raise ValueError.
+
+    Wraps ``make_url`` so every caller gets the same message — its
+    own ArgumentError text names internals a bookkeeper can't act on.
+    """
+    from sqlalchemy.engine import make_url
+    from sqlalchemy.exc import ArgumentError
+
+    if not uri or not uri.strip():
+        raise ValueError("Book URI is empty")
+    try:
+        return make_url(uri.strip())
+    except ArgumentError as e:
+        raise ValueError(
+            f"Not a valid database URL: {uri.strip()!r}. Expected a "
+            f"SQLAlchemy connection string such as "
+            f"'postgresql://user:password@host:5432/gnucash'. ({e})"
+        ) from None
+
+
+def _redact_uri(uri: str) -> str:
+    """A connection URI with its password masked.
+
+    UNCONDITIONAL — unlike path redaction, this is not gated on
+    ``GNUCASH_REDACT_PATHS``. A book path is a privacy preference; a
+    database password in an audit file or a tool result is a
+    credential leak, and the audit log is a file the user shares when
+    asking for help.
+
+    Unparseable input is reported as ``<database>`` rather than
+    echoed: if we can't find the password we can't prove there isn't
+    one.
+    """
+    try:
+        return _parse_book_url(uri).render_as_string(hide_password=True)
+    except ValueError:
+        return "<database>"
+
+
 def _book_display_name(book_path) -> str:
-    """Render a book path as filename only — no directory leakage.
+    """Render a book reference for display — no secrets, no directory
+    leakage.
 
     Routine LLM-visible responses must not carry the full book path:
     it leaks username and home-directory layout into every
@@ -798,10 +840,35 @@ def _book_display_name(book_path) -> str:
     loaded. Always-on, unlike the opt-in ``redact_paths`` (which
     targets error-message paths where the directory can be
     load-bearing debugging signal). Falsy input → ``"not set"``.
+
+    A database URI takes the same trip through ``_redact_uri``: it
+    identifies the book by host and database name while masking the
+    password. Sending one of these through ``os.path.basename``
+    instead would print the credential verbatim, which is why the
+    URI branch lives HERE rather than at each call site — every
+    existing caller (the summary header, ``get_server_config``, the
+    audit-log header) inherits the masking by construction.
     """
     if not book_path:
         return "not set"
-    return os.path.basename(str(book_path))
+    text = str(book_path)
+    if _looks_like_book_uri(text):
+        return _redact_uri(text)
+    return os.path.basename(text)
+
+
+def _looks_like_book_uri(value: str) -> bool:
+    """True when ``value`` is a connection URI rather than a path.
+
+    Deliberately narrow: a ``scheme://`` prefix, where the scheme is
+    letters/digits/``+``/``-``/``.`` per RFC 3986. A Windows path
+    (``C:\\Users\\...``) has no ``//`` after the colon and a POSIX
+    path has no colon at all, so neither matches.
+    """
+    return bool(_URI_SCHEME_RE.match(value))
+
+
+_URI_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
 
 
 # ── Limit enforcement ──────────────────────────────────────────────

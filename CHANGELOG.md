@@ -4,7 +4,17 @@ Entries are terse by design: what changed, one line each, PR numbers where they 
 
 ## Unreleased
 
+### Added
+- **Database-backed books** — `GNUCASH_BOOK_URI` / `--book-uri` serve a book GnuCash keeps in PostgreSQL (or any SQLAlchemy-addressable backend) instead of a SQLite file. Every read and write tool works unchanged. Install the driver with `pip install "gnucash-mcp[postgres]"`. Closes the v1.5 roadmap's "DB backend" item.
+- `_gnc_bool` — one coercion for GnuCash's INTEGER flag columns (`placeholder`, `hidden`, `enabled`, `is_closed`, `active`, the entry `*_taxable` / `*_taxincluded` pair), with a contract test. PostgreSQL rejects a Python bool where SQLite coerced it silently.
+
 ### Changed
+- URI mode is single-book by construction: `switch_book`, demo books, and the multi-book write disarm are all governed by the (empty) path list, so none of them needed a special case. Setting both `GNUCASH_BOOK_PATH` and `GNUCASH_BOOK_URI` is a startup error.
+- Backups are the one feature that degrades on a database book: `create_backup` refuses with a message naming `pg_dump`, and the auto-backup hook no-ops. `docs/RESTORE_FROM_BACKUP.md` gains a PostgreSQL section.
+- Connection URIs are password-masked everywhere a book is named — tool results, the dashboard header, and the audit log — unconditionally, not behind `GNUCASH_REDACT_PATHS`.
+- `GNUCASH_LOG_DIR` is required in URI mode: a connection string has no directory to keep `.mcp` beside.
+- GUID-prefix lookups run through one SQLAlchemy engine instead of a raw `sqlite3` connection, so a single query text serves both dialects.
+- `open()` disposes piecash's engine after close. piecash binds a fresh engine per open and never disposes it; on PostgreSQL that held one server connection per tool call until garbage collection.
 - `--modules=bookkeeper` is everything except business: `tax_lots` and `portfolio` join `reporting`, `budgets`, and `scheduling`. The MCPB bundle's always-on base is now defined as this group rather than a parallel list. `investor` remains selectable on its own.
 - `--modules=business` is one module. The `freelancer` / `business_complete` split reduced to a runtime gate on `owner_type` plus one report once the party and document tools went polymorphic; both halves merged into the single `business` leaf and the gate is gone. The retired names are still accepted on `--modules` / `GNUCASH_MCP_MODULES` and resolve to `business`, so existing config files keep starting the server. A stored `GNUCASH_ENABLE_FREELANCER=true` from a pre-#163 bundle install now unlocks the whole business suite.
 - `get_document` carries `status` (open / posted / paid) and, once posted, `amount_paid` and `amount_due`; a paid document keeps its amounts after leaving the unpaid list. `pay_document` reports the per-call `payment` beside a cumulative `total_paid` (the old `amount_paid` read as the only payment on a second partial). One chokepoint, `_document_settlement`, now feeds both and `get_outstanding_documents`.
@@ -20,6 +30,8 @@ Entries are terse by design: what changed, one line each, PR numbers where they 
 - Scheduled templates store account GUIDs, not the caller's path; an account rename or move no longer breaks the schedule on its due date. Readers render paths. Templates written before this keep working while their path lives.
 - Finite schedules (`num_occur > 0`) honor `rem_occur`: instantiation counts it down and a schedule at zero remaining has no next occurrence, matching desktop creation. `remaining_occurrences` is reported where it applies.
 - A failure late in `create_scheduled_transaction` rolls the session back instead of deleting the template account and saving, which committed the half-written rows and only looked clean because of a piecash cascade.
+- `create_account(placeholder=True)`, `update_account(placeholder=True)`, and `update_party(active=...)` wrote a Python bool into an INTEGER column — silently coerced on SQLite, a hard `DatatypeMismatch` on PostgreSQL.
+- Short-GUID resolution failed on a book whose filename contains a percent escape (`budget 100%25 final.gnucash`): the lookup URI was built unescaped and sqlite3 percent-decoded the path back to a filename that doesn't exist. The path is percent-encoded now.
 
 ## v1.4.4 - The statement is the call
 
