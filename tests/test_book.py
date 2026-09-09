@@ -13281,3 +13281,45 @@ class TestDashboardTriageRollups:
         w = [l for l in summary.splitlines() if "days behind — " in l]
         assert w, summary
         assert "unentered activity" in w[0]
+
+
+class TestScheduledLineOverdueCopy:
+    """Bookkeeper, 2026-09-08: "14 overdue ⚠, none due in next 7
+    days" read as a contradiction. The 7-day bucket starts after
+    the overdue set; the line now says so and carries the oldest
+    age so the reader needn't visit the warning block."""
+
+    def test_overdue_line_says_further_and_oldest(self, scheduled_book):
+        from datetime import timedelta as _td
+        gb = GnuCashBook(str(scheduled_book))
+        gb.create_scheduled_transaction(
+            name="Rent", description="Rent",
+            splits=[
+                {"account": "Expenses:Rent", "amount": "1850.00"},
+                {"account": "Assets:Checking", "amount": "-1850.00"},
+            ],
+            start_date=(date.today() - _td(days=10)).isoformat(),
+            frequency="monthly",
+        )
+        summary = gb.get_book_summary()
+        sched_line = next(l for l in summary.splitlines() if l.startswith("Scheduled:"))
+        assert "1 overdue ⚠ (oldest 10 days)" in sched_line
+        assert "none further due in next 7 days" in sched_line
+
+    def test_no_overdue_keeps_plain_copy(self, scheduled_book):
+        from datetime import timedelta as _td
+        gb = GnuCashBook(str(scheduled_book))
+        gb.create_scheduled_transaction(
+            name="Rent", description="Rent",
+            splits=[
+                {"account": "Expenses:Rent", "amount": "1850.00"},
+                {"account": "Assets:Checking", "amount": "-1850.00"},
+            ],
+            start_date=(date.today() + _td(days=3)).isoformat(),
+            frequency="monthly",
+        )
+        summary = gb.get_book_summary()
+        sched_line = next(l for l in summary.splitlines() if l.startswith("Scheduled:"))
+        assert "overdue" not in sched_line
+        assert "further" not in sched_line
+        assert "1 due in next 7 days" in sched_line

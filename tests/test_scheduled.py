@@ -1251,7 +1251,7 @@ class TestFiniteSchedules:
         assert r1["remaining_occurrences"] == 1
         r2 = gb.create_transaction_from_scheduled(guid=sx["guid"])
         assert r2["remaining_occurrences"] == 0
-        with pytest.raises(ValueError, match="no occurrences remaining"):
+        with pytest.raises(ValueError, match="entered all 2 occurrences"):
             gb.create_transaction_from_scheduled(guid=sx["guid"])
         listed = gb.list_scheduled_transactions(compact=False)
         row = listed["scheduled_transactions"][0]
@@ -1355,3 +1355,67 @@ class TestTornWriteLate:
             names = [a.name for a in book.root_template.children]
         assert rows == 0
         assert "TornLate" not in names
+
+
+class TestLoopFollowUps:
+    """Bookkeeper loop on fix/scheduled-occurrence-chokepoint,
+    2026-09-08: the four items the plan's seven steps surfaced."""
+
+    def test_create_response_reads_the_chokepoint(self, scheduled_book):
+        """The first number a caller sees after creating a schedule.
+        Pre-fix it searched from today: a schedule starting 70 days
+        ago answered start+3 months while the list, one call later,
+        said overdue:<start>. The production workaround was passing
+        explicit dates to every instantiation."""
+        gb = GnuCashBook(str(scheduled_book))
+        start = date.today() - timedelta(days=70)
+        created = _rent(gb, start)
+        assert created["next_occurrence"] == start.isoformat()
+        listed = gb.list_scheduled_transactions(compact=False)
+        assert listed["scheduled_transactions"][0]["next_occurrence"] == created["next_occurrence"]
+
+    def test_upcoming_amount_at_commodity_quantum(self, scheduled_book):
+        """Stored amounts carry the caller's precision; the bill
+        list renders at the currency's quantum regardless (Lin Wei
+        showed 15000 beside Alex's 4200.00)."""
+        gb = GnuCashBook(str(scheduled_book))
+        gb.create_scheduled_transaction(
+            name="Salary", description="Salary",
+            splits=[
+                {"account": "Assets:Checking", "amount": "15000"},
+                {"account": "Income:Salary", "amount": "-15000"},
+            ],
+            start_date=date.today().isoformat(), frequency="monthly",
+        )
+        up = gb.get_upcoming_transactions(days=7, compact=False)
+        assert up["upcoming_transactions"][0]["amount"] == "15000.00"
+
+    def test_ended_schedule_refusal_names_end_and_next_move(self, scheduled_book):
+        gb = GnuCashBook(str(scheduled_book))
+        start = date.today() - timedelta(days=40)
+        sx = _rent(gb, start)
+        gb.create_transaction_from_scheduled(guid=sx["guid"])
+        # End ON the entered date: nothing after it is due, so the
+        # refusal fires (ending yesterday would leave start+1 month
+        # still due — and the server would rightly post it).
+        gb.update_scheduled_transaction(sx["guid"], end_date=start.isoformat())
+        with pytest.raises(ValueError) as exc:
+            gb.create_transaction_from_scheduled(guid=sx["guid"])
+        msg = str(exc.value)
+        assert f"'Rent' ended {start.isoformat()}" in msg
+        assert f"last entered {start.isoformat()}" in msg
+        assert 'end_date=""' in msg
+        assert "delete_scheduled_transaction" in msg
+
+    def test_finished_finite_refusal_names_the_count(self, scheduled_book):
+        from sqlalchemy import text
+        gb = GnuCashBook(str(scheduled_book))
+        sx = _rent(gb, date.today() - timedelta(days=40))
+        with gb.open(readonly=False) as book:
+            book.session.execute(
+                text("UPDATE schedxactions SET num_occur=1, rem_occur=1 WHERE name='Rent'")
+            )
+            book.save()
+        gb.create_transaction_from_scheduled(guid=sx["guid"])
+        with pytest.raises(ValueError, match="entered all 1 occurrences"):
+            gb.create_transaction_from_scheduled(guid=sx["guid"])

@@ -2227,6 +2227,7 @@ class CoreMixin:
         enabled_sx: int,
         currency: str,
         overdue_count: int = 0,
+        oldest_overdue_days: int | None = None,
     ) -> list[str]:
         """Render the Transactions count + Scheduled line.
 
@@ -2245,6 +2246,14 @@ class CoreMixin:
             line = f"Scheduled: {enabled_sx} recurring"
             if overdue_count > 0:
                 line += f", {overdue_count} overdue ⚠"
+                if oldest_overdue_days is not None:
+                    line += f" (oldest {oldest_overdue_days} days)"
+            # The 7-day bucket starts AFTER the overdue set (each
+            # schedule sits in one bucket, at its oldest un-entered
+            # date). "14 overdue, none due in next 7 days" read as a
+            # contradiction; "further" tells the reader where the
+            # bucket begins.
+            further = "further " if overdue_count > 0 else ""
             if hasattr(self, "_upcoming_within_days"):
                 upcoming = self._upcoming_within_days(book, days=7)
                 if upcoming["count"] > 0:
@@ -2262,11 +2271,11 @@ class CoreMixin:
                             f"w/o rate ⚠"
                         )
                     line += (
-                        f", {upcoming['count']} due in next "
+                        f", {upcoming['count']} {further}due in next "
                         f"7 days ({amount_part})"
                     )
                 else:
-                    line += ", none due in next 7 days"
+                    line += f", none {further}due in next 7 days"
             lines.append(line)
         return lines
 
@@ -2523,6 +2532,10 @@ class CoreMixin:
                 self._render_transactions_scheduled(
                     book, total_txns, enabled_sx, currency,
                     overdue_count=len(overdue_sched),
+                    oldest_overdue_days=(
+                        overdue_sched[0]["days"]
+                        if overdue_sched else None
+                    ),
                 )
             )
             lines.extend(

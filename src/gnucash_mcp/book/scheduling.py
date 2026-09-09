@@ -26,6 +26,7 @@ from sqlalchemy import text
 
 from gnucash_mcp.book._base import (
     _HEX_GUID_RE,
+    _commodity_quantum,
     _gnc_bool,
     _guid_prefix_map,
     _sx_to_compact_line,
@@ -573,12 +574,16 @@ class SchedulingMixin:
                 book.cancel()
                 raise
 
-            next_occ = self._next_occurrence(
-                parsed_start, frequency,
-                after=date.today() - timedelta(days=1),
-                end_date=parsed_end,
-            )
-
+            # The first number a caller sees after creating a
+            # schedule — read from the same rule as every other
+            # surface. This site used to search from today and told
+            # the bookkeeper "October" for a schedule starting in
+            # July, which is why explicit dates were being passed
+            # to every instantiation on the production book.
+            sx_row = book.session.query(
+                ScheduledTransaction
+            ).filter_by(guid=sx_guid).first()
+            next_occ = self._sx_next_due(sx_row)
 
             all_sx_guids = [
                 row[0]
@@ -785,6 +790,20 @@ class SchedulingMixin:
                         amt = _to_decimal(s["amount"])
                         if amt > 0:
                             total += amt
+                    # Rendered at the template currency's quantum
+                    # (15000.00, not 15000): stored amounts carry
+                    # whatever precision the caller typed, and the
+                    # bill list shouldn't pad by book.
+                    sx_cur = self._get_sx_slot_string(
+                        book, sx.guid, "currency",
+                    )
+                    amount_commodity = (
+                        self._find_commodity(book, sx_cur)
+                        if sx_cur else None
+                    ) or self._require_default_currency(book)
+                    total = total.quantize(
+                        _commodity_quantum(amount_commodity)
+                    )
 
                     entry = {
                         "guid": sx.guid,
@@ -796,9 +815,6 @@ class SchedulingMixin:
                     # Amounts are denominated in the template's
                     # currency — label foreign ones so the bill
                     # list never reads HKD numbers as book-default.
-                    sx_cur = self._get_sx_slot_string(
-                        book, sx.guid, "currency",
-                    )
                     if sx_cur:
                         entry["currency"] = sx_cur
                     if not compact:
@@ -886,7 +902,7 @@ class SchedulingMixin:
                     "Scheduled transaction is disabled"
                 )
 
-            frequency, _start, _end, last = self._sx_schedule(sx)
+            frequency, _start, end, last = self._sx_schedule(sx)
             if not frequency:
                 raise ValueError("Unknown recurrence frequency")
 
@@ -900,10 +916,28 @@ class SchedulingMixin:
                 # below.
                 txn_date = self._sx_next_due(sx)
                 if not txn_date:
+                    # The server knows which stop applied; say so,
+                    # and say what to do — "past end date, or a
+                    # finite schedule..." was the server declining
+                    # to read its own row.
+                    if sx.num_occur > 0 and sx.rem_occur <= 0:
+                        raise ValueError(
+                            f"No occurrence due: '{sx.name}' has "
+                            f"entered all {sx.num_occur} occurrences. "
+                            f"delete_scheduled_transaction if it's "
+                            f"finished."
+                        )
+                    last_note = (
+                        f" (last entered {last.isoformat()})"
+                        if last else ""
+                    )
                     raise ValueError(
-                        "No occurrence due (past end date, or a "
-                        "finite schedule has no occurrences "
-                        "remaining)"
+                        f"No occurrence due: '{sx.name}' ended "
+                        f"{end.isoformat()}{last_note}. Clear the end "
+                        f"date with update_scheduled_transaction("
+                        f"end_date=\"\") to resume, or "
+                        f"delete_scheduled_transaction if it's "
+                        f"finished."
                     )
 
             # Refuse dates on or before last_occur — desktop's
