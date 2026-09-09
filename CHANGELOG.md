@@ -26,6 +26,14 @@ Entries are terse by design: what changed, one line each, PR numbers where they 
 - A credit note at zero balance reports `status: applied` on `get_document`; it settles by application, not cash.
 
 ### Fixed
+- Scheduled transactions: every surface now answers "which occurrence is next" from one rule, `_sx_next_due` — the oldest occurrence not yet entered, GnuCash's own Since-Last-Run semantics. The dashboard already did; `list_scheduled_transactions`, `get_upcoming_transactions`, the Scheduled summary line, and the default date on `create_transaction_from_scheduled` searched from today and skipped missed periods, so a schedule flagged "overdue, due July 15" would post October 15 by default and then refuse July forever behind the backfill guard. Overdue occurrences now lead `get_upcoming_transactions` (`N days overdue`), the compact list marks them `overdue:`, and repeated default instantiation walks the missed periods forward. Agreement lock across all five surfaces.
+- Scheduled templates store account GUIDs, not the caller's path; an account rename or move no longer breaks the schedule on its due date. Readers render paths. Templates written before this keep working while their path lives.
+- Finite schedules (`num_occur > 0`) honor `rem_occur`: instantiation counts it down and a schedule at zero remaining has no next occurrence, matching desktop creation. `remaining_occurrences` is reported where it applies.
+- A failure late in `create_scheduled_transaction` rolls the session back instead of deleting the template account and saving, which committed the half-written rows and only looked clean because of a piecash cascade.
+- `create_scheduled_transaction`'s response reads the same next-occurrence rule as every other surface; it answered start-plus-one-period, which is why explicit dates were being passed to every instantiation on a live book (bookkeeper loop, 2026-09-08).
+- The dashboard's Scheduled line reads `N overdue ⚠ (oldest D days), none further due in next 7 days`; the 7-day bucket starts after the overdue set and the line now says so.
+- `get_upcoming_transactions` renders amounts at the template currency's quantum (`15000.00`, not `15000`) regardless of the precision the schedule was created with.
+- The instantiation refusal on a finished schedule names which stop applied — the end date (with the last entered date) or the occurrence count — and the tool call that resumes or retires it.
 - `create_account(placeholder=True)`, `update_account(placeholder=True)`, and `update_party(active=...)` wrote a Python bool into an INTEGER column — silently coerced on SQLite, a hard `DatatypeMismatch` on PostgreSQL.
 - Short-GUID resolution failed on a book whose filename contains a percent escape (`budget 100%25 final.gnucash`): the lookup URI was built unescaped and sqlite3 percent-decoded the path back to a filename that doesn't exist. The path is percent-encoded now.
 

@@ -813,7 +813,12 @@ def _sx_to_compact_line(
     if not sx_dict.get("enabled"):
         status = "disabled"
     elif sx_dict.get("next_occurrence"):
-        status = f"next:{sx_dict['next_occurrence']}"
+        # next_occurrence is the oldest un-entered date; one in the
+        # past is overdue and reads that way (ISO strings compare
+        # as dates).
+        nxt = sx_dict["next_occurrence"]
+        label = "overdue" if nxt < date.today().isoformat() else "next"
+        status = f"{label}:{nxt}"
     else:
         status = "no upcoming"
     return f"{short}\t{name}\t{freq}\t{status}"
@@ -840,7 +845,8 @@ def _upcoming_to_compact_line(
     # "2000" from an HKD schedule reads as the book currency.
     if entry.get("currency"):
         amount = f"{amount} {entry['currency']}"
-    return f"{short}\t{name}\t{occ_date}\t{days} days\t{amount}"
+    due = f"{-days} days overdue" if days < 0 else f"{days} days"
+    return f"{short}\t{name}\t{occ_date}\t{due}\t{amount}"
 
 
 # ── Book source ────────────────────────────────────────────────────

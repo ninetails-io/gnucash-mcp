@@ -658,16 +658,15 @@ class CoreMixin:
         ``{days, name, msg}``; ``len()`` still feeds the Scheduled
         line's overdue count.
 
-        Requires SchedulingMixin's helpers (_next_occurrence,
-        RECURRENCE_TO_FREQUENCY). When that module isn't loaded,
-        the attribute lookup degrades gracefully via getattr and
-        this returns []. Shared between the Warnings section and
-        the Scheduled line's overdue count so the two surfaces
-        agree by construction.
+        Reads SchedulingMixin's ``_sx_next_due`` — the one rule for
+        "which occurrence is next" — so the date flagged here is the
+        date ``create_transaction_from_scheduled`` posts by default
+        and the date ``get_upcoming_transactions`` lists. When the
+        scheduling module isn't loaded the getattr degrades to []
+        and the summary skips the section.
         """
-        next_occ_fn = getattr(self, "_next_occurrence", None)
-        rec_to_freq = getattr(self, "RECURRENCE_TO_FREQUENCY", None)
-        if next_occ_fn is None or rec_to_freq is None:
+        next_due_fn = getattr(self, "_sx_next_due", None)
+        if next_due_fn is None:
             return []
         try:
             from piecash.core.transaction import ScheduledTransaction
@@ -676,31 +675,9 @@ class CoreMixin:
                 if not sx.enabled:
                     continue
                 try:
-                    rec = sx.recurrence
-                    key = (
-                        rec.recurrence_period_type,
-                        rec.recurrence_mult,
-                    )
-                    frequency = rec_to_freq.get(key)
-                    if not frequency:
-                        continue
-                    start = sx.start_date
-                    if isinstance(start, datetime):
-                        start = start.date()
-                    end = sx.end_date
-                    if isinstance(end, datetime):
-                        end = end.date()
-                    last = sx.last_occur
-                    if isinstance(last, datetime):
-                        last = last.date()
-                    # Search relative to "yesterday" so today's
-                    # occurrence isn't classified as overdue
-                    # before the user has a chance to enter it.
-                    next_occ = next_occ_fn(
-                        start, frequency,
-                        after=start - timedelta(days=1),
-                        end_date=end, last_occur=last,
-                    )
+                    # Strictly before today: today's occurrence is
+                    # due, not overdue, until the day has passed.
+                    next_occ = next_due_fn(sx)
                     if next_occ and next_occ < today:
                         days_overdue = (today - next_occ).days
                         overdue_entries.append((
@@ -2250,6 +2227,7 @@ class CoreMixin:
         enabled_sx: int,
         currency: str,
         overdue_count: int = 0,
+        oldest_overdue_days: int | None = None,
     ) -> list[str]:
         """Render the Transactions count + Scheduled line.
 
@@ -2268,6 +2246,14 @@ class CoreMixin:
             line = f"Scheduled: {enabled_sx} recurring"
             if overdue_count > 0:
                 line += f", {overdue_count} overdue ⚠"
+                if oldest_overdue_days is not None:
+                    line += f" (oldest {oldest_overdue_days} days)"
+            # The 7-day bucket starts AFTER the overdue set (each
+            # schedule sits in one bucket, at its oldest un-entered
+            # date). "14 overdue, none due in next 7 days" read as a
+            # contradiction; "further" tells the reader where the
+            # bucket begins.
+            further = "further " if overdue_count > 0 else ""
             if hasattr(self, "_upcoming_within_days"):
                 upcoming = self._upcoming_within_days(book, days=7)
                 if upcoming["count"] > 0:
@@ -2285,11 +2271,11 @@ class CoreMixin:
                             f"w/o rate ⚠"
                         )
                     line += (
-                        f", {upcoming['count']} due in next "
+                        f", {upcoming['count']} {further}due in next "
                         f"7 days ({amount_part})"
                     )
                 else:
-                    line += ", none due in next 7 days"
+                    line += f", none {further}due in next 7 days"
             lines.append(line)
         return lines
 
@@ -2546,6 +2532,10 @@ class CoreMixin:
                 self._render_transactions_scheduled(
                     book, total_txns, enabled_sx, currency,
                     overdue_count=len(overdue_sched),
+                    oldest_overdue_days=(
+                        overdue_sched[0]["days"]
+                        if overdue_sched else None
+                    ),
                 )
             )
             lines.extend(
