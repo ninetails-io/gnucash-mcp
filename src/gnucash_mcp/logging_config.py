@@ -2042,6 +2042,24 @@ def _fmt_budget_create(entry: dict) -> list[str]:
     desc = params.get("description", "")
     if desc:
         lines.append(f'{_INDENT}description: "{desc}"')
+    lines.extend(_budget_stamp_lines(after))
+    return lines
+
+
+def _budget_stamp_lines(after: dict) -> list[str]:
+    """A budget write that stamped the book with GnuCash's
+    natural-sign feature, or scrubbed existing rows to it, is a
+    book-level change and never leaves the log silent about it."""
+    lines = []
+    if after.get("book_stamped"):
+        lines.append(
+            f'{_INDENT}book stamped: "{after["book_stamped"]}" '
+            f"(GnuCash natural-sign budget storage)"
+        )
+    if after.get("book_scrubbed"):
+        lines.append(
+            f"{_INDENT}existing budget rows scrubbed to natural sign"
+        )
     return lines
 
 
@@ -2071,6 +2089,7 @@ def _fmt_budget_update(entry: dict) -> list[str]:
             )
     else:
         lines.append(f"{_INDENT}amount: {new_amount}")
+    lines.extend(_budget_stamp_lines(entry.get("after_state") or {}))
     return lines
 
 

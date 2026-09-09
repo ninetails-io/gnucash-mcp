@@ -16,15 +16,19 @@ import piecash
 from dateutil.relativedelta import relativedelta
 from piecash._common import Recurrence
 from piecash.budget import Budget, BudgetAmount
+from piecash.kvp import Slot
 
 from gnucash_mcp.book._base import (
     _BUDGET_SCRUB_FLIP,
+    _BUDGET_UNREVERSED_BOGUS_KEY,
+    _BUDGET_UNREVERSED_FEATURE,
     _BUDGET_UNREVERSED_DESCRIPTION,
     _BUDGET_UNREVERSED_KEY,
     _budget_scrub_policy,
     _budget_stored_sign,
     _budget_targets,
     _budget_unreversed,
+    _verify_delete,
     _to_decimal,
     _unique_prefix,
     _verify_composite_write,
@@ -481,15 +485,38 @@ class BudgetsMixin:
 
             return _format_get_budget_compact(result, account_rows)
 
-    def _ensure_budget_unreversed(self, book) -> bool:
+    def _ensure_budget_unreversed(self, book) -> dict:
         """Write path only: bring an un-stamped book to GnuCash 3.8+
         natural-sign storage exactly as its own open-time scrub
-        would (same policy, same rows), then stamp it. Returns True
-        when rows were scrubbed. Every budget write calls this
-        first so the new row and the existing ones share one
-        convention; readers never call it."""
+        would (same policy, same rows), then stamp it. Returns
+        ``{"stamped", "scrubbed", "migrated"}`` booleans so the
+        caller can put the stamp in its audit entry — a book-level
+        slot write must never be invisible in the log. Every budget
+        write calls this first so the new row and the existing ones
+        share one convention; readers never call it."""
+        migrated = False
+        try:
+            book[_BUDGET_UNREVERSED_BOGUS_KEY]
+            has_bogus = True
+        except KeyError:
+            has_bogus = False
+        if has_bogus:
+            # The pre-merge key GnuCash refuses. Delete the row; the
+            # real stamp is written below if it isn't there already.
+            book.session.execute(
+                Slot.__table__.delete().where(
+                    Slot.__table__.c.name == _BUDGET_UNREVERSED_BOGUS_KEY
+                )
+            )
+            _verify_delete(
+                book.session, Slot.__table__,
+                {"name": _BUDGET_UNREVERSED_BOGUS_KEY},
+                "unrecognized budget feature stamp",
+            )
+            book.session.expire_all()
+            migrated = True
         if _budget_unreversed(book):
-            return False
+            return {"stamped": False, "scrubbed": False, "migrated": migrated}
         scrubbed = False
         for budget in book.session.query(Budget).all():
             flip = _BUDGET_SCRUB_FLIP[_budget_scrub_policy(budget)]
@@ -503,7 +530,7 @@ class BudgetsMixin:
                     ba._amount_num = -ba._amount_num
                     scrubbed = True
         book[_BUDGET_UNREVERSED_KEY] = _BUDGET_UNREVERSED_DESCRIPTION
-        return scrubbed
+        return {"stamped": True, "scrubbed": scrubbed, "migrated": migrated}
 
     def create_budget(
         self,
@@ -600,7 +627,7 @@ class BudgetsMixin:
 
             # A budget written by this server is natural-sign from
             # birth; stamp the book so GnuCash never runs its scrub.
-            self._ensure_budget_unreversed(book)
+            stamp = self._ensure_budget_unreversed(book)
             book.save()
 
 
@@ -609,12 +636,15 @@ class BudgetsMixin:
                 for row in book.session.query(Budget.guid).all()
             ]
             short_guid = _unique_prefix(budget_guid, all_budget_guids)
-            return {
+            result = {
                 "guid": short_guid,
                 "name": name,
                 "start_date": period_start.isoformat(),
                 "status": "created",
             }
+            if stamp["stamped"]:
+                result["book_stamped"] = _BUDGET_UNREVERSED_FEATURE
+            return result
 
     def set_budget_amount(
         self,
@@ -658,7 +688,7 @@ class BudgetsMixin:
             # Storage is GnuCash's natural sign. Bring an un-stamped
             # book there first so this row and the existing ones
             # share one convention, then apply the account's sign.
-            self._ensure_budget_unreversed(book)
+            stamp = self._ensure_budget_unreversed(book)
             sign = _budget_stored_sign(acct)
 
             # Prior per-period amounts for the audit log's
@@ -721,10 +751,16 @@ class BudgetsMixin:
 
             # periods_set is computed ("q1" → [0, 1, 2]); the echoed
             # inputs come from tool params in the audit log.
-            return {
+            result = {
                 "periods_set": periods,
                 "status": "updated",
             }
+            # Book-level slot writes are never silent in the log.
+            if stamp["stamped"]:
+                result["book_stamped"] = _BUDGET_UNREVERSED_FEATURE
+            if stamp["scrubbed"]:
+                result["book_scrubbed"] = True
+            return result
 
     def get_budget_report(
         self,

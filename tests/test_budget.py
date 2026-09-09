@@ -1223,7 +1223,7 @@ def _stamped(book_path):
     with gb.open(readonly=True) as book:
         return book.session.execute(
             text("SELECT COUNT(*) FROM slots WHERE name = "
-                 "'features/Budgets: sign reversal fixed'")
+                 "'features/Use natural signs in budget amounts'")
         ).scalar() == 1
 
 
@@ -1377,3 +1377,101 @@ class TestBudgetSignConvention:
         with gb.open(readonly=True) as book:
             headline = gb._budget_headline(book, list(book.transactions))
         assert headline is not None
+
+
+class TestBudgetFeatureKey:
+    """The stamp key is GnuCash's, verbatim. A key GnuCash does not
+    know makes it refuse to open the book ("features not supported
+    by this version") — which is exactly what the first cut of this
+    branch did to the maintainer's production book. Pinned against
+    a copy of the #define, not a paraphrase."""
+
+    GNC_FEATURES_H_LINE = (
+        '#define GNC_FEATURE_BUDGET_UNREVERSED '
+        '"Use natural signs in budget amounts"'
+    )
+
+    def test_key_matches_gnc_features_h(self):
+        from gnucash_mcp.book._base import (
+            _BUDGET_UNREVERSED_FEATURE, _BUDGET_UNREVERSED_KEY,
+        )
+        import re
+        define = re.search(r'"([^"]+)"', self.GNC_FEATURES_H_LINE).group(1)
+        assert _BUDGET_UNREVERSED_FEATURE == define
+        assert _BUDGET_UNREVERSED_KEY == f"features/{define}"
+
+    def test_bogus_key_migrated_on_next_write(self, budget_book):
+        """A book stamped by the pre-merge branch: bogus key present,
+        real key absent. The next budget write deletes the bogus
+        row and writes the real stamp."""
+        from sqlalchemy import text
+        from gnucash_mcp.book._base import (
+            _BUDGET_UNREVERSED_BOGUS_KEY, _BUDGET_UNREVERSED_KEY,
+        )
+        gb = GnuCashBook(str(budget_book))
+        gb.create_budget(name="B", num_periods=12, period_type="monthly",
+                         start_date="2026-01-01")
+        _unstamp(budget_book)
+        with gb.open(readonly=False) as book:
+            book[_BUDGET_UNREVERSED_BOGUS_KEY] = "x"
+            book.save()
+        r = gb.set_budget_amount("B", "Expenses:Groceries", "300", period=0)
+        assert r.get("book_stamped") == "Use natural signs in budget amounts"
+        with gb.open(readonly=True) as book:
+            names = [row[0] for row in book.session.execute(
+                text("SELECT name FROM slots WHERE name LIKE 'features/%'")
+            ).fetchall()]
+        assert names == [_BUDGET_UNREVERSED_KEY]
+
+    def test_bogus_beside_real_is_deleted(self, budget_book):
+        """The bookkeeper's production case: desktop had already
+        written the real stamp, the branch added the bogus one
+        beside it. Delete the bogus row, touch nothing else, and
+        do NOT scrub — the real stamp says the rows are natural."""
+        from sqlalchemy import text
+        from gnucash_mcp.book._base import (
+            _BUDGET_UNREVERSED_BOGUS_KEY, _BUDGET_UNREVERSED_KEY,
+        )
+        gb = GnuCashBook(str(budget_book))
+        gb.create_budget(name="B", num_periods=12, period_type="monthly",
+                         start_date="2026-01-01")
+        gb.set_budget_amount("B", "Income:Salary", "5000", period=0)
+        with gb.open(readonly=False) as book:
+            book[_BUDGET_UNREVERSED_BOGUS_KEY] = "x"
+            book.save()
+        r = gb.set_budget_amount("B", "Expenses:Groceries", "300", period=0)
+        assert "book_stamped" not in r and "book_scrubbed" not in r
+        assert _raw_amount(budget_book, "Salary") == -500000
+        with gb.open(readonly=True) as book:
+            names = [row[0] for row in book.session.execute(
+                text("SELECT name FROM slots WHERE name LIKE 'features/%'")
+            ).fetchall()]
+        assert names == [_BUDGET_UNREVERSED_KEY]
+
+    def test_first_write_reports_the_stamp(self, budget_book):
+        gb = GnuCashBook(str(budget_book))
+        r = gb.create_budget(name="B", num_periods=12, period_type="monthly",
+                             start_date="2026-01-01")
+        assert r.get("book_stamped") == "Use natural signs in budget amounts"
+        r2 = gb.set_budget_amount("B", "Expenses:Groceries", "300", period=0)
+        assert "book_stamped" not in r2
+
+    def test_audit_lines_render_the_stamp(self):
+        from gnucash_mcp.logging_config import (
+            _fmt_budget_create, _fmt_budget_update,
+        )
+        feature = "Use natural signs in budget amounts"
+        create = _fmt_budget_create({
+            "timestamp": "2026-09-09T10:00:00",
+            "params": {"name": "B", "num_periods": 12},
+            "after_state": {"name": "B", "book_stamped": feature},
+        })
+        assert any(f'book stamped: "{feature}"' in l for l in create)
+        update = _fmt_budget_update({
+            "timestamp": "2026-09-09T10:00:00",
+            "params": {"budget_name": "B", "account": "Income:Salary", "amount": "5000"},
+            "before_state": {"prior_amounts": {"0": None}},
+            "after_state": {"periods_set": [0], "book_stamped": feature, "book_scrubbed": True},
+        })
+        assert any("book stamped" in l for l in update)
+        assert any("scrubbed to natural sign" in l for l in update)

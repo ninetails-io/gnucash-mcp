@@ -81,7 +81,17 @@ def _slot_value_str(value) -> str:
 # every type was stored as a magnitude, so an income target read as
 # "-5,000 / 0%" after GnuCash scrubbed it, and displayed as -5,000
 # in GnuCash when we wrote it.
-_BUDGET_UNREVERSED_KEY = "features/Budgets: sign reversal fixed"
+# The KEY is GNC_FEATURE_BUDGET_UNREVERSED from gnc-features.h,
+# verbatim; GnuCash looks features up by key and refuses to open a
+# book carrying one it doesn't know ("features not supported by this
+# version"). The description is what it stores as the value. A test
+# pins the key against a copy of the #define.
+_BUDGET_UNREVERSED_FEATURE = "Use natural signs in budget amounts"
+_BUDGET_UNREVERSED_KEY = f"features/{_BUDGET_UNREVERSED_FEATURE}"
+# Written by this branch before merge under a key GnuCash did not
+# recognize (the bookkeeper's production book would not open).
+# Never released; migrated away on the next budget write.
+_BUDGET_UNREVERSED_BOGUS_KEY = "features/Budgets: sign reversal fixed"
 _BUDGET_UNREVERSED_DESCRIPTION = (
     "Store budget amounts unreversed (i.e. natural) signs "
     "(requires at least Gnucash 3.8)"
