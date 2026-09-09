@@ -33,6 +33,7 @@ from gnucash_mcp._format import (
 _debug_logger = logging.getLogger(DEBUG_LOGGER_NAME)
 
 from gnucash_mcp.book._base import (
+    _budget_targets,
     _account_to_compact_line,
     _account_to_dict,
     _commodity_quantum,
@@ -1249,8 +1250,7 @@ class CoreMixin:
         total_budgeted = Decimal("0")
         budgeted_accounts: list = []
         budgeted_account_guids: set[str] = set()
-        for ba in budget.amounts:
-            ba_amount = Decimal(str(ba.amount))
+        for ba, ba_amount in _budget_targets(book, budget):
             factor = factors.get(ba.account.guid)
             if factor is not None:
                 ba_amount = ba_amount * factor

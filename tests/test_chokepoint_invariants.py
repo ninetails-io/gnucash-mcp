@@ -1334,3 +1334,24 @@ class TestAccountNotFoundGoesThroughSuggestions:
                 if bare.search(line):
                     offenders.append(f"{path.name}:{lineno}")
         assert not offenders, offenders
+
+
+class TestBudgetSignChokepoint:
+    """``_budget_targets`` is the one reader of budget amounts and
+    ``_budget_stored_sign`` the one writer-side sign; a site that
+    reads ``ba.amount`` raw reintroduces the magnitude-vs-natural
+    disagreement with GnuCash 3.8+ (the "-5,000 / 0%" income row)."""
+
+    def test_no_raw_budget_amount_reads_outside_base(self):
+        import gnucash_mcp.book as pkg
+        raw = re.compile(r"Decimal\(str\(ba\.amount\)\)")
+        offenders = []
+        for path in sorted(Path(pkg.__file__).parent.glob("*.py")):
+            if path.name == "_base.py":
+                continue
+            for lineno, line in enumerate(
+                path.read_text().splitlines(), start=1,
+            ):
+                if raw.search(line):
+                    offenders.append(f"{path.name}:{lineno}")
+        assert not offenders, offenders

@@ -119,7 +119,10 @@ def register(mcp, get_book) -> None:
         Args:
             budget_name: Name of the budget.
             account: Account ref: full path (e.g., "Expenses:Groceries"), %short GUID, or full 32-char GUID.
-            amount: Monthly budget amount as string (e.g., "500.00").
+            amount: Monthly budget amount as string (e.g., "500.00"),
+                as a magnitude for every account type — "5000" on an
+                income account means 5,000 expected in. The server
+                stores GnuCash's natural sign underneath.
             period: Which period(s) to set:
                 - None or "all": Set same amount for all periods (default)
                 - Integer 0-11: Set specific period (0 = January for yearly budget)

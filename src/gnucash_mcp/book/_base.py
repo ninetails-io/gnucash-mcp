@@ -67,6 +67,102 @@ def _slot_value_str(value) -> str:
     return str(value)
 
 
+# ── Budget sign convention ──────────────────────────────────────────
+# GnuCash 3.8+ stores budget amounts in the account's NATURAL sign
+# and stamps the book with a feature to say so: a 5,000 income target
+# is -5000 on disk, and the budget editor negates on entry and on
+# display for credit-normal types (gnc_reverse_balance under the
+# default "credit accounts" preference). A book without the stamp
+# gets a one-time heuristic scrub the next time GnuCash opens it
+# (libgnucash/engine/ScrubBudget.c). This server's surface is
+# magnitudes — what a default-preference user types and sees — and
+# the sign is applied at the storage boundary in exactly one place:
+# _budget_targets reads, _budget_stored_sign writes. Before this,
+# every type was stored as a magnitude, so an income target read as
+# "-5,000 / 0%" after GnuCash scrubbed it, and displayed as -5,000
+# in GnuCash when we wrote it.
+_BUDGET_UNREVERSED_KEY = "features/Budgets: sign reversal fixed"
+_BUDGET_UNREVERSED_DESCRIPTION = (
+    "Store budget amounts unreversed (i.e. natural) signs "
+    "(requires at least Gnucash 3.8)"
+)
+# gnc_reverse_balance's set under the default preference.
+_BUDGET_CREDIT_NORMAL_TYPES = frozenset(
+    {"INCOME", "LIABILITY", "PAYABLE", "EQUITY", "CREDIT"}
+)
+# ScrubBudget.c's three policies and what each flips. Deliberately
+# narrower than the display set (PAYABLE / CREDIT rows are left
+# alone) — mirrored exactly, so a book scrubbed here lands in the
+# state GnuCash's own open-time scrub would have produced.
+_BUDGET_SCRUB_FLIP = {
+    "INC_EXP": frozenset({"INCOME", "EXPENSE"}),
+    "CREDIT_ACC": frozenset({"LIABILITY", "EQUITY", "INCOME"}),
+    "NONE": frozenset(),
+}
+
+
+def _budget_stored_sign(account) -> int:
+    """+1 or -1: the factor between a user-facing magnitude and the
+    on-disk amount for this account, per GnuCash's natural-sign
+    storage."""
+    return -1 if account.type in _BUDGET_CREDIT_NORMAL_TYPES else 1
+
+
+def _budget_unreversed(book) -> bool:
+    """Has this book been stamped with GnuCash's natural-sign
+    budget feature? piecash raises KeyError on an absent slot path."""
+    try:
+        return book[_BUDGET_UNREVERSED_KEY] is not None
+    except KeyError:
+        return False
+
+
+def _budget_scrub_policy(budget) -> str:
+    """Port of ScrubBudget.c heuristics_on_budget: which rows an
+    un-stamped budget's signs imply need flipping. Per account, the
+    sign of its total across set periods (-1 / 0 / +1) is tallied
+    by type; any negative expense total means the book was kept
+    under the "income & expense" reversal, a negative income total
+    means it is already natural, anything else means the default
+    "credit accounts" reversal."""
+    totals: dict[str, list] = {}
+    for ba in budget.amounts:
+        entry = totals.setdefault(
+            ba.account.guid, [ba.account.type, Decimal("0")],
+        )
+        entry[1] += Decimal(str(ba.amount))
+    tally = {"EXPENSE": 0, "INCOME": 0}
+    for acct_type, total in totals.values():
+        if acct_type in tally:
+            tally[acct_type] += (total > 0) - (total < 0)
+    if tally["EXPENSE"] < 0:
+        return "INC_EXP"
+    if tally["INCOME"] < 0:
+        return "NONE"
+    return "CREDIT_ACC"
+
+
+def _budget_targets(book, budget) -> list[tuple[object, Decimal]]:
+    """THE reader for budget amounts: ``[(BudgetAmount, magnitude)]``
+    in the surface convention, whatever the book's storage state.
+    A stamped book is read as natural sign; an un-stamped one is
+    read through the same heuristic GnuCash will apply when it
+    opens the book, so the numbers don't change underneath the user
+    at that moment. Readers never write — the scrub itself happens
+    on the write path (``_ensure_budget_unreversed``)."""
+    flip = (
+        frozenset() if _budget_unreversed(book)
+        else _BUDGET_SCRUB_FLIP[_budget_scrub_policy(budget)]
+    )
+    out = []
+    for ba in budget.amounts:
+        natural = Decimal(str(ba.amount))
+        if ba.account.type in flip:
+            natural = -natural
+        out.append((ba, natural * _budget_stored_sign(ba.account)))
+    return out
+
+
 def _commodity_quantum(commodity) -> Decimal:
     """Smallest representable unit of a commodity, as a Decimal quantum.
 
