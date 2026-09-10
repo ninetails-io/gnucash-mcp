@@ -107,7 +107,8 @@ def _format_budget_report_compact(report: dict) -> str:
     prefix is stripped. A budget with both income and expense
     targets ends in INCOME / EXPENSES / NET lines instead of one
     TOTAL. The marker never fires on an income row or the INCOME
-    line — beating an income target is not a warning.
+    line — beating an income target is not a warning — and NET
+    carries no %Used (a difference, not a ratio).
     """
     accounts = report.get("accounts", [])
     totals = report.get("totals", {})
@@ -162,7 +163,10 @@ def _format_budget_report_compact(report: dict) -> str:
             _fmt(row.get("budgeted", "0")),
             _fmt(row.get("actual", "0")),
             _fmt(row.get("remaining", "0")),
-            f"{row.get('percent_used', '0')}%",
+            (
+                f"{row['percent_used']}%"
+                if "percent_used" in row else "—"
+            ),
             markable,
         )
         for label, row, markable in closing
@@ -1018,6 +1022,12 @@ class BudgetsMixin:
                     "expenses": _totals_row(exp_b, exp_a),
                 }
                 totals = _totals_row(inc_b - exp_b, inc_a - exp_a)
+                # NET is a difference, not a ratio: net actual ÷ net
+                # budgeted goes negative whenever expenses post
+                # before income and flips meaning with the sign of
+                # the planned net (bookkeeper, 2026-09-10). No pace
+                # number on this line.
+                del totals["percent_used"]
                 totals["basis"] = "net (income - expenses)"
             else:
                 only = next(iter(sides_seen)) if sides_seen else "expenses"

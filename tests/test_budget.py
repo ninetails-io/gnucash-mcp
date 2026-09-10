@@ -1525,11 +1525,13 @@ class TestBudgetReportSides:
         assert Decimal(t["budgeted"]) == Decimal("4700")
         assert Decimal(t["actual"]) == Decimal("4550")
         assert Decimal(t["remaining"]) == Decimal("150")
+        assert "percent_used" not in t  # a difference, not a ratio
         text = gb.get_budget_report("M", period=5)
         lines = text.splitlines()
         assert lines[-3].startswith("INCOME")
         assert lines[-2].startswith("EXPENSES")
         assert lines[-1].startswith("NET")
+        assert lines[-1].rstrip().endswith("—")  # no %Used on NET
         assert not any(l.startswith("TOTAL") for l in lines)
 
     def test_single_side_unchanged(self, budget_book):
