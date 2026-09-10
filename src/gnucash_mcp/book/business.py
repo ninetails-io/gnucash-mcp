@@ -5611,9 +5611,9 @@ class BusinessMixin:
         )
 
         with self.open(readonly=False) as book:
-            # Every pre-1.5 invoice link in the book is renamed to
-            # GnuCash's key on this write (nothing posted).
-            links_migrated = self._migrate_invoice_link_keys(book)
+            # Every pre-1.5 shape in the book converts on this write
+            # (nothing posted) — see _upgrade_book_shapes.
+            shapes = self._upgrade_book_shapes(book)
             # Customer-invoice and vendor-bill ID sequences collide
             # in the shared ``invoices`` table — without an
             # owner_type filter, posting bill 000010 can fetch an
@@ -5877,8 +5877,7 @@ class BusinessMixin:
                 result["fx_stale"] = max(
                     fx_stale_overrides, key=lambda m: m["age_days"]
                 )
-        if links_migrated:
-            result["invoice_links_migrated"] = links_migrated
+        result.update(shapes)
         return result
 
     def unpost_invoice(
@@ -5911,9 +5910,9 @@ class BusinessMixin:
         ot = self._parse_owner_type(owner_type)
 
         with self.open(readonly=False) as book:
-            # Every pre-1.5 invoice link in the book is renamed to
-            # GnuCash's key on this write (nothing posted).
-            links_migrated = self._migrate_invoice_link_keys(book)
+            # Every pre-1.5 shape in the book converts on this write
+            # (nothing posted) — see _upgrade_book_shapes.
+            shapes = self._upgrade_book_shapes(book)
             inv = self._find_invoice(book, invoice_id, owner_type=ot)
             if not inv:
                 raise ValueError(
@@ -6055,7 +6054,7 @@ class BusinessMixin:
             book.save()
 
             return {
-                **({"invoice_links_migrated": links_migrated} if links_migrated else {}),
+                **shapes,
                 "id": inv_id_snapshot,
                 "type": (
                     "credit_note"
@@ -6146,11 +6145,9 @@ class BusinessMixin:
         )
 
         with self.open(readonly=dry_run) as book:
-            # Every pre-1.5 invoice link in the book is renamed to
-            # GnuCash's key on a real payment (nothing posted).
-            links_migrated = (
-                0 if dry_run else self._migrate_invoice_link_keys(book)
-            )
+            # Every pre-1.5 shape in the book converts on a real
+            # payment (nothing posted) — see _upgrade_book_shapes.
+            shapes = {} if dry_run else self._upgrade_book_shapes(book)
             inv = self._find_invoice(book, invoice_id, owner_type=ot)
             if not inv:
                 raise ValueError(
@@ -6735,8 +6732,7 @@ class BusinessMixin:
                 result["total_paid"] = str(total_paid)
             _attach_extras(result)
 
-        if links_migrated:
-            result["invoice_links_migrated"] = links_migrated
+        result.update(shapes)
         return result
 
     def apply_credit_note(
@@ -6784,9 +6780,9 @@ class BusinessMixin:
         )
 
         with self.open(readonly=False) as book:
-            # Every pre-1.5 invoice link in the book is renamed to
-            # GnuCash's key on this write (nothing posted).
-            links_migrated = self._migrate_invoice_link_keys(book)
+            # Every pre-1.5 shape in the book converts on this write
+            # (nothing posted) — see _upgrade_book_shapes.
+            shapes = self._upgrade_book_shapes(book)
             # Resolve the credit note (validates it IS a credit note).
             cn = self._resolve_credit_note(
                 book, credit_note_id, owner_type=owner_type,
@@ -7069,8 +7065,7 @@ class BusinessMixin:
                     f"applied to {target.id} (credit note "
                     f"references {linked['id']})"
                 )
-            if links_migrated:
-                result["invoice_links_migrated"] = links_migrated
+            result.update(shapes)
             return result
 
     # ── Delete paths ──────────────────────────────────────────────
@@ -7149,9 +7144,9 @@ class BusinessMixin:
         entry_fk_col = getattr(Entry.__table__.c, entry_fk)
 
         with self.open(readonly=False) as book:
-            # Every pre-1.5 invoice link in the book is renamed to
-            # GnuCash's key on this write (nothing posted).
-            links_migrated = self._migrate_invoice_link_keys(book)
+            # Every pre-1.5 shape in the book converts on this write
+            # (nothing posted) — see _upgrade_book_shapes.
+            shapes = self._upgrade_book_shapes(book)
             inv = self._find_invoice(book, doc_id, owner_type=owner_type)
             if not inv:
                 raise ValueError(f"{type_label} not found: {doc_id}")
@@ -7250,7 +7245,7 @@ class BusinessMixin:
             book.save()
 
             return {
-                **({"invoice_links_migrated": links_migrated} if links_migrated else {}),
+                **shapes,
                 "id": doc_id,
                 "guid": inv_guid,
                 "type": type_label.lower(),

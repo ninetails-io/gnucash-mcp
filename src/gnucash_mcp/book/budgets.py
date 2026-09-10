@@ -658,7 +658,7 @@ class BudgetsMixin:
 
             # A budget written by this server is natural-sign from
             # birth; stamp the book so GnuCash never runs its scrub.
-            stamp = self._ensure_budget_unreversed(book)
+            shapes = self._upgrade_book_shapes(book)
             book.save()
 
 
@@ -673,8 +673,7 @@ class BudgetsMixin:
                 "start_date": period_start.isoformat(),
                 "status": "created",
             }
-            if stamp["stamped"]:
-                result["book_stamped"] = _BUDGET_UNREVERSED_FEATURE
+            result.update(shapes)
             return result
 
     def set_budget_amount(
@@ -719,7 +718,7 @@ class BudgetsMixin:
             # Storage is GnuCash's natural sign. Bring an un-stamped
             # book there first so this row and the existing ones
             # share one convention, then apply the account's sign.
-            stamp = self._ensure_budget_unreversed(book)
+            shapes = self._upgrade_book_shapes(book)
             sign = _budget_stored_sign(acct)
 
             # Prior per-period amounts for the audit log's
@@ -786,11 +785,8 @@ class BudgetsMixin:
                 "periods_set": periods,
                 "status": "updated",
             }
-            # Book-level slot writes are never silent in the log.
-            if stamp["stamped"]:
-                result["book_stamped"] = _BUDGET_UNREVERSED_FEATURE
-            if stamp["scrubbed"]:
-                result["book_scrubbed"] = True
+            # Book-level shape changes are never silent in the log.
+            result.update(shapes)
             return result
 
     def get_budget_report(

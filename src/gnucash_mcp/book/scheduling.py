@@ -1029,7 +1029,7 @@ class SchedulingMixin:
                         for s, v in zip(splits, validated)
                     ],
                 )
-                templates_migrated = self._migrate_all_legacy(book)
+                shapes = self._upgrade_book_shapes(book)
 
                 book.save()
             except Exception:
@@ -1068,8 +1068,7 @@ class SchedulingMixin:
                 ),
                 "status": "created",
             }
-            if templates_migrated:
-                out["templates_migrated"] = templates_migrated
+            out.update(shapes)
             return out
 
     def list_scheduled_transactions(
@@ -1495,7 +1494,7 @@ class SchedulingMixin:
         # ── Phase 3: advance the schedule. ──────────────────────
         # Re-find by guid — the phase-1 ORM object detached when
         # its session closed.
-        templates_migrated = 0
+        shapes: dict = {}
         with self.open(readonly=False) as book:
             sx = self._find_scheduled_transaction(book, guid)
             if not sx:
@@ -1519,10 +1518,10 @@ class SchedulingMixin:
                             f"from-sched-xaction on {created.guid[:8]}",
                             guid_val=sx.guid,
                         )
-                # Every legacy recipe in the book becomes native on
-                # this write; the others are converted without being
-                # posted.
-                templates_migrated = self._migrate_all_legacy(book)
+                # Every pre-1.5 shape in the book converts on this
+                # write; the other schedules are converted without
+                # being posted.
+                shapes = self._upgrade_book_shapes(book)
                 current_last = sx.last_occur
                 if isinstance(current_last, datetime):
                     current_last = current_last.date()
@@ -1554,8 +1553,7 @@ class SchedulingMixin:
         }
         if remaining is not None:
             response["remaining_occurrences"] = remaining
-        if templates_migrated:
-            response["templates_migrated"] = templates_migrated
+        response.update(shapes)
         if txn_result.get("status") == "rejected":
             # Evidence that the rejection is the CORRECT outcome —
             # without it, the natural retry instinct re-triggers the
@@ -1608,12 +1606,12 @@ class SchedulingMixin:
                 ),
                 "notes": recipe["notes"],
             })
-            # Every legacy recipe in the book becomes native on this
-            # write (a no-change update is the one-call conversion);
-            # notes then live on the template transaction, where
-            # desktop reads them.
-            templates_migrated = self._migrate_all_legacy(book)
-            if templates_migrated:
+            # Every pre-1.5 shape in the book converts on this write
+            # (a no-change update is the one-call conversion); notes
+            # then live on the template transaction, where desktop
+            # reads them.
+            shapes = self._upgrade_book_shapes(book)
+            if shapes.get("templates_migrated"):
                 recipe = self._sx_recipe(book, sx)
             notes_owner = sx.guid
             if recipe["source"] == "native":
@@ -1668,8 +1666,7 @@ class SchedulingMixin:
             ]
             short_guid = _unique_prefix(sx.guid, all_sx_guids)
             out = self._sx_to_dict(sx) | {"guid": short_guid}
-            if templates_migrated:
-                out["templates_migrated"] = templates_migrated
+            out.update(shapes)
             return out
 
     def delete_scheduled_transaction(self, guid: str) -> dict:
@@ -1720,19 +1717,9 @@ class SchedulingMixin:
                 f"Slots for scheduled transaction '{result['name']}'",
             )
 
-            # The other schedules convert on this write too; this
-            # one is going away and is left alone.
-            templates_migrated = 0
-            for other in book.session.query(ScheduledTransaction).all():
-                if other.guid == sx.guid:
-                    continue
-                other_recipe = self._sx_recipe(book, other)
-                if other_recipe["source"] == "legacy" and self._migrate_sx_recipe(
-                    book, other, other_recipe,
-                ):
-                    templates_migrated += 1
-            if templates_migrated:
-                result["templates_migrated"] = templates_migrated
+            # Every pre-1.5 shape converts on this write too (the
+            # schedule being deleted included — it goes right after).
+            result.update(self._upgrade_book_shapes(book))
 
             template_acct = sx.template_account
             sx_guid_full = sx.guid

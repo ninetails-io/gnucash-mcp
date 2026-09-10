@@ -2046,6 +2046,51 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
                 out[key] = value
         return out
 
+    def _upgrade_book_shapes(self, book) -> dict:
+        """Write path only: convert every pre-1.5 private shape in the
+        book to GnuCash's own, posting nothing, and say what it did.
+
+        Three shapes shipped between 1.2 and 1.4.4 that only this
+        server could read — schedule recipes in a `splits-json` slot
+        (desktop's editor crashes on them), the invoice link under a
+        child key desktop never reads, and budget amounts stored as
+        magnitudes instead of GnuCash's natural sign. Each has its
+        own converter on its mixin; this is the one caller, so a
+        budget write converts the schedules too and the release note
+        can say one thing: the first schedule, budget, or business
+        write after upgrading converts the book. Reads never write
+        (maintainer ruling, 2026-09-10). Modules that aren't loaded
+        contribute nothing.
+
+        Returns the non-zero counts / flags, keyed the way each
+        module's response already reports them: ``templates_migrated``,
+        ``invoice_links_migrated``, ``book_stamped``,
+        ``book_scrubbed``.
+        """
+        out: dict = {}
+        sweep = getattr(self, "_migrate_all_legacy", None)
+        if sweep is not None:
+            n = sweep(book)
+            if n:
+                out["templates_migrated"] = n
+        rename = getattr(self, "_migrate_invoice_link_keys", None)
+        if rename is not None:
+            n = rename(book)
+            if n:
+                out["invoice_links_migrated"] = n
+        stamp = getattr(self, "_ensure_budget_unreversed", None)
+        if stamp is not None:
+            from piecash.budget import Budget
+            # GnuCash stamps only a book that has budgets (and
+            # unstamps one that has none); mirror that.
+            if book.session.query(Budget.guid).first() is not None:
+                st = stamp(book)
+                if st.get("stamped"):
+                    out["book_stamped"] = _BUDGET_UNREVERSED_FEATURE
+                if st.get("scrubbed"):
+                    out["book_scrubbed"] = True
+        return out
+
     def _strip_guid_slots(
         self, book, obj_guids: list[str], label: str, objects=(),
     ) -> None:
