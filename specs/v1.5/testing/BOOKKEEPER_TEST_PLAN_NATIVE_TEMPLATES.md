@@ -183,3 +183,18 @@ Post-merge, per the bookkeeper: bounce, then on production one
 no-change update converts all 8 with nothing posted; then the
 paycheck through the normal path, verifying the VFIFX leg's
 quantity 6.1954 on disk — the live cross-commodity replay.
+
+## Round 3 — 2026-09-10, production, SHIP
+
+Filed in the report. Production converted by one no-change update
+(8 migrated, nothing posted, transaction count unchanged); every
+schedule opens in the SX editor; the paycheck posted through the
+migrated path with the VFIFX leg at 6.1954, matching the
+pre-migration placeholder exactly. Pre-check established that the
+1.2–1.4.4 shape crashes the editor on ANY server-made schedule.
+
+**Follow-up ruling (maintainer, 2026-09-10):** no conversion on
+open. Read-only operations keep the book read-only; conversion
+happens on the first schedule write, and the dashboard warns —
+count, crash, one-call fix — while any legacy recipe remains.
+Option (a) declined; option (b) shipped.
