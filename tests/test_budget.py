@@ -1365,15 +1365,19 @@ class TestBudgetSignConvention:
         assert Decimal(before["prior_amounts"][0]) == Decimal("5000.00")
 
     def test_dashboard_headline_agrees(self, budget_book):
-        """The dashboard's budget headline reads the same chokepoint;
-        pre-fix an income-only budget summed to a negative total and
-        the headline vanished."""
+        """The dashboard's budget headline reads the same chokepoint.
+        Pre-fix a natural-sign income row summed into a negative
+        total and the headline vanished even with expense targets
+        present. (The headline paces expense targets only; an
+        income-only budget has no spending headline by design.)"""
         from datetime import date
         gb = GnuCashBook(str(budget_book))
         today = date.today()
         gb.create_budget(name="Now", num_periods=12, period_type="monthly",
                          start_date=today.replace(day=1).isoformat())
         gb.set_budget_amount("Now", "Income:Salary", "5000.00")
+        gb.set_budget_amount("Now", "Expenses:Groceries", "100.00")
+        _set_raw(budget_book, "Salary", -500000)  # native sign, as stored
         with gb.open(readonly=True) as book:
             headline = gb._budget_headline(book, list(book.transactions))
         assert headline is not None
@@ -1475,3 +1479,137 @@ class TestBudgetFeatureKey:
         })
         assert any("book stamped" in l for l in update)
         assert any("scrubbed to natural sign" in l for l in update)
+
+
+# ── Report sides (income vs. expenses) ──────────────────────────
+
+
+class TestBudgetReportSides:
+    """Income and expense targets are tallied on their own sides.
+    One side → TOTAL as always. Both → INCOME / EXPENSES / NET.
+    Pre-fix a 5,000 income target and 300 of expenses summed to a
+    TOTAL of 5,300 that read as spending (bookkeeper, 2026-09-09)."""
+
+    def _mixed(self, gb, salary_actual="4800", groceries_actual="250"):
+        from datetime import date as _date
+        gb.create_budget(name="M", num_periods=12, period_type="monthly",
+                         start_date="2026-01-01")
+        gb.set_budget_amount("M", "Income:Salary", "5000", period=5)
+        gb.set_budget_amount("M", "Expenses:Groceries", "300", period=5)
+        gb.create_transaction(
+            description="Pay",
+            splits=[
+                {"account": "Assets:Checking", "amount": salary_actual},
+                {"account": "Income:Salary", "amount": f"-{salary_actual}"},
+            ],
+            trans_date=_date(2026, 6, 15),
+        )
+        gb.create_transaction(
+            description="Food",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": groceries_actual},
+                {"account": "Assets:Checking", "amount": f"-{groceries_actual}"},
+            ],
+            trans_date=_date(2026, 6, 16),
+        )
+
+    def test_mixed_budget_reports_sides_and_net(self, budget_book):
+        gb = GnuCashBook(str(budget_book))
+        self._mixed(gb)
+        r = gb.get_budget_report("M", period=5, compact=False)
+        inc, exp = r["subtotals"]["income"], r["subtotals"]["expenses"]
+        assert (Decimal(inc["budgeted"]), Decimal(inc["actual"])) == (Decimal("5000"), Decimal("4800"))
+        assert (Decimal(exp["budgeted"]), Decimal(exp["actual"])) == (Decimal("300"), Decimal("250"))
+        t = r["totals"]
+        assert t["basis"] == "net (income - expenses)"
+        assert Decimal(t["budgeted"]) == Decimal("4700")
+        assert Decimal(t["actual"]) == Decimal("4550")
+        assert Decimal(t["remaining"]) == Decimal("150")
+        assert "percent_used" not in t  # a difference, not a ratio
+        text = gb.get_budget_report("M", period=5)
+        lines = text.splitlines()
+        assert lines[-3].startswith("INCOME")
+        assert lines[-2].startswith("EXPENSES")
+        assert lines[-1].startswith("NET")
+        assert lines[-1].rstrip().endswith("—")  # no %Used on NET
+        assert not any(l.startswith("TOTAL") for l in lines)
+
+    def test_single_side_unchanged(self, budget_book):
+        gb = GnuCashBook(str(budget_book))
+        gb.create_budget(name="E", num_periods=12, period_type="monthly",
+                         start_date="2026-01-01")
+        gb.set_budget_amount("E", "Expenses:Groceries", "300", period=0)
+        r = gb.get_budget_report("E", period=0, compact=False)
+        assert "subtotals" not in r
+        assert "basis" not in r["totals"]
+        assert Decimal(r["totals"]["budgeted"]) == Decimal("300")
+        assert gb.get_budget_report("E", period=0).splitlines()[-1].startswith("TOTAL")
+
+    def test_income_only_is_a_single_side(self, budget_book):
+        gb = GnuCashBook(str(budget_book))
+        gb.create_budget(name="I", num_periods=12, period_type="monthly",
+                         start_date="2026-01-01")
+        gb.set_budget_amount("I", "Income:Salary", "5000", period=0)
+        r = gb.get_budget_report("I", period=0, compact=False)
+        assert "subtotals" not in r
+        assert Decimal(r["totals"]["budgeted"]) == Decimal("5000")
+        assert gb.get_budget_report("I", period=0).splitlines()[-1].startswith("TOTAL")
+
+    def test_marker_fires_on_expenses_side_only(self, budget_book):
+        gb = GnuCashBook(str(budget_book))
+        self._mixed(gb, salary_actual="6000", groceries_actual="400")
+        lines = gb.get_budget_report("M", period=5).splitlines()
+        income_line = next(l for l in lines if l.startswith("INCOME"))
+        expenses_line = next(l for l in lines if l.startswith("EXPENSES"))
+        net_line = next(l for l in lines if l.startswith("NET"))
+        assert "⚠" not in income_line        # 120% of income is good news
+        salary_row = next(l for l in lines if l.startswith("Income:Salary"))
+        assert "⚠" not in salary_row         # nor on the row itself
+        assert expenses_line.endswith("⚠")   # 133% of expenses is not
+        assert "⚠" not in net_line
+
+
+class TestBudgetHeadlineExpensesOnly:
+    """The dashboard headline paces expense targets only."""
+
+    def _covering_today(self, gb):
+        from datetime import date as _date
+        today = _date.today()
+        # One period covering this month: the headline paces the
+        # whole budget span, so a 12-month budget would read 250
+        # against 6,000.
+        gb.create_budget(name="H", num_periods=1, period_type="monthly",
+                         start_date=today.replace(day=1).isoformat())
+        return today
+
+    def test_income_target_does_not_dilute_used_pct(self, budget_book):
+        gb = GnuCashBook(str(budget_book))
+        today = self._covering_today(gb)
+        gb.set_budget_amount("H", "Income:Salary", "5000")
+        gb.set_budget_amount("H", "Expenses:Groceries", "500")
+        gb.create_transaction(
+            description="Food",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "250"},
+                {"account": "Assets:Checking", "amount": "-250"},
+            ],
+            trans_date=today,
+        )
+        gb.create_transaction(
+            description="Pay",
+            splits=[
+                {"account": "Assets:Checking", "amount": "4800"},
+                {"account": "Income:Salary", "amount": "-4800"},
+            ],
+            trans_date=today,
+        )
+        with gb.open(readonly=True) as book:
+            h = gb._budget_headline(book, list(book.transactions))
+        assert h["used_pct"] == Decimal("50")  # 250 / 500, not 5050 / 5500
+
+    def test_income_only_budget_has_no_spending_headline(self, budget_book):
+        gb = GnuCashBook(str(budget_book))
+        self._covering_today(gb)
+        gb.set_budget_amount("H", "Income:Salary", "5000")
+        with gb.open(readonly=True) as book:
+            assert gb._budget_headline(book, list(book.transactions)) is None

@@ -104,10 +104,15 @@ def _format_budget_report_compact(report: dict) -> str:
 
     ``⚠`` fires above 110% used — same threshold as the
     get_book_summary headline. A common ``Expenses:`` / ``Income:``
-    prefix is stripped.
+    prefix is stripped. A budget with both income and expense
+    targets ends in INCOME / EXPENSES / NET lines instead of one
+    TOTAL. The marker never fires on an income row or the INCOME
+    line — beating an income target is not a warning — and NET
+    carries no %Used (a difference, not a ratio).
     """
     accounts = report.get("accounts", [])
     totals = report.get("totals", {})
+    subtotals = report.get("subtotals")
     budget_name = report.get("budget", "?")
     period_info = report.get("period", "")
 
@@ -125,8 +130,19 @@ def _format_budget_report_compact(report: dict) -> str:
             common_prefix = candidate
     leaves = [n[len(common_prefix):] for n in full_names]
 
+    # (label, row, marker-eligible) for the closing lines.
+    if subtotals:
+        closing = [
+            ("INCOME", subtotals["income"], False),
+            ("EXPENSES", subtotals["expenses"], True),
+            ("NET", totals, False),
+        ]
+    else:
+        closing = [("TOTAL", totals, True)]
+
     name_width = max(
-        max(len(l) for l in leaves), len("Account"), len("TOTAL"),
+        max(len(l) for l in leaves), len("Account"),
+        max(len(label) for label, _, _ in closing),
     )
 
     def _fmt(value: str) -> str:
@@ -141,24 +157,36 @@ def _format_budget_report_compact(report: dict) -> str:
     remaining_strs = [_fmt(r["remaining"]) for r in accounts]
     pct_strs = [f"{r['percent_used']}%" for r in accounts]
 
-    total_budget = _fmt(totals.get("budgeted", "0"))
-    total_actual = _fmt(totals.get("actual", "0"))
-    total_remaining = _fmt(totals.get("remaining", "0"))
-    total_pct = f"{totals.get('percent_used', '0')}%"
+    closing_strs = [
+        (
+            label,
+            _fmt(row.get("budgeted", "0")),
+            _fmt(row.get("actual", "0")),
+            _fmt(row.get("remaining", "0")),
+            (
+                f"{row['percent_used']}%"
+                if "percent_used" in row else "—"
+            ),
+            markable,
+        )
+        for label, row, markable in closing
+    ]
 
     budget_w = max(
-        max(len(s) for s in budget_strs), len(total_budget), len("Budget"),
+        max(len(s) for s in budget_strs),
+        max(len(c[1]) for c in closing_strs), len("Budget"),
     )
     actual_w = max(
-        max(len(s) for s in actual_strs), len(total_actual), len("Actual"),
+        max(len(s) for s in actual_strs),
+        max(len(c[2]) for c in closing_strs), len("Actual"),
     )
     remaining_w = max(
         max(len(s) for s in remaining_strs),
-        len(total_remaining),
-        len("Remaining"),
+        max(len(c[3]) for c in closing_strs), len("Remaining"),
     )
     pct_w = max(
-        max(len(s) for s in pct_strs), len(total_pct), len("%Used"),
+        max(len(s) for s in pct_strs),
+        max(len(c[4]) for c in closing_strs), len("%Used"),
     )
 
     def _pct_marker(pct_str: str) -> str:
@@ -177,23 +205,26 @@ def _format_budget_report_compact(report: dict) -> str:
         f"{'Remaining':>{remaining_w}}  "
         f"{'%Used':>{pct_w}}"
     )
-    for leaf, b, a, rem, pct in zip(
-        leaves, budget_strs, actual_strs, remaining_strs, pct_strs,
+    for row, leaf, b, a, rem, pct in zip(
+        accounts, leaves, budget_strs, actual_strs, remaining_strs,
+        pct_strs,
     ):
+        markable = row.get("side", "expenses") != "income"
         lines.append(
             f"{leaf:<{name_width}}  "
             f"{b:>{budget_w}}  "
             f"{a:>{actual_w}}  "
             f"{rem:>{remaining_w}}  "
-            f"{pct:>{pct_w}}{_pct_marker(pct)}"
+            f"{pct:>{pct_w}}{_pct_marker(pct) if markable else ''}"
         )
-    lines.append(
-        f"{'TOTAL':<{name_width}}  "
-        f"{total_budget:>{budget_w}}  "
-        f"{total_actual:>{actual_w}}  "
-        f"{total_remaining:>{remaining_w}}  "
-        f"{total_pct:>{pct_w}}{_pct_marker(total_pct)}"
-    )
+    for label, b, a, rem, pct, markable in closing_strs:
+        lines.append(
+            f"{label:<{name_width}}  "
+            f"{b:>{budget_w}}  "
+            f"{a:>{actual_w}}  "
+            f"{rem:>{remaining_w}}  "
+            f"{pct:>{pct_w}}{_pct_marker(pct) if markable else ''}"
+        )
     return "\n".join(lines)
 
 
@@ -940,38 +971,67 @@ class BudgetsMixin:
                     ) + (-amount)
 
             accounts_result = []
-            total_budgeted = Decimal("0")
-            total_actual = Decimal("0")
+            # Income and expense targets are tallied on their own
+            # sides. A single TOTAL that adds a 5,000 income target
+            # to 300 of expenses is a number that means nothing; it
+            # only looked like spending while no income row existed
+            # (bookkeeper, 2026-09-09). One side present → the
+            # TOTAL is that side, as it always was. Both → per-side
+            # subtotals and a NET (income − expenses) line.
+            side_sums = {
+                "income": [Decimal("0"), Decimal("0")],
+                "expenses": [Decimal("0"), Decimal("0")],
+            }
+            sides_seen: set[str] = set()
+
+            def _totals_row(b: Decimal, a: Decimal) -> dict:
+                pct = (
+                    (a / b * 100).quantize(Decimal("0.1"))
+                    if b > 0 else Decimal("0")
+                )
+                return {
+                    "budgeted": str(b),
+                    "actual": str(a),
+                    "remaining": str(b - a),
+                    "percent_used": str(pct),
+                }
 
             for acct_name in sorted(budgeted.keys()):
                 b = budgeted[acct_name]
                 a = actuals.get(acct_name, Decimal("0"))
-                remaining = b - a
-                pct = (
-                    (a / b * 100).quantize(Decimal("0.1"))
-                    if b > 0
-                    else Decimal("0")
+                side = (
+                    "income"
+                    if budgeted_accounts[acct_name].type == "INCOME"
+                    else "expenses"
                 )
-
                 accounts_result.append({
                     "account": acct_name,
-                    "budgeted": str(b),
-                    "actual": str(a),
-                    "remaining": str(remaining),
-                    "percent_used": str(pct),
+                    "side": side,
+                    **_totals_row(b, a),
                 })
+                sides_seen.add(side)
+                side_sums[side][0] += b
+                side_sums[side][1] += a
 
-                total_budgeted += b
-                total_actual += a
-
-            total_remaining = total_budgeted - total_actual
-            total_pct = (
-                (total_actual / total_budgeted * 100).quantize(
-                    Decimal("0.1")
-                )
-                if total_budgeted > 0
-                else Decimal("0")
-            )
+            subtotals = None
+            if len(sides_seen) == 2:
+                inc_b, inc_a = side_sums["income"]
+                exp_b, exp_a = side_sums["expenses"]
+                subtotals = {
+                    "income": _totals_row(inc_b, inc_a),
+                    "expenses": _totals_row(exp_b, exp_a),
+                }
+                totals = _totals_row(inc_b - exp_b, inc_a - exp_a)
+                # NET is a difference, not a ratio: net actual ÷ net
+                # budgeted goes negative whenever expenses post
+                # before income and flips meaning with the sign of
+                # the planned net (bookkeeper, 2026-09-10). No pace
+                # number on this line.
+                del totals["percent_used"]
+                totals["basis"] = "net (income - expenses)"
+            else:
+                only = next(iter(sides_seen)) if sides_seen else "expenses"
+                totals = _totals_row(*side_sums[only])
 
             if len(report_periods) == 1:
                 p_start, p_end = self._period_to_date_range(
@@ -991,13 +1051,10 @@ class BudgetsMixin:
                 "budget": budget_name,
                 "period": period_info,
                 "accounts": accounts_result,
-                "totals": {
-                    "budgeted": str(total_budgeted),
-                    "actual": str(total_actual),
-                    "remaining": str(total_remaining),
-                    "percent_used": str(total_pct),
-                },
+                "totals": totals,
             }
+            if subtotals:
+                full["subtotals"] = subtotals
             warning = None
             if unconverted_currencies:
                 warning = (
