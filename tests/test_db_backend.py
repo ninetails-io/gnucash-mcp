@@ -66,6 +66,11 @@ def clean_server():
         k: os.environ.get(k)
         for k in ("GNUCASH_BOOK_PATH", "GNUCASH_BOOK_URI", "GNUCASH_LOG_DIR")
     }
+    # _server_state is a dict the globals above do not cover; a test
+    # here writes book_is_uri into it, and the config-rendering tests
+    # in test_modules read it back (an xdist worker running both saw
+    # "Backend: database" on a file book — the 6-lines-not-5 flake).
+    saved_state = dict(srv._server_state)
     srv._book = None
     srv._book_uri = None
     srv._book_paths = []
@@ -79,6 +84,8 @@ def clean_server():
     finally:
         for name, value in saved.items():
             setattr(srv, name, value)
+        srv._server_state.clear()
+        srv._server_state.update(saved_state)
         for k, v in saved_env.items():
             if v is None:
                 os.environ.pop(k, None)

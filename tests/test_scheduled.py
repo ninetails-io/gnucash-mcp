@@ -389,14 +389,12 @@ class TestCreateFromScheduled:
     def test_falls_back_to_name_without_description_slot(
         self, scheduled_book,
     ):
-        """Templates created before the description slot existed
-        instantiate with the SX name, as they always did."""
-        from sqlalchemy import text
-
+        """A legacy recipe with no description slot instantiates
+        under the SX name — what instantiation always used to do."""
         gb = GnuCashBook(str(scheduled_book))
-        gb.create_scheduled_transaction(
-            name="Monthly Rent",
-            description="Rent",
+        sx = gb.create_scheduled_transaction(
+            name="Rent",
+            description="Monthly Rent",
             splits=[
                 {"account": "Expenses:Rent", "amount": "1850.00"},
                 {"account": "Assets:Checking", "amount": "-1850.00"},
@@ -404,21 +402,11 @@ class TestCreateFromScheduled:
             start_date="2026-01-01",
             frequency="monthly",
         )
-        # Simulate a pre-slot template by removing the slot.
-        with gb.open(readonly=False) as book:
-            book.session.execute(
-                text("DELETE FROM slots WHERE name = 'description'")
-            )
-            book.save()
-            sx_guid = book.session.execute(
-                text("SELECT guid FROM schedxactions")
-            ).first()[0]
-
+        _make_legacy(scheduled_book, "Rent", description=False)
         result = gb.create_transaction_from_scheduled(
-            guid=sx_guid, transaction_date="2026-02-01",
+            guid=sx["guid"], transaction_date="2026-01-01",
         )
-        txn = gb.get_transaction(result["transaction_guid"])
-        assert txn["description"] == "Monthly Rent"
+        assert result["description"] == "Rent"
 
     def test_updates_tracking(self, scheduled_book):
         gb = GnuCashBook(str(scheduled_book))
@@ -1133,6 +1121,66 @@ class TestScheduledSplitAction:
         assert eur["action"] == "Buy"
 
 
+# ── Legacy-shape helper ─────────────────────────────────────────
+
+
+def _make_legacy(book_path, sx_name, *, refs="guid", description=True,
+                 notes=None, currency=None):
+    """Rewrite a native schedule as the pre-native on-disk shape,
+    byte-faithfully: template rows gone, recipe in a ``splits-json``
+    slot on the SX row (account refs as GUIDs or paths), optional
+    description / notes / currency slots. The state outlives the
+    door that made it — real books carry it until their first
+    write — so the guards that read it need tests that can still
+    construct it."""
+    import json
+    from sqlalchemy import text
+    gb = GnuCashBook(str(book_path))
+    with gb.open(readonly=False) as book:
+        sx = next(s for s in book.session.query(
+            __import__("piecash").core.transaction.ScheduledTransaction
+        ).all() if s.name == sx_name)
+        recipe = gb._sx_recipe(book, sx)
+        assert recipe["source"] == "native"
+        legs = []
+        for s in recipe["splits"]:
+            leg = dict(s)
+            if refs == "path":
+                acct = book.session.query(
+                    __import__("piecash").Account
+                ).filter_by(guid=s["account"]).first()
+                leg["account"] = acct.fullname
+            legs.append(leg)
+        desc = recipe["description"]
+        tmpl = sx.template_account
+        txns = gb._strip_template_recipe(book, tmpl, "legacy-ize")
+        for t in txns:
+            book.session.delete(t)
+        book.session.flush()
+        # Pre-native containers: named by the schedule, on the book
+        # currency (what create used to make).
+        book.session.execute(
+            text("UPDATE accounts SET name = :n, commodity_guid = "
+                 "(SELECT guid FROM commodities WHERE mnemonic = 'USD' "
+                 "AND namespace = 'CURRENCY') WHERE guid = :g"),
+            {"n": sx_name, "g": tmpl.guid},
+        )
+        rows = [("splits-json", json.dumps(legs))]
+        if description and desc:
+            rows.append(("description", desc))
+        if notes:
+            rows.append(("notes", notes))
+        if currency:
+            rows.append(("currency", currency))
+        for name, val in rows:
+            book.session.execute(
+                text("INSERT INTO slots (obj_guid, name, slot_type, string_val) "
+                     "VALUES (:g, :n, 4, :v)"),
+                {"g": sx.guid, "n": name, "v": val},
+            )
+        book.save()
+
+
 # ── Occurrence agreement (the _sx_next_due chokepoint) ─────────
 
 
@@ -1290,10 +1338,16 @@ class TestSplitRefStorage:
         _rent(gb, date.today())
         from sqlalchemy import text
         with gb.open(readonly=True) as book:
-            raw = book.session.execute(
-                text("SELECT string_val FROM slots WHERE name='splits-json'")
-            ).scalar()
-        assert "Expenses:Rent" not in raw  # stored as GUID
+            assert book.session.execute(
+                text("SELECT COUNT(*) FROM slots WHERE name='splits-json'")
+            ).scalar() == 0
+            guids = [r[0] for r in book.session.execute(text(
+                "SELECT guid_val FROM slots WHERE name='sched-xaction/account'"
+            )).fetchall()]
+            rent_guid = next(
+                a.guid for a in book.accounts if a.fullname == "Expenses:Rent"
+            )
+        assert rent_guid in guids  # stored as GUID
         listed = gb.list_scheduled_transactions(compact=False)
         paths = {s["account"] for s in listed["scheduled_transactions"][0]["splits"]}
         assert paths == {"Expenses:Rent", "Assets:Checking"}
@@ -1306,18 +1360,7 @@ class TestSplitRefStorage:
         keep working while the path lives."""
         gb = GnuCashBook(str(scheduled_book))
         sx = _rent(gb, date.today())
-        import json
-        from sqlalchemy import text
-        legacy = json.dumps([
-            {"account": "Expenses:Rent", "amount": "1850.00", "memo": ""},
-            {"account": "Assets:Checking", "amount": "-1850.00", "memo": ""},
-        ])
-        with gb.open(readonly=False) as book:
-            book.session.execute(
-                text("UPDATE slots SET string_val=:v WHERE name='splits-json'"),
-                {"v": legacy},
-            )
-            book.save()
+        _make_legacy(scheduled_book, "Rent", refs="path")
         r = gb.create_transaction_from_scheduled(guid=sx["guid"])
         assert r["status"] == "created"
         listed = gb.list_scheduled_transactions(compact=False)
@@ -1419,3 +1462,564 @@ class TestLoopFollowUps:
         gb.create_transaction_from_scheduled(guid=sx["guid"])
         with pytest.raises(ValueError, match="entered all 1 occurrences"):
             gb.create_transaction_from_scheduled(guid=sx["guid"])
+
+
+# ── Native template transactions (GnuCash's own recipe format) ──
+
+
+def _slots_for(book, obj_guid):
+    from sqlalchemy import text
+    rows = book.session.execute(
+        text("SELECT name, slot_type, string_val, guid_val, numeric_val_num, "
+             "numeric_val_denom FROM slots WHERE obj_guid = :g"),
+        {"g": obj_guid},
+    ).fetchall()
+    return {r[0]: tuple(r[1:]) for r in rows}
+
+
+def _template_rows(book, sx_name):
+    """(template account row, [split guids], template txn guids)."""
+    from sqlalchemy import text
+    sx = book.session.execute(
+        text("SELECT guid, template_act_guid FROM schedxactions WHERE name = :n"),
+        {"n": sx_name},
+    ).first()
+    acct = book.session.execute(
+        text("SELECT name, account_type, commodity_guid FROM accounts WHERE guid = :g"),
+        {"g": sx[1]},
+    ).first()
+    splits = [r[0] for r in book.session.execute(
+        text("SELECT guid FROM splits WHERE account_guid = :a"), {"a": sx[1]},
+    ).fetchall()]
+    txns = [r[0] for r in book.session.execute(
+        text("SELECT DISTINCT tx_guid FROM splits WHERE account_guid = :a"),
+        {"a": sx[1]},
+    ).fetchall()]
+    return sx, acct, splits, txns
+
+
+class TestNativeTemplates:
+    """The recipe is stored the way GnuCash's SX editor stores it —
+    Split.cpp's sched-xaction slots on zero-value splits of a template
+    transaction — so Since-Last-Run sees what this server wrote and
+    this server reads what desktop wrote. Pre-fix the recipe lived in
+    a private splits-json slot: desktop advanced our schedules with
+    nothing posted, and desktop-made schedules had no recipe here."""
+
+    def test_round_trip_writes_the_split_cpp_shape(self, scheduled_book):
+        from sqlalchemy import text
+        gb = GnuCashBook(str(scheduled_book))
+        gb.create_scheduled_transaction(
+            name="Rent", description="Monthly Rent", notes="lease 12",
+            splits=[
+                {"account": "Expenses:Rent", "amount": "1850.00", "memo": "unit 4"},
+                {"account": "Assets:Checking", "amount": "-1850.00"},
+            ],
+            start_date="2026-01-01", frequency="monthly",
+        )
+        with gb.open(readonly=True) as book:
+            sx, acct, splits, txns = _template_rows(book, "Rent")
+            # Template account as xaccSchedXactionInit makes it.
+            assert acct[0] == sx[0] and acct[1] == "BANK"
+            com = book.session.execute(
+                text("SELECT namespace, mnemonic, fullname, cusip, fraction "
+                     "FROM commodities WHERE guid = :g"), {"g": acct[2]},
+            ).first()
+            assert tuple(com) == ("template", "template", "template", "template", 1)
+            # One template transaction carrying description + notes.
+            assert len(txns) == 1
+            desc, cur = book.session.execute(
+                text("SELECT t.description, c.mnemonic FROM transactions t "
+                     "JOIN commodities c ON c.guid = t.currency_guid WHERE t.guid = :g"),
+                {"g": txns[0]},
+            ).first()
+            assert (desc, cur) == ("Monthly Rent", "USD")
+            assert _slots_for(book, txns[0])["notes"][1] == "lease 12"
+            # Each split: frame + five children, both sides written.
+            rent_guid = next(a.guid for a in book.accounts if a.fullname == "Expenses:Rent")
+            seen = {}
+            for sg in splits:
+                frame = _slots_for(book, sg)["sched-xaction"]
+                assert frame[0] == 9
+                ch = _slots_for(book, frame[2])
+                assert set(ch) == {
+                    "sched-xaction/account", "sched-xaction/credit-formula",
+                    "sched-xaction/debit-formula", "sched-xaction/credit-numeric",
+                    "sched-xaction/debit-numeric",
+                }
+                seen[ch["sched-xaction/account"][2]] = ch
+            rent = seen[rent_guid]
+            assert rent["sched-xaction/account"][0] == 5
+            assert rent["sched-xaction/debit-formula"][1] == "1850.00"
+            assert rent["sched-xaction/debit-numeric"][3:] == (185000, 100)
+            assert rent["sched-xaction/credit-formula"][1] == ""
+            assert rent["sched-xaction/credit-numeric"][3:] == (0, 100)
+            # Nothing legacy on the SX row.
+            assert _slots_for(book, sx[0]) == {}
+
+    def test_desktop_shaped_rows_formula_only_instantiate(self, scheduled_book):
+        """Older desktop templates carry formulas without numerics;
+        a plain-number formula is parsed."""
+        from sqlalchemy import text
+        gb = GnuCashBook(str(scheduled_book))
+        sx = _rent(gb, date.today())
+        with gb.open(readonly=False) as book:
+            book.session.execute(text(
+                "DELETE FROM slots WHERE name IN "
+                "('sched-xaction/credit-numeric', 'sched-xaction/debit-numeric')"
+            ))
+            book.save()
+        r = gb.create_transaction_from_scheduled(guid=sx["guid"])
+        assert r["status"] == "created"
+        txn = gb.get_transaction(r["transaction_guid"])
+        amounts = {s["account"]: Decimal(s["value"]) for s in txn["splits"]}
+        assert amounts["Expenses:Rent"] == Decimal("1850.00")
+
+    def test_formula_with_variables_is_refused_and_listed(self, scheduled_book):
+        from sqlalchemy import text
+        gb = GnuCashBook(str(scheduled_book))
+        sx = _rent(gb, date.today())
+        with gb.open(readonly=False) as book:
+            book.session.execute(text(
+                "UPDATE slots SET string_val = 'rent*2' "
+                "WHERE name = 'sched-xaction/debit-formula' AND string_val <> ''"
+            ))
+            book.session.execute(text(
+                "UPDATE slots SET numeric_val_num = 0 "
+                "WHERE name = 'sched-xaction/debit-numeric'"
+            ))
+            book.save()
+        row = gb.list_scheduled_transactions(compact=False)["scheduled_transactions"][0]
+        assert any("rent*2" in p for p in row["problems"])
+        with pytest.raises(ValueError, match="rent\\*2"):
+            gb.create_transaction_from_scheduled(guid=sx["guid"])
+
+    def test_legacy_recipe_migrates_on_update(self, scheduled_book):
+        from sqlalchemy import text
+        gb = GnuCashBook(str(scheduled_book))
+        _rent(gb, date.today())
+        _make_legacy(scheduled_book, "Rent", notes="old notes", currency="USD")
+        listed = gb.list_scheduled_transactions(compact=False)["scheduled_transactions"][0]
+        assert listed["recipe"] == "legacy"
+        guid = listed["guid"]
+        r = gb.update_scheduled_transaction(guid, enabled=True)
+        assert r.get("templates_migrated") == 1
+        with gb.open(readonly=True) as book:
+            sx, acct, splits, txns = _template_rows(book, "Rent")
+            assert len(txns) == 1 and len(splits) == 2
+            assert _slots_for(book, sx[0]) == {}  # four legacy slots gone
+            assert _slots_for(book, txns[0])["notes"][1] == "old notes"
+        r2 = gb.update_scheduled_transaction(guid, enabled=True)
+        assert "templates_migrated" not in r2
+        assert gb.list_scheduled_transactions(compact=False)["scheduled_transactions"][0]["recipe"] == "native"
+
+    def test_legacy_recipe_migrates_on_instantiate(self, scheduled_book):
+        gb = GnuCashBook(str(scheduled_book))
+        sx = _rent(gb, date.today())
+        _make_legacy(scheduled_book, "Rent", refs="path")
+        r = gb.create_transaction_from_scheduled(guid=sx["guid"])
+        assert r["status"] == "created" and r.get("templates_migrated") == 1
+        with gb.open(readonly=True) as book:
+            sx_row, _, splits, txns = _template_rows(book, "Rent")
+            assert len(txns) == 1 and len(splits) == 2
+            assert _slots_for(book, sx_row[0]) == {}
+
+    def test_reads_never_migrate(self, scheduled_book):
+        from sqlalchemy import text
+        gb = GnuCashBook(str(scheduled_book))
+        _rent(gb, date.today())
+        _make_legacy(scheduled_book, "Rent")
+        gb.list_scheduled_transactions(compact=False)
+        gb.get_upcoming_transactions(days=7, compact=False)
+        gb.get_book_summary()
+        with gb.open(readonly=True) as book:
+            assert book.session.execute(
+                text("SELECT COUNT(*) FROM slots WHERE name = 'splits-json'")
+            ).scalar() == 1
+
+    def test_update_notes_lands_on_template_transaction(self, scheduled_book):
+        gb = GnuCashBook(str(scheduled_book))
+        sx = _rent(gb, date.today())
+        gb.update_scheduled_transaction(sx["guid"], notes="new")
+        with gb.open(readonly=True) as book:
+            sx_row, _, _, txns = _template_rows(book, "Rent")
+            assert _slots_for(book, txns[0])["notes"][1] == "new"
+            assert "notes" not in _slots_for(book, sx_row[0])
+        assert gb.list_scheduled_transactions(compact=False)["scheduled_transactions"][0]["notes"] == "new"
+
+    def test_instance_is_stamped_and_its_delete_spares_the_schedule(self, scheduled_book):
+        """Desktop stamps instances from-sched-xaction; so do we.
+        Deleting the instance must not cascade through that GUID slot
+        into the schedule (piecash's SlotGUID delete-orphan trap)."""
+        gb = GnuCashBook(str(scheduled_book))
+        sx = _rent(gb, date.today())
+        r = gb.create_transaction_from_scheduled(guid=sx["guid"])
+        with gb.open(readonly=True) as book:
+            created = gb._find_transaction(book, r["transaction_guid"])
+            stamp = _slots_for(book, created.guid)["from-sched-xaction"]
+            sx_guid = _template_rows(book, "Rent")[0][0]
+        assert stamp[0] == 5 and stamp[2] == sx_guid
+        gb.delete_transaction(r["transaction_guid"])
+        # Schedule intact: recipe still native, still instantiable.
+        row = gb.list_scheduled_transactions(compact=False)["scheduled_transactions"][0]
+        assert row["recipe"] == "native" and len(row["splits"]) == 2
+
+    def test_delete_schedule_spares_target_account_slots(self, scheduled_book):
+        """The landmine: sched-xaction/account is a GUID slot; an ORM
+        delete of the template split would sweep every slot of the
+        TARGET account. Strip first, then delete."""
+        gb = GnuCashBook(str(scheduled_book))
+        sx = _rent(gb, date.today())
+        gb.set_account_slot("Expenses:Rent", "apr", "0")
+        gb.set_account_slot("Assets:Checking", "statement_close_day", "15")
+        gb.delete_scheduled_transaction(sx["guid"])
+        assert gb.get_account_slots("Expenses:Rent")["slots"]["apr"] == "0"
+        assert gb.get_account_slots("Assets:Checking")["slots"]["statement_close_day"] == "15"
+        with gb.open(readonly=True) as book:
+            from sqlalchemy import text
+            assert book.session.execute(
+                text("SELECT COUNT(*) FROM slots WHERE name LIKE 'sched-xaction%'")
+            ).scalar() == 0
+            assert book.session.execute(text("SELECT COUNT(*) FROM schedxactions")).scalar() == 0
+
+    def test_template_commodity_once_and_filtered(self, scheduled_book):
+        from sqlalchemy import text
+        gb = GnuCashBook(str(scheduled_book))
+        _rent(gb, date.today())
+        _rent(gb, date.today(), name="Rent 2")
+        with gb.open(readonly=True) as book:
+            assert book.session.execute(
+                text("SELECT COUNT(*) FROM commodities WHERE namespace = 'template'")
+            ).scalar() == 1
+        assert "template" not in gb.list_commodities()
+
+    def test_template_rows_do_not_trip_duplicate_detection(self, scheduled_book):
+        """Template rows are real transactions on a hidden account; a
+        real entry with the same description and amount on the
+        schedule's start date must not be flagged against them."""
+        gb = GnuCashBook(str(scheduled_book))
+        today = date.today()
+        gb.create_scheduled_transaction(
+            name="Rent", description="Rent",
+            splits=[
+                {"account": "Expenses:Rent", "amount": "1850.00"},
+                {"account": "Assets:Checking", "amount": "-1850.00"},
+            ],
+            start_date=today.isoformat(), frequency="monthly",
+        )
+        r = gb.create_transaction(
+            description="Rent",
+            splits=[
+                {"account": "Expenses:Rent", "amount": "1850.00"},
+                {"account": "Assets:Checking", "amount": "-1850.00"},
+            ],
+            trans_date=today,
+        )
+        assert r["status"] == "created"
+
+
+class TestNativeTemplatesFX:
+    def _eur_schedule(self, gb, with_quantity=True):
+        splits = [
+            {"account": "Assets:Euro Savings", "amount": "-110.00",
+             **({"quantity": "-100.00"} if with_quantity else {})},
+            {"account": "Expenses:Groceries", "amount": "110.00"},
+        ]
+        return gb.create_scheduled_transaction(
+            name="EU Groceries", description="EU Groceries", splits=splits,
+            start_date=date.today().isoformat(), frequency="monthly",
+        )
+
+    def test_quantity_replays_from_namespaced_slot(self, multi_currency_book):
+        from sqlalchemy import text
+        gb = GnuCashBook(str(multi_currency_book))
+        sx = self._eur_schedule(gb)
+        with gb.open(readonly=True) as book:
+            q = book.session.execute(text(
+                "SELECT numeric_val_num, numeric_val_denom FROM slots "
+                "WHERE name = 'gnc-mcp/quantity'"
+            )).first()
+        assert tuple(q) == (-10000, 100)
+        r = gb.create_transaction_from_scheduled(guid=sx["guid"])
+        txn = gb.get_transaction(r["transaction_guid"])
+        eur = next(s for s in txn["splits"] if s["account"] == "Assets:Euro Savings")
+        assert Decimal(eur["quantity"]) == Decimal("-100.00")
+
+    def test_desktop_fx_leg_uses_rate_on_file_or_refuses(self, multi_currency_book):
+        """A desktop-made cross-commodity leg has no fixed quantity;
+        GnuCash asks for the rate. We answer from book.prices at the
+        instance date, or refuse naming the leg."""
+        from sqlalchemy import text
+        gb = GnuCashBook(str(multi_currency_book))
+        # Create requires the quantity (shared split contract); the
+        # desktop shape is engineered by dropping our namespaced slot.
+        sx = self._eur_schedule(gb)
+        with gb.open(readonly=False) as book:
+            book.session.execute(text("DELETE FROM prices"))
+            book.session.execute(text(
+                "DELETE FROM slots WHERE name IN ('gnc-mcp', 'gnc-mcp/quantity')"
+            ))
+            book.save()
+        with pytest.raises(ValueError, match="Euro Savings.*EUR/USD rate"):
+            gb.create_transaction_from_scheduled(guid=sx["guid"])
+        gb.create_price(commodity="EUR", namespace="CURRENCY", value="1.10", currency="USD",
+                        price_date=date.today())
+        r = gb.create_transaction_from_scheduled(guid=sx["guid"])
+        txn = gb.get_transaction(r["transaction_guid"])
+        eur = next(s for s in txn["splits"] if s["account"] == "Assets:Euro Savings")
+        assert Decimal(eur["quantity"]) == Decimal("-100.00")
+
+
+
+# ── Recurrence engine (Recurrence.cpp, ported) ─────────────────
+
+
+class TestRecurrenceEngine:
+    """recurrenceNextInstance, line for line. Desktop anchors an
+    occurrence on the recurrence row — period start, multiplier,
+    period type, weekend adjustment — and a schedule may carry
+    several rows. Pre-fix the server used start_date + its own
+    frequency label: a desktop schedule "start 9 Sep, monthly on
+    the 15th" posted on the 9th and wrote last_occur=9th, so
+    desktop's next run posted the 15th again (bookkeeper, 2026-09-10)."""
+
+    def _n(self, pt, mult, start, ref, wadj="none"):
+        from gnucash_mcp.book.scheduling import _recurrence_next
+        return _recurrence_next(pt, mult, start, wadj, ref)
+
+    def test_ref_before_start_is_the_start(self):
+        assert self._n("month", 1, date(2026, 9, 15), date(2026, 9, 8)) == date(2026, 9, 15)
+
+    def test_monthly_anchor_day(self):
+        assert self._n("month", 1, date(2026, 9, 15), date(2026, 9, 15)) == date(2026, 10, 15)
+        assert self._n("month", 1, date(2026, 9, 15), date(2026, 9, 20)) == date(2026, 10, 15)
+
+    def test_monthly_31st_clamps_and_recovers(self):
+        assert self._n("month", 1, date(2026, 1, 31), date(2026, 1, 31)) == date(2026, 2, 28)
+        assert self._n("month", 1, date(2026, 1, 31), date(2026, 2, 28)) == date(2026, 3, 31)
+
+    def test_quarterly_from_anchor(self):
+        assert self._n("month", 3, date(2025, 4, 15), date(2026, 4, 15)) == date(2026, 7, 15)
+
+    def test_semiannual_is_just_a_multiplier(self):
+        assert self._n("month", 6, date(2026, 1, 10), date(2026, 3, 1)) == date(2026, 7, 10)
+
+    def test_yearly_leap_day(self):
+        assert self._n("year", 1, date(2024, 2, 29), date(2024, 2, 29)) == date(2025, 2, 28)
+        assert self._n("year", 1, date(2024, 2, 29), date(2027, 2, 28)) == date(2028, 2, 29)
+
+    def test_biweekly_and_daily(self):
+        assert self._n("week", 2, date(2025, 1, 10), date(2026, 7, 10)) == date(2026, 7, 24)
+        assert self._n("day", 1, date(2026, 9, 1), date(2026, 9, 1)) == date(2026, 9, 2)
+        assert self._n("day", 10, date(2026, 9, 1), date(2026, 9, 15)) == date(2026, 9, 21)
+
+    def test_end_of_month(self):
+        assert self._n("end of month", 1, date(2026, 1, 31), date(2026, 2, 28)) == date(2026, 3, 31)
+        assert self._n("end of month", 1, date(2026, 1, 31), date(2026, 3, 15)) == date(2026, 3, 31)
+
+    def test_nth_weekday(self):
+        # 2nd Tuesday: Sep 8 2026 → Oct 13 2026.
+        assert self._n("nth weekday", 1, date(2026, 9, 8), date(2026, 9, 8)) == date(2026, 10, 13)
+
+    def test_last_weekday(self):
+        # last Tuesday: Sep 29 2026 → Oct 27 2026.
+        assert self._n("last weekday", 1, date(2026, 9, 29), date(2026, 9, 29)) == date(2026, 10, 27)
+
+    def test_weekend_forward(self):
+        # Aug 15 2026 is a Saturday → adjusted start Mon Aug 17.
+        assert self._n("month", 1, date(2026, 8, 15), date(2026, 7, 20), "forward") == date(2026, 8, 17)
+        assert self._n("month", 1, date(2026, 8, 15), date(2026, 8, 17), "forward") == date(2026, 9, 15)
+
+    def test_weekend_back(self):
+        assert self._n("month", 1, date(2026, 8, 15), date(2026, 7, 20), "back") == date(2026, 8, 14)
+        # Nov 15 2026 is a Sunday → Fri Nov 13.
+        assert self._n("month", 1, date(2026, 8, 15), date(2026, 10, 15), "back") == date(2026, 11, 13)
+
+    def test_once(self):
+        assert self._n("once", 1, date(2026, 9, 15), date(2026, 9, 1)) == date(2026, 9, 15)
+        assert self._n("once", 1, date(2026, 9, 15), date(2026, 9, 15)) is None
+
+
+class TestScheduleReadsRecurrenceRows:
+    def _second_row(self, book_path, sx_name, period_start_yyyymmdd, pt="month", mult=1):
+        from sqlalchemy import text
+        gb = GnuCashBook(str(book_path))
+        with gb.open(readonly=False) as book:
+            book.session.execute(
+                text("INSERT INTO recurrences (obj_guid, recurrence_mult, "
+                     "recurrence_period_type, recurrence_period_start, "
+                     "recurrence_weekend_adjust) VALUES ((SELECT guid FROM "
+                     "schedxactions WHERE name = :n), :m, :t, :s, 'none')"),
+                {"n": sx_name, "m": mult, "t": pt, "s": period_start_yyyymmdd},
+            )
+            book.save()
+
+    def test_desktop_anchor_day_wins_over_start_date(self, scheduled_book):
+        """Desktop: start 2026-09-09, monthly on the 15th."""
+        from sqlalchemy import text
+        gb = GnuCashBook(str(scheduled_book))
+        sx = _rent(gb, date(2026, 9, 9))
+        with gb.open(readonly=False) as book:
+            book.session.execute(text(
+                "UPDATE recurrences SET recurrence_period_start = '20260915'"
+            ))
+            book.save()
+        row = gb.list_scheduled_transactions(compact=False)["scheduled_transactions"][0]
+        assert row["next_occurrence"] == "2026-09-15"
+        r = gb.create_transaction_from_scheduled(guid=sx["guid"])
+        assert r["transaction_date"] == "2026-09-15"
+
+    def test_composite_schedule_walks_both_rows(self, scheduled_book):
+        gb = GnuCashBook(str(scheduled_book))
+        sx = _rent(gb, date(2026, 9, 20))
+        self._second_row(scheduled_book, "Rent", "20260905")
+        row = gb.list_scheduled_transactions(compact=False)["scheduled_transactions"][0]
+        assert row["frequency"] == "composite (2 rules)"
+        assert row["next_occurrence"] == "2026-09-20"
+        gb.create_transaction_from_scheduled(guid=sx["guid"])
+        row = gb.list_scheduled_transactions(compact=False)["scheduled_transactions"][0]
+        assert row["next_occurrence"] == "2026-10-05"
+        gb.create_transaction_from_scheduled(guid=sx["guid"])
+        row = gb.list_scheduled_transactions(compact=False)["scheduled_transactions"][0]
+        assert row["next_occurrence"] == "2026-10-20"
+
+    def test_unfamiliar_single_rows_are_labeled_and_scheduled(self, scheduled_book):
+        from sqlalchemy import text
+        gb = GnuCashBook(str(scheduled_book))
+        _rent(gb, date(2026, 1, 31))
+        with gb.open(readonly=False) as book:
+            book.session.execute(text(
+                "UPDATE recurrences SET recurrence_period_type = 'end of month', "
+                "recurrence_weekend_adjust = 'forward'"
+            ))
+            book.save()
+        row = gb.list_scheduled_transactions(compact=False)["scheduled_transactions"][0]
+        assert row["frequency"] == "end of month, weekends forward"
+        assert row["next_occurrence"] == "2026-02-02"  # Jan 31 2026 is a Saturday
+
+    def test_delete_removes_every_recurrence_row(self, scheduled_book):
+        from sqlalchemy import text
+        gb = GnuCashBook(str(scheduled_book))
+        sx = _rent(gb, date(2026, 9, 20))
+        self._second_row(scheduled_book, "Rent", "20260905")
+        gb.delete_scheduled_transaction(sx["guid"])
+        with gb.open(readonly=True) as book:
+            assert book.session.execute(text("SELECT COUNT(*) FROM recurrences")).scalar() == 0
+
+
+class TestMigrationRebuildsContainer:
+    def test_migrated_schedule_matches_a_fresh_one(self, scheduled_book):
+        """The legacy template account (book currency, named by the
+        schedule) crashed GnuCash's SX editor once a template
+        transaction sat on it. Migration builds the container create
+        builds and drops the old account."""
+        from sqlalchemy import text
+        gb = GnuCashBook(str(scheduled_book))
+        sx = _rent(gb, date.today())
+        _make_legacy(scheduled_book, "Rent")
+        r = gb.update_scheduled_transaction(sx["guid"], enabled=True)
+        assert r.get("templates_migrated") == 1
+        with gb.open(readonly=True) as book:
+            sx_row, acct, splits, txns = _template_rows(book, "Rent")
+            assert acct[0] == sx_row[0] and acct[1] == "BANK"
+            ns, frac = book.session.execute(
+                text("SELECT namespace, fraction FROM commodities WHERE guid = :g"),
+                {"g": acct[2]},
+            ).first()
+            assert (ns, frac) == ("template", 1)
+            denoms = book.session.execute(
+                text("SELECT DISTINCT quantity_denom FROM splits WHERE account_guid = :a"),
+                {"a": sx_row[1]},
+            ).fetchall()
+            assert denoms == [(1,)]
+            # Exactly one template account under the template root.
+            assert len(book.root_template.children) == 1
+            assert book.session.execute(text("SELECT COUNT(*) FROM schedxactions")).scalar() == 1
+        assert gb.list_scheduled_transactions(compact=False)["scheduled_transactions"][0]["recipe"] == "native"
+
+
+class TestLegacyCountOnDashboard:
+    def test_scheduled_line_counts_legacy_recipes(self, scheduled_book):
+        gb = GnuCashBook(str(scheduled_book))
+        _rent(gb, date.today() + timedelta(days=3))
+        _rent(gb, date.today() + timedelta(days=4), name="Legacy One")
+        _make_legacy(scheduled_book, "Legacy One")
+        line = next(l for l in gb.get_book_summary().splitlines() if l.startswith("Scheduled:"))
+        assert "1 on legacy recipe (migrates on first write)" in line
+
+
+
+class TestMigrationSweep:
+    """Any schedule write converts every legacy recipe in the book,
+    posting nothing — a real book's schedules are all exposed to
+    desktop's Since-Last-Run until converted, and converting by
+    instantiation would post early (bookkeeper addendum,
+    2026-09-10). A no-change update is the one-call conversion."""
+
+    def test_no_change_update_converts_the_whole_book(self, scheduled_book):
+        gb = GnuCashBook(str(scheduled_book))
+        a = _rent(gb, date.today() + timedelta(days=5))
+        _rent(gb, date.today() + timedelta(days=6), name="Rent B")
+        _rent(gb, date.today() + timedelta(days=7), name="Rent C")
+        _make_legacy(scheduled_book, "Rent")
+        _make_legacy(scheduled_book, "Rent B")
+        before = gb.list_transactions(limit=250)
+        r = gb.update_scheduled_transaction(a["guid"])
+        assert r["templates_migrated"] == 2
+        rows = gb.list_scheduled_transactions(compact=False)["scheduled_transactions"]
+        assert {x["recipe"] for x in rows} == {"native"}
+        assert gb.list_transactions(limit=250) == before  # nothing posted
+        r2 = gb.update_scheduled_transaction(a["guid"])
+        assert "templates_migrated" not in r2
+
+    def test_instantiation_sweeps_the_others_without_posting(self, scheduled_book):
+        gb = GnuCashBook(str(scheduled_book))
+        a = _rent(gb, date.today())
+        _rent(gb, date.today() + timedelta(days=9), name="Rent B")
+        _make_legacy(scheduled_book, "Rent")
+        _make_legacy(scheduled_book, "Rent B")
+        r = gb.create_transaction_from_scheduled(guid=a["guid"])
+        assert r["status"] == "created" and r["templates_migrated"] == 2
+        rows = {x["name"]: x for x in gb.list_scheduled_transactions(compact=False)["scheduled_transactions"]}
+        assert rows["Rent B"]["recipe"] == "native"
+        assert rows["Rent B"]["last_occurrence"] is None  # not posted
+
+    def test_delete_sweeps_the_others(self, scheduled_book):
+        gb = GnuCashBook(str(scheduled_book))
+        a = _rent(gb, date.today())
+        _rent(gb, date.today(), name="Rent B")
+        _make_legacy(scheduled_book, "Rent B")
+        r = gb.delete_scheduled_transaction(a["guid"])
+        assert r["templates_migrated"] == 1
+        rows = gb.list_scheduled_transactions(compact=False)["scheduled_transactions"]
+        assert [x["name"] for x in rows] == ["Rent B"] and rows[0]["recipe"] == "native"
+
+    def test_audit_line_names_the_sweep(self):
+        from gnucash_mcp.logging_config import _fmt_scheduled_transaction_update
+        lines = _fmt_scheduled_transaction_update({
+            "timestamp": "2026-09-10T10:00:00",
+            "params": {"guid": "abc"},
+            "before_state": {"name": "Rent"},
+            "after_state": {"templates_migrated": 8},
+        })
+        assert any("8 schedule recipes migrated" in l and "nothing posted" in l for l in lines)
+
+
+class TestLegacyRecipeWarning:
+    """GnuCash 5.12's schedule editor crashes on a 1.2–1.4.4
+    server-made schedule until it is converted (production book,
+    2026-09-10). The dashboard names the stake and the one-call fix
+    while any remain, and says nothing once they're gone."""
+
+    def test_warning_while_legacy_remains_then_gone(self, scheduled_book):
+        gb = GnuCashBook(str(scheduled_book))
+        a = _rent(gb, date.today() + timedelta(days=3))
+        _rent(gb, date.today() + timedelta(days=4), name="Rent B")
+        _make_legacy(scheduled_book, "Rent")
+        _make_legacy(scheduled_book, "Rent B")
+        summary = gb.get_book_summary()
+        line = next(l for l in summary.splitlines() if "on the 1.4 recipe" in l)
+        assert "2 schedules on the 1.4 recipe" in line
+        assert "crashes" in line and "update_scheduled_transaction" in line
+        gb.update_scheduled_transaction(a["guid"])
+        assert "on the 1.4 recipe" not in gb.get_book_summary()

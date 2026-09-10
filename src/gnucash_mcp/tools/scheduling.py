@@ -29,6 +29,11 @@ def register(mcp, get_book) -> None:
     ) -> str:
         """Create a recurring transaction template.
 
+        Stored in GnuCash's own template format, so the schedule
+        shows in GnuCash desktop's editor and its Since-Last-Run
+        posts it. Schedules made in desktop can be instantiated
+        here.
+
         Args:
             name: Scheduled transaction name (e.g., "Monthly Rent").
             description: Transaction description at instantiation.
@@ -157,6 +162,9 @@ def register(mcp, get_book) -> None:
                 the oldest occurrence not yet entered — the overdue
                 one if the dashboard reports one, else the next due.
                 Call again to walk forward through missed periods.
+                Any schedule still stored in the pre-native shape is
+                migrated on this call, nothing posted for the others
+                (``templates_migrated`` in the response).
         """
         book = get_book()
         result = book.create_transaction_from_scheduled(
@@ -175,6 +183,12 @@ def register(mcp, get_book) -> None:
         notes: str | None = None,
     ) -> str:
         """Update a scheduled transaction.
+
+        Any schedule still stored in the pre-native (1.2–1.4.4)
+        shape is converted to GnuCash's template format on this
+        call, nothing posted. A call with no changes is the
+        deliberate one-step conversion of a whole book: run it once
+        after upgrading, before the next GnuCash desktop session.
 
         Args:
             guid: Scheduled transaction GUID (or 8+ char prefix).

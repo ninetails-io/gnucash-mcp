@@ -285,13 +285,14 @@ class TestUpdateTransactionNonDyadic:
 
 
 class TestScheduledSplitsPersistedAsStrings:
-    """The splits-json slot must never store a JSON numeric literal.
-    If a float slips through the schema layer, the write-side
-    normalization re-routes it through str(Decimal(str(x))) so every
-    future instantiation reads a clean decimal string."""
+    """A float that slips through the schema layer must not leave
+    its IEEE-754 epsilon in the recipe. The recipe is native template
+    rows now: each side is a gnc_numeric (num/denom at the currency
+    fraction) plus a formula string, so the persisted amount is exact
+    by construction — 94.87 lands as 9487/100 and "94.87", never
+    94.8699999…"""
 
     def test_slot_stores_string_amounts(self, scheduled_book: Path):
-        import json
         from sqlalchemy import text
 
         gc = GnuCashBook(str(scheduled_book))
@@ -306,24 +307,26 @@ class TestScheduledSplitsPersistedAsStrings:
             frequency="monthly",
         )
 
-        # Read the slot raw to confirm the stored JSON is strings.
         with gc.open(readonly=True) as book:
-            rows = book.session.execute(
+            numerics = book.session.execute(
                 text(
-                    "SELECT string_val FROM slots WHERE name = :name"
+                    "SELECT name, numeric_val_num, numeric_val_denom "
+                    "FROM slots WHERE name LIKE 'sched-xaction/%-numeric'"
                 ),
-                {"name": "splits-json"},
             ).fetchall()
-        assert len(rows) == 1
-        payload = json.loads(rows[0][0])
-        # json.loads preserves types: if amount were a float, it would
-        # parse as float, not str.
-        assert all(isinstance(s["amount"], str) for s in payload)
-        # And the values round-trip through Decimal exactly.
-        total = sum(
-            (Decimal(s["amount"]) for s in payload), Decimal("0"),
-        )
-        assert total == Decimal("0")
+            formulas = book.session.execute(
+                text(
+                    "SELECT string_val FROM slots WHERE name LIKE "
+                    "'sched-xaction/%-formula' AND string_val <> ''"
+                ),
+            ).fetchall()
+        assert sorted((n, d) for _, n, d in numerics) == [
+            (0, 100), (0, 100), (9487, 100), (9487, 100),
+        ]
+        assert sorted(f[0] for f in formulas) == ["94.87", "94.87"]
+        # And the recipe balances exactly when read back.
+        row = gc.list_scheduled_transactions(compact=False)["scheduled_transactions"][0]
+        assert sum(Decimal(s["amount"]) for s in row["splits"]) == Decimal("0")
 
     def test_instantiation_balances(self, scheduled_book: Path):
         """End-to-end: create a schedule with float amounts, then

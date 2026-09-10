@@ -595,7 +595,21 @@ def _fmt_transaction_create_from_scheduled(entry: dict) -> list[str]:
     if instance:
         detail += f"  instance #{instance}"
     lines.append(f"{_INDENT}{detail}")
+    lines.extend(_template_migration_lines(after))
     return lines
+
+
+def _template_migration_lines(after: dict) -> list[str]:
+    """A schedule write converts every legacy recipe in the book to
+    native template rows (nothing posted); a storage change is never
+    silent in the log."""
+    n = after.get("templates_migrated")
+    if not n:
+        return []
+    return [
+        f"{_INDENT}{n} schedule recipe{'s' if n != 1 else ''} migrated "
+        f"to native template rows (GnuCash-readable, nothing posted)"
+    ]
 
 
 def _parse_audit_tsv_rows(tsv: str) -> list[dict]:
@@ -2142,6 +2156,7 @@ def _fmt_scheduled_transaction_create(entry: dict) -> list[str]:
     next_occ = after.get("next_occurrence")
     if next_occ:
         lines.append(f"{_INDENT}next: {next_occ}")
+    lines.extend(_template_migration_lines(entry.get("after_state") or {}))
     return lines
 
 
@@ -2172,6 +2187,7 @@ def _fmt_scheduled_transaction_update(entry: dict) -> list[str]:
         new_str = new or "(cleared)"
         if old != new:
             lines.append(f"{_INDENT}notes: {old_str} → {new_str}")
+    lines.extend(_template_migration_lines(entry.get("after_state") or {}))
     return lines
 
 
@@ -2190,6 +2206,7 @@ def _fmt_scheduled_transaction_delete(entry: dict) -> list[str]:
             f"{_INDENT}had run {instance_count} time"
             f"{'s' if instance_count != 1 else ''}"
         )
+    lines.extend(_template_migration_lines(entry.get("after_state") or {}))
     return lines
 
 
