@@ -38,6 +38,11 @@ packages = ["src/gnucash_mcp"]
 postgres = [
     "psycopg2-binary>=2.9.9",
 ]
+# Driver for MySQL / MariaDB books (GNUCASH_BOOK_URI=mysql+pymysql://...).
+# PyMySQL is pure Python, so it too installs without a compiler.
+mysql = [
+    "pymysql>=1.1.0",
+]
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",

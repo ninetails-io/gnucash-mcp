@@ -958,6 +958,17 @@ def _upcoming_to_compact_line(
 # ── Book source ────────────────────────────────────────────────────
 
 
+# The snapshot command per SQLAlchemy backend name, for the backup
+# refusals. MariaDB ships ``mariadb-dump`` and keeps ``mysqldump`` as a
+# compatibility alias, so the MySQL row names what works on both.
+_DB_DUMP_TOOLS = {
+    "postgresql": "pg_dump",
+    "mysql": "mysqldump (mariadb-dump on MariaDB)",
+    "mariadb": "mariadb-dump",
+    "sqlite": "sqlite3 .backup",
+}
+
+
 @dataclass(frozen=True)
 class BookSource:
     """Where a book lives, and what that implies about its features.
@@ -996,6 +1007,26 @@ class BookSource:
     uri: str
     display_name: str
     log_name: str
+
+    @property
+    def backend(self) -> str:
+        """SQLAlchemy backend name: ``sqlite``, ``postgresql``, ``mysql``.
+
+        File books are ``sqlite`` by construction; URI books answer
+        whatever dialect the connection string names (``mariadb``
+        for the ``mariadb+`` scheme).
+        """
+        return _parse_book_url(self.uri).get_backend_name()
+
+    @property
+    def dump_tool(self) -> str:
+        """The native snapshot command for this book's database.
+
+        Every backup refusal and the server-config backend line name
+        it, so a MySQL user is not told to run ``pg_dump``. One table,
+        one reader: a new dialect adds a row here and nowhere else.
+        """
+        return _DB_DUMP_TOOLS.get(self.backend, "your database's dump tool")
 
     @property
     def is_file(self) -> bool:

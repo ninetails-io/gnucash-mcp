@@ -7,12 +7,15 @@ every DB code path that isn't dialect-specific — ``open()`` through
 token, the backup refusal, and the whole config pipeline — in the
 ordinary hermetic suite.
 
-The genuinely PostgreSQL-shaped assertions live in
-``TestPostgresBackend`` and skip unless ``GNUCASH_TEST_PG_URI`` names
-a reachable server (CI's postgres service sets it).
+The genuinely dialect-shaped assertions live in ``_RealDatabaseTests``,
+run once per real server — ``TestPostgresBackend`` under
+``GNUCASH_TEST_PG_URI``, ``TestMySQLBackend`` under
+``GNUCASH_TEST_MYSQL_URI`` — and skip when the variable is unset
+(CI's postgres and mysql service jobs set them).
 """
 
 import os
+import re
 from datetime import date
 from pathlib import Path
 
@@ -238,8 +241,22 @@ class TestBackupDegradation:
         with pytest.raises(ValueError) as exc:
             uri_book.create_backup()
         msg = str(exc.value)
-        assert "pg_dump" in msg
+        # A sqlite:/// URI is a database book by declaration; the
+        # refusal names that dialect's tool, not PostgreSQL's.
+        assert "sqlite3 .backup" in msg
         assert "RESTORE_FROM_BACKUP" in msg
+
+    @pytest.mark.parametrize("uri, tool", [
+        ("postgresql://u:p@h/gnucash", "pg_dump"),
+        ("postgresql+psycopg2://u:p@h/gnucash", "pg_dump"),
+        ("mysql+pymysql://u:p@h/gnucash", "mysqldump"),
+        ("mariadb+pymysql://u:p@h/gnucash", "mariadb-dump"),
+        ("sqlite:////tmp/x.gnucash", "sqlite3 .backup"),
+    ])
+    def test_dump_tool_names_the_dialect(self, uri, tool):
+        """One table in _base.py, read by the backup refusal and the
+        server-config line. Parsing only — nothing here connects."""
+        assert tool in BookSource.from_uri(uri).dump_tool
 
     def test_refusal_does_not_leak_the_password(self):
         book = GnuCashBook(
@@ -613,18 +630,18 @@ class TestEngineDisposal:
         assert "Book: {book_path}" not in src
 
 
-# ── PostgreSQL ────────────────────────────────────────────────────
+# ── Real database servers ─────────────────────────────────────────
 
 
-def _worker_pg_uri() -> str | None:
-    """``GNUCASH_TEST_PG_URI`` with a per-xdist-worker database name.
+def _worker_db_uri(env_var: str) -> str | None:
+    """The env var's URI with a per-xdist-worker database name.
 
     The fixture below creates its book with ``overwrite=True``, which
     DROPS and recreates the database. Under the suite's default
     parallel run two workers would do that to each other mid-test, so
     each worker gets its own database instead.
     """
-    uri = os.environ.get("GNUCASH_TEST_PG_URI")
+    uri = os.environ.get(env_var)
     worker = os.environ.get("PYTEST_XDIST_WORKER")
     if not uri or not worker:
         return uri
@@ -632,27 +649,34 @@ def _worker_pg_uri() -> str | None:
     return str(url.set(database=f"{url.database or 'gnucash'}_{worker}"))
 
 
-_PG_URI = _worker_pg_uri()
+_PG_URI = _worker_db_uri("GNUCASH_TEST_PG_URI")
+_MYSQL_URI = _worker_db_uri("GNUCASH_TEST_MYSQL_URI")
 
 
-@pytest.mark.skipif(
-    not _PG_URI, reason="set GNUCASH_TEST_PG_URI to run PostgreSQL tests"
-)
-class TestPostgresBackend:
-    """The dialect-specific half: a real GnuCash book in PostgreSQL.
+class _RealDatabaseTests:
+    """The dialect-specific half: a real GnuCash book in a database.
 
-    Everything above proves the URI *plumbing* on SQLite. What only
-    PostgreSQL can prove is that piecash's schema round-trips through
-    a second dialect at all — the paramstyle of the GUID queries
-    (``%s`` vs ``?``), server-side type coercion of GnuCash's numeric
-    columns, and the gnclock lock check on a non-file backend.
+    Everything above proves the URI *plumbing* on SQLite. What only a
+    real server can prove is that piecash's schema round-trips
+    through a second dialect at all — the paramstyle of the GUID
+    queries (``%s`` vs ``?``), server-side type coercion of GnuCash's
+    numeric and INTEGER-flag columns, and the gnclock lock check on a
+    non-file backend. One body, one subclass per dialect: the three
+    class attributes are the only things PostgreSQL and MySQL answer
+    differently.
     """
 
-    @staticmethod
+    URI: str | None = None
+    # Substring the backup refusal must carry for this dialect.
+    DUMP_TOOL: str = ""
+    # Count of this database's live server connections.
+    LIVE_CONNECTIONS_SQL: str = ""
+
     @pytest.fixture(scope="class")
-    def pg_book():
+    def db_book(self, request):
+        uri = request.cls.URI
         book = piecash.create_book(
-            uri_conn=_PG_URI, currency="USD", overwrite=True
+            uri_conn=uri, currency="USD", overwrite=True
         )
         root = book.root_account
         usd = book.default_currency
@@ -676,7 +700,7 @@ class TestPostgresBackend:
         # make the drop below fail with ObjectInUse — the same leak
         # open() disposes for the server.
         book.session.get_bind().dispose()
-        yield GnuCashBook(BookSource.from_uri(_PG_URI))
+        yield GnuCashBook(BookSource.from_uri(uri))
 
         # Drop the worker's database so a local run doesn't leave one
         # behind per worker. Best-effort: a failure here is litter,
@@ -685,18 +709,18 @@ class TestPostgresBackend:
         try:
             from sqlalchemy_utils import drop_database
 
-            drop_database(_PG_URI)
+            drop_database(uri)
         except Exception:
             pass
 
-    def test_accounts_read_back(self, pg_book):
-        listing = pg_book.list_accounts()
+    def test_accounts_read_back(self, db_book):
+        listing = db_book.list_accounts()
         assert "Assets:Checking" in listing
         assert "Expenses:Groceries" in listing
 
-    def test_write_round_trips(self, pg_book):
-        result = pg_book.create_transaction(
-            description="Postgres write",
+    def test_write_round_trips(self, db_book):
+        result = db_book.create_transaction(
+            description="Database write",
             splits=[
                 {"account": "Expenses:Groceries", "amount": "42.50"},
                 {"account": "Assets:Checking", "amount": "-42.50"},
@@ -705,59 +729,83 @@ class TestPostgresBackend:
             check_duplicates=False,
         )
         assert result["status"] == "created"
-        assert "Postgres write" in pg_book.search_transactions("Postgres write")
+        assert "Database write" in db_book.search_transactions("Database write")
 
-    def test_guid_prefix_resolution_uses_the_right_paramstyle(self, pg_book):
-        """psycopg2 wants ``%s`` where sqlite3 wants ``?``; the named
-        ``:prefix`` form is what makes one query text serve both."""
-        with pg_book.open() as book:
+    def test_guid_prefix_resolution_uses_the_right_paramstyle(self, db_book):
+        """psycopg2 and PyMySQL want ``%s`` where sqlite3 wants ``?``;
+        the named ``:prefix`` form is what makes one query text serve
+        every dialect."""
+        with db_book.open() as book:
             guid = book.root_account.guid
-        assert pg_book._resolve_guid("accounts", guid[:8]) == guid
+        assert db_book._resolve_guid("accounts", guid[:8]) == guid
 
-    def test_balance_report_runs(self, pg_book):
-        assert pg_book.get_book_summary()
+    def test_balance_report_runs(self, db_book):
+        assert db_book.get_book_summary()
 
-    def test_backups_refuse(self, pg_book):
-        with pytest.raises(ValueError, match="pg_dump"):
-            pg_book.create_backup()
+    def test_backups_refuse(self, db_book):
+        with pytest.raises(ValueError, match=re.escape(self.DUMP_TOOL)):
+            db_book.create_backup()
 
-    def test_placeholder_account_creation(self, pg_book):
+    def test_placeholder_account_creation(self, db_book):
         """Regression: ``create_account(placeholder=True)`` passed a
         Python bool into an INTEGER column. SQLite coerced it
         silently; PostgreSQL raises DatatypeMismatch, so this core
         tool was simply broken on the new backend until _gnc_bool.
         """
-        pg_book.create_account(
+        db_book.create_account(
             name="Sub", account_type="EXPENSE",
             parent="Expenses", placeholder=True,
         )
-        assert "Expenses:Sub" in pg_book.list_accounts()
+        assert "Expenses:Sub" in db_book.list_accounts()
 
-    def test_placeholder_toggle(self, pg_book):
+    def test_placeholder_toggle(self, db_book):
         """The update path writes the same column."""
-        pg_book.create_account(
+        db_book.create_account(
             name="Toggle", account_type="EXPENSE", parent="Expenses",
         )
-        pg_book.update_account("Expenses:Toggle", placeholder=True)
-        assert "Expenses:Toggle [PLACEHOLDER]" in pg_book.list_accounts()
+        db_book.update_account("Expenses:Toggle", placeholder=True)
+        assert "Expenses:Toggle [PLACEHOLDER]" in db_book.list_accounts()
 
-    def test_open_close_releases_the_connection(self, pg_book):
+    def test_open_close_releases_the_connection(self, db_book):
         """Five open/close cycles leave the server's connection count
         where it started — the engine is disposed, not pooled."""
         from sqlalchemy import create_engine, text
         from sqlalchemy.pool import NullPool
 
-        probe = create_engine(_PG_URI, poolclass=NullPool)
+        probe = create_engine(self.URI, poolclass=NullPool)
 
         def live() -> int:
             with probe.connect() as conn:
-                return conn.execute(text(
-                    "SELECT count(*) FROM pg_stat_activity "
-                    "WHERE datname = current_database()"
-                )).scalar()
+                return conn.execute(text(self.LIVE_CONNECTIONS_SQL)).scalar()
 
         before = live()
         for _ in range(5):
-            with pg_book.open(readonly=True) as opened:
+            with db_book.open(readonly=True) as opened:
                 assert opened.default_currency is not None
         assert live() == before
+
+
+@pytest.mark.skipif(
+    not _PG_URI, reason="set GNUCASH_TEST_PG_URI to run PostgreSQL tests"
+)
+class TestPostgresBackend(_RealDatabaseTests):
+    URI = _PG_URI
+    DUMP_TOOL = "pg_dump"
+    LIVE_CONNECTIONS_SQL = (
+        "SELECT count(*) FROM pg_stat_activity "
+        "WHERE datname = current_database()"
+    )
+
+
+@pytest.mark.skipif(
+    not _MYSQL_URI, reason="set GNUCASH_TEST_MYSQL_URI to run MySQL tests"
+)
+class TestMySQLBackend(_RealDatabaseTests):
+    """MariaDB in CI; the ``mysql+pymysql`` dialect serves both."""
+
+    URI = _MYSQL_URI
+    DUMP_TOOL = "mysqldump"
+    LIVE_CONNECTIONS_SQL = (
+        "SELECT count(*) FROM information_schema.PROCESSLIST "
+        "WHERE DB = DATABASE()"
+    )
