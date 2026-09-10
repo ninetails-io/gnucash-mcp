@@ -1520,6 +1520,18 @@ def _fx_stale_lines(entry: dict) -> list[str]:
     ]
 
 
+
+def _invoice_link_migration_lines(after: dict) -> list[str]:
+    """A business write renames every pre-1.5 invoice link to
+    GnuCash's key; a storage change is never silent in the log."""
+    n = after.get("invoice_links_migrated")
+    if not n:
+        return []
+    return [
+        f"{_INDENT}{n} invoice link{'s' if n != 1 else ''} renamed to "
+        f"GnuCash's key (desktop-navigable, nothing posted)"
+    ]
+
 def _fmt_invoice_post(entry: dict) -> list[str]:
     time_part = _extract_time(entry)
     params = entry.get("params") or {}
@@ -1535,6 +1547,7 @@ def _fmt_invoice_post(entry: dict) -> list[str]:
             f"{_INDENT}account: {params.get('post_account', '')}  txn:{txn_guid}"
         )
     lines += _fx_stale_lines(entry)
+    lines.extend(_invoice_link_migration_lines(entry.get("after_state") or {}))
     return lines
 
 
@@ -1694,6 +1707,7 @@ def _fmt_invoice_unpost(entry: dict) -> list[str]:
             f"{_INDENT}was posted:{was_posted}  "
             f"post_account:{was_account}"
         )
+    lines.extend(_invoice_link_migration_lines(entry.get("after_state") or {}))
     return lines
 
 
@@ -1749,6 +1763,7 @@ def _fmt_invoice_pay(entry: dict) -> list[str]:
     if memo:
         lines.append(f"{_INDENT}memo: {memo}")
     lines += _fx_stale_lines(entry)
+    lines.extend(_invoice_link_migration_lines(entry.get("after_state") or {}))
     return lines
 
 
