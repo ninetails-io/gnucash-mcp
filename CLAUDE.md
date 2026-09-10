@@ -116,6 +116,24 @@ module contributes zero tools to the MCP surface.
 
 ### Invariants worth preserving
 
+- **The server never invents a storage shape for a GnuCash object.
+  If it can't write what desktop writes, it doesn't write.** The book
+  is a shared file; GnuCash desktop is the other party to it and reads
+  every row we persist. A private shape that only this server can read
+  is a defect even when every server-side test passes — scheduled
+  transactions shipped that way from 1.2 through 1.4.4 (desktop listed
+  them, advanced them on Since-Last-Run, posted nothing) and the first
+  migration attempt produced a template that crashed GnuCash 5.12 on
+  edit. Feature stamps under a key GnuCash doesn't know made a book
+  unopenable the same week. Consequences: (1) before persisting any
+  object type, read how GnuCash's own backend writes it (tables, slot
+  frames, commodity of template accounts, recurrence rows) and write
+  exactly that; (2) "opens and edits cleanly in GnuCash desktop" is a
+  merge gate for any branch that touches storage, not an optional
+  bookkeeper step; (3) any migration for a shape we already shipped
+  rebuilds the object the way `create` does — never patches the old
+  container in place. (Added 2026-09-10 by ruling, after the
+  native-templates loop.)
 - **piecash objects never cross the MCP boundary.** Book methods
   return dicts or primitives. Tool wrappers stringify for transport.
 - **One book open per write.** `@audit_log` stages before-state on
@@ -181,7 +199,9 @@ module contributes zero tools to the MCP surface.
   Anything new that persists per-book state under the log dir must
   follow the same scoping or two books will share it.
 - **A book may not be a file.** `GNUCASH_BOOK_URI` / `--book-uri`
-  serves a book from PostgreSQL (or any SQLAlchemy URL). Ask
+  serves a book from PostgreSQL (or any SQLAlchemy URL) —
+  contributed by [@vchatela](https://github.com/vchatela) in PR
+  #175, from the request in #174. Ask
   `self.source.is_file` — never `book_path is not None` — before
   doing anything file-shaped. `BookSource` (`book/_base.py`) owns
   that question, and exactly four things ask it: backups, the
@@ -320,9 +340,10 @@ Working rules:
    price-invalidation and preload SQL-count tests for the house
    styles: set-equality, grep-the-source, output-agreement, and
    count-the-queries all work.
-4. **The payoff is legibility, not just correctness.** PR #126 — an
-   outside contributor fixing a never-completes pathology on a
-   33k-split book — was possible as a small, safe diff because every
+4. **The payoff is legibility, not just correctness.** PR #126 —
+   [@bhbrunt](https://github.com/bhbrunt), an outside contributor,
+   fixing a never-completes pathology on a 33k-split book — was
+   possible as a small, safe diff because every
    rate lookup already flowed through one function. Keep it that
    way: new code that bypasses a chokepoint makes the next
    contributor's change bigger than it should be.
