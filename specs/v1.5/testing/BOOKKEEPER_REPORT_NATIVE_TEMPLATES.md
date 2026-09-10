@@ -93,3 +93,23 @@ All 8 schedules in Steve's `books.gnucash` read `recipe: legacy` — all written
 1. Until migrated, one OK on desktop's Since-Last-Run silently advances all 8 with nothing posted (rent, storage, autopays, paycheck). Standing instruction: Cancel.
 2. Migration-on-first-write posts a transaction. Correct for the paycheck (due 09-10) — and that instantiation is the live cross-commodity test (VFIFX leg, quantity 6.1954) the plan marked unit-locked only. Wrong for the other 7 (3 already posted this month, 4 still upcoming): converting them by instantiation means posting early. **Required: a migrate-without-posting path (sweep or per-schedule), so a real book can be converted in one step after the bounce with nothing posted.**
 3. Bookkeeper will not touch production schedules until merge + bounce + Steve's go; first action then is the paycheck through the migrated path, verifying the VFIFX leg on disk before anything else.
+
+---
+
+# Round 3 — 2026-09-10, branch @ `2fc774e` (sweep: `8abf9d0`), PRODUCTION book `books.gnucash`. Steve at the GUI.
+
+## Verdict: SHIP. The real book is converted, desktop opens every schedule, the paycheck posted through the migrated path.
+
+- Pre-check: Steve confirmed that on the un-migrated production book, opening ANY schedule in GnuCash 5.12's SX Editor crashed the app instantly. So the 1.2–1.4.4 legacy shape is crash-on-edit, not merely hollow. **Every 1.4.x book with a schedule is affected. Release note + hotfix guidance required.**
+- Backup: `books.gnucash.mcp/backups/books-20260910T184836778445-manual-pre-sx-native-migration.gnucash` (integrity ok).
+- Sweep: one no-change `update_scheduled_transaction` on Netflix → `templates_migrated: 8`; transaction count unchanged (1,003); every next-due unchanged. Disk: zero legacy template accounts remain; all 8 schedules carry template splits (paycheck: 17) and one recurrence row each. VFIFX leg stored GnuCash-native: `debit-formula 415.40` in book currency, shares derived at posting from `book.prices`.
+- Desktop: Since-Last-Run cancelled (it would now POST — the templates are real). SX Editor → "Jesse Paycheck (base, no bonus)" (17 legs) opened clean, 3,281.40 into UCU Checking and 415.40 into VFIFX (Steve's eyes). "Looks perfect."
+- Post: `create_transaction_from_scheduled` (no date) → `4374a192` on 2026-09-10, 17 splits, VFIFX quantity **6.1954** derived from 415.40 @ 67.05 (matches the pre-migration placeholder exactly), action Buy, memos and notes intact. True-up from the paystub as usual.
+
+## Routed around
+Nothing. Stale-lock note from round 1 stands (two Claude-launched server trees + one `~/.local/bin` instance still running).
+
+Signed: Abe VII, bookkeeper. Ship it.
+
+## Follow-up before release (2026-09-10)
+The sweep runs only on a schedule WRITE. A user who upgrades and only reads keeps a crash-on-edit book until a write happens to occur. Given the crash is confirmed on real books, either (a) sweep on first open of a book with legacy recipes (audit it as a MIGRATE entry, no posting), or (b) make the dashboard line say what is at stake and what to do: "N schedules on the 1.4 recipe — GnuCash's schedule editor crashes on them until converted; run update_scheduled_transaction on any schedule." (a) preferred; (b) is the floor.
