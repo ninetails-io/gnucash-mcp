@@ -5,7 +5,7 @@ Entries are terse by design: what changed, one line each, PR numbers where they 
 ## Unreleased
 
 ### Added
-- **Database-backed books** — `GNUCASH_BOOK_URI` / `--book-uri` serve a book GnuCash keeps in PostgreSQL (or any SQLAlchemy-addressable backend) instead of a SQLite file. Every read and write tool works unchanged. Install the driver with `pip install "gnucash-mcp[postgres]"`. Closes the v1.5 roadmap's "DB backend" item.
+- **Database-backed books** — `GNUCASH_BOOK_URI` / `--book-uri` serve a book GnuCash keeps in PostgreSQL (or any SQLAlchemy-addressable backend) instead of a SQLite file. Every read and write tool works unchanged. Install the driver with `pip install "gnucash-mcp[postgres]"`. Closes the v1.5 roadmap's "DB backend" item. Contributed by @vchatela (#175; requested in #174).
 - `_gnc_bool` — one coercion for GnuCash's INTEGER flag columns (`placeholder`, `hidden`, `enabled`, `is_closed`, `active`, the entry `*_taxable` / `*_taxincluded` pair), with a contract test. PostgreSQL rejects a Python bool where SQLite coerced it silently.
 
 ### Changed
@@ -45,6 +45,9 @@ Three things this server stored in a private shape only it could read are now wr
 - `get_budget_report` keeps income and expense targets on their own sides. A budget with both ends in INCOME / EXPENSES / NET lines (verbose: `subtotals` per side, `totals` is the net with `basis` named) instead of one TOTAL that added a 5,000 income target to 300 of expenses; the ⚠ marker fires on expense rows only, and NET carries no %Used (a difference, not a ratio). A single-side budget renders as before; every verbose account row now carries `side`. The dashboard's Budget headline paces expense targets only.
 - `create_account(placeholder=True)`, `update_account(placeholder=True)`, and `update_party(active=...)` wrote a Python bool into an INTEGER column — silently coerced on SQLite, a hard `DatatypeMismatch` on PostgreSQL.
 - Short-GUID resolution failed on a book whose filename contains a percent escape (`budget 100%25 final.gnucash`): the lookup URI was built unescaped and sqlite3 percent-decoded the path back to a filename that doesn't exist. The path is percent-encoded now.
+
+### Credits
+- @vchatela — the database backend (#175), the largest outside code contribution to date: nine commits, the `[postgres]` extra, and CI against PostgreSQL.
 
 ## v1.4.4 - The statement is the call
 
