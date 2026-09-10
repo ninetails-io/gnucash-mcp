@@ -1561,6 +1561,8 @@ class TestBudgetReportSides:
         expenses_line = next(l for l in lines if l.startswith("EXPENSES"))
         net_line = next(l for l in lines if l.startswith("NET"))
         assert "⚠" not in income_line        # 120% of income is good news
+        salary_row = next(l for l in lines if l.startswith("Income:Salary"))
+        assert "⚠" not in salary_row         # nor on the row itself
         assert expenses_line.endswith("⚠")   # 133% of expenses is not
         assert "⚠" not in net_line
 

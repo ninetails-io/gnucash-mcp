@@ -106,7 +106,8 @@ def _format_budget_report_compact(report: dict) -> str:
     get_book_summary headline. A common ``Expenses:`` / ``Income:``
     prefix is stripped. A budget with both income and expense
     targets ends in INCOME / EXPENSES / NET lines instead of one
-    TOTAL; the marker fires on the EXPENSES line only.
+    TOTAL. The marker never fires on an income row or the INCOME
+    line — beating an income target is not a warning.
     """
     accounts = report.get("accounts", [])
     totals = report.get("totals", {})
@@ -200,15 +201,17 @@ def _format_budget_report_compact(report: dict) -> str:
         f"{'Remaining':>{remaining_w}}  "
         f"{'%Used':>{pct_w}}"
     )
-    for leaf, b, a, rem, pct in zip(
-        leaves, budget_strs, actual_strs, remaining_strs, pct_strs,
+    for row, leaf, b, a, rem, pct in zip(
+        accounts, leaves, budget_strs, actual_strs, remaining_strs,
+        pct_strs,
     ):
+        markable = row.get("side", "expenses") != "income"
         lines.append(
             f"{leaf:<{name_width}}  "
             f"{b:>{budget_w}}  "
             f"{a:>{actual_w}}  "
             f"{rem:>{remaining_w}}  "
-            f"{pct:>{pct_w}}{_pct_marker(pct)}"
+            f"{pct:>{pct_w}}{_pct_marker(pct) if markable else ''}"
         )
     for label, b, a, rem, pct, markable in closing_strs:
         lines.append(
@@ -992,15 +995,16 @@ class BudgetsMixin:
             for acct_name in sorted(budgeted.keys()):
                 b = budgeted[acct_name]
                 a = actuals.get(acct_name, Decimal("0"))
-                accounts_result.append({
-                    "account": acct_name,
-                    **_totals_row(b, a),
-                })
                 side = (
                     "income"
                     if budgeted_accounts[acct_name].type == "INCOME"
                     else "expenses"
                 )
+                accounts_result.append({
+                    "account": acct_name,
+                    "side": side,
+                    **_totals_row(b, a),
+                })
                 sides_seen.add(side)
                 side_sums[side][0] += b
                 side_sums[side][1] += a
