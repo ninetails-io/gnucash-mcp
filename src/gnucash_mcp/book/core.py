@@ -1101,6 +1101,32 @@ class CoreMixin:
             ),
         )
 
+        # ── 7. Schedules still on the pre-native recipe ──
+        # Crash-class: GnuCash 5.12's schedule editor crashes on a
+        # 1.2–1.4.4 server-made schedule until it is converted
+        # (confirmed on a real book, 2026-09-10), and Since-Last-Run
+        # advances it with nothing posted. Name the stake and the
+        # one-call fix while any remain.
+        legacy_recipe: list[str] = []
+        recipe_fn = getattr(self, "_sx_recipe", None)
+        if recipe_fn is not None:
+            try:
+                from piecash.core.transaction import ScheduledTransaction
+                n_legacy = sum(
+                    1 for sx in book.session.query(ScheduledTransaction).all()
+                    if recipe_fn(book, sx)["source"] == "legacy"
+                )
+                if n_legacy:
+                    legacy_recipe.append(
+                        f"{n_legacy} schedule{'s' if n_legacy != 1 else ''} "
+                        f"on the 1.4 recipe: GnuCash's schedule editor "
+                        f"crashes on them until converted — "
+                        f"update_scheduled_transaction on any schedule "
+                        f"converts all, nothing posted"
+                    )
+            except Exception:
+                pass
+
         # Staleness linkage: when the book itself is far behind,
         # time-based warnings describe the gap, not events — say so
         # FIRST, where it frames everything below it.
@@ -1119,6 +1145,7 @@ class CoreMixin:
         return (
             staleness_note
             + integrity
+            + legacy_recipe
             + backup_health
             + low_cash
             + overdue_invoices

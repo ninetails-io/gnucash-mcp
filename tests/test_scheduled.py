@@ -2003,3 +2003,23 @@ class TestMigrationSweep:
             "after_state": {"templates_migrated": 8},
         })
         assert any("8 schedule recipes migrated" in l and "nothing posted" in l for l in lines)
+
+
+class TestLegacyRecipeWarning:
+    """GnuCash 5.12's schedule editor crashes on a 1.2–1.4.4
+    server-made schedule until it is converted (production book,
+    2026-09-10). The dashboard names the stake and the one-call fix
+    while any remain, and says nothing once they're gone."""
+
+    def test_warning_while_legacy_remains_then_gone(self, scheduled_book):
+        gb = GnuCashBook(str(scheduled_book))
+        a = _rent(gb, date.today() + timedelta(days=3))
+        _rent(gb, date.today() + timedelta(days=4), name="Rent B")
+        _make_legacy(scheduled_book, "Rent")
+        _make_legacy(scheduled_book, "Rent B")
+        summary = gb.get_book_summary()
+        line = next(l for l in summary.splitlines() if "on the 1.4 recipe" in l)
+        assert "2 schedules on the 1.4 recipe" in line
+        assert "crashes" in line and "update_scheduled_transaction" in line
+        gb.update_scheduled_transaction(a["guid"])
+        assert "on the 1.4 recipe" not in gb.get_book_summary()
