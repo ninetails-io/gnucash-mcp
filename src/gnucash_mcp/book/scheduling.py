@@ -14,6 +14,7 @@ Depends on shared helpers from BaseGnuCashBook:
   - _verify_write, _verify_composite_write, _verify_delete
 """
 
+from calendar import monthrange
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 import uuid
@@ -24,6 +25,7 @@ from piecash._common import Recurrence
 from piecash.core.transaction import ScheduledTransaction
 from piecash.kvp import KVP_Type, Slot
 from sqlalchemy import text
+from sqlalchemy.orm import object_session
 
 from gnucash_mcp.book._base import (
     _HEX_GUID_RE,
@@ -39,6 +41,138 @@ from gnucash_mcp.book._base import (
     _verify_write,
 )
 from gnucash_mcp._format import _paginate
+
+
+# ── GnuCash's recurrence engine, ported from Recurrence.cpp ──────
+# The occurrence anchor is the RECURRENCE row (period type, mult,
+# period start, weekend adjust), never the schedule's start_date and
+# never a frequency label: desktop lets "start 9 Sep, monthly on the
+# 15th" exist, and a schedule may carry several rows (monthly on the
+# 5th AND the 20th). recurrenceNextInstance is ported line for line,
+# including the weekend-adjust Friday special case; string tables
+# verbatim from period_type_strings / weekend_adj_strings.
+_PT_MONTHISH = frozenset(
+    {"year", "month", "end of month", "nth weekday", "last weekday"}
+)
+_PT_WEEKEND_ADJUSTED = frozenset({"year", "month", "end of month"})
+
+
+def _add_months(d: date, n: int) -> date:
+    """g_date_add_months: day clamped to the target month's length."""
+    total = d.month - 1 + n
+    y, m = d.year + total // 12, total % 12 + 1
+    return date(y, m, min(d.day, monthrange(y, m)[1]))
+
+
+def _is_last_of_month(d: date) -> bool:
+    return d.day == monthrange(d.year, d.month)[1]
+
+
+def _nth_weekday_compare(start: date, nxt: date, pt: str) -> int:
+    nd, sd = nxt.day, start.day
+    week = 3 if sd // 7 > 3 else sd // 7
+    if week > 0 and sd % 7 == 0 and sd != 28:
+        week -= 1
+    matchday = 7 * week + (
+        nd - nxt.isoweekday() + start.isoweekday() + 7
+    ) % 7
+    dim = monthrange(nxt.year, nxt.month)[1]
+    if (dim - matchday) >= 7 and pt == "last weekday":
+        matchday += 7
+    if pt == "nth weekday" and matchday % 7 == 0:
+        matchday += 7
+    return matchday - nd
+
+
+def _adjust_for_weekend(pt: str, wadj: str, d: date) -> date:
+    if pt in _PT_WEEKEND_ADJUSTED and d.isoweekday() in (6, 7):
+        sat = d.isoweekday() == 6
+        if wadj == "back":
+            return d - timedelta(days=1 if sat else 2)
+        if wadj == "forward":
+            return d + timedelta(days=2 if sat else 1)
+    return d
+
+
+def _recurrence_next(
+    pt: str, mult: int, start: date, wadj: str, ref: date,
+) -> date | None:
+    """First occurrence strictly after ``ref``; None when the
+    recurrence yields nothing (``once`` already past, unknown type)."""
+    mult = max(int(mult or 1), 1)
+    adjusted_start = _adjust_for_weekend(pt, wadj, start)
+    if ref < adjusted_start:
+        return adjusted_start
+    nxt = ref
+    if pt == "once":
+        return None
+    if pt in _PT_MONTHISH:
+        m = mult * 12 if pt == "year" else mult
+        # Step 1: forward one period, passing exactly one occurrence.
+        if (wadj == "back" and pt in _PT_WEEKEND_ADJUSTED
+                and nxt.isoweekday() in (6, 7)):
+            nxt -= timedelta(days=1 if nxt.isoweekday() == 6 else 2)
+        if (wadj == "back" and pt in _PT_WEEKEND_ADJUSTED
+                and nxt.isoweekday() == 5):
+            tmp_sat, tmp_sun = nxt + timedelta(days=1), nxt + timedelta(days=2)
+            if pt == "end of month":
+                if (_is_last_of_month(nxt) or _is_last_of_month(tmp_sat)
+                        or _is_last_of_month(tmp_sun)):
+                    nxt = _add_months(nxt, m)
+                else:
+                    nxt = _add_months(nxt, m - 1)
+            else:
+                if tmp_sat.day == start.day:
+                    nxt = _add_months(tmp_sat, m)
+                elif tmp_sun.day == start.day:
+                    nxt = _add_months(tmp_sun, m)
+                elif nxt.day >= start.day:
+                    nxt = _add_months(nxt, m)
+                elif _is_last_of_month(nxt):
+                    nxt = _add_months(nxt, m)
+                elif _is_last_of_month(tmp_sat):
+                    nxt = _add_months(tmp_sat, m)
+                elif _is_last_of_month(tmp_sun):
+                    nxt = _add_months(tmp_sun, m)
+                else:
+                    nxt = _add_months(nxt, m - 1)
+        elif (_is_last_of_month(nxt)
+              or (pt in ("month", "year") and nxt.day >= start.day)
+              or (pt in ("nth weekday", "last weekday")
+                  and _nth_weekday_compare(start, nxt, pt) <= 0)):
+            nxt = _add_months(nxt, m)
+        else:
+            nxt = _add_months(nxt, m - 1)
+        # Step 2: back up to the base phase, then align the day.
+        n_months = 12 * (nxt.year - start.year) + (nxt.month - start.month)
+        nxt = _add_months(nxt, -(n_months % m))
+        dim = monthrange(nxt.year, nxt.month)[1]
+        if pt in ("nth weekday", "last weekday"):
+            nxt += timedelta(days=_nth_weekday_compare(start, nxt, pt))
+        elif pt == "end of month" or start.day >= dim:
+            nxt = nxt.replace(day=dim)
+        else:
+            nxt = nxt.replace(day=start.day)
+        return _adjust_for_weekend(pt, wadj, nxt)
+    if pt in ("week", "day"):
+        step = mult * 7 if pt == "week" else mult
+        nxt = nxt + timedelta(days=step)
+        return nxt - timedelta(days=(nxt - start).days % step)
+    return None
+
+
+def _gdate(v) -> date | None:
+    """GDATE columns come back as ``YYYYMMDD`` strings on SQLite and
+    as dates on PostgreSQL; date.fromisoformat rejects the former on
+    3.10."""
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    s = "".join(ch for ch in str(v) if ch.isdigit())
+    return date(int(s[:4]), int(s[4:6]), int(s[6:8]))
 
 
 class SchedulingMixin:
@@ -76,50 +210,21 @@ class SchedulingMixin:
         end_date: date | None = None,
         last_occur: date | None = None,
     ) -> date | None:
-        """Calculate the next occurrence of a scheduled transaction.
-
-        Args:
-            start_date: First occurrence date.
-            frequency: One of VALID_FREQUENCIES.
-            after: Find next occurrence after this date. Defaults to today.
-            end_date: If set, return None if next occurrence past this date.
-            last_occur: Last instantiation date. If set and greater than
-                        `after`, the search threshold is raised to
-                        `last_occur` so already-instantiated occurrences
-                        aren't returned (e.g., when GnuCash desktop has
-                        run the schedule ahead).
-
-        Returns:
-            Next occurrence date, or None if past end_date.
+        """Next occurrence of a label-frequency schedule after
+        ``after`` (default today), raised to ``last_occur`` when that
+        is later; None past ``end_date``. A thin face on the
+        recurrence engine for the six labels this server creates;
+        the schedule-level rule is ``_sx_next_due``, which reads the
+        recurrence rows themselves.
         """
         if after is None:
             after = date.today()
-
         if last_occur is not None and last_occur > after:
             after = last_occur
-
-        # Anchor each occurrence to ``start_date + (n × period)``,
-        # never chained ``occurrence += delta``: relativedelta clamps
-        # on month-end overflow, so a Jan-31 monthly chain drifts
-        # Jan 31 → Feb 28 → Mar 28 → … and never recovers. Anchored:
-        # Feb 28 → Mar 31 → Apr 30, preserving "31st, falling back
-        # to month-end".
-        delta_for = {
-            "weekly": lambda n: relativedelta(weeks=n),
-            "biweekly": lambda n: relativedelta(weeks=2 * n),
-            "monthly": lambda n: relativedelta(months=n),
-            "bimonthly": lambda n: relativedelta(months=2 * n),
-            "quarterly": lambda n: relativedelta(months=3 * n),
-            "yearly": lambda n: relativedelta(years=n),
-        }[frequency]
-
-        n = 0
-        while True:
-            occurrence = start_date + delta_for(n)
-            if occurrence > after:
-                break
-            n += 1
-
+        pt, mult = self.FREQUENCY_TO_RECURRENCE[frequency]
+        occurrence = _recurrence_next(pt, mult, start_date, "none", after)
+        if occurrence is None:
+            return None
         if end_date and occurrence > end_date:
             return None
         return occurrence
@@ -136,17 +241,61 @@ class SchedulingMixin:
         arrive as date or datetime depending on the piecash column
         path; normalized here once instead of at every reader.
         """
-        rec = sx.recurrence
-        frequency = None
-        if rec is not None:
-            frequency = self.RECURRENCE_TO_FREQUENCY.get(
-                (rec.recurrence_period_type, rec.recurrence_mult)
-            )
+        rows = self._sx_recurrences(sx)
+        return (
+            self._describe_recurrences(rows),
+            _gdate(sx.start_date), _gdate(sx.end_date), _gdate(sx.last_occur),
+        )
 
-        def _d(v):
-            return v.date() if isinstance(v, datetime) else v
+    def _sx_recurrences(self, sx) -> list[tuple[str, int, date, str]]:
+        """Every recurrence row of a schedule as ``(period_type,
+        mult, period_start, weekend_adjust)``. Raw SQL: piecash's
+        ``recurrence`` relation is ``uselist=False`` and shows one
+        row of a composite schedule."""
+        session = object_session(sx)
+        rows = session.execute(
+            text(
+                "SELECT recurrence_period_type, recurrence_mult, "
+                "recurrence_period_start, recurrence_weekend_adjust "
+                "FROM recurrences WHERE obj_guid = :g ORDER BY id"
+            ),
+            {"g": sx.guid},
+        ).fetchall()
+        return [
+            (r[0], int(r[1] or 1), _gdate(r[2]), r[3] or "none")
+            for r in rows
+            if _gdate(r[2]) is not None
+        ]
 
-        return frequency, _d(sx.start_date), _d(sx.end_date), _d(sx.last_occur)
+    def _describe_recurrences(self, rows) -> str | None:
+        """A frequency label honest about the rows: the six names
+        this server creates when one row matches, a plain
+        description for any other single row, ``composite (N
+        rules)`` for several. None with no rows."""
+        if not rows:
+            return None
+        if len(rows) > 1:
+            return f"composite ({len(rows)} rules)"
+        pt, mult, _start, wadj = rows[0]
+        label = self.RECURRENCE_TO_FREQUENCY.get((pt, mult))
+        if label is None:
+            unit = {
+                "day": "day", "week": "week", "month": "month",
+                "year": "year",
+            }.get(pt)
+            if pt == "once":
+                label = "once"
+            elif unit:
+                label = f"every {mult} {unit}s" if mult != 1 else f"every {unit}"
+            elif pt == "end of month":
+                label = "end of month" + (f" (every {mult} months)" if mult != 1 else "")
+            elif pt in ("nth weekday", "last weekday"):
+                label = pt + (f" (every {mult} months)" if mult != 1 else "")
+            else:
+                label = pt
+        if wadj in ("back", "forward"):
+            label += f", weekends {wadj}"
+        return label
 
     def _sx_next_due(self, sx) -> date | None:
         """The oldest occurrence this schedule has not yet produced —
@@ -163,20 +312,34 @@ class SchedulingMixin:
         ``last_occur`` past July and, through the backfill guard,
         locks July out for good.
 
-        None when the recurrence shape is unmodeled, the end date has
-        passed, or a finite schedule (``num_occur > 0``) has no
-        occurrences remaining — the same three stops GnuCash applies
-        in xaccSchedXactionGetNextInstance.
+        Reads the recurrence ROWS (all of them) through the ported
+        engine — the anchor day, multiplier, period type, and
+        weekend adjustment are theirs, and a composite schedule's
+        next is the earliest across its rows
+        (recurrenceListNextInstance). ``start_date`` only seeds the
+        reference for a schedule that has never run. None when the
+        schedule has no rows, the end date has passed, or a finite
+        schedule (``num_occur > 0``) has no occurrences remaining —
+        the stops GnuCash applies in xaccSchedXactionGetNextInstance.
         """
-        frequency, start, end, last = self._sx_schedule(sx)
-        if frequency is None:
+        _label, start, end, last = self._sx_schedule(sx)
+        rows = self._sx_recurrences(sx)
+        if not rows or start is None:
             return None
         if sx.num_occur > 0 and sx.rem_occur <= 0:
             return None
-        return self._next_occurrence(
-            start, frequency, after=start - timedelta(days=1),
-            end_date=end, last_occur=last,
-        )
+        ref = last if last is not None else start - timedelta(days=1)
+        candidates = [
+            _recurrence_next(pt, mult, anchor, wadj, ref)
+            for pt, mult, anchor, wadj in rows
+        ]
+        candidates = [c for c in candidates if c is not None]
+        if not candidates:
+            return None
+        nxt = min(candidates)
+        if end and nxt > end:
+            return None
+        return nxt
 
     def _sx_to_dict(self, sx, frequency: str | None = None) -> dict:
         """Serialize a ScheduledTransaction to a dict.
@@ -555,14 +718,35 @@ class SchedulingMixin:
             self._find_commodity(book, recipe["currency"])
             if recipe["currency"] else None
         ) or self._require_default_currency(book)
-        start = sx.start_date
-        if isinstance(start, datetime):
-            start = start.date()
+        start = _gdate(sx.start_date)
+        # A fresh container, exactly as create makes it — the legacy
+        # template account is a book-currency account named by the
+        # schedule; a template transaction on it crashes GnuCash's
+        # SX editor (bookkeeper, 2026-09-10). Repoint, then drop the
+        # old account.
+        old_acct = sx.template_account
+        new_acct = piecash.Account(
+            name=sx.guid, type="BANK", parent=book.root_template,
+            commodity=self._ensure_template_commodity(book),
+        )
+        book.session.flush()
         self._write_template_recipe(
-            book, sx.template_account, currency,
+            book, new_acct, currency,
             recipe["description"] or sx.name, recipe["notes"],
             start, legs,
         )
+        sx.template_account = new_acct
+        book.session.flush()
+        if old_acct is not None and old_acct.guid != new_acct.guid:
+            # Account.scheduled_transaction cascades delete-orphan;
+            # re-read it after the repoint so it finds nothing.
+            book.session.expire(old_acct, ["scheduled_transaction"])
+            for t in self._strip_template_recipe(
+                book, old_acct, f"legacy template of '{sx.name}'",
+            ):
+                book.session.delete(t)
+            book.session.delete(old_acct)
+            book.session.flush()
         for key in self._LEGACY_SX_SLOTS:
             book.session.execute(
                 Slot.__table__.delete().where(
@@ -970,7 +1154,12 @@ class SchedulingMixin:
         count = 0
         total = Decimal("0")
         unrated = 0
+        legacy = 0
         for sx in book.session.query(ScheduledTransaction).all():
+            # Recipes still in the pre-native shape are invisible
+            # to desktop until their first write migrates them.
+            if self._sx_recipe(book, sx)["source"] == "legacy":
+                legacy += 1
             if not sx.enabled:
                 continue
 
@@ -1002,7 +1191,10 @@ class SchedulingMixin:
                 amt = _to_decimal(s["amount"])
                 if amt > 0:
                     total += amt * rate
-        return {"count": count, "total": total, "unrated": unrated}
+        return {
+            "count": count, "total": total, "unrated": unrated,
+            "legacy": legacy,
+        }
 
     def get_upcoming_transactions(
         self,
@@ -1166,9 +1358,12 @@ class SchedulingMixin:
                     "Scheduled transaction is disabled"
                 )
 
-            frequency, _start, end, last = self._sx_schedule(sx)
-            if not frequency:
-                raise ValueError("Unknown recurrence frequency")
+            _label, _start, end, last = self._sx_schedule(sx)
+            if not self._sx_recurrences(sx):
+                raise ValueError(
+                    f"Cannot instantiate '{sx.name}': it has no "
+                    f"recurrence rule"
+                )
 
             if transaction_date:
                 txn_date = date.fromisoformat(transaction_date)
@@ -1505,7 +1700,21 @@ class SchedulingMixin:
             )
 
             template_acct = sx.template_account
+            sx_guid_full = sx.guid
             book.session.delete(sx)
+            book.session.flush()
+            # piecash's uselist=False relation cascaded one row; a
+            # composite schedule has more. Every row goes.
+            book.session.execute(
+                Recurrence.__table__.delete().where(
+                    Recurrence.__table__.c.obj_guid == sx_guid_full
+                )
+            )
+            _verify_delete(
+                book.session, Recurrence.__table__,
+                {"obj_guid": sx_guid_full},
+                f"recurrence rows of '{result['name']}'",
+            )
             if template_acct:
                 # The recipe is real Transaction rows on the template
                 # account. Strip their GUID/frame slots first: the

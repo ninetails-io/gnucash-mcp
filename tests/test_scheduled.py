@@ -1157,6 +1157,14 @@ def _make_legacy(book_path, sx_name, *, refs="guid", description=True,
         for t in txns:
             book.session.delete(t)
         book.session.flush()
+        # Pre-native containers: named by the schedule, on the book
+        # currency (what create used to make).
+        book.session.execute(
+            text("UPDATE accounts SET name = :n, commodity_guid = "
+                 "(SELECT guid FROM commodities WHERE mnemonic = 'USD' "
+                 "AND namespace = 'CURRENCY') WHERE guid = :g"),
+            {"n": sx_name, "g": tmpl.guid},
+        )
         rows = [("splits-json", json.dumps(legs))]
         if description and desc:
             rows.append(("description", desc))
@@ -1760,3 +1768,181 @@ class TestNativeTemplatesFX:
         txn = gb.get_transaction(r["transaction_guid"])
         eur = next(s for s in txn["splits"] if s["account"] == "Assets:Euro Savings")
         assert Decimal(eur["quantity"]) == Decimal("-100.00")
+
+
+
+# ── Recurrence engine (Recurrence.cpp, ported) ─────────────────
+
+
+class TestRecurrenceEngine:
+    """recurrenceNextInstance, line for line. Desktop anchors an
+    occurrence on the recurrence row — period start, multiplier,
+    period type, weekend adjustment — and a schedule may carry
+    several rows. Pre-fix the server used start_date + its own
+    frequency label: a desktop schedule "start 9 Sep, monthly on
+    the 15th" posted on the 9th and wrote last_occur=9th, so
+    desktop's next run posted the 15th again (bookkeeper, 2026-09-10)."""
+
+    def _n(self, pt, mult, start, ref, wadj="none"):
+        from gnucash_mcp.book.scheduling import _recurrence_next
+        return _recurrence_next(pt, mult, start, wadj, ref)
+
+    def test_ref_before_start_is_the_start(self):
+        assert self._n("month", 1, date(2026, 9, 15), date(2026, 9, 8)) == date(2026, 9, 15)
+
+    def test_monthly_anchor_day(self):
+        assert self._n("month", 1, date(2026, 9, 15), date(2026, 9, 15)) == date(2026, 10, 15)
+        assert self._n("month", 1, date(2026, 9, 15), date(2026, 9, 20)) == date(2026, 10, 15)
+
+    def test_monthly_31st_clamps_and_recovers(self):
+        assert self._n("month", 1, date(2026, 1, 31), date(2026, 1, 31)) == date(2026, 2, 28)
+        assert self._n("month", 1, date(2026, 1, 31), date(2026, 2, 28)) == date(2026, 3, 31)
+
+    def test_quarterly_from_anchor(self):
+        assert self._n("month", 3, date(2025, 4, 15), date(2026, 4, 15)) == date(2026, 7, 15)
+
+    def test_semiannual_is_just_a_multiplier(self):
+        assert self._n("month", 6, date(2026, 1, 10), date(2026, 3, 1)) == date(2026, 7, 10)
+
+    def test_yearly_leap_day(self):
+        assert self._n("year", 1, date(2024, 2, 29), date(2024, 2, 29)) == date(2025, 2, 28)
+        assert self._n("year", 1, date(2024, 2, 29), date(2027, 2, 28)) == date(2028, 2, 29)
+
+    def test_biweekly_and_daily(self):
+        assert self._n("week", 2, date(2025, 1, 10), date(2026, 7, 10)) == date(2026, 7, 24)
+        assert self._n("day", 1, date(2026, 9, 1), date(2026, 9, 1)) == date(2026, 9, 2)
+        assert self._n("day", 10, date(2026, 9, 1), date(2026, 9, 15)) == date(2026, 9, 21)
+
+    def test_end_of_month(self):
+        assert self._n("end of month", 1, date(2026, 1, 31), date(2026, 2, 28)) == date(2026, 3, 31)
+        assert self._n("end of month", 1, date(2026, 1, 31), date(2026, 3, 15)) == date(2026, 3, 31)
+
+    def test_nth_weekday(self):
+        # 2nd Tuesday: Sep 8 2026 → Oct 13 2026.
+        assert self._n("nth weekday", 1, date(2026, 9, 8), date(2026, 9, 8)) == date(2026, 10, 13)
+
+    def test_last_weekday(self):
+        # last Tuesday: Sep 29 2026 → Oct 27 2026.
+        assert self._n("last weekday", 1, date(2026, 9, 29), date(2026, 9, 29)) == date(2026, 10, 27)
+
+    def test_weekend_forward(self):
+        # Aug 15 2026 is a Saturday → adjusted start Mon Aug 17.
+        assert self._n("month", 1, date(2026, 8, 15), date(2026, 7, 20), "forward") == date(2026, 8, 17)
+        assert self._n("month", 1, date(2026, 8, 15), date(2026, 8, 17), "forward") == date(2026, 9, 15)
+
+    def test_weekend_back(self):
+        assert self._n("month", 1, date(2026, 8, 15), date(2026, 7, 20), "back") == date(2026, 8, 14)
+        # Nov 15 2026 is a Sunday → Fri Nov 13.
+        assert self._n("month", 1, date(2026, 8, 15), date(2026, 10, 15), "back") == date(2026, 11, 13)
+
+    def test_once(self):
+        assert self._n("once", 1, date(2026, 9, 15), date(2026, 9, 1)) == date(2026, 9, 15)
+        assert self._n("once", 1, date(2026, 9, 15), date(2026, 9, 15)) is None
+
+
+class TestScheduleReadsRecurrenceRows:
+    def _second_row(self, book_path, sx_name, period_start_yyyymmdd, pt="month", mult=1):
+        from sqlalchemy import text
+        gb = GnuCashBook(str(book_path))
+        with gb.open(readonly=False) as book:
+            book.session.execute(
+                text("INSERT INTO recurrences (obj_guid, recurrence_mult, "
+                     "recurrence_period_type, recurrence_period_start, "
+                     "recurrence_weekend_adjust) VALUES ((SELECT guid FROM "
+                     "schedxactions WHERE name = :n), :m, :t, :s, 'none')"),
+                {"n": sx_name, "m": mult, "t": pt, "s": period_start_yyyymmdd},
+            )
+            book.save()
+
+    def test_desktop_anchor_day_wins_over_start_date(self, scheduled_book):
+        """Desktop: start 2026-09-09, monthly on the 15th."""
+        from sqlalchemy import text
+        gb = GnuCashBook(str(scheduled_book))
+        sx = _rent(gb, date(2026, 9, 9))
+        with gb.open(readonly=False) as book:
+            book.session.execute(text(
+                "UPDATE recurrences SET recurrence_period_start = '20260915'"
+            ))
+            book.save()
+        row = gb.list_scheduled_transactions(compact=False)["scheduled_transactions"][0]
+        assert row["next_occurrence"] == "2026-09-15"
+        r = gb.create_transaction_from_scheduled(guid=sx["guid"])
+        assert r["transaction_date"] == "2026-09-15"
+
+    def test_composite_schedule_walks_both_rows(self, scheduled_book):
+        gb = GnuCashBook(str(scheduled_book))
+        sx = _rent(gb, date(2026, 9, 20))
+        self._second_row(scheduled_book, "Rent", "20260905")
+        row = gb.list_scheduled_transactions(compact=False)["scheduled_transactions"][0]
+        assert row["frequency"] == "composite (2 rules)"
+        assert row["next_occurrence"] == "2026-09-20"
+        gb.create_transaction_from_scheduled(guid=sx["guid"])
+        row = gb.list_scheduled_transactions(compact=False)["scheduled_transactions"][0]
+        assert row["next_occurrence"] == "2026-10-05"
+        gb.create_transaction_from_scheduled(guid=sx["guid"])
+        row = gb.list_scheduled_transactions(compact=False)["scheduled_transactions"][0]
+        assert row["next_occurrence"] == "2026-10-20"
+
+    def test_unfamiliar_single_rows_are_labeled_and_scheduled(self, scheduled_book):
+        from sqlalchemy import text
+        gb = GnuCashBook(str(scheduled_book))
+        _rent(gb, date(2026, 1, 31))
+        with gb.open(readonly=False) as book:
+            book.session.execute(text(
+                "UPDATE recurrences SET recurrence_period_type = 'end of month', "
+                "recurrence_weekend_adjust = 'forward'"
+            ))
+            book.save()
+        row = gb.list_scheduled_transactions(compact=False)["scheduled_transactions"][0]
+        assert row["frequency"] == "end of month, weekends forward"
+        assert row["next_occurrence"] == "2026-02-02"  # Jan 31 2026 is a Saturday
+
+    def test_delete_removes_every_recurrence_row(self, scheduled_book):
+        from sqlalchemy import text
+        gb = GnuCashBook(str(scheduled_book))
+        sx = _rent(gb, date(2026, 9, 20))
+        self._second_row(scheduled_book, "Rent", "20260905")
+        gb.delete_scheduled_transaction(sx["guid"])
+        with gb.open(readonly=True) as book:
+            assert book.session.execute(text("SELECT COUNT(*) FROM recurrences")).scalar() == 0
+
+
+class TestMigrationRebuildsContainer:
+    def test_migrated_schedule_matches_a_fresh_one(self, scheduled_book):
+        """The legacy template account (book currency, named by the
+        schedule) crashed GnuCash's SX editor once a template
+        transaction sat on it. Migration builds the container create
+        builds and drops the old account."""
+        from sqlalchemy import text
+        gb = GnuCashBook(str(scheduled_book))
+        sx = _rent(gb, date.today())
+        _make_legacy(scheduled_book, "Rent")
+        r = gb.update_scheduled_transaction(sx["guid"], enabled=True)
+        assert r.get("template_migrated") is True
+        with gb.open(readonly=True) as book:
+            sx_row, acct, splits, txns = _template_rows(book, "Rent")
+            assert acct[0] == sx_row[0] and acct[1] == "BANK"
+            ns, frac = book.session.execute(
+                text("SELECT namespace, fraction FROM commodities WHERE guid = :g"),
+                {"g": acct[2]},
+            ).first()
+            assert (ns, frac) == ("template", 1)
+            denoms = book.session.execute(
+                text("SELECT DISTINCT quantity_denom FROM splits WHERE account_guid = :a"),
+                {"a": sx_row[1]},
+            ).fetchall()
+            assert denoms == [(1,)]
+            # Exactly one template account under the template root.
+            assert len(book.root_template.children) == 1
+            assert book.session.execute(text("SELECT COUNT(*) FROM schedxactions")).scalar() == 1
+        assert gb.list_scheduled_transactions(compact=False)["scheduled_transactions"][0]["recipe"] == "native"
+
+
+class TestLegacyCountOnDashboard:
+    def test_scheduled_line_counts_legacy_recipes(self, scheduled_book):
+        gb = GnuCashBook(str(scheduled_book))
+        _rent(gb, date.today() + timedelta(days=3))
+        _rent(gb, date.today() + timedelta(days=4), name="Legacy One")
+        _make_legacy(scheduled_book, "Legacy One")
+        line = next(l for l in gb.get_book_summary().splitlines() if l.startswith("Scheduled:"))
+        assert "1 on legacy recipe (migrates on first write)" in line

@@ -2275,6 +2275,14 @@ class CoreMixin:
                     )
                 else:
                     line += f", none {further}due in next 7 days"
+                # Pre-native recipes: desktop's Since-Last-Run
+                # advances these with nothing posted until their
+                # first write here migrates them.
+                if upcoming.get("legacy"):
+                    line += (
+                        f", {upcoming['legacy']} on legacy recipe "
+                        f"(migrates on first write)"
+                    )
             lines.append(line)
         return lines
 
