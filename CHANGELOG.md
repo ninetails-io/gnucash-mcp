@@ -6,6 +6,7 @@ Entries are terse by design: what changed, one line each, PR numbers where they 
 
 ### Added
 - **Database-backed books** — `GNUCASH_BOOK_URI` / `--book-uri` serve a book GnuCash keeps in PostgreSQL (or any SQLAlchemy-addressable backend) instead of a SQLite file. Every read and write tool works unchanged. Install the driver with `pip install "gnucash-mcp[postgres]"`. Closes the v1.5 roadmap's "DB backend" item. Contributed by @vchatela (#175; requested in #174).
+- **MySQL / MariaDB books** — the `mysql` extra (PyMySQL, pure Python) and `GNUCASH_BOOK_URI=mysql+pymysql://…`. The database tests run once per dialect, and CI gains a MariaDB 11 job beside the PostgreSQL one. The backup refusal and the server-config backend line name the dialect's own dump tool (`pg_dump`, `mysqldump` / `mariadb-dump`) instead of assuming PostgreSQL.
 - `_gnc_bool` — one coercion for GnuCash's INTEGER flag columns (`placeholder`, `hidden`, `enabled`, `is_closed`, `active`, the entry `*_taxable` / `*_taxincluded` pair), with a contract test. PostgreSQL rejects a Python bool where SQLite coerced it silently.
 
 ### Changed

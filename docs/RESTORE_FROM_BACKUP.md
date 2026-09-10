@@ -28,7 +28,7 @@ You'll need:
 
 If your book lives in a database rather than a file
 (`GNUCASH_BOOK_URI`), this procedure does not apply — skip to
-[If your book lives in PostgreSQL](#if-your-book-lives-in-postgresql).
+[If your book lives in PostgreSQL or MySQL](#if-your-book-lives-in-postgresql-or-mysql).
 
 ---
 
@@ -125,7 +125,7 @@ If something's still off:
 
 ---
 
-## If your book lives in PostgreSQL
+## If your book lives in PostgreSQL or MySQL
 
 Everything above assumes a book in a SQLite file, which is what the
 MCP backup store snapshots. A database-backed book
@@ -142,6 +142,18 @@ pg_dump --format=custom gnucash > gnucash-$(date -u +%Y%m%dT%H%M%SZ).dump
 # Restore, with the MCP server and GnuCash both stopped (Step 1 above)
 dropdb gnucash && createdb gnucash
 pg_restore --dbname=gnucash gnucash-20260907T101500Z.dump
+```
+
+MySQL / MariaDB, the same shape (`mariadb-dump` is MariaDB's name for
+the same tool; `mysqldump` still works there):
+
+```bash
+# Back up
+mysqldump --single-transaction gnucash > gnucash-$(date -u +%Y%m%dT%H%M%SZ).sql
+
+# Restore, both programs stopped
+mysql -e "DROP DATABASE gnucash; CREATE DATABASE gnucash CHARACTER SET utf8mb4"
+mysql gnucash < gnucash-20260907T101500Z.sql
 ```
 
 Steps 1, 4 and 5 of the file procedure still apply as written: stop
