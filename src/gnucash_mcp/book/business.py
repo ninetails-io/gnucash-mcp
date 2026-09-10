@@ -1949,18 +1949,30 @@ class BusinessMixin:
                     result["taxtable_guid"] = taxtable_guid
         return result
 
+    # gnc-engine.h, verbatim — the link GnuCash walks from a posting
+    # transaction or its lot back to the invoice (register "Jump to
+    # Invoice", the lot viewer, Process Payment's open-lot list):
+    #   #define GNC_INVOICE_ID    "gncInvoice"
+    #   #define GNC_INVOICE_GUID  "invoice-guid"
+    # On disk: a `gncInvoice` frame row on the object, and a GUID row
+    # named by the FULL path on the frame's guid. Before 1.5 the child
+    # was named `invoice`, which desktop never reads; the sweep below
+    # renames it on the next business write.
+    _GNC_INVOICE_ID = "gncInvoice"
+    _GNC_INVOICE_GUID = "invoice-guid"
+    _GNC_INVOICE_LINK = "gncInvoice/invoice-guid"
+    _LEGACY_INVOICE_LINK = "invoice"
+
     @staticmethod
     def _write_gncinvoice_slot(book, obj_guid: str, invoice_guid: str):
-        """Write a gncInvoice FRAME+GUID slot linking an object to an invoice.
+        """Write the gncInvoice frame + GUID link from an object (the
+        posting transaction, its lot) to its invoice, in GnuCash's
+        own two-row shape:
 
-        GnuCash stores invoice linkage as a two-row structure:
-          Row 1: obj_guid=<parent>, name='gncInvoice', slot_type=9 (FRAME),
-                 guid_val=<frame_guid>
-          Row 2: obj_guid=<frame_guid>, name='invoice', slot_type=5 (GUID),
-                 guid_val=<invoice_guid>
-
-        This is used on both posting transactions and lots to enable
-        GnuCash UI navigation from transaction/lot back to the invoice.
+          Row 1: obj_guid=<parent>, name='gncInvoice', slot_type=9
+                 (FRAME), guid_val=<frame_guid>
+          Row 2: obj_guid=<frame_guid>, name='gncInvoice/invoice-guid',
+                 slot_type=5 (GUID), guid_val=<invoice_guid>
         """
         import uuid
         from piecash.kvp import Slot, KVP_Type
@@ -1982,15 +1994,66 @@ class BusinessMixin:
         book.session.execute(
             Slot.__table__.insert().values(
                 obj_guid=frame_guid,
-                name="invoice",
+                name=BusinessMixin._GNC_INVOICE_LINK,
                 slot_type=KVP_Type.KVP_TYPE_GUID,
                 guid_val=invoice_guid,
             )
         )
         _verify_composite_write(
             book.session, Slot.__table__,
-            {"obj_guid": frame_guid, "name": "invoice"},
+            {"obj_guid": frame_guid, "name": BusinessMixin._GNC_INVOICE_LINK},
             f"gncInvoice ref slot for frame {frame_guid[:8]}",
+        )
+
+    @staticmethod
+    def _migrate_invoice_link_keys(book) -> int:
+        """Write path only: rename every pre-1.5 link child (`invoice`)
+        under a `gncInvoice` frame to GnuCash's key. A rename of rows,
+        nothing else changes and nothing posts; every business write
+        calls it so the first one after the upgrade converts the whole
+        book. Returns how many links were renamed."""
+        from piecash.kvp import Slot
+        from sqlalchemy import text
+
+        frames = [
+            r[0] for r in book.session.execute(
+                text(
+                    "SELECT s.obj_guid FROM slots s WHERE s.name = :old "
+                    "AND s.slot_type = 5 AND s.obj_guid IN "
+                    "(SELECT guid_val FROM slots WHERE name = :frame "
+                    "AND slot_type = 9)"
+                ),
+                {"old": BusinessMixin._LEGACY_INVOICE_LINK,
+                 "frame": BusinessMixin._GNC_INVOICE_ID},
+            ).fetchall()
+        ]
+        for frame_guid in frames:
+            book.session.execute(
+                Slot.__table__.update()
+                .where(
+                    (Slot.__table__.c.obj_guid == frame_guid)
+                    & (Slot.__table__.c.name
+                       == BusinessMixin._LEGACY_INVOICE_LINK)
+                )
+                .values(name=BusinessMixin._GNC_INVOICE_LINK)
+            )
+            _verify_composite_write(
+                book.session, Slot.__table__,
+                {"obj_guid": frame_guid,
+                 "name": BusinessMixin._GNC_INVOICE_LINK},
+                f"renamed invoice link on frame {frame_guid[:8]}",
+            )
+        return len(frames)
+
+    def _doc_type_string(self, book, inv) -> str:
+        """gncInvoiceGetTypeString, verbatim: "Invoice", "Bill",
+        "Expense" (voucher), "Credit Note". GnuCash uses it for the
+        lot title ("%s %s" with the id) and every posting split's
+        action; so do we."""
+        if self._get_is_credit_note(inv):
+            return "Credit Note"
+        return {2: "Invoice", 4: "Bill", 5: "Expense"}.get(
+            self._effective_owner_type(book, inv), "Invoice",
         )
 
     @staticmethod
@@ -5548,6 +5611,9 @@ class BusinessMixin:
         )
 
         with self.open(readonly=False) as book:
+            # Every pre-1.5 shape in the book converts on this write
+            # (nothing posted) — see _upgrade_book_shapes.
+            shapes = self._upgrade_book_shapes(book)
             # Customer-invoice and vendor-bill ID sequences collide
             # in the shared ``invoices`` table — without an
             # owner_type filter, posting bill 000010 can fetch an
@@ -5628,8 +5694,9 @@ class BusinessMixin:
             acct_totals = totals["acct_totals"]
             grand_total = totals["grand_total"]
 
+            type_string = self._doc_type_string(book, inv)
             lot = Lot(
-                title=f"Invoice {inv.id}",
+                title=f"{type_string} {inv.id}",
                 account=post_acct,
                 is_closed=0,
             )
@@ -5702,9 +5769,7 @@ class BusinessMixin:
             # commodity differs from the transaction currency —
             # brokerage vocabulary on a client bill. Forward-only:
             # existing transactions are never rewritten to conform.
-            doc_action = (
-                "Credit Note" if is_credit_note else "Invoice"
-            )
+            doc_action = type_string
             ar_ap_split = piecash.Split(
                 account=post_acct,
                 value=ar_ap_value,
@@ -5812,6 +5877,7 @@ class BusinessMixin:
                 result["fx_stale"] = max(
                     fx_stale_overrides, key=lambda m: m["age_days"]
                 )
+        result.update(shapes)
         return result
 
     def unpost_invoice(
@@ -5844,6 +5910,9 @@ class BusinessMixin:
         ot = self._parse_owner_type(owner_type)
 
         with self.open(readonly=False) as book:
+            # Every pre-1.5 shape in the book converts on this write
+            # (nothing posted) — see _upgrade_book_shapes.
+            shapes = self._upgrade_book_shapes(book)
             inv = self._find_invoice(book, invoice_id, owner_type=ot)
             if not inv:
                 raise ValueError(
@@ -5985,6 +6054,7 @@ class BusinessMixin:
             book.save()
 
             return {
+                **shapes,
                 "id": inv_id_snapshot,
                 "type": (
                     "credit_note"
@@ -6075,6 +6145,9 @@ class BusinessMixin:
         )
 
         with self.open(readonly=dry_run) as book:
+            # Every pre-1.5 shape in the book converts on a real
+            # payment (nothing posted) — see _upgrade_book_shapes.
+            shapes = {} if dry_run else self._upgrade_book_shapes(book)
             inv = self._find_invoice(book, invoice_id, owner_type=ot)
             if not inv:
                 raise ValueError(
@@ -6659,6 +6732,7 @@ class BusinessMixin:
                 result["total_paid"] = str(total_paid)
             _attach_extras(result)
 
+        result.update(shapes)
         return result
 
     def apply_credit_note(
@@ -6706,6 +6780,9 @@ class BusinessMixin:
         )
 
         with self.open(readonly=False) as book:
+            # Every pre-1.5 shape in the book converts on this write
+            # (nothing posted) — see _upgrade_book_shapes.
+            shapes = self._upgrade_book_shapes(book)
             # Resolve the credit note (validates it IS a credit note).
             cn = self._resolve_credit_note(
                 book, credit_note_id, owner_type=owner_type,
@@ -6988,6 +7065,7 @@ class BusinessMixin:
                     f"applied to {target.id} (credit note "
                     f"references {linked['id']})"
                 )
+            result.update(shapes)
             return result
 
     # ── Delete paths ──────────────────────────────────────────────
@@ -7066,6 +7144,9 @@ class BusinessMixin:
         entry_fk_col = getattr(Entry.__table__.c, entry_fk)
 
         with self.open(readonly=False) as book:
+            # Every pre-1.5 shape in the book converts on this write
+            # (nothing posted) — see _upgrade_book_shapes.
+            shapes = self._upgrade_book_shapes(book)
             inv = self._find_invoice(book, doc_id, owner_type=owner_type)
             if not inv:
                 raise ValueError(f"{type_label} not found: {doc_id}")
@@ -7164,6 +7245,7 @@ class BusinessMixin:
             book.save()
 
             return {
+                **shapes,
                 "id": doc_id,
                 "guid": inv_guid,
                 "type": type_label.lower(),

@@ -599,17 +599,7 @@ def _fmt_transaction_create_from_scheduled(entry: dict) -> list[str]:
     return lines
 
 
-def _template_migration_lines(after: dict) -> list[str]:
-    """A schedule write converts every legacy recipe in the book to
-    native template rows (nothing posted); a storage change is never
-    silent in the log."""
-    n = after.get("templates_migrated")
-    if not n:
-        return []
-    return [
-        f"{_INDENT}{n} schedule recipe{'s' if n != 1 else ''} migrated "
-        f"to native template rows (GnuCash-readable, nothing posted)"
-    ]
+
 
 
 def _parse_audit_tsv_rows(tsv: str) -> list[dict]:
@@ -1520,22 +1510,8 @@ def _fx_stale_lines(entry: dict) -> list[str]:
     ]
 
 
-def _fmt_invoice_post(entry: dict) -> list[str]:
-    time_part = _extract_time(entry)
-    params = entry.get("params") or {}
-    after = entry.get("after_state")
 
-    lines = [f"{time_part}  POST INVOICE  id:{params.get('id', '')}"]
-    if after:
-        total = after.get("total", "")
-        post_date = after.get("post_date", "")
-        txn_guid = after.get("transaction_guid") or ""
-        lines.append(f"{_INDENT}total: {total}  date: {post_date}")
-        lines.append(
-            f"{_INDENT}account: {params.get('post_account', '')}  txn:{txn_guid}"
-        )
-    lines += _fx_stale_lines(entry)
-    return lines
+
 
 
 # ── Investment handlers ───────────────────────────────────────────
@@ -1694,6 +1670,7 @@ def _fmt_invoice_unpost(entry: dict) -> list[str]:
             f"{_INDENT}was posted:{was_posted}  "
             f"post_account:{was_account}"
         )
+    lines.extend(_invoice_link_migration_lines(entry.get("after_state") or {}))
     return lines
 
 
@@ -1749,6 +1726,7 @@ def _fmt_invoice_pay(entry: dict) -> list[str]:
     if memo:
         lines.append(f"{_INDENT}memo: {memo}")
     lines += _fx_stale_lines(entry)
+    lines.extend(_invoice_link_migration_lines(entry.get("after_state") or {}))
     return lines
 
 
@@ -2060,11 +2038,25 @@ def _fmt_budget_create(entry: dict) -> list[str]:
     return lines
 
 
-def _budget_stamp_lines(after: dict) -> list[str]:
-    """A budget write that stamped the book with GnuCash's
-    natural-sign feature, or scrubbed existing rows to it, is a
-    book-level change and never leaves the log silent about it."""
+def _shape_upgrade_lines(after: dict) -> list[str]:
+    """Any schedule, budget, or business write converts every
+    pre-1.5 private shape in the book to GnuCash's own
+    (``_upgrade_book_shapes``); a storage change is never silent in
+    the log. One renderer for all of it, whichever formatter calls."""
     lines = []
+    n = after.get("templates_migrated")
+    if n:
+        lines.append(
+            f"{_INDENT}{n} schedule recipe{'s' if n != 1 else ''} "
+            f"migrated to native template rows (GnuCash-readable, "
+            f"nothing posted)"
+        )
+    n = after.get("invoice_links_migrated")
+    if n:
+        lines.append(
+            f"{_INDENT}{n} invoice link{'s' if n != 1 else ''} renamed "
+            f"to GnuCash's key (desktop-navigable, nothing posted)"
+        )
     if after.get("book_stamped"):
         lines.append(
             f'{_INDENT}book stamped: "{after["book_stamped"]}" '
@@ -2075,6 +2067,33 @@ def _budget_stamp_lines(after: dict) -> list[str]:
             f"{_INDENT}existing budget rows scrubbed to natural sign"
         )
     return lines
+
+
+_budget_stamp_lines = _shape_upgrade_lines
+_template_migration_lines = _shape_upgrade_lines
+_invoice_link_migration_lines = _shape_upgrade_lines
+
+
+def _fmt_invoice_post(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state")
+
+    lines = [f"{time_part}  POST INVOICE  id:{params.get('id', '')}"]
+    if after:
+        total = after.get("total", "")
+        post_date = after.get("post_date", "")
+        txn_guid = after.get("transaction_guid") or ""
+        lines.append(f"{_INDENT}total: {total}  date: {post_date}")
+        lines.append(
+            f"{_INDENT}account: {params.get('post_account', '')}  txn:{txn_guid}"
+        )
+    lines += _fx_stale_lines(entry)
+    lines.extend(_invoice_link_migration_lines(entry.get("after_state") or {}))
+    return lines
+
+
+# ── Investment handlers ───────────────────────────────────────────
 
 
 def _fmt_budget_update(entry: dict) -> list[str]:

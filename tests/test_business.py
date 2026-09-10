@@ -7016,10 +7016,10 @@ class TestPostInvoice:
             # Child GUID slot inside the frame
             child = conn.execute(
                 "SELECT name, slot_type, guid_val FROM slots "
-                "WHERE obj_guid = ? AND name = 'invoice'",
+                "WHERE obj_guid = ? AND name = 'gncInvoice/invoice-guid'",
                 (frame_guid,),
             ).fetchone()
-            assert child is not None, "missing gncInvoice/invoice child slot"
+            assert child is not None, "missing gncInvoice/invoice-guid child slot"
             assert child[1] == 5, "child slot should be GUID type (5)"
 
             # Due date slot
@@ -12182,3 +12182,116 @@ class TestDocumentPaymentState:
         assert second["remaining_balance"] == "0.00"
         assert second["status"] == "paid"
         assert "amount_paid" not in second
+
+
+# ── Invoice link key (gnc-engine.h GNC_INVOICE_GUID) ────────────
+
+
+def _link_rows(gb, obj_guid):
+    """Children of the gncInvoice frame on an object: [(name, guid_val)]."""
+    from sqlalchemy import text
+    with gb.open(readonly=True) as book:
+        return book.session.execute(
+            text("SELECT c.name, c.guid_val FROM slots f JOIN slots c "
+                 "ON c.obj_guid = f.guid_val WHERE f.obj_guid = :o "
+                 "AND f.name = 'gncInvoice' AND f.slot_type = 9"),
+            {"o": obj_guid},
+        ).fetchall()
+
+
+class TestInvoiceLinkKey:
+    """The link from a posting transaction (and its lot) back to the
+    invoice is the two-element KVP path GnuCash walks for "Jump to
+    Invoice", the lot viewer, and Process Payment's open-lot list.
+    Pre-1.5 the child row was named `invoice`; desktop never read
+    it. Pinned against a copy of the header."""
+
+    GNC_ENGINE_H_LINES = (
+        '#define GNC_INVOICE_ID    "gncInvoice"\n'
+        '#define GNC_INVOICE_GUID  "invoice-guid"\n'
+    )
+
+    def test_key_matches_gnc_engine_h(self):
+        import re
+        from gnucash_mcp.book.business import BusinessMixin as B
+        ids = re.findall(r'"([^"]+)"', self.GNC_ENGINE_H_LINES)
+        assert (B._GNC_INVOICE_ID, B._GNC_INVOICE_GUID) == tuple(ids)
+        assert B._GNC_INVOICE_LINK == f"{ids[0]}/{ids[1]}"
+
+    def _posted(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        cust = gb.create_customer(name="Link Co")
+        inv = gb.create_invoice(customer_id=cust["id"])
+        gb.add_invoice_entry(inv["id"], description="Work",
+                             quantity="1", price="100.00",
+                             account="Income:Sales")
+        r = gb.post_invoice(inv["id"], post_account="Assets:Accounts Receivable",
+                            post_date="2026-09-01")
+        with gb.open(readonly=True) as book:
+            row = gb._find_invoice(book, inv["id"], owner_type=2)
+            return gb, inv["id"], row.post_txn.guid, row.post_lot.guid
+
+    def test_post_writes_the_real_key_on_txn_and_lot(self, business_book):
+        gb, _id, txn_guid, lot_guid = self._posted(business_book)
+        for obj in (txn_guid, lot_guid):
+            rows = _link_rows(gb, obj)
+            assert [r[0] for r in rows] == ["gncInvoice/invoice-guid"], rows
+
+    def test_legacy_links_renamed_on_next_business_write(self, business_book):
+        from sqlalchemy import text
+        gb, inv_id, txn_guid, lot_guid = self._posted(business_book)
+        # Engineer the pre-1.5 shape byte-faithfully.
+        with gb.open(readonly=False) as book:
+            book.session.execute(text(
+                "UPDATE slots SET name = 'invoice' "
+                "WHERE name = 'gncInvoice/invoice-guid'"
+            ))
+            book.save()
+        assert [r[0] for r in _link_rows(gb, txn_guid)] == ["invoice"]
+        r = gb.pay_invoice(inv_id, amount="100.00",
+                           payment_account="Assets:Checking",
+                           payment_date="2026-09-02")
+        assert r.get("invoice_links_migrated") == 2
+        for obj in (txn_guid, lot_guid):
+            assert [x[0] for x in _link_rows(gb, obj)] == ["gncInvoice/invoice-guid"]
+        # Idempotent: a second write finds nothing to rename.
+        inv2 = gb.create_invoice(customer_id=gb.list_customers(compact=False)["customers"][0]["id"])
+        gb.add_invoice_entry(inv2["id"], description="More", quantity="1",
+                             price="5.00", account="Income:Sales")
+        r2 = gb.post_invoice(inv2["id"], post_account="Assets:Accounts Receivable",
+                             post_date="2026-09-03")
+        assert "invoice_links_migrated" not in r2
+
+    def test_audit_line_names_the_rename(self):
+        from gnucash_mcp.logging_config import _fmt_invoice_pay
+        lines = _fmt_invoice_pay({
+            "timestamp": "2026-09-10T10:00:00",
+            "params": {"invoice_id": "000001", "amount": "100.00"},
+            "after_state": {"invoice_id": "000001", "invoice_links_migrated": 2},
+        })
+        assert any("2 invoice links renamed" in l and "nothing posted" in l for l in lines)
+
+
+class TestDocumentTypeStrings:
+    """gncInvoiceGetTypeString, verbatim: Invoice / Bill / Expense /
+    Credit Note — GnuCash's lot title ("%s %s" with the id) and every
+    posting split's action. Pre-fix every type got "Invoice"."""
+
+    def test_bill_lot_title_and_action(self, business_book):
+        from sqlalchemy import text
+        gb = GnuCashBook(str(business_book))
+        v = gb.create_vendor(name="Type Co")
+        bill = gb.create_bill(vendor_id=v["id"])
+        gb.add_bill_entry(bill["id"], description="Parts", quantity="1",
+                          price="40.00", account="Expenses:Office Supplies")
+        gb.post_invoice(bill["id"], post_account="Liabilities:Accounts Payable",
+                        post_date="2026-09-01", owner_type="vendor")
+        with gb.open(readonly=True) as book:
+            row = gb._find_invoice(book, bill["id"], owner_type=4)
+            title = book.session.execute(
+                text("SELECT string_val FROM slots WHERE obj_guid = :l AND name = 'title'"),
+                {"l": row.post_lot.guid},
+            ).scalar()
+            actions = {s.action for s in row.post_txn.splits}
+        assert title == f"Bill {bill['id']}"
+        assert actions == {"Bill"}
