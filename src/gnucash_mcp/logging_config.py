@@ -595,6 +595,11 @@ def _fmt_transaction_create_from_scheduled(entry: dict) -> list[str]:
     if instance:
         detail += f"  instance #{instance}"
     lines.append(f"{_INDENT}{detail}")
+    if after.get("template_migrated"):
+        lines.append(
+            f"{_INDENT}recipe migrated to native template rows "
+            f"(GnuCash-readable)"
+        )
     return lines
 
 
@@ -2172,6 +2177,11 @@ def _fmt_scheduled_transaction_update(entry: dict) -> list[str]:
         new_str = new or "(cleared)"
         if old != new:
             lines.append(f"{_INDENT}notes: {old_str} → {new_str}")
+    if (entry.get("after_state") or {}).get("template_migrated"):
+        lines.append(
+            f"{_INDENT}recipe migrated to native template rows "
+            f"(GnuCash-readable)"
+        )
     return lines
 
 

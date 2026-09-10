@@ -5823,6 +5823,16 @@ class CoreMixin:
             if reconciled_count:
                 result["reconciled_splits_affected"] = reconciled_count
 
+            # Strip GUID-valued slots (from-sched-xaction,
+            # invoice-guid, gains-split…) and frames by raw SQL
+            # first: piecash's SlotGUID cascade would otherwise
+            # delete every slot of the entity they point at.
+            self._strip_guid_slots(
+                book,
+                [transaction.guid] + [s.guid for s in transaction.splits],
+                f"delete of {transaction.guid[:8]}",
+                objects=[transaction, *transaction.splits],
+            )
             # Delete the transaction
             book.session.delete(transaction)
             book.save()
@@ -5898,6 +5908,12 @@ class CoreMixin:
                 items.append(item)
 
             for transaction, _ in resolved:
+                self._strip_guid_slots(
+                    book,
+                    [transaction.guid] + [s.guid for s in transaction.splits],
+                    f"delete of {transaction.guid[:8]}",
+                    objects=[transaction, *transaction.splits],
+                )
                 book.session.delete(transaction)
             book.save()
 

@@ -2046,6 +2046,82 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
                 out[key] = value
         return out
 
+    def _strip_guid_slots(
+        self, book, obj_guids: list[str], label: str, objects=(),
+    ) -> None:
+        """Delete, by raw SQL, every GUID-valued slot and every frame
+        subtree hanging off ``obj_guids`` — BEFORE the owning rows
+        are ORM-deleted.
+
+        piecash's ``SlotGUID`` inherits ``SlotFrame.slots``, a
+        delete-orphan relation joined on ``obj_guid == guid_val``.
+        For a frame that's its children; for a GUID slot it is every
+        slot of the REFERENCED entity. ORM-deleting a transaction
+        that carries ``from-sched-xaction`` sweeps the schedule's
+        slots; deleting a template split that carries
+        ``sched-xaction/account`` sweeps the target ACCOUNT's slots
+        (notes, apr, designated-account markers). The credit-note
+        incident was this cascade through ``invoice-guid``. Stripping
+        the GUID and frame rows first leaves the ORM nothing to
+        cascade through. Plain string/numeric slots are left to the
+        normal cascade. ``objects`` are the ORM owners whose ``slots``
+        collections may already be loaded (reading ``txn.notes``
+        loads every slot of the transaction, GUID ones included);
+        they are expired after the strip so the cascade re-reads an
+        empty collection instead of a deleted object.
+        """
+        from piecash.kvp import KVP_Type, Slot
+        from sqlalchemy import text
+
+        frames: list[str] = []
+        pending = list(obj_guids)
+        while pending:
+            rows = book.session.execute(
+                text(
+                    "SELECT guid_val FROM slots WHERE slot_type = 9 "
+                    "AND guid_val IS NOT NULL AND obj_guid IN ("
+                    + ",".join(f":g{i}" for i in range(len(pending)))
+                    + ")"
+                ),
+                {f"g{i}": g for i, g in enumerate(pending)},
+            ).fetchall()
+            pending = [r[0] for r in rows if r[0] not in frames]
+            frames.extend(pending)
+        for owner in frames:
+            book.session.execute(
+                Slot.__table__.delete().where(
+                    Slot.__table__.c.obj_guid == owner
+                )
+            )
+            _verify_delete(
+                book.session, Slot.__table__, {"obj_guid": owner},
+                f"{label}: frame children",
+            )
+        for owner in obj_guids:
+            book.session.execute(
+                Slot.__table__.delete().where(
+                    (Slot.__table__.c.obj_guid == owner)
+                    & (Slot.__table__.c.slot_type.in_(
+                        [KVP_Type.KVP_TYPE_GUID, KVP_Type.KVP_TYPE_FRAME]
+                    ))
+                )
+            )
+            # _verify_delete matches equality filters only; the
+            # type-restricted delete is verified by count.
+            left = book.session.execute(
+                text(
+                    "SELECT COUNT(*) FROM slots WHERE obj_guid = :o "
+                    "AND slot_type IN (5, 9)"
+                ),
+                {"o": owner},
+            ).scalar()
+            if left:
+                raise RuntimeError(
+                    f"{label}: {left} GUID/frame slot(s) survived delete"
+                )
+        for obj in objects:
+            book.session.expire(obj, ["slots"])
+
     def _find_transaction(
         self, book: piecash.Book, guid: str
     ) -> piecash.Transaction | None:

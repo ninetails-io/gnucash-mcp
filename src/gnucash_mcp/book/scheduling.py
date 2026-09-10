@@ -15,7 +15,8 @@ Depends on shared helpers from BaseGnuCashBook:
 """
 
 from datetime import date, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
+import uuid
 
 import piecash
 from dateutil.relativedelta import relativedelta
@@ -225,18 +226,370 @@ class SchedulingMixin:
         ).first()
         return row[0] if row else None
 
-    def _get_sx_splits(self, book, sx) -> list[dict]:
-        """Read split templates from the scheduled transaction's slot.
+    # ── Native template recipes ───────────────────────────────────
+    # GnuCash stores a schedule's recipe as real Transaction rows on
+    # the schedule's template account, one split per leg, with the
+    # target account and the amounts in KVP slots on each split.
+    # Keys verbatim from libgnucash/engine/Split.cpp (GNC_SX_ID +
+    # GNC_SX_ACCOUNT / *_FORMULA / *_NUMERIC), Transaction.cpp
+    # (GNC_SX_FROM) and gnc-commodity.h (GNC_COMMODITY_NS_TEMPLATE).
+    # Since-Last-Run reads sched-xaction/account by GUID, prefers
+    # the numeric when it's non-zero and no variables are bound, and
+    # takes debit − credit as the signed value. Before this the
+    # recipe lived in a private splits-json slot GnuCash never read,
+    # so desktop's Since-Last-Run advanced our schedules with nothing
+    # posted, and desktop-made schedules had no recipe here.
+    _SX_FRAME = "sched-xaction"
+    _SX_ACCOUNT = "sched-xaction/account"
+    _SX_CREDIT_FORMULA = "sched-xaction/credit-formula"
+    _SX_DEBIT_FORMULA = "sched-xaction/debit-formula"
+    _SX_CREDIT_NUMERIC = "sched-xaction/credit-numeric"
+    _SX_DEBIT_NUMERIC = "sched-xaction/debit-numeric"
+    # Ours, namespaced: the fixed quantity this server replays on a
+    # cross-commodity leg. GnuCash asks the user for a rate instead
+    # and ignores this key.
+    _MCP_FRAME = "gnc-mcp"
+    _MCP_QUANTITY = "gnc-mcp/quantity"
+    # Stamped on an instantiated transaction, as desktop does.
+    _SX_FROM = "from-sched-xaction"
+    _TEMPLATE_NS = "template"
+    _LEGACY_SX_SLOTS = ("splits-json", "description", "notes", "currency")
 
-        The split templates are stored as JSON in a slot named
-        'splits-json' on the ScheduledTransaction.
+    def _ensure_template_commodity(self, book):
+        """GnuCash's template pseudo-commodity, exactly the row
+        gnc_commodity_table_add_default_data creates: namespace
+        ``template``, mnemonic/fullname/cusip ``template``, fraction
+        1. piecash never creates it; books GnuCash has opened have
+        it. list_commodities already filters the namespace."""
+        c = book.session.query(piecash.Commodity).filter_by(
+            namespace=self._TEMPLATE_NS, mnemonic="template",
+        ).first()
+        if c is not None:
+            return c
+        c = piecash.Commodity(
+            namespace=self._TEMPLATE_NS, mnemonic="template",
+            fullname="template", fraction=1, cusip="template",
+            quote_flag=0, quote_source="user", book=book,
+        )
+        book.session.flush()
+        return c
+
+    def _slot_insert(self, book, obj_guid, name, slot_type, label, **cols):
+        book.session.execute(
+            Slot.__table__.insert().values(
+                obj_guid=obj_guid, name=name, slot_type=slot_type, **cols,
+            )
+        )
+        _verify_composite_write(
+            book.session, Slot.__table__,
+            {"obj_guid": obj_guid, "name": name}, label,
+        )
+
+    def _write_template_recipe(
+        self, book, template_acct, currency, description, notes,
+        start, legs: list[dict],
+    ):
+        """Write the recipe the way the SX editor does: one template
+        Transaction on the template account, one zero-value Split per
+        leg carrying the six ``sched-xaction`` slots (both sides
+        always written, zero on the unused one). ``legs`` items:
+        ``account`` (Account), ``amount`` (Decimal, transaction
+        currency), ``memo``, ``action``, ``quantity`` (Decimal|None).
+        Returns the template transaction."""
+        txn = piecash.Transaction(
+            currency=currency,
+            description=description,
+            notes=notes or None,
+            post_date=start,
+            splits=[
+                piecash.Split(
+                    account=template_acct,
+                    value=Decimal("0"), quantity=Decimal("0"),
+                    memo=leg.get("memo") or "",
+                    action=leg.get("action") or "",
+                )
+                for leg in legs
+            ],
+        )
+        book.session.flush()
+        denom = currency.fraction
+        for split, leg in zip(txn.splits, legs):
+            label = f"template split for {leg['account'].fullname}"
+            frame_guid = uuid.uuid4().hex
+            self._slot_insert(
+                book, split.guid, self._SX_FRAME,
+                KVP_Type.KVP_TYPE_FRAME, label, guid_val=frame_guid,
+            )
+            self._slot_insert(
+                book, frame_guid, self._SX_ACCOUNT,
+                KVP_Type.KVP_TYPE_GUID, label,
+                guid_val=leg["account"].guid,
+            )
+            amount = leg["amount"]
+            debit = amount if amount > 0 else Decimal("0")
+            credit = -amount if amount < 0 else Decimal("0")
+            for side, val in (("credit", credit), ("debit", debit)):
+                self._slot_insert(
+                    book, frame_guid, f"{self._SX_FRAME}/{side}-formula",
+                    KVP_Type.KVP_TYPE_STRING, label,
+                    string_val=format(val, "f") if val else "",
+                )
+                self._slot_insert(
+                    book, frame_guid, f"{self._SX_FRAME}/{side}-numeric",
+                    KVP_Type.KVP_TYPE_NUMERIC, label,
+                    numeric_val_num=int(val * denom),
+                    numeric_val_denom=denom,
+                )
+            if leg.get("quantity") is not None:
+                q = leg["quantity"]
+                q_denom = leg["account"].commodity.fraction
+                mcp_frame = uuid.uuid4().hex
+                self._slot_insert(
+                    book, split.guid, self._MCP_FRAME,
+                    KVP_Type.KVP_TYPE_FRAME, label, guid_val=mcp_frame,
+                )
+                self._slot_insert(
+                    book, mcp_frame, self._MCP_QUANTITY,
+                    KVP_Type.KVP_TYPE_NUMERIC, label,
+                    numeric_val_num=int(q * q_denom),
+                    numeric_val_denom=q_denom,
+                )
+        return txn
+
+    def _split_frame_children(self, book, split_guid, frame_name):
+        """``{path: (slot_type, string_val, guid_val, num, denom)}``
+        for the children of one frame on a split. Raw SQL: the
+        polymorphic Slot ORM is unsafe to query, and loading a
+        SlotGUID into the session arms the delete cascade."""
+        frame = book.session.execute(
+            text(
+                "SELECT guid_val FROM slots WHERE obj_guid = :s "
+                "AND name = :n AND slot_type = 9"
+            ),
+            {"s": split_guid, "n": frame_name},
+        ).first()
+        if not frame:
+            return {}
+        rows = book.session.execute(
+            text(
+                "SELECT name, slot_type, string_val, guid_val, "
+                "numeric_val_num, numeric_val_denom FROM slots "
+                "WHERE obj_guid = :f"
+            ),
+            {"f": frame[0]},
+        ).fetchall()
+        return {r[0]: tuple(r[1:]) for r in rows}
+
+    @staticmethod
+    def _slot_amount(children, numeric_key, formula_key):
+        """Debit or credit side of a template split: the numeric when
+        present and non-zero (what Since-Last-Run prefers), else the
+        formula parsed as a plain number, else None (a formula with
+        variables — GnuCash prompts; we refuse)."""
+        num = children.get(numeric_key)
+        if num and num[3] is not None and num[4] and num[3] != 0:
+            value = Decimal(num[3]) / Decimal(num[4])
+            # 4250/100 is 42.50, not 42.5 — keep the fraction's
+            # precision so amounts round-trip as typed.
+            return value.quantize(Decimal(1) / Decimal(num[4]))
+        formula = children.get(formula_key)
+        text_val = (formula[1] or "").strip() if formula else ""
+        if not text_val:
+            return Decimal("0")
+        try:
+            return Decimal(text_val.replace(",", ""))
+        except InvalidOperation:
+            return None
+
+    def _sx_recipe(self, book, sx) -> dict:
+        """THE reader for a schedule's recipe. Native template rows
+        first (what GnuCash wrote, or what this server writes since
+        native storage); ``splits-json`` and the three SX slots as
+        the legacy fallback. Readers never write.
+
+        ``{"source": "native"|"legacy"|"none", "splits": [...],
+        "description", "notes", "currency", "template_txn_count",
+        "problems": [...]}``. Split dicts are the shared contract
+        (``account`` = GUID, ``amount``, ``memo``, ``action``,
+        ``quantity``) and go straight to create_transaction.
+        ``problems`` names anything instantiation must refuse: a
+        formula with variables, a split without an account, more
+        than one template transaction.
         """
         import json
 
+        recipe = {
+            "source": "none", "splits": [], "description": None,
+            "notes": None, "currency": None, "template_txn_count": 0,
+            "problems": [],
+        }
+        tmpl = sx.template_account
+        rows = []
+        if tmpl is not None:
+            rows = book.session.execute(
+                text(
+                    "SELECT s.guid, s.tx_guid, s.memo, s.action "
+                    "FROM splits s WHERE s.account_guid = :a "
+                    "ORDER BY s.tx_guid, s.guid"
+                ),
+                {"a": tmpl.guid},
+            ).fetchall()
+        if rows:
+            tx_guids = list(dict.fromkeys(r[1] for r in rows))
+            recipe["source"] = "native"
+            recipe["template_txn_count"] = len(tx_guids)
+            if len(tx_guids) > 1:
+                recipe["problems"].append(
+                    f"{len(tx_guids)} template transactions (this "
+                    f"server instantiates one)"
+                )
+            txn = book.session.query(piecash.Transaction).filter_by(
+                guid=tx_guids[0],
+            ).first()
+            recipe["description"] = txn.description or None
+            recipe["notes"] = txn.notes or None
+            recipe["currency"] = txn.currency.mnemonic
+            for split_guid, tx_guid, memo, action in rows:
+                if tx_guid != tx_guids[0]:
+                    continue
+                ch = self._split_frame_children(
+                    book, split_guid, self._SX_FRAME,
+                )
+                acct = ch.get(self._SX_ACCOUNT)
+                if not acct or not acct[2]:
+                    recipe["problems"].append(
+                        "a template split names no account"
+                    )
+                    continue
+                debit = self._slot_amount(
+                    ch, self._SX_DEBIT_NUMERIC, self._SX_DEBIT_FORMULA,
+                )
+                credit = self._slot_amount(
+                    ch, self._SX_CREDIT_NUMERIC, self._SX_CREDIT_FORMULA,
+                )
+                if debit is None or credit is None:
+                    bad = (ch.get(self._SX_DEBIT_FORMULA) or ch.get(
+                        self._SX_CREDIT_FORMULA) or ("", ""))[1]
+                    recipe["problems"].append(
+                        f"formula with variables: {bad!r} (GnuCash "
+                        f"prompts for these; run it from the desktop)"
+                    )
+                    continue
+                leg = {
+                    "account": acct[2],
+                    "amount": str(debit - credit),
+                    "memo": memo or "",
+                }
+                if action:
+                    leg["action"] = action
+                q = self._split_frame_children(
+                    book, split_guid, self._MCP_FRAME,
+                ).get(self._MCP_QUANTITY)
+                if q and q[4]:
+                    leg["quantity"] = str(
+                        (Decimal(q[3]) / Decimal(q[4])).quantize(
+                            Decimal(1) / Decimal(q[4])
+                        )
+                    )
+                recipe["splits"].append(leg)
+            # The splits table has no sequence column, so the
+            # caller's order is not recoverable; ledger order
+            # instead — debits first, then by account path — which
+            # is stable across backends (no rowid on PostgreSQL).
+            names = {}
+            for leg in recipe["splits"]:
+                a = book.session.query(piecash.Account).filter_by(
+                    guid=leg["account"],
+                ).first()
+                names[leg["account"]] = a.fullname if a else leg["account"]
+            recipe["splits"].sort(
+                key=lambda l: (
+                    _to_decimal(l["amount"]) < 0, names[l["account"]],
+                )
+            )
+            return recipe
+
         raw = self._get_sx_slot_string(book, sx.guid, "splits-json")
         if raw:
-            return json.loads(raw)
-        return []
+            recipe["source"] = "legacy"
+            recipe["splits"] = json.loads(raw)
+            recipe["description"] = self._get_sx_slot_string(
+                book, sx.guid, "description",
+            )
+            recipe["notes"] = self._get_sx_slot_string(
+                book, sx.guid, "notes",
+            )
+            recipe["currency"] = self._get_sx_slot_string(
+                book, sx.guid, "currency",
+            )
+        return recipe
+
+    def _get_sx_splits(self, book, sx) -> list[dict]:
+        """The recipe's splits — see ``_sx_recipe``."""
+        return self._sx_recipe(book, sx)["splits"]
+
+    def _migrate_sx_recipe(self, book, sx, recipe: dict) -> bool:
+        """Write path only: rewrite a legacy ``splits-json`` recipe as
+        native template rows and drop the four legacy slots. A legacy
+        ref that no longer resolves leaves the schedule as it is (the
+        next instantiation will name the account). Returns True when
+        it migrated."""
+        if recipe["source"] != "legacy" or not recipe["splits"]:
+            return False
+        legs = []
+        for s in recipe["splits"]:
+            acct = self._resolve_account(book, s["account"])
+            if acct is None:
+                return False
+            legs.append({
+                "account": acct,
+                "amount": _to_decimal(s["amount"]),
+                "memo": s.get("memo", ""),
+                "action": s.get("action"),
+                "quantity": (
+                    _to_decimal(s["quantity"])
+                    if s.get("quantity") is not None else None
+                ),
+            })
+        currency = (
+            self._find_commodity(book, recipe["currency"])
+            if recipe["currency"] else None
+        ) or self._require_default_currency(book)
+        start = sx.start_date
+        if isinstance(start, datetime):
+            start = start.date()
+        self._write_template_recipe(
+            book, sx.template_account, currency,
+            recipe["description"] or sx.name, recipe["notes"],
+            start, legs,
+        )
+        for key in self._LEGACY_SX_SLOTS:
+            book.session.execute(
+                Slot.__table__.delete().where(
+                    (Slot.__table__.c.obj_guid == sx.guid)
+                    & (Slot.__table__.c.name == key)
+                )
+            )
+            _verify_delete(
+                book.session, Slot.__table__,
+                {"obj_guid": sx.guid, "name": key},
+                f"legacy slot {key} on '{sx.name}'",
+            )
+        return True
+
+    def _strip_template_recipe(self, book, template_acct, label):
+        """Before ORM-deleting a template account's recipe rows: strip
+        the GUID/frame slots off every template split and transaction
+        so the delete can't cascade into the TARGET accounts' slots.
+        Returns the recipe transactions to delete."""
+        splits = list(template_acct.splits)
+        txns = {s.transaction for s in splits}
+        owners = [s.guid for s in splits] + [t.guid for t in txns]
+        if owners:
+            self._strip_guid_slots(
+                book, owners, label, objects=[*splits, *txns],
+            )
+        return txns
 
     def _sx_splits_for_display(
         self, book, splits: list[dict],
@@ -263,17 +616,9 @@ class SchedulingMixin:
         return out
 
     def _get_sx_description(self, book, sx) -> str:
-        """Instantiation description for a scheduled transaction.
-
-        MCP-created templates store it in a ``description`` slot
-        (bare key — universal financial concept). Templates from
-        before the slot existed have no row and fall back to the
-        SX name, which is what instantiation always used to use.
-        """
-        return (
-            self._get_sx_slot_string(book, sx.guid, "description")
-            or sx.name
-        )
+        """Instantiation description: the recipe's, else the SX name
+        (what instantiation always used to use)."""
+        return self._sx_recipe(book, sx)["description"] or sx.name
 
     def _find_scheduled_transaction(self, book, guid: str):
         """Find a scheduled transaction by GUID (supports partial GUIDs, 8+ chars)."""
@@ -337,10 +682,6 @@ class SchedulingMixin:
             ValueError: If invalid frequency, accounts not found,
                        or splits don't balance.
         """
-        import json
-        import uuid
-
-
         if frequency not in self.VALID_FREQUENCIES:
             raise ValueError(
                 f"Invalid frequency: {frequency}. "
@@ -409,11 +750,13 @@ class SchedulingMixin:
             # already on disk — the try/except below cleans up the
             # orphan, or a ghost template sits under root_template
             # forever.
+            # As xaccSchedXactionInit makes it: named by the SX GUID,
+            # BANK, on the template pseudo-commodity.
             template_acct = piecash.Account(
-                name=name,
+                name=sx_guid,
                 type="BANK",
                 parent=book.root_template,
-                commodity=self._require_default_currency(book),
+                commodity=self._ensure_template_commodity(book),
             )
             # No session.add — piecash Accounts auto-register via
             # the parent relationship. The flush is needed: the raw
@@ -460,107 +803,29 @@ class SchedulingMixin:
                     f"Recurrence for scheduled transaction '{name}'",
                 )
 
-                # amount normalized via _to_decimal → str so the
-                # persisted JSON is a clean decimal string — a float
-                # surviving json.dumps would replay its IEEE-754
-                # epsilon on every future instantiation.
-                # Account stored by GUID, never by the caller's ref:
-                # GnuCash's own template splits carry the GUID, and
-                # a path stored here breaks at the first rename —
-                # instantiation fails "Account not found" on the due
-                # date. _resolve_account takes the 32-hex form, so
-                # instantiation passes it straight through; readers
-                # map it back to a path via _sx_splits_for_display.
-                # Pre-GUID rows hold paths and resolve while the
-                # path lives.
-                splits_json = json.dumps([
-                    {
-                        "account": v["account"].guid,
-                        "amount": str(_to_decimal(s["amount"])),
-                        "memo": s.get("memo", ""),
-                        # Cross-commodity legs replay their stored
-                        # quantity at every instantiation; actions
-                        # (Buy/Sell on investment templates) replay
-                        # the same way.
-                        **(
-                            {"quantity": str(_to_decimal(s["quantity"]))}
-                            if s.get("quantity") is not None else {}
-                        ),
-                        **(
-                            {"action": s["action"]}
-                            if s.get("action") else {}
-                        ),
-                    }
-                    for s, v in zip(splits, validated)
-                ])
-                book.session.execute(
-                    Slot.__table__.insert().values(
-                        obj_guid=sx_guid,
-                        name="splits-json",
-                        slot_type=KVP_Type.KVP_TYPE_STRING,
-                        string_val=splits_json,
-                    )
+                # The recipe, in GnuCash's own shape (see the
+                # constants above). Accounts by GUID from the
+                # validated splits — a stored path broke at the
+                # first rename; cross-commodity legs keep their
+                # replay quantity in our namespaced slot.
+                self._write_template_recipe(
+                    book, template_acct, frame,
+                    description or name, notes, parsed_start,
+                    [
+                        {
+                            "account": v["account"],
+                            "amount": _to_decimal(s["amount"]),
+                            "memo": s.get("memo", ""),
+                            "action": s.get("action"),
+                            "quantity": (
+                                _to_decimal(s["quantity"])
+                                if s.get("quantity") is not None
+                                else None
+                            ),
+                        }
+                        for s, v in zip(splits, validated)
+                    ],
                 )
-                _verify_composite_write(
-                    book.session, Slot.__table__,
-                    {"obj_guid": sx_guid, "name": "splits-json"},
-                    f"Splits slot for scheduled transaction '{name}'",
-                )
-
-                # Instantiation description — read back by
-                # _get_sx_description, which falls back to the SX
-                # name when the slot is absent (pre-slot templates).
-                if description:
-                    book.session.execute(
-                        Slot.__table__.insert().values(
-                            obj_guid=sx_guid,
-                            name="description",
-                            slot_type=KVP_Type.KVP_TYPE_STRING,
-                            string_val=description,
-                        )
-                    )
-                    _verify_composite_write(
-                        book.session, Slot.__table__,
-                        {"obj_guid": sx_guid, "name": "description"},
-                        f"Description slot for scheduled "
-                        f"transaction '{name}'",
-                    )
-
-                # Instantiation currency — absent slot means the
-                # book default at instantiation time.
-                if sx_currency is not None:
-                    book.session.execute(
-                        Slot.__table__.insert().values(
-                            obj_guid=sx_guid,
-                            name="currency",
-                            slot_type=KVP_Type.KVP_TYPE_STRING,
-                            string_val=sx_currency.mnemonic,
-                        )
-                    )
-                    _verify_composite_write(
-                        book.session, Slot.__table__,
-                        {"obj_guid": sx_guid, "name": "currency"},
-                        f"Currency slot for scheduled "
-                        f"transaction '{name}'",
-                    )
-
-                # Instantiation notes — same lifecycle as the
-                # description slot; absent row means "no notes".
-                if notes:
-                    book.session.execute(
-                        Slot.__table__.insert().values(
-                            obj_guid=sx_guid,
-                            name="notes",
-                            slot_type=KVP_Type.KVP_TYPE_STRING,
-                            string_val=notes,
-                        )
-                    )
-                    _verify_composite_write(
-                        book.session, Slot.__table__,
-                        {"obj_guid": sx_guid, "name": "notes"},
-                        f"Notes slot for scheduled "
-                        f"transaction '{name}'",
-                    )
 
                 book.save()
             except Exception:
@@ -629,6 +894,7 @@ class SchedulingMixin:
             all_sx = book.session.query(
                 ScheduledTransaction
             ).all()
+            default_mnemonic = self._require_default_currency(book).mnemonic
 
             results = []
             for sx in all_sx:
@@ -636,26 +902,23 @@ class SchedulingMixin:
                     continue
                 d = self._sx_to_dict(sx)
                 if not compact:
-                    # Only when a slot exists — echoing the name
-                    # back as "description" would just be noise.
-                    desc = self._get_sx_slot_string(
-                        book, sx.guid, "description",
-                    )
+                    recipe = self._sx_recipe(book, sx)
+                    # Echoing the name back as "description" would
+                    # just be noise; a foreign currency is worth
+                    # naming, the book default is not.
+                    desc = recipe["description"]
                     if desc and desc != sx.name:
                         d["description"] = desc
-                    sx_notes = self._get_sx_slot_string(
-                        book, sx.guid, "notes",
-                    )
-                    if sx_notes:
-                        d["notes"] = sx_notes
-                    sx_cur = self._get_sx_slot_string(
-                        book, sx.guid, "currency",
-                    )
-                    if sx_cur:
-                        d["currency"] = sx_cur
+                    if recipe["notes"]:
+                        d["notes"] = recipe["notes"]
+                    if recipe["currency"] and recipe["currency"] != default_mnemonic:
+                        d["currency"] = recipe["currency"]
                     d["splits"] = self._sx_splits_for_display(
-                        book, self._get_sx_splits(book, sx),
+                        book, recipe["splits"],
                     )
+                    d["recipe"] = recipe["source"]
+                    if recipe["problems"]:
+                        d["problems"] = recipe["problems"]
                 results.append(d)
 
             page, indicator = _paginate(
@@ -725,7 +988,8 @@ class SchedulingMixin:
             # market rate; no rate on file → counted, excluded from
             # the total, reported via ``unrated``.
             rate = Decimal("1")
-            sx_cur = self._get_sx_slot_string(book, sx.guid, "currency")
+            recipe = self._sx_recipe(book, sx)
+            sx_cur = recipe["currency"]
             if sx_cur and sx_cur != default_currency.mnemonic:
                 commodity = self._find_commodity(book, sx_cur)
                 rate = (
@@ -734,7 +998,7 @@ class SchedulingMixin:
                 if rate is None:
                     unrated += 1
                     continue
-            for s in self._get_sx_splits(book, sx):
+            for s in recipe["splits"]:
                 amt = _to_decimal(s["amount"])
                 if amt > 0:
                     total += amt * rate
@@ -772,6 +1036,7 @@ class SchedulingMixin:
             all_sx = book.session.query(
                 ScheduledTransaction
             ).all()
+            default_mnemonic = self._require_default_currency(book).mnemonic
 
             upcoming = []
             for sx in all_sx:
@@ -780,7 +1045,8 @@ class SchedulingMixin:
 
                 next_occ = self._sx_next_due(sx)
                 if next_occ and next_occ <= window_end:
-                    splits = self._get_sx_splits(book, sx)
+                    recipe = self._sx_recipe(book, sx)
+                    splits = recipe["splits"]
 
                     # Calculate total amount (sum of positive splits).
                     # _to_decimal is defensive for any older slots whose
@@ -794,9 +1060,7 @@ class SchedulingMixin:
                     # (15000.00, not 15000): stored amounts carry
                     # whatever precision the caller typed, and the
                     # bill list shouldn't pad by book.
-                    sx_cur = self._get_sx_slot_string(
-                        book, sx.guid, "currency",
-                    )
+                    sx_cur = recipe["currency"]
                     amount_commodity = (
                         self._find_commodity(book, sx_cur)
                         if sx_cur else None
@@ -815,7 +1079,7 @@ class SchedulingMixin:
                     # Amounts are denominated in the template's
                     # currency — label foreign ones so the bill
                     # list never reads HKD numbers as book-default.
-                    if sx_cur:
+                    if sx_cur and sx_cur != default_mnemonic:
                         entry["currency"] = sx_cur
                     if not compact:
                         entry["splits"] = self._sx_splits_for_display(
@@ -951,21 +1215,56 @@ class SchedulingMixin:
                     f"(possibly by GnuCash desktop). Use a later date."
                 )
 
-            splits = self._get_sx_splits(book, sx)
+            recipe = self._sx_recipe(book, sx)
+            if recipe["problems"]:
+                raise ValueError(
+                    f"Cannot instantiate '{sx.name}': "
+                    + "; ".join(recipe["problems"])
+                )
+            splits = [dict(s) for s in recipe["splits"]]
             if not splits:
                 raise ValueError(
                     "No split templates found for scheduled "
                     "transaction"
                 )
+            sx_currency = recipe["currency"]
+            txn_currency = (
+                self._find_commodity(book, sx_currency)
+                if sx_currency else None
+            ) or self._require_default_currency(book)
+            # A desktop-made cross-commodity leg carries no fixed
+            # quantity (GnuCash asks for the rate at Since-Last-Run).
+            # Answer the one variable we can: the rate on file at
+            # the instance date. No rate → refuse, naming the leg.
+            rates = None
+            for s in splits:
+                if s.get("quantity") is not None:
+                    continue
+                acct = self._resolve_account(book, s["account"])
+                if acct is None or acct.commodity == txn_currency:
+                    continue
+                if rates is None:
+                    rates = self._rates_as_of(book, txn_date, txn_currency)
+                rate = rates.get(acct.commodity.guid)
+                if not rate:
+                    raise ValueError(
+                        f"Cannot instantiate '{sx.name}': the leg on "
+                        f"{acct.fullname} is in {acct.commodity.mnemonic} "
+                        f"and no {acct.commodity.mnemonic}/"
+                        f"{txn_currency.mnemonic} rate is on file for "
+                        f"{txn_date.isoformat()}. create_price, or run "
+                        f"it from GnuCash desktop."
+                    )
+                s["quantity"] = str(
+                    (_to_decimal(s["amount"]) / rate).quantize(
+                        _commodity_quantum(acct.commodity)
+                    )
+                )
 
             sx_name = sx.name
-            sx_description = self._get_sx_description(book, sx)
-            sx_notes = self._get_sx_slot_string(
-                book, sx.guid, "notes",
-            )
-            sx_currency = self._get_sx_slot_string(
-                book, sx.guid, "currency",
-            )
+            sx_description = recipe["description"] or sx.name
+            sx_notes = recipe["notes"]
+            recipe_source = recipe["source"]
 
         # ── Phase 2: create the transaction (see docstring). ─────
         txn_result = self.create_transaction(
@@ -979,6 +1278,7 @@ class SchedulingMixin:
         # ── Phase 3: advance the schedule. ──────────────────────
         # Re-find by guid — the phase-1 ORM object detached when
         # its session closed.
+        template_migrated = False
         with self.open(readonly=False) as book:
             sx = self._find_scheduled_transaction(book, guid)
             if not sx:
@@ -988,6 +1288,26 @@ class SchedulingMixin:
                 instance_count = None
                 remaining = None
             else:
+                # Desktop stamps every instance with its schedule;
+                # so do we, by raw SQL — an ORM SlotGUID in the
+                # session arms the delete cascade.
+                if txn_result.get("guid"):
+                    created = self._find_transaction(
+                        book, txn_result["guid"],
+                    )
+                    if created is not None:
+                        self._slot_insert(
+                            book, created.guid, self._SX_FROM,
+                            KVP_Type.KVP_TYPE_GUID,
+                            f"from-sched-xaction on {created.guid[:8]}",
+                            guid_val=sx.guid,
+                        )
+                # A legacy recipe becomes native on the first write
+                # that touches its schedule.
+                if recipe_source == "legacy":
+                    template_migrated = self._migrate_sx_recipe(
+                        book, sx, self._sx_recipe(book, sx),
+                    )
                 current_last = sx.last_occur
                 if isinstance(current_last, datetime):
                     current_last = current_last.date()
@@ -1004,7 +1324,7 @@ class SchedulingMixin:
                     # answers None and the schedule is finished.
                     if sx.num_occur > 0 and sx.rem_occur > 0:
                         sx.rem_occur -= 1
-                    book.save()
+                book.save()
                 instance_count = sx.instance_count
                 remaining = sx.rem_occur if sx.num_occur > 0 else None
 
@@ -1019,6 +1339,8 @@ class SchedulingMixin:
         }
         if remaining is not None:
             response["remaining_occurrences"] = remaining
+        if template_migrated:
+            response["template_migrated"] = True
         if txn_result.get("status") == "rejected":
             # Evidence that the rejection is the CORRECT outcome —
             # without it, the natural retry instinct re-triggers the
@@ -1060,6 +1382,7 @@ class SchedulingMixin:
                     f"Scheduled transaction not found: {guid}"
                 )
 
+            recipe = self._sx_recipe(book, sx)
             # Audit before-state — without it the log only knows
             # the new state.
             self._stage_audit_before({
@@ -1068,10 +1391,23 @@ class SchedulingMixin:
                 "end_date": (
                     sx.end_date.isoformat() if sx.end_date else None
                 ),
-                "notes": self._get_sx_slot_string(
-                    book, sx.guid, "notes",
-                ),
+                "notes": recipe["notes"],
             })
+            # A legacy recipe becomes native on the first write that
+            # touches its schedule; notes then live on the template
+            # transaction, where desktop reads them.
+            template_migrated = self._migrate_sx_recipe(book, sx, recipe)
+            if template_migrated:
+                recipe = self._sx_recipe(book, sx)
+            notes_owner = sx.guid
+            if recipe["source"] == "native":
+                notes_owner = book.session.execute(
+                    text(
+                        "SELECT tx_guid FROM splits WHERE "
+                        "account_guid = :a ORDER BY tx_guid LIMIT 1"
+                    ),
+                    {"a": sx.template_account.guid},
+                ).scalar()
 
             if enabled is not None:
                 sx.enabled = _gnc_bool(enabled)
@@ -1088,30 +1424,23 @@ class SchedulingMixin:
                 # polymorphic Slot ORM can't be queried directly.
                 book.session.execute(
                     Slot.__table__.delete().where(
-                        (Slot.__table__.c.obj_guid == sx.guid)
+                        (Slot.__table__.c.obj_guid == notes_owner)
                         & (Slot.__table__.c.name == "notes")
                     )
                 )
                 _verify_delete(
                     book.session, Slot.__table__,
-                    {"obj_guid": sx.guid, "name": "notes"},
+                    {"obj_guid": notes_owner, "name": "notes"},
                     f"Notes slot for scheduled transaction "
                     f"'{sx.name}'",
                 )
                 if notes != "":
-                    book.session.execute(
-                        Slot.__table__.insert().values(
-                            obj_guid=sx.guid,
-                            name="notes",
-                            slot_type=KVP_Type.KVP_TYPE_STRING,
-                            string_val=notes,
-                        )
-                    )
-                    _verify_composite_write(
-                        book.session, Slot.__table__,
-                        {"obj_guid": sx.guid, "name": "notes"},
+                    self._slot_insert(
+                        book, notes_owner, "notes",
+                        KVP_Type.KVP_TYPE_STRING,
                         f"Notes slot for scheduled transaction "
                         f"'{sx.name}'",
+                        string_val=notes,
                     )
 
             book.save()
@@ -1122,7 +1451,10 @@ class SchedulingMixin:
                 for row in book.session.query(ScheduledTransaction.guid).all()
             ]
             short_guid = _unique_prefix(sx.guid, all_sx_guids)
-            return self._sx_to_dict(sx) | {"guid": short_guid}
+            out = self._sx_to_dict(sx) | {"guid": short_guid}
+            if template_migrated:
+                out["template_migrated"] = True
+            return out
 
     def delete_scheduled_transaction(self, guid: str) -> dict:
         """Delete a scheduled transaction.
@@ -1175,13 +1507,16 @@ class SchedulingMixin:
             template_acct = sx.template_account
             book.session.delete(sx)
             if template_acct:
-                # Desktop SXs store the recipe as real Transactions
-                # on the template account (ours leave it empty).
-                # Delete those first or the account delete orphans
-                # their splits / fails the FK check.
-                recipe_txns = {
-                    s.transaction for s in list(template_acct.splits)
-                }
+                # The recipe is real Transaction rows on the template
+                # account. Strip their GUID/frame slots first: the
+                # sched-xaction/account SlotGUID would otherwise
+                # cascade the delete into the TARGET account's slots.
+                # Then the rows, then the account (or the account
+                # delete orphans their splits / fails the FK check).
+                recipe_txns = self._strip_template_recipe(
+                    book, template_acct,
+                    f"recipe of scheduled transaction '{result['name']}'",
+                )
                 for txn in recipe_txns:
                     book.session.delete(txn)
                 book.session.delete(template_acct)
