@@ -274,6 +274,27 @@ Established chokepoints and the rule each one owns:
   columns.
 - `_book_display_name` — how a book is named to anyone, path
   basenamed and URI password-masked.
+- `_sx_recipe` — the one reader of a schedule's recipe: GnuCash's
+  template rows first, the pre-1.5 `splits-json` slot as fallback.
+  Readers never write; every schedule write converts the book's
+  legacy recipes at once, posting nothing.
+- `_sx_next_due` / `_recurrence_next` — which occurrence is next.
+  `Recurrence.cpp` ported verbatim: the anchor is the recurrence
+  row (period start, mult, type, weekend adjust), a composite takes
+  the earliest across its rows, and every surface — dashboard
+  overdue, list, upcoming, the instantiation default — reads the
+  same answer.
+- `_budget_targets` / `_budget_stored_sign` — budget amounts cross
+  the storage boundary in exactly two places: GnuCash's natural
+  sign on disk (credit-normal types negative, book stamped), the
+  surface's magnitudes everywhere else.
+- `_strip_guid_slots` — called before every ORM delete of a
+  transaction or template row. piecash's `SlotGUID` inherits a
+  delete-orphan cascade joined on the referenced GUID, so deleting a
+  row that carries one sweeps every slot of the entity it points at
+  (the target account's for a template split, the schedule's for a
+  stamped instance, the invoice's for a posting transaction — the
+  credit-note incident). Strip GUID and frame rows by raw SQL first.
 - `_parse_owner_type`, `_commodity_quantum`, `_is_market_price`,
   `_effective_owner_type` — same story, smaller surface.
 
