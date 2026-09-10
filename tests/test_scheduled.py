@@ -1603,14 +1603,14 @@ class TestNativeTemplates:
         assert listed["recipe"] == "legacy"
         guid = listed["guid"]
         r = gb.update_scheduled_transaction(guid, enabled=True)
-        assert r.get("template_migrated") is True
+        assert r.get("templates_migrated") == 1
         with gb.open(readonly=True) as book:
             sx, acct, splits, txns = _template_rows(book, "Rent")
             assert len(txns) == 1 and len(splits) == 2
             assert _slots_for(book, sx[0]) == {}  # four legacy slots gone
             assert _slots_for(book, txns[0])["notes"][1] == "old notes"
         r2 = gb.update_scheduled_transaction(guid, enabled=True)
-        assert "template_migrated" not in r2
+        assert "templates_migrated" not in r2
         assert gb.list_scheduled_transactions(compact=False)["scheduled_transactions"][0]["recipe"] == "native"
 
     def test_legacy_recipe_migrates_on_instantiate(self, scheduled_book):
@@ -1618,7 +1618,7 @@ class TestNativeTemplates:
         sx = _rent(gb, date.today())
         _make_legacy(scheduled_book, "Rent", refs="path")
         r = gb.create_transaction_from_scheduled(guid=sx["guid"])
-        assert r["status"] == "created" and r.get("template_migrated") is True
+        assert r["status"] == "created" and r.get("templates_migrated") == 1
         with gb.open(readonly=True) as book:
             sx_row, _, splits, txns = _template_rows(book, "Rent")
             assert len(txns) == 1 and len(splits) == 2
@@ -1918,7 +1918,7 @@ class TestMigrationRebuildsContainer:
         sx = _rent(gb, date.today())
         _make_legacy(scheduled_book, "Rent")
         r = gb.update_scheduled_transaction(sx["guid"], enabled=True)
-        assert r.get("template_migrated") is True
+        assert r.get("templates_migrated") == 1
         with gb.open(readonly=True) as book:
             sx_row, acct, splits, txns = _template_rows(book, "Rent")
             assert acct[0] == sx_row[0] and acct[1] == "BANK"
@@ -1946,3 +1946,60 @@ class TestLegacyCountOnDashboard:
         _make_legacy(scheduled_book, "Legacy One")
         line = next(l for l in gb.get_book_summary().splitlines() if l.startswith("Scheduled:"))
         assert "1 on legacy recipe (migrates on first write)" in line
+
+
+
+class TestMigrationSweep:
+    """Any schedule write converts every legacy recipe in the book,
+    posting nothing — a real book's schedules are all exposed to
+    desktop's Since-Last-Run until converted, and converting by
+    instantiation would post early (bookkeeper addendum,
+    2026-09-10). A no-change update is the one-call conversion."""
+
+    def test_no_change_update_converts_the_whole_book(self, scheduled_book):
+        gb = GnuCashBook(str(scheduled_book))
+        a = _rent(gb, date.today() + timedelta(days=5))
+        _rent(gb, date.today() + timedelta(days=6), name="Rent B")
+        _rent(gb, date.today() + timedelta(days=7), name="Rent C")
+        _make_legacy(scheduled_book, "Rent")
+        _make_legacy(scheduled_book, "Rent B")
+        before = gb.list_transactions(limit=250)
+        r = gb.update_scheduled_transaction(a["guid"])
+        assert r["templates_migrated"] == 2
+        rows = gb.list_scheduled_transactions(compact=False)["scheduled_transactions"]
+        assert {x["recipe"] for x in rows} == {"native"}
+        assert gb.list_transactions(limit=250) == before  # nothing posted
+        r2 = gb.update_scheduled_transaction(a["guid"])
+        assert "templates_migrated" not in r2
+
+    def test_instantiation_sweeps_the_others_without_posting(self, scheduled_book):
+        gb = GnuCashBook(str(scheduled_book))
+        a = _rent(gb, date.today())
+        _rent(gb, date.today() + timedelta(days=9), name="Rent B")
+        _make_legacy(scheduled_book, "Rent")
+        _make_legacy(scheduled_book, "Rent B")
+        r = gb.create_transaction_from_scheduled(guid=a["guid"])
+        assert r["status"] == "created" and r["templates_migrated"] == 2
+        rows = {x["name"]: x for x in gb.list_scheduled_transactions(compact=False)["scheduled_transactions"]}
+        assert rows["Rent B"]["recipe"] == "native"
+        assert rows["Rent B"]["last_occurrence"] is None  # not posted
+
+    def test_delete_sweeps_the_others(self, scheduled_book):
+        gb = GnuCashBook(str(scheduled_book))
+        a = _rent(gb, date.today())
+        _rent(gb, date.today(), name="Rent B")
+        _make_legacy(scheduled_book, "Rent B")
+        r = gb.delete_scheduled_transaction(a["guid"])
+        assert r["templates_migrated"] == 1
+        rows = gb.list_scheduled_transactions(compact=False)["scheduled_transactions"]
+        assert [x["name"] for x in rows] == ["Rent B"] and rows[0]["recipe"] == "native"
+
+    def test_audit_line_names_the_sweep(self):
+        from gnucash_mcp.logging_config import _fmt_scheduled_transaction_update
+        lines = _fmt_scheduled_transaction_update({
+            "timestamp": "2026-09-10T10:00:00",
+            "params": {"guid": "abc"},
+            "before_state": {"name": "Rent"},
+            "after_state": {"templates_migrated": 8},
+        })
+        assert any("8 schedule recipes migrated" in l and "nothing posted" in l for l in lines)
