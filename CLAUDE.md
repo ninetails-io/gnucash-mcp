@@ -295,6 +295,13 @@ Established chokepoints and the rule each one owns:
   (the target account's for a template split, the schedule's for a
   stamped instance, the invoice's for a posting transaction — the
   credit-note incident). Strip GUID and frame rows by raw SQL first.
+- `_upgrade_book_shapes` — the one caller of every conversion from
+  a pre-1.5 private shape to GnuCash's own (schedule recipes,
+  invoice link key, budget signs). Every schedule, budget, and
+  business write runs it, merges its counts into the response, and
+  one audit renderer names what converted. Reads never write. A new
+  converter for a shape we shipped wrong goes here, not on its own
+  module's writes.
 - `_parse_owner_type`, `_commodity_quantum`, `_is_market_price`,
   `_effective_owner_type` — same story, smaller surface.
 
