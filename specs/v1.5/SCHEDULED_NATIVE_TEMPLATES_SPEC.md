@@ -357,3 +357,21 @@ Steps 1, 2, and 5 each end with GnuCash desktop opening the book.
 - The §3.6 source-grep lock was not added: the remaining
   `book.transactions` iterations are GUID-prefix maps, where a
   template row is harmless. Duplicate detection is locked by test.
+
+## 10. Round 2 (2026-09-10), after the bookkeeper's blockers
+
+The spec assumed the server's own occurrence math could stay; the
+loop showed it could not. Desktop anchors an occurrence on the
+RECURRENCE row (period start, multiplier, period type, weekend
+adjust) and a schedule may carry several rows. `Recurrence.cpp`'s
+`recurrenceNextInstance`, `nth_weekday_compare`, and
+`adjust_for_weekend` are now ported line for line
+(`_recurrence_next`), `_sx_next_due` takes the earliest across all
+rows (`recurrenceListNextInstance`), and `start_date` only seeds a
+never-run schedule. Migration rebuilds the template container the
+way create does — the first cut wrote the template transaction onto
+the legacy account (book currency, named by the schedule) and that
+crashed GnuCash's SX editor; the bookkeeper's repro is preserved at
+`samples/native-scratch.gnucash` (untracked). Delete removes every
+recurrence row. The dashboard names how many schedules are still on
+the legacy recipe.
