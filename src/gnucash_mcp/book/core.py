@@ -1251,6 +1251,11 @@ class CoreMixin:
         budgeted_accounts: list = []
         budgeted_account_guids: set[str] = set()
         for ba, ba_amount in _budget_targets(book, budget):
+            # Spending pace only. An income target in the same sum
+            # made "used %" a ratio of nothing; the report carries
+            # income on its own side.
+            if ba.account.type != "EXPENSE":
+                continue
             factor = factors.get(ba.account.guid)
             if factor is not None:
                 ba_amount = ba_amount * factor
@@ -1284,20 +1289,14 @@ class CoreMixin:
             for s in txn.splits:
                 if s.account.guid not in rollup_guids:
                     continue
-                atype = s.account.type
-                if atype not in ("EXPENSE", "INCOME"):
+                if s.account.type != "EXPENSE":
                     continue
-                amt = self._split_in_default_currency(
+                # SIGNED accumulation so contra splits (refunds)
+                # net into the headline — same convention as
+                # get_budget_report's expenses side.
+                actuals += self._split_in_default_currency(
                     s, s.account, factors.get(s.account.guid),
                 )
-                # SIGNED accumulation so contra splits (expense
-                # refunds, income clawbacks) net into the headline —
-                # same convention as get_budget_report. INCOME is
-                # stored negative; flip so revenue counts positive.
-                if atype == "EXPENSE":
-                    actuals += amt
-                elif atype == "INCOME":
-                    actuals += -amt
 
         # Period progression.
         total_days = (period_end - period_start).days + 1

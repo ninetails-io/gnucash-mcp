@@ -150,7 +150,9 @@ def register(mcp, get_book) -> None:
         """Compare actual spending against budget.
 
         Returns a compact text table by default with ⚠ markers on
-        categories exceeding budget. Use verbose=true for the full
+        categories exceeding budget. A budget with both income and
+        expense targets closes with INCOME / EXPENSES / NET lines
+        rather than one TOTAL. Use verbose=true for the full
         structured dict.
 
         Args:
