@@ -630,6 +630,56 @@ class TestEngineDisposal:
         assert "Book: {book_path}" not in src
 
 
+# ── A bounce is observable on a database book ─────────────────────
+
+
+class TestUriBookIsNamedLikeAFileBook:
+    def test_startup_notice_fires_without_a_path(self, clean_server):
+        """The first tool result after a (re)start names the active
+        book. File books get it from the path list; a URI book has
+        none, and used to get silence — so a bounce was invisible."""
+        import gnucash_mcp.server as srv
+
+        srv._book_paths = []
+        srv._current_path = None
+        srv._book_uri = "mysql+pymysql://gnucash:s3cret@127.0.0.1/gnucash"
+        was = srv._startup_notice_pending
+        try:
+            srv._startup_notice_pending = True
+            notice = srv._consume_startup_notice()
+            assert notice and "(re)started" in notice
+            assert "mysql+pymysql://gnucash:***@127.0.0.1/gnucash" in notice
+            assert "s3cret" not in notice
+            assert srv._consume_startup_notice() is None
+        finally:
+            srv._startup_notice_pending = was
+
+    def test_audit_header_names_the_masked_uri(self, monkeypatch):
+        """``log_name`` is the storage key (``gnucash.gnucash``); the
+        header a human reads should say what the book is."""
+        import gnucash_mcp.server as srv
+
+        seen = {}
+        monkeypatch.setattr(
+            srv, "setup_logging", lambda **kw: seen.update(kw),
+        )
+        source = BookSource.from_uri(
+            "postgresql://gnucash:s3cret@db.example/ledger"
+        )
+        srv._activate_logging(source)
+        assert seen["book_path"] == "ledger.gnucash"
+        assert seen["display_name"] == "postgresql://gnucash:***@db.example/ledger"
+
+    def test_header_uses_the_display_name(self, tmp_path):
+        from gnucash_mcp.logging_config import _format_text_header
+
+        header = _format_text_header(
+            "2026-09-10", "postgresql://gnucash:***@db.example/ledger",
+        )
+        assert "postgresql://gnucash:***@db.example/ledger" in header
+        assert "ledger.gnucash" not in header
+
+
 # ── Real database servers ─────────────────────────────────────────
 
 

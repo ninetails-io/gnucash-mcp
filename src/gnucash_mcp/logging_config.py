@@ -322,6 +322,7 @@ def setup_logging(
     debug: bool = False,
     audit: bool = True,
     get_book: Callable | None = None,
+    display_name: str | None = None,
 ) -> None:
     """Configure audit and debug logging.
 
@@ -336,6 +337,10 @@ def setup_logging(
         debug: Enable debug-level MCP protocol logging.
         audit: Enable audit logging. Default True. Use --noaudit to disable.
         get_book: Function to get the GnuCashBook instance (for state capture).
+        display_name: What the audit header calls the book. Defaults to
+                   ``book_path``; a database book passes its masked URI,
+                   since its ``book_path`` is the synthetic storage key
+                   (``{database}.gnucash``), not a name anyone recognizes.
 
     Raises:
         ValueError: If book_path is not provided and either audit or debug is enabled.
@@ -413,7 +418,9 @@ def setup_logging(
         # block: excluded from the count, rendered on every page,
         # and leaked through limit=0.
         if write_header:
-            header = _format_text_header(today, book_path, tz_name)
+            header = _format_text_header(
+                today, display_name or book_path, tz_name,
+            )
             audit_logger.info(header + "\n")
             _flush_logger(audit_logger)
     else:

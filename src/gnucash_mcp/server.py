@@ -820,6 +820,14 @@ def _consume_startup_notice() -> str | None:
         paths[0] if paths else None
     )
     if active is None:
+        # A database book has no path, but a bounce is just as
+        # invisible there — the notice is how a bookkeeper knows one
+        # took. Password-masked, like everywhere a book is named.
+        if _book_uri:
+            return (
+                f"ℹ GnuCash MCP server (re)started — active book: "
+                f"{_book_display_name(_book_uri)}."
+            )
         return None
     if len(paths) >= 2 and not _determine_writes_armed():
         # Coaching for the calling model, not the user: perform the
@@ -1351,6 +1359,10 @@ def _activate_logging(target) -> None:
         debug=_logging_debug,
         audit=_logging_audit,
         get_book=get_book,
+        display_name=(
+            target.display_name if isinstance(target, BookSource)
+            else None
+        ),
     )
 
 

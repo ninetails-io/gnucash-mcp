@@ -1964,6 +1964,14 @@ class BusinessMixin:
     _GNC_INVOICE_ID = "gncInvoice"
     _GNC_INVOICE_GUID = "invoice-guid"
     _GNC_INVOICE_LINK = "gncInvoice/invoice-guid"
+    # Two spellings of the pre-1.5 child. The server wrote the bare
+    # ``invoice``; GnuCash desktop, on its next save of such a book,
+    # re-serializes every child under the frame's full path — so a
+    # book that has been through desktop since 1.2 carries
+    # ``gncInvoice/invoice`` instead (found on the MariaDB loop, where
+    # Save As did exactly that to all 108 of Alex's links). Neither is
+    # the key desktop reads; both are renamed.
+    _LEGACY_INVOICE_LINKS = ("invoice", "gncInvoice/invoice")
     _LEGACY_INVOICE_LINK = "invoice"
 
     @staticmethod
@@ -2010,7 +2018,8 @@ class BusinessMixin:
 
     @staticmethod
     def _migrate_invoice_link_keys(book) -> int:
-        """Write path only: rename every pre-1.5 link child (`invoice`)
+        """Write path only: rename every pre-1.5 link child (`invoice`,
+        or `gncInvoice/invoice` once desktop has re-saved the book)
         under a `gncInvoice` frame to GnuCash's key. A rename of rows,
         nothing else changes and nothing posts; every business write
         calls it so the first one after the upgrade converts the whole
@@ -2018,15 +2027,17 @@ class BusinessMixin:
         from piecash.kvp import Slot
         from sqlalchemy import text
 
+        bare, prefixed = BusinessMixin._LEGACY_INVOICE_LINKS
         frames = [
             r[0] for r in book.session.execute(
                 text(
-                    "SELECT s.obj_guid FROM slots s WHERE s.name = :old "
+                    "SELECT s.obj_guid FROM slots s "
+                    "WHERE s.name IN (:bare, :prefixed) "
                     "AND s.slot_type = 5 AND s.obj_guid IN "
                     "(SELECT guid_val FROM slots WHERE name = :frame "
                     "AND slot_type = 9)"
                 ),
-                {"old": BusinessMixin._LEGACY_INVOICE_LINK,
+                {"bare": bare, "prefixed": prefixed,
                  "frame": BusinessMixin._GNC_INVOICE_ID},
             ).fetchall()
         ]
@@ -2035,8 +2046,9 @@ class BusinessMixin:
                 Slot.__table__.update()
                 .where(
                     (Slot.__table__.c.obj_guid == frame_guid)
-                    & (Slot.__table__.c.name
-                       == BusinessMixin._LEGACY_INVOICE_LINK)
+                    & (Slot.__table__.c.name.in_(
+                        BusinessMixin._LEGACY_INVOICE_LINKS
+                    ))
                 )
                 .values(name=BusinessMixin._GNC_INVOICE_LINK)
             )
