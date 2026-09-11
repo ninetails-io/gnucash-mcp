@@ -312,7 +312,7 @@ point at your own SQLite-format book. Restart Claude Desktop.
 > Windows: `C:\\Users\\yourname\\Documents\\mybook.gnucash`
 > (note the doubled backslashes — that's a JSON requirement).
 
-### Or: keep the book in PostgreSQL
+### Or: keep the book in PostgreSQL or MySQL
 
 GnuCash can also keep a book in a database instead of a file, and
 the server serves one of those too. Point it at a connection
@@ -329,18 +329,24 @@ string instead of a path:
 }
 ```
 
-Install the driver alongside the server:
+Install the driver alongside the server — `postgres` or `mysql`
+(MariaDB uses the same one):
 
 ```bash
 uv tool install "gnucash-mcp[postgres]"
 ```
 
+For MySQL / MariaDB the connection string is
+`mysql+pymysql://user:password@localhost:3306/gnucash` and the extra
+is `"gnucash-mcp[mysql]"`.
+
 To move an existing book across: open it in GnuCash,
-**File → Save As**, pick **postgres**, and fill in the connection
-details. (On Debian/Ubuntu that entry needs `sudo apt install
-libdbd-pgsql`, the same way SQLite3 needs `libdbd-sqlite3`.) **Keep
-the file** — it stays a perfectly good backup of everything up to
-the moment you switched.
+**File → Save As**, pick **postgres** or **mysql**, and fill in the
+connection details. (On Debian/Ubuntu those entries need `sudo apt
+install libdbd-pgsql` or `libdbd-mysql`, the same way SQLite3 needs
+`libdbd-sqlite3`; the macOS and Windows builds ship all three.)
+**Keep the file** — it stays a perfectly good backup of everything
+up to the moment you switched.
 
 Worth knowing before you switch:
 
@@ -356,15 +362,14 @@ Worth knowing before you switch:
 - **The server stops taking backups.** This is the real trade-off:
   the automatic safety net exists because it can snapshot a file,
   and it can't snapshot your database. `create_backup` says so
-  rather than pretending. Set up `pg_dump` on a schedule before
-  you move a real book over — see
+  rather than pretending. Set up `pg_dump` or `mysqldump` on a
+  schedule before you move a real book over — see
   [`docs/RESTORE_FROM_BACKUP.md`](docs/RESTORE_FROM_BACKUP.md).
 - Your password is masked wherever the server names the book — in
   tool results, in the dashboard header, and in the audit log.
 
-MySQL/MariaDB should work the same way with a driver installed
-(`GNUCASH_BOOK_URI=mysql+pymysql://...`), but PostgreSQL is what
-the test suite and CI actually exercise.
+Both dialects are exercised by the test suite and CI: PostgreSQL
+16 and MariaDB 11, each against a real server.
 
 ### Other AI clients
 

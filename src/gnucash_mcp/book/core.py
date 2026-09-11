@@ -33,6 +33,7 @@ from gnucash_mcp._format import (
 _debug_logger = logging.getLogger(DEBUG_LOGGER_NAME)
 
 from gnucash_mcp.book._base import (
+    _txn_sort_key,
     _budget_targets,
     _account_to_compact_line,
     _account_to_dict,
@@ -689,9 +690,9 @@ class CoreMixin:
                         ))
                 except Exception:
                     continue
-            overdue_entries.sort(
-                key=lambda e: e[0], reverse=True,
-            )
+            # Most overdue first; equal days by name, so the "+N
+            # more" preview names the same three on every backend.
+            overdue_entries.sort(key=lambda e: (-e[0], e[1]))
             return [
                 {"days": d, "name": n, "msg": m}
                 for d, n, m in overdue_entries
@@ -1022,7 +1023,7 @@ class CoreMixin:
                         f"Stale price: {commodity.mnemonic} "
                         f"last updated {days_old} days ago",
                     ))
-            stale_entries.sort(key=lambda e: e[0], reverse=True)
+            stale_entries.sort(key=lambda e: (-e[0], e[1]))
             stale_prices = self._rollup_warnings(
                 [m for _, _, m in stale_entries],
                 names=[n for _, n, m in stale_entries],
@@ -2801,10 +2802,9 @@ class CoreMixin:
                     continue
                 filtered.append(trans)
 
-            # Sort by date descending
-            filtered.sort(
-                key=lambda t: t.post_date or date.min, reverse=True
-            )
+            # Newest first; same-day rows by entry time, then GUID —
+            # never by which order the backend returned them.
+            filtered.sort(key=_txn_sort_key, reverse=True)
 
             page, indicator = _paginate(
                 filtered,
@@ -2981,7 +2981,9 @@ class CoreMixin:
         ]
         # One sort, descending — recent-first lets the capped
         # buckets in the collector short-circuit.
-        swept.sort(key=lambda pair: pair[0].post_date, reverse=True)
+        # Same-day ties by entry time then GUID: the first recent
+        # match is the auto-fill source, so this order is behavior.
+        swept.sort(key=lambda pair: _txn_sort_key(pair[0]), reverse=True)
         return swept
 
     def _collect_create_signals(
@@ -5309,9 +5311,7 @@ class CoreMixin:
 
             # Sort by date descending; null post_date (old-book
             # artifact) sorts oldest.
-            matched.sort(
-                key=lambda t: t.post_date or date.min, reverse=True
-            )
+            matched.sort(key=_txn_sort_key, reverse=True)
 
             page, indicator = _paginate(
                 matched,

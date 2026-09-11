@@ -164,11 +164,33 @@ def prefix_txn_count(book_path: Path, cutoff: date) -> int:
     (release-review finding 9: the interest write once slipped a
     pre-cutoff date past a pay_date-only guard, and
     verify_invariants replicated the same boundary blindness)."""
+    # Ledger transactions only. A scheduled transaction's TEMPLATE is
+    # a transaction row too (on an account under the template root,
+    # dated at the schedule's start), and since 1.5 the first schedule
+    # write converts every pre-1.5 recipe into one — 17 new rows dated
+    # inside Alex's frozen prefix, none of them ledger activity. The
+    # bundle build failed on exactly that from the day the conversion
+    # merged. Template accounts are every descendant of a ROOT that is
+    # not the book's root.
     con = sqlite3.connect(str(book_path))
     try:
         row = con.execute(
-            "SELECT COUNT(*) FROM transactions "
-            "WHERE date(post_date) <= ?",
+            """
+            WITH RECURSIVE tmpl(guid) AS (
+                SELECT guid FROM accounts
+                WHERE account_type = 'ROOT'
+                  AND guid <> (SELECT root_account_guid FROM books)
+                UNION ALL
+                SELECT a.guid FROM accounts a JOIN tmpl ON a.parent_guid = tmpl.guid
+            )
+            SELECT COUNT(*) FROM transactions t
+            WHERE date(t.post_date) <= ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM splits s
+                  WHERE s.tx_guid = t.guid
+                    AND s.account_guid IN (SELECT guid FROM tmpl)
+              )
+            """,
             (cutoff.isoformat(),),
         ).fetchone()
     finally:

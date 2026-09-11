@@ -820,6 +820,14 @@ def _consume_startup_notice() -> str | None:
         paths[0] if paths else None
     )
     if active is None:
+        # A database book has no path, but a bounce is just as
+        # invisible there — the notice is how a bookkeeper knows one
+        # took. Password-masked, like everywhere a book is named.
+        if _book_uri:
+            return (
+                f"ℹ GnuCash MCP server (re)started — active book: "
+                f"{_book_display_name(_book_uri)}."
+            )
         return None
     if len(paths) >= 2 and not _determine_writes_armed():
         # Coaching for the calling model, not the user: perform the
@@ -1351,6 +1359,10 @@ def _activate_logging(target) -> None:
         debug=_logging_debug,
         audit=_logging_audit,
         get_book=get_book,
+        display_name=(
+            target.display_name if isinstance(target, BookSource)
+            else None
+        ),
     )
 
 
@@ -1621,7 +1633,7 @@ def _get_server_config_impl() -> str:
     if _server_state.get("book_is_uri"):
         lines.append(
             "Backend: database — MCP backups unavailable "
-            "(snapshot with pg_dump or your DB's own tooling)"
+            f"(snapshot with {_server_state.get('book_dump_tool')})"
         )
     dc_ok = _server_state.get("default_currency_ok")
     if dc_ok is False:
@@ -1869,14 +1881,16 @@ Options:
                        instead of a file, as a SQLAlchemy connection
                        string:
                          postgresql://user:pw@host:5432/gnucash
+                         mysql+pymysql://user:pw@host:3306/gnucash
                        Overrides GNUCASH_BOOK_URI, and is mutually
                        exclusive with --book. Exactly one book — a
                        connection string has no filename for
                        switch_book to match. Requires the driver
-                       (`pip install "gnucash-mcp[postgres]"`) and
-                       GNUCASH_LOG_DIR. Backups are the server's
-                       one unavailable feature there: snapshot the
-                       database with pg_dump instead.
+                       (`pip install "gnucash-mcp[postgres]"` or
+                       `"gnucash-mcp[mysql]"`) and GNUCASH_LOG_DIR.
+                       Backups are the server's one unavailable
+                       feature there: snapshot the database with
+                       pg_dump / mysqldump instead.
   --modules=MODULES    Tool modules to load (comma-separated).
                        Default: core ({core} tools, always-on). Use "all"
                        for every module ({total} tools; configuring
@@ -2225,6 +2239,11 @@ def main() -> None:
         "debug": _logging_debug,
         "default_currency_ok": currency_ok,
         "book_is_uri": bool(_book_uri),
+        # Named per dialect so the line never tells a MySQL user to
+        # run pg_dump. from_uri only parses; it opens nothing.
+        "book_dump_tool": (
+            BookSource.from_uri(_book_uri).dump_tool if _book_uri else None
+        ),
     })
 
     if debug_flag or _debug_mode:

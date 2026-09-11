@@ -317,11 +317,80 @@ def resolve_mcp_dir(book_path: Path | str) -> Path:
     return mcp_dir
 
 
+def _local_day() -> str:
+    """Today's date in the local zone, the audit/debug file stem.
+    A function so a test can move the clock past midnight."""
+    return datetime.now().astimezone().strftime("%Y-%m-%d")
+
+
+class _DailyFileHandler(logging.Handler):
+    """A log handler that opens the day's file BY PATH on every record.
+
+    ``logging.FileHandler`` holds one descriptor for the life of the
+    process, which fails two ways here. A file renamed or removed
+    underneath it keeps receiving entries in an unlinked inode while
+    ``get_audit_log``, which opens by path, reports no log for the
+    day (the bookkeeper hit this on the MariaDB loop, 2026-09-10:
+    set today's file aside, wrote, read back "No audit log"). And a
+    server that runs past midnight — every Claude Desktop session
+    that stays open — keeps writing into yesterday's file. Opening
+    per record costs a few syscalls per tool call, which is nothing
+    at a human's pace, and makes both impossible: the path is
+    recomputed and the file recreated (with its header) each time.
+    """
+
+    def __init__(
+        self, directory: Path, suffix: str, header_fn=None,
+    ) -> None:
+        super().__init__()
+        self.directory = directory
+        self.suffix = suffix
+        self.header_fn = header_fn
+
+    def path_for(self, day: str) -> Path:
+        return self.directory / f"{day}{self.suffix}"
+
+    def ensure_file(self, day: str | None = None) -> Path:
+        """Create the day's file with its header if it isn't there.
+        Called at setup so the file exists before the first entry,
+        and on every emit so a removed file comes back."""
+        path = self.path_for(day or _local_day())
+        if path.exists() and path.stat().st_size > 0:
+            return path
+        # Explicit UTF-8: under a C/POSIX locale (common for
+        # daemonized MCP servers) the platform default is ASCII, and
+        # localized account names would raise inside the handler.
+        with open(path, "a", encoding="utf-8") as fh:
+            if self.header_fn is not None:
+                # The blank line after the banner matters:
+                # get_audit_log splits entries on blank lines, so
+                # without it the day's first entry glues to the
+                # header block.
+                fh.write(self.header_fn(day or _local_day()) + "\n\n")
+        # Owner read/write only — audit logs carry financial data
+        # the default umask would leave group/other readable.
+        # Best-effort: Windows no-ops and its ACLs apply.
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        return path
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            path = self.ensure_file()
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(self.format(record) + "\n")
+        except Exception:
+            self.handleError(record)
+
+
 def setup_logging(
     book_path: str | None = None,
     debug: bool = False,
     audit: bool = True,
     get_book: Callable | None = None,
+    display_name: str | None = None,
 ) -> None:
     """Configure audit and debug logging.
 
@@ -336,6 +405,10 @@ def setup_logging(
         debug: Enable debug-level MCP protocol logging.
         audit: Enable audit logging. Default True. Use --noaudit to disable.
         get_book: Function to get the GnuCashBook instance (for state capture).
+        display_name: What the audit header calls the book. Defaults to
+                   ``book_path``; a database book passes its masked URI,
+                   since its ``book_path`` is the synthetic storage key
+                   (``{database}.gnucash``), not a name anyone recognizes.
 
     Raises:
         ValueError: If book_path is not provided and either audit or debug is enabled.
@@ -382,40 +455,18 @@ def setup_logging(
         audit_logger.setLevel(logging.INFO)
         audit_logger.propagate = False
 
-        audit_file = audit_dir / f"{today}.txt"
-
-        # Write header if file is new
-        write_header = not audit_file.exists()
-
-        # Explicit UTF-8: under a C/POSIX locale (common for
-        # daemonized MCP servers) the platform default encoding is
-        # ASCII, and audit lines carrying localized account names
-        # ("已实现获利(亏损)", "Erträge:…") would hit UnicodeEncodeError
-        # inside the handler and be dropped to stderr.
-        audit_handler = logging.FileHandler(audit_file, encoding="utf-8")
+        # Opened by path per entry (see _DailyFileHandler); the
+        # header names the book the way a human knows it.
+        book_label = display_name or book_path
+        audit_handler = _DailyFileHandler(
+            audit_dir, ".txt",
+            header_fn=lambda day: _format_text_header(
+                day, book_label, tz_name,
+            ),
+        )
         audit_handler.setFormatter(logging.Formatter("%(message)s"))
-        audit_handler.stream.reconfigure(line_buffering=True)
         audit_logger.addHandler(audit_handler)
-
-        # Owner read/write only — audit logs carry financial data
-        # the default umask would leave group/other readable.
-        # Best-effort: Windows no-ops and its ACLs apply.
-        try:
-            import os as _os
-            _os.chmod(audit_file, 0o600)
-        except OSError:
-            pass
-
-        # Write header if needed. The trailing "\n" (plus the
-        # logger's own newline) leaves a blank line after the
-        # banner — get_audit_log splits entries on blank lines, so
-        # without it the day's first entry glues to the header
-        # block: excluded from the count, rendered on every page,
-        # and leaked through limit=0.
-        if write_header:
-            header = _format_text_header(today, book_path, tz_name)
-            audit_logger.info(header + "\n")
-            _flush_logger(audit_logger)
+        audit_handler.ensure_file(today)
     else:
         # Disable audit logging
         audit_logger.setLevel(logging.CRITICAL + 1)
@@ -431,9 +482,7 @@ def setup_logging(
         debug_logger.setLevel(logging.DEBUG)
         debug_logger.propagate = False
 
-        debug_handler = logging.FileHandler(
-            debug_dir / f"{today}.log", encoding="utf-8",
-        )
+        debug_handler = _DailyFileHandler(debug_dir, ".log")
         # PID in every line: MCP clients can spawn multiple server
         # processes against one config (observed: Claude Desktop
         # starts twins), and they all append to this same per-book

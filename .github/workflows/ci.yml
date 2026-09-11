@@ -14,6 +14,10 @@
 #             fast and dependency-free while this one proves the
 #             second dialect actually round-trips.
 #
+#   mysql    — the same DB-backend tests against MariaDB, the other
+#             database GnuCash itself can keep a book in. Gated on
+#             GNUCASH_TEST_MYSQL_URI the same way.
+#
 #   bundle  — validates manifest.json and packs the MCPB via the same
 #             script humans run (scripts/build_bundle.sh), then
 #             uploads the .mcpb as a build artifact: every PR gets a
@@ -81,6 +85,37 @@ jobs:
           GNUCASH_TEST_PG_URI: postgresql://gnucash:gnucash@localhost:5432/gnucash
         run: >-
           uv run --locked --extra dev --extra postgres
+          pytest -q tests/test_db_backend.py
+
+  mysql:
+    runs-on: ubuntu-latest
+    services:
+      mariadb:
+        image: mariadb:11
+        env:
+          MARIADB_ROOT_PASSWORD: gnucash
+          MARIADB_DATABASE: gnucash
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "healthcheck.sh --connect --innodb_initialized"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+      - name: Install dependencies (locked, with the mysql driver)
+        run: uv sync --locked --extra dev --extra mysql
+      # root, not an app user: the test fixture creates one database
+      # per xdist worker (gnucash_gw0, ...), which needs CREATE on the
+      # server, and the image's MARIADB_USER only owns MARIADB_DATABASE.
+      - name: Run the MySQL tests
+        env:
+          GNUCASH_TEST_MYSQL_URI: mysql+pymysql://root:gnucash@127.0.0.1:3306/gnucash
+        run: >-
+          uv run --locked --extra dev --extra mysql
           pytest -q tests/test_db_backend.py
 
   bundle:

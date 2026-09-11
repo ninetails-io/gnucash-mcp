@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 import time
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -2589,3 +2590,62 @@ class TestCreateLinesCarryCounterpartyName:
         )
         assert "employee: 000001" in rendered
         assert "(" not in rendered.split("employee:")[1].split("\n")[0]
+
+
+class TestAuditFileOpenedByPath:
+    """The writer opens the day's file by path on every entry.
+
+    ``logging.FileHandler`` kept one descriptor for the process, so a
+    file renamed or removed underneath it went on receiving entries
+    in an unlinked inode while ``get_audit_log`` (by path) reported
+    no log for the day — the bookkeeper's MariaDB-loop finding — and
+    a server running past midnight kept writing yesterday's file.
+    """
+
+    def _emit(self, text: str) -> None:
+        logging.getLogger("gnucash_mcp.audit").info(text)
+
+    def test_entry_after_rename_lands_at_the_path(self, temp_book_path, temp_log_dir):
+        setup_logging(book_path=str(temp_book_path), debug=False)
+        today = datetime.now().astimezone().strftime("%Y-%m-%d")
+        live = temp_log_dir / "audit" / f"{today}.txt"
+        self._emit("FIRST ENTRY")
+        aside = live.with_name(f"{today}.round1.txt")
+        live.rename(aside)
+        self._emit("SECOND ENTRY")
+        assert live.exists(), "the file was recreated at the path"
+        fresh = live.read_text()
+        assert "GNUCASH MCP AUDIT LOG" in fresh, "with its header"
+        assert "SECOND ENTRY" in fresh
+        assert "SECOND ENTRY" not in aside.read_text()
+        assert "FIRST ENTRY" in aside.read_text()
+
+    def test_midnight_moves_to_the_next_days_file(self, temp_book_path, temp_log_dir, monkeypatch):
+        import gnucash_mcp.logging_config as lc
+
+        setup_logging(book_path=str(temp_book_path), debug=True)
+        today = datetime.now().astimezone().strftime("%Y-%m-%d")
+        self._emit("BEFORE MIDNIGHT")
+        lc.debug_log("before")
+        monkeypatch.setattr(lc, "_local_day", lambda: "2099-01-01")
+        self._emit("AFTER MIDNIGHT")
+        lc.debug_log("after")
+        tomorrow_audit = temp_log_dir / "audit" / "2099-01-01.txt"
+        tomorrow_debug = temp_log_dir / "debug" / "2099-01-01.log"
+        assert "AFTER MIDNIGHT" in tomorrow_audit.read_text()
+        assert "GNUCASH MCP AUDIT LOG" in tomorrow_audit.read_text()
+        assert "2099-01-01" in tomorrow_audit.read_text().splitlines()[0:6].__str__()
+        assert "AFTER MIDNIGHT" not in (temp_log_dir / "audit" / f"{today}.txt").read_text()
+        assert "after" in tomorrow_debug.read_text()
+        assert "before" not in tomorrow_debug.read_text()
+
+    def test_removed_file_comes_back_with_permissions(self, temp_book_path, temp_log_dir):
+        import stat
+
+        setup_logging(book_path=str(temp_book_path), debug=False)
+        today = datetime.now().astimezone().strftime("%Y-%m-%d")
+        live = temp_log_dir / "audit" / f"{today}.txt"
+        live.unlink()
+        self._emit("AFTER DELETE")
+        assert "AFTER DELETE" in live.read_text()
+        assert stat.S_IMODE(live.stat().st_mode) == 0o600

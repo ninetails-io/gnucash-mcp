@@ -410,10 +410,9 @@ class BackupMixin:
             f"Cannot {action}: this book is served from a database "
             f"({self.source.display_name}), not a file. The MCP "
             f"backup store snapshots SQLite files only. Back the "
-            f"database up with your server's own tooling — for "
-            f"PostgreSQL, `pg_dump <database> > backup.sql` — and "
-            f"schedule it outside this server. See "
-            f"docs/RESTORE_FROM_BACKUP.md."
+            f"database up with its own tooling — "
+            f"`{self.source.dump_tool}` — and schedule it outside this "
+            f"server. See docs/RESTORE_FROM_BACKUP.md."
         )
 
     def _resolve_backup_path(self, entry: dict) -> Path:

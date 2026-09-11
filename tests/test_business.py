@@ -7801,7 +7801,9 @@ class TestPayInvoice:
             amount="500",
         )
 
-        # Check lot is_closed = -1 in the database
+        # Check lot is_closed = 1 in the database — the value GnuCash
+        # caches for a zero-balance lot (gnc_lot_get_balance). -1 is
+        # LOT_CLOSED_UNKNOWN, which desktop would recompute.
         conn = sqlite3.connect(str(business_book))
         try:
             lots = conn.execute(
@@ -7809,8 +7811,8 @@ class TestPayInvoice:
                 "(SELECT guid FROM accounts WHERE name = 'Accounts Receivable')"
             ).fetchall()
             assert any(
-                row[0] == -1 for row in lots
-            ), "lot should be closed with is_closed=-1"
+                row[0] == 1 for row in lots
+            ), "lot should be closed with is_closed=1"
         finally:
             conn.close()
 
@@ -12237,17 +12239,27 @@ class TestInvoiceLinkKey:
             rows = _link_rows(gb, obj)
             assert [r[0] for r in rows] == ["gncInvoice/invoice-guid"], rows
 
-    def test_legacy_links_renamed_on_next_business_write(self, business_book):
+    # The server's own spelling, and the one GnuCash desktop writes
+    # back when it re-saves such a book (every child under its frame's
+    # full path). A book that has been through desktop since 1.2
+    # carries the second; the MariaDB loop's Save As produced 108.
+    @pytest.mark.parametrize("legacy_name", ["invoice", "gncInvoice/invoice"])
+    def test_legacy_links_renamed_on_next_business_write(
+        self, business_book, legacy_name,
+    ):
         from sqlalchemy import text
         gb, inv_id, txn_guid, lot_guid = self._posted(business_book)
         # Engineer the pre-1.5 shape byte-faithfully.
         with gb.open(readonly=False) as book:
-            book.session.execute(text(
-                "UPDATE slots SET name = 'invoice' "
-                "WHERE name = 'gncInvoice/invoice-guid'"
-            ))
+            book.session.execute(
+                text(
+                    "UPDATE slots SET name = :legacy "
+                    "WHERE name = 'gncInvoice/invoice-guid'"
+                ),
+                {"legacy": legacy_name},
+            )
             book.save()
-        assert [r[0] for r in _link_rows(gb, txn_guid)] == ["invoice"]
+        assert [r[0] for r in _link_rows(gb, txn_guid)] == [legacy_name]
         r = gb.pay_invoice(inv_id, amount="100.00",
                            payment_account="Assets:Checking",
                            payment_date="2026-09-02")
