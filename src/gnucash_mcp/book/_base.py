@@ -18,7 +18,7 @@ import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Generator, Iterable
@@ -617,6 +617,90 @@ def _account_to_compact_line(account: piecash.Account) -> str:
     return fullname
 
 
+# GnuCash's lot flag is a tri-state, from libgnucash/engine/gnc-lot.cpp:
+#
+#     #define LOT_CLOSED_UNKNOWN (-1)
+#
+# ``gnc_lot_is_closed`` recomputes whenever the stored value is
+# negative, and ``gnc_lot_get_balance`` caches the answer: no splits →
+# FALSE; balance zero → TRUE; otherwise FALSE. Desktop resets a lot to
+# UNKNOWN every time it adds or removes a split, so a book that has
+# been through desktop carries -1 on most of its lots. Reading -1 as
+# "closed" (which this server did, believing -1 was GnuCash's TRUE)
+# hid every open lot desktop had touched.
+_LOT_CLOSED_UNKNOWN = -1
+_LOT_OPEN = 0
+_LOT_CLOSED = 1
+
+
+def _lot_is_closed(lot) -> bool:
+    """``gnc_lot_is_closed``, ported: the one reader of ``lot.is_closed``.
+
+    A stored 0 or 1 is the answer. Anything negative means compute it
+    the way GnuCash does — a lot with no splits is open; a lot whose
+    quantities sum to zero is closed; anything else is open.
+    """
+    flag = lot.is_closed
+    if flag is not None and flag >= 0:
+        return bool(flag)
+    splits = list(lot.splits)
+    if not splits:
+        return False
+    return sum((s.quantity for s in splits), Decimal("0")) == 0
+
+
+def _lot_cache_flag(lot) -> None:
+    """Cache the computed flag before adding a split to a lot.
+
+    What ``gnc_lot_is_closed`` does on every read: an UNKNOWN flag is
+    resolved and stored. Needed on the write side because piecash's
+    own guard (``check_no_change_if_lot_is_close``) tests the raw
+    column for truth, and -1 is true — so a desktop-touched open lot
+    would refuse a payment or an assignment until someone wrote the
+    real answer down. Call it before every ``split.lot = lot``.
+    """
+    if lot.is_closed is not None and lot.is_closed >= 0:
+        return
+    if _lot_is_closed(lot):
+        lot.is_closed = _LOT_CLOSED
+    else:
+        lot.is_closed = _LOT_OPEN
+
+
+def _ordered_splits(transaction) -> list:
+    """A transaction's splits in GnuCash's own order, on every backend.
+
+    ``Transaction.cpp`` (``xaccTransSortSplits``, run on every commit)
+    sorts with ``split_sign_cmp``: splits whose value is not negative
+    first, negative after, and nothing else — a stable sort keeps the
+    rest as loaded. "As loaded" is the part that differs by backend:
+    SQLite hands rows back in insertion order, InnoDB in primary-key
+    order, so the same book listed its splits credit-first on MySQL
+    and debit-first on the file. Debits first is GnuCash's rule; the
+    account path and then the split GUID break ties the same way
+    everywhere. Every renderer of a transaction's legs reads this.
+    """
+    return sorted(
+        transaction.splits,
+        key=lambda s: (s.value < 0, s.account.fullname, s.guid),
+    )
+
+
+def _txn_sort_key(transaction) -> tuple:
+    """Newest-first ordering key for transaction listings.
+
+    ``post_date`` alone leaves same-day transactions in storage order,
+    which is a different order per backend. ``enter_date`` is the
+    timestamp GnuCash stamps at entry — the order the book was
+    written in — and the GUID settles anything left.
+    """
+    return (
+        transaction.post_date or date.min,
+        transaction.enter_date or datetime.min,
+        transaction.guid,
+    )
+
+
 def _split_to_dict(
     split: piecash.Split,
     split_prefixes: dict[str, str] | None = None,
@@ -712,7 +796,7 @@ def _transaction_to_dict(
                 split_prefixes=split_prefixes,
                 lot_prefixes=lot_prefixes,
             )
-            for s in transaction.splits
+            for s in _ordered_splits(transaction)
         ],
     }
     if transaction.notes:
@@ -852,7 +936,7 @@ def _transaction_to_compact_line(
     )
     short = _short_guid(transaction.guid, prefixes)
     desc = transaction.description
-    splits = list(transaction.splits)
+    splits = _ordered_splits(transaction)
 
     if focus_account is not None:
         focus_splits = [

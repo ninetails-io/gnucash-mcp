@@ -7801,7 +7801,9 @@ class TestPayInvoice:
             amount="500",
         )
 
-        # Check lot is_closed = -1 in the database
+        # Check lot is_closed = 1 in the database — the value GnuCash
+        # caches for a zero-balance lot (gnc_lot_get_balance). -1 is
+        # LOT_CLOSED_UNKNOWN, which desktop would recompute.
         conn = sqlite3.connect(str(business_book))
         try:
             lots = conn.execute(
@@ -7809,8 +7811,8 @@ class TestPayInvoice:
                 "(SELECT guid FROM accounts WHERE name = 'Accounts Receivable')"
             ).fetchall()
             assert any(
-                row[0] == -1 for row in lots
-            ), "lot should be closed with is_closed=-1"
+                row[0] == 1 for row in lots
+            ), "lot should be closed with is_closed=1"
         finally:
             conn.close()
 

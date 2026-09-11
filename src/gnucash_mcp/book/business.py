@@ -21,6 +21,9 @@ from decimal import Decimal
 import piecash
 
 from gnucash_mcp.book._base import (
+    _lot_cache_flag,
+    _LOT_CLOSED,
+    _LOT_OPEN,
     _commodity_quantum,
     _gnc_bool,
     _slot_value_str,
@@ -5698,7 +5701,7 @@ class BusinessMixin:
             lot = Lot(
                 title=f"{type_string} {inv.id}",
                 account=post_acct,
-                is_closed=0,
+                is_closed=_LOT_OPEN,
             )
             # Lot auto-registers via the account back-pop —
             # an explicit session.add would be redundant (see
@@ -5813,6 +5816,7 @@ class BusinessMixin:
                 splits=piecash_splits,
             )
 
+            _lot_cache_flag(lot)
             ar_ap_split.lot = lot
 
             inv.date_posted = datetime.combine(
@@ -6675,6 +6679,7 @@ class BusinessMixin:
                 splits=splits,
             )
 
+            _lot_cache_flag(lot_obj)
             ar_ap_split.lot = lot_obj
 
             book.flush()
@@ -6683,7 +6688,7 @@ class BusinessMixin:
 
             remaining = self._calculate_lot_balance(lot_obj)
             if remaining == Decimal(0):
-                lot_obj.is_closed = -1
+                lot_obj.is_closed = _LOT_CLOSED
 
             book.save()
 
@@ -7012,6 +7017,8 @@ class BusinessMixin:
 
             # Assign splits to the respective lots — this is what
             # tells GnuCash the lots are being settled.
+            _lot_cache_flag(cn_lot)
+            _lot_cache_flag(target_lot)
             cn_split.lot = cn_lot
             target_split.lot = target_lot
 
@@ -7028,9 +7035,9 @@ class BusinessMixin:
                 self._calculate_lot_balance(target_lot)
             )
             if new_cn_remaining == 0:
-                cn_lot.is_closed = -1
+                cn_lot.is_closed = _LOT_CLOSED
             if new_target_remaining == 0:
-                target_lot.is_closed = -1
+                target_lot.is_closed = _LOT_CLOSED
 
             book.save()
 

@@ -20,6 +20,10 @@ from piecash.core.commodity import Price
 from piecash.core.transaction import Lot
 
 from gnucash_mcp.book._base import (
+    _lot_cache_flag,
+    _LOT_CLOSED,
+    _LOT_OPEN,
+    _lot_is_closed,
     _commodity_to_compact_line,
     _guid_prefix_map,
     _is_market_price,
@@ -1014,7 +1018,7 @@ class InvestmentsMixin:
             "remaining_cost_basis": remaining_cb,
             "original_cost_basis": original_cb,
             "cost_per_share": _format_number(raw["cost_per_share"], decimals=4),
-            "is_closed": bool(lot.is_closed),
+            "is_closed": _lot_is_closed(lot),
         }
 
     def create_lot(
@@ -1049,7 +1053,7 @@ class InvestmentsMixin:
                 title=title,
                 account=acct,
                 notes=notes,
-                is_closed=0,
+                is_closed=_LOT_OPEN,
             )
             # No session.add — the Lot auto-registers via the
             # Account.lots back-populate.
@@ -1103,8 +1107,17 @@ class InvestmentsMixin:
 
             default_ccy = self._require_default_currency(book)
             results = []
-            for lot in acct.lots:
-                if not include_closed and lot.is_closed:
+            # Acquisition order — earliest split date, then title, then
+            # GUID — rather than the order the backend returned rows.
+            def _lot_key(lot):
+                dates = [
+                    s.transaction.post_date for s in lot.splits
+                    if s.transaction.post_date is not None
+                ]
+                return (min(dates) if dates else date.max, lot.title or "", lot.guid)
+
+            for lot in sorted(acct.lots, key=_lot_key):
+                if not include_closed and _lot_is_closed(lot):
                     continue
                 summary = self._lot_summary(lot, book, default_ccy)
                 # The open-positions view also skips zero-position
@@ -1201,7 +1214,7 @@ class InvestmentsMixin:
                 "title": lot.title,
                 "account": lot.account.fullname,
                 "notes": lot.notes or "",
-                "is_closed": bool(lot.is_closed),
+                "is_closed": _lot_is_closed(lot),
                 "splits": splits,
                 "summary": summary_compact,
             }
@@ -1245,7 +1258,7 @@ class InvestmentsMixin:
             if not lot:
                 raise ValueError(f"Lot not found: {lot_guid}")
 
-            if lot.is_closed:
+            if _lot_is_closed(lot):
                 raise ValueError("Cannot assign split to a closed lot")
 
             if split.account != lot.account:
@@ -1259,16 +1272,18 @@ class InvestmentsMixin:
                     f"Split is already assigned to lot: {split.lot.guid}"
                 )
 
+            _lot_cache_flag(lot)
             split.lot = lot
             book.save()
 
             default_ccy = self._require_default_currency(book)
             summary = self._lot_summary(lot, book, default_ccy)
 
-            # Auto-close if quantity reaches zero; GnuCash uses -1 for boolean true
+            # Auto-close at zero quantity — the value GnuCash itself
+            # caches for a zero-balance lot (gnc_lot_get_balance).
             auto_closed = False
             if Decimal(summary["quantity"]) == 0 and len(lot.splits) > 0:
-                lot.is_closed = -1
+                lot.is_closed = _LOT_CLOSED
                 book.save()
                 auto_closed = True
 
@@ -1278,7 +1293,7 @@ class InvestmentsMixin:
             return {
                 "status": "assigned",
                 **summary,
-                "is_closed": auto_closed or bool(lot.is_closed),
+                "is_closed": auto_closed or _lot_is_closed(lot),
             }
 
     def calculate_lot_gain(
@@ -1384,10 +1399,14 @@ class InvestmentsMixin:
             }
 
     def close_lot(self, guid: str) -> dict:
-        """Mark a lot as closed.
+        """Mark a zero-balance lot as closed.
 
-        Use when a lot is fully sold but wasn't automatically marked closed,
-        or to manually close a lot with zero shares.
+        GnuCash defines a closed lot as one whose quantities sum to
+        zero (``gnc_lot_get_balance`` caches exactly that), and it
+        recomputes the flag whenever desktop touches the lot — so a
+        "closed" flag on a lot that still holds shares would not
+        survive the next desktop session. Use this when a lot is fully
+        sold but the flag was never cached.
 
         Args:
             guid: Lot GUID.
@@ -1396,18 +1415,28 @@ class InvestmentsMixin:
             Dict with status.
 
         Raises:
-            ValueError: If lot not found or already closed.
+            ValueError: If lot not found, already closed, or still
+                holds a balance.
         """
         with self.open(readonly=False) as book:
             lot = self._find_lot(book, guid)
             if not lot:
                 raise ValueError(f"Lot not found: {guid}")
 
-            if lot.is_closed:
+            if _lot_is_closed(lot):
                 raise ValueError("Lot is already closed")
 
-            # GnuCash uses -1 for boolean true
-            lot.is_closed = -1
+            balance = sum((s.quantity for s in lot.splits), Decimal("0"))
+            if balance != 0:
+                raise ValueError(
+                    f"Cannot close lot: it still holds "
+                    f"{_format_number(balance, decimals=4)} "
+                    f"{lot.account.commodity.mnemonic}. GnuCash defines "
+                    f"a closed lot as zero balance; assign the sale "
+                    f"split(s) first (assign_split_to_lot)."
+                )
+
+            lot.is_closed = _LOT_CLOSED
             book.save()
 
 

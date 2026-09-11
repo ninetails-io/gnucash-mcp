@@ -519,10 +519,13 @@ def register(mcp, get_book) -> None:
     def close_lot(
         guid: LotGuid,
     ) -> str:
-        """Mark a lot as closed.
+        """Mark a zero-balance lot as closed.
 
-        Use when a lot is fully sold but wasn't automatically marked closed,
-        or to manually close a lot with zero shares.
+        GnuCash defines a closed lot as one whose assigned quantities
+        sum to zero, and recomputes the flag whenever desktop touches
+        the lot — a lot that still holds shares cannot be closed here
+        and the call refuses, naming the balance. Use this when a lot is
+        fully sold but the flag was never cached.
 
         Args:
             guid: Lot GUID (or 8+ char prefix).

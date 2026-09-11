@@ -1097,9 +1097,15 @@ class SchedulingMixin:
         """
 
         with self.open(readonly=True) as book:
-            all_sx = book.session.query(
-                ScheduledTransaction
-            ).all()
+            # Soonest due first, then name, then GUID. The query's
+            # own order is the backend's (insertion on SQLite,
+            # primary key on InnoDB) and was leaking into the list.
+            all_sx = sorted(
+                book.session.query(ScheduledTransaction).all(),
+                key=lambda sx: (
+                    self._sx_next_due(sx) or date.max, sx.name, sx.guid,
+                ),
+            )
             default_mnemonic = self._require_default_currency(book).mnemonic
 
             results = []
@@ -1301,7 +1307,9 @@ class SchedulingMixin:
                         )
                     upcoming.append(entry)
 
-            upcoming.sort(key=lambda x: x["occurrence_date"])
+            # Same-day occurrences by name: the backend's row order
+            # is not a sort.
+            upcoming.sort(key=lambda x: (x["occurrence_date"], x["name"]))
 
             page, indicator = _paginate(
                 upcoming, offset=offset, limit=limit,

@@ -724,9 +724,15 @@ def _is_row_shaped_call(func: ast.expr) -> bool:
     return name in ("values", "dict") or name[:1].isupper()
 
 
+_LOT_FLAG_NAMES = frozenset({"_LOT_OPEN", "_LOT_CLOSED", "_LOT_CLOSED_UNKNOWN"})
+
+
 def _is_integer_literal(value: ast.expr) -> bool:
     if isinstance(value, ast.Constant) and isinstance(value.value, int):
         return not isinstance(value.value, bool)
+    # The lot flag's named integers (gnc-lot.cpp's tri-state).
+    if isinstance(value, ast.Name) and value.id in _LOT_FLAG_NAMES:
+        return True
     # ``-1`` parses as a unary op, not a constant.
     return (
         isinstance(value, ast.UnaryOp)
