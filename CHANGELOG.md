@@ -34,6 +34,7 @@ Schedule recipes, invoice links, and budget signs are now stored the way GnuCash
 - Deleting a transaction or schedule strips GUID-valued slots before the ORM delete, so piecash's cascade can never reach the entity the slot points at (#179).
 - A database book's flag columns and a book path with a percent escape both round-trip (#175).
 - Demo-book continuation counts ledger rows only when guarding its frozen prefix; schedule templates are not activity (#181).
+- **Intel Macs install without a Rust toolchain again**: `cryptography` (transitive, via `mcp`) dropped macOS x86_64 wheels at 49.0; a marker-scoped constraint keeps 48.0.1 on that platform only, every other platform stays current.
 
 ### Credits
 - @vchatela — the database backend (#175), the largest outside code contribution to date: nine commits, the `[postgres]` extra, and CI against PostgreSQL.

@@ -90,3 +90,17 @@ target-version = ["py310", "py311", "py312", "py313"]
 dev = [
     "pytest-xdist>=3.8.0",
 ]
+
+[tool.uv]
+# cryptography (transitive: mcp -> pyjwt[crypto]) stopped shipping
+# macOS x86_64 wheels at 49.0; from there an Intel Mac must compile it
+# from source, which needs a Rust toolchain newer than Homebrew can
+# bottle for Intel macOS 26. 48.0.1 is the last release with a
+# universal2 wheel. Scoped by marker so every other platform stays on
+# the current release. Nothing here exercises the pinned code paths
+# (X.509 / PKCS#7 parsing) — cryptography is present only for mcp's
+# HTTP-auth mode, which a stdio server never enters. Drop this
+# constraint when Intel macOS leaves support.
+constraint-dependencies = [
+    "cryptography<49; sys_platform == 'darwin' and platform_machine == 'x86_64'",
+]
