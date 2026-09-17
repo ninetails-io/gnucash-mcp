@@ -103,6 +103,9 @@ class PersonaPolicy:
     # (e.g. Sabine's Ausgleichskonto clearing). Must be idempotent —
     # check the book before writing.
     book_repairs: Callable[[Path, date, date], list[str]] | None = None
+    # holidays(year) -> the dates no ACH settles on, beyond weekends
+    # (``federal_holidays`` for a US persona). None = weekends only.
+    holidays: Callable[[int], frozenset[date]] | None = None
     # Accounts stamped with the server's no_reconcile opt-out slot:
     # loans, VAT clearing — no statement exists to reconcile against
     # (bookkeeper review §1: they'd otherwise sit forever in the
@@ -154,14 +157,68 @@ def _seeded(persona: str, purpose: str, anchor: date, lo: int, hi: int) -> int:
     return rng.randint(lo, hi)
 
 
-def business_day(d: date) -> date:
-    """``d`` rolled forward off a weekend to the next Monday. Card
-    statement payments and document settlements are ACH movements and
-    post on business days (Alex cold audit C3); month-end interest
-    credits and the closed-loop transfers stay on the calendar day the
-    engine reads them at, deliberately."""
+def _nth_weekday(year: int, month: int, weekday: int, n: int) -> date:
+    """The ``n``-th (1-based; -1 = last) ``weekday`` of the month."""
+    if n > 0:
+        first = date(year, month, 1)
+        return first + timedelta(days=(weekday - first.weekday()) % 7
+                                 + 7 * (n - 1))
+    nxt = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
+    last = nxt - timedelta(days=1)
+    return last - timedelta(days=(last.weekday() - weekday) % 7)
+
+
+def _observed(d: date) -> date:
+    """5 U.S.C. 6103(b): a Saturday holiday is observed the Friday
+    before, a Sunday holiday the Monday after."""
+    if d.weekday() == 5:
+        return d - timedelta(days=1)
+    if d.weekday() == 6:
+        return d + timedelta(days=1)
+    return d
+
+
+def federal_holidays(year: int) -> frozenset[date]:
+    """The eleven US federal holidays of ``year`` as observed (5 U.S.C.
+    6103), plus any observed New Year's Day that falls on this year's
+    December 31. The Federal Reserve closes on each, so no ACH settles
+    (Alex cold audit R2: a contractor paid on Christmas Day)."""
+    days = {
+        _observed(date(year, 1, 1)),               # New Year's Day
+        _nth_weekday(year, 1, 0, 3),               # Birthday of MLK, Jr.
+        _nth_weekday(year, 2, 0, 3),               # Washington's Birthday
+        _nth_weekday(year, 5, 0, -1),              # Memorial Day
+        _observed(date(year, 6, 19)),              # Juneteenth
+        _observed(date(year, 7, 4)),               # Independence Day
+        _nth_weekday(year, 9, 0, 1),               # Labor Day
+        _nth_weekday(year, 10, 0, 2),              # Columbus Day
+        _observed(date(year, 11, 11)),             # Veterans Day
+        _nth_weekday(year, 11, 3, 4),              # Thanksgiving Day
+        _observed(date(year, 12, 25)),             # Christmas Day
+        _observed(date(year + 1, 1, 1)),           # may land on Dec 31
+    }
+    return frozenset(d for d in days if d.year == year)
+
+
+def is_business_day(d: date, holidays=None) -> bool:
+    """Weekday and, when ``holidays`` (a year → set-of-dates function)
+    is given, not one of its days."""
     if d.weekday() >= 5:
-        d += timedelta(days=7 - d.weekday())
+        return False
+    return holidays is None or d not in holidays(d.year)
+
+
+def business_day(d: date, holidays=None) -> date:
+    """``d`` rolled forward off a weekend — and off any day in
+    ``holidays(year)`` when a calendar is given — to the next business
+    day. Card statement payments and document settlements are ACH
+    movements and post on business days (Alex cold audit C3; federal
+    holidays R2); month-end interest credits and the closed-loop
+    transfers stay on the calendar day the engine reads them at,
+    deliberately. Personas pass their own calendar through
+    ``PersonaPolicy.holidays``; None keeps weekends-only."""
+    while not is_business_day(d, holidays):
+        d += timedelta(days=1)
     return d
 
 
@@ -329,7 +386,7 @@ def _pay_card(book: GnuCashBook, policy: PersonaPolicy, card: CardPolicy,
     cycle closing at ``close``. No-ops when the payment would land in
     the frozen prefix or past the horizon."""
     pay_lag = _seeded(policy.key, f"paylag:{card.label}", close, 3, 7)
-    pay_date = business_day(close + timedelta(days=pay_lag))
+    pay_date = business_day(close + timedelta(days=pay_lag), policy.holidays)
     if pay_date <= cutoff or pay_date > through:
         return
 
@@ -717,7 +774,7 @@ def settle_documents(policy: PersonaPolicy, book_path: Path, cutoff: date,
         if pay_date <= cutoff:
             pay_date = cutoff + timedelta(
                 days=_seeded(policy.key, "settle-late", posted, 4, 12))
-        pay_date = business_day(pay_date)
+        pay_date = business_day(pay_date, policy.holidays)
         if pay_date > through:
             continue  # stays open — the recent window
         amount = D(str(doc.get("amount_due", "0")))
@@ -1022,7 +1079,8 @@ def verify_invariants(policy: PersonaPolicy, book_path: Path, cutoff: date,
         # that landed during the payment lag — a fraction of a cycle.
         for close in _card_closes(book, card, cutoff, through):
             lag = _seeded(policy.key, f"paylag:{card.label}", close, 3, 7)
-            pay_date = business_day(close + timedelta(days=lag))
+            pay_date = business_day(close + timedelta(days=lag),
+                                    policy.holidays)
             if pay_date <= cutoff or pay_date > through:
                 continue
             residual = -_balance(book, card.account, pay_date)

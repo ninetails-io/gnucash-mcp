@@ -114,7 +114,11 @@ def continue_persona(persona: str, book_path: Path, through: date) -> int:
     inv = mod.continue_investments(book_path, through, cutoff)
     print(f"   investments: {inv}")
 
-    actions = continuation.run_policy(policy, book_path, cutoff, through)
+    # A persona may wrap the engine (Alex splits it at each April
+    # 1040 so the settlement is prepared from the book and the next
+    # month-end sees it); the bare loop is the default.
+    run_policy = getattr(mod, "run_policy", continuation.run_policy)
+    actions = run_policy(policy, book_path, cutoff, through)
     for line in actions:
         print(f"   policy: {line}")
 

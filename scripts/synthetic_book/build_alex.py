@@ -19,12 +19,17 @@ month; every dollar of revenue is an invoice; the one contract
 developer is a 1099 vendor billing in arrears on the month's last
 business day (no employee, no vouchers — a W-2 employee with no
 payroll was the audit's phantom); quarterly 1040-ES installments
-and the April settlement come from ONE household MFJ model (Robin's
-W-2 and withholding, Schedule C, SE tax with the wage base, the
-Solo 401(k), QBI, the bracket table) — the settlement is signed, so
-an overpaid year posts a refund; WA B&O is apportioned to the
-Washington clients (RCW 82.04.462) and Seattle's B&O taxes the whole
-apportioned base once worldwide gross clears the $100K exemption;
+project the year on ONE household MFJ model (Robin's W-2 and
+withholding, Schedule C, SE tax with the wage base, the Solo 401(k),
+QBI, the bracket table) and the April settlement runs the same model
+on the BOOK'S OWN ROWS — Schedule C from the LLC's revenue and
+expense accounts, Schedule B from the interest and dividend accounts,
+Box 1 and withholding from the payroll rows (cold audit R2 W1) — and
+is signed, so an overpaid year posts a refund; WA B&O is apportioned
+to the Washington clients (RCW 82.04.462), net of the small-business
+credit (RCW 82.04.4451 — a $0 return is still filed), and Seattle's
+B&O taxes the whole apportioned base once worldwide gross clears the
+$100K exemption;
 the Seattle license and the SOS annual report are paid from the
 LLC; Robin's stub carries WA PFML (year-keyed rate) / WA Cares / L&I
 and a 7% UWRP deferral with match, withholding computed on wages net
@@ -79,10 +84,12 @@ from gnucash_mcp.book import GnuCashBook
 # module or as a path because uv adds the script dir to sys.path.
 try:
     from market_data import MarketData
+    from continuation import business_day, federal_holidays, is_business_day
 except ImportError:  # pragma: no cover - fallback for package-style import
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from market_data import MarketData
+    from continuation import business_day, federal_holidays, is_business_day
 
 
 # ── Configuration ───────────────────────────────────────────────
@@ -136,22 +143,23 @@ def _clamp_day(year: int, month: int, day: int) -> date:
 
 
 def _next_bday(d: date) -> date:
-    """``d`` rolled forward off a weekend to the next Monday.
+    """``d`` rolled forward off a weekend or a US federal holiday (as
+    observed) to the next business day.
 
     ACH debits, autopays, IRS deadlines and fund trades post on business
-    days (a 1040-ES due on a Sunday is due the Monday); card charges and
-    bank-side interest credits may land on any calendar day and are
-    deliberately NOT routed through here.
+    days (a 1040-ES due on a Sunday is due the Monday; nothing settles
+    on Christmas Day — cold audit R2); card charges and bank-side
+    interest credits may land on any calendar day and are deliberately
+    NOT routed through here. Same calendar as the continuation's
+    ``business_day`` (``POLICY.holidays``).
     """
-    if d.weekday() >= 5:
-        d += timedelta(days=7 - d.weekday())
-    return d
+    return business_day(d, federal_holidays)
 
 
 def _last_bday(year: int, month: int) -> date:
     """The last business day of the month."""
     d = _clamp_day(year, month, 31)
-    while d.weekday() >= 5:
+    while not is_business_day(d, federal_holidays):
         d -= timedelta(days=1)
     return d
 
@@ -968,7 +976,9 @@ def _pfml_rate(when: date) -> Decimal:
 def _paychecks(through: date) -> list[tuple[date, Decimal, Decimal]]:
     """Robin's biweekly checks from 2025-01-10 through ``through`` as
     (pay date, gross, overtime). One RNG stream, so the tax plan and
-    the payroll stream read the same checks."""
+    the payroll stream read the same checks. A payday on a federal
+    holiday (a Christmas Friday) is paid the business day BEFORE —
+    employers advance the deposit, they don't hold it."""
     rng = random.Random(SEED + 5)
     out: list[tuple[date, Decimal, Decimal]] = []
     d = date(YEAR, 1, 10)
@@ -977,7 +987,10 @@ def _paychecks(through: date) -> list[tuple[date, Decimal, Decimal]]:
         overtime = D("0")
         if i > 0 and i % rng.choice([3, 4]) == 0:
             overtime = D(str(rng.randint(200, 400)))
-        out.append((d, _base_gross(d) + overtime, overtime))
+        pay = d
+        while not is_business_day(pay, federal_holidays):
+            pay -= timedelta(days=1)
+        out.append((pay, _base_gross(d) + overtime, overtime))
         d += timedelta(days=14)
         i += 1
     return out
@@ -1049,19 +1062,25 @@ def _property_tax_half(year: int) -> Decimal:
 AUTO_INSURANCE = D("142.00")
 HO6_INSURANCE = D("58.00")
 
-# ── Owner-level tax sizing (audit A3; cold audit A2) ──
-# One household model, used three times: the 1040-ES installments
+# ── Owner-level tax sizing (audit A3; cold audit A2, R2 W1) ──
+# One household model, two sets of inputs. The 1040-ES installments
 # project the year from annualized figures (Form 2210 Schedule AI
-# style), the April settlement computes the finished year on the
-# same model, and the stability verifier checks the book against it.
-# Married filing jointly: Robin's W-2 (Box 1 = gross − 403(b) − §125)
-# plus Alex's Schedule C net, less ½ SE tax, the Solo 401(k) employer
-# contribution, the QBI deduction and the standard deduction, through
-# the bracket table; SE tax at 92.35% × 15.3% with the Social Security
-# wage base; Schedule D long-term gains at 15%. Each installment pays
-# up to the cumulative 90% safe-harbor fraction of the tax NOT covered
-# by Robin's withholding; the settlement is liability − prepayments,
-# signed — a refund posts as an ``IRS TREAS 310`` deposit.
+# style — a run-rate is fine for a voucher); the April settlement is
+# prepared from the finished year's LEDGER (``_ledger_tax_inputs``):
+# Schedule C = LLC revenue + FX gain/loss − every Expenses:Business
+# account (meals at 50%), Schedule B = the interest and dividend
+# accounts, Schedule D = the capital-gains account, Box 1 and
+# withholding from the payroll rows; and the stability verifier
+# recomputes that liability from the same rows. Married filing
+# jointly: Robin's W-2 (Box 1 = gross − 403(b) − §125) plus Alex's
+# Schedule C net and Schedule B, less ½ SE tax, the Solo 401(k)
+# employer contribution, the QBI deduction and the standard deduction,
+# through the bracket table; SE tax at 92.35% × 15.3% with the Social
+# Security wage base; Schedule D long-term gains at 15%. Each
+# installment pays up to the cumulative 90% safe-harbor fraction of
+# the tax NOT covered by Robin's withholding; the settlement is
+# liability − prepayments, signed — a refund posts as an ``IRS TREAS
+# 310`` deposit.
 SE_TAX_RATE = D("0.153")
 SE_TAXABLE_SHARE = D("0.9235")
 SE_SS_RATE = D("0.124")
@@ -1089,10 +1108,16 @@ FED_MFJ_TABLES = {
 SS_WAGE_BASE = {2025: D("176100"), 2026: D("184500")}
 TAX_INDEX_FACTOR = D("1.025")
 
-# Washington B&O (audit A7; cold audit A1/B1): Service & Other
+# Washington B&O (audit A7; cold audit A1/B1; R2 W2): Service & Other
 # Activities at 1.5% of the WA-APPORTIONED gross — services are sourced
 # to the customer's location (RCW 82.04.462), so only the Seattle
-# clients' receipts are Washington's; filed quarterly. Seattle's own
+# clients' receipts are Washington's; filed quarterly, less the
+# small-business B&O credit (RCW 82.04.4451(3)–(4): for a ≥50% service
+# filer the maximum credit is $160 per month of the period since
+# 2023-01-01, the credit is the whole tax when the tax is at or under
+# that maximum, and 2 × maximum − tax, floor $0, above it). A quarter
+# whose tax the credit covers still files — a $0 row records the
+# return; nothing is paid. Seattle's own
 # B&O (SMC 5.45) tests its $100K exemption on worldwide gross and,
 # once over it, taxes the whole Seattle-apportioned base at 0.427%
 # (the threshold is an exemption, not a deduction); it settles annually
@@ -1100,6 +1125,7 @@ TAX_INDEX_FACTOR = D("1.025")
 # LLC's anniversary month.
 WA_CLIENTS = {"emerald", "sound_transit"}
 WA_BO_RATE = D("0.015")
+WA_BO_CREDIT_MONTHLY_MAX = D("160.00")   # RCW 82.04.4451(3)(a), service
 SEATTLE_BO_RATE = D("0.00427")
 SEATTLE_BO_THRESHOLD = D("100000")
 SEATTLE_LICENSE_FEE = D("115.00")
@@ -1164,9 +1190,11 @@ def _bracket_tax(taxable: Decimal, brackets: list) -> Decimal:
 
 
 def _household_tax(tax_year: int, se_net: Decimal, wages_box1: Decimal,
-                   ltcg: Decimal = D("0")) -> dict:
+                   ltcg: Decimal = D("0"),
+                   schedule_b: Decimal = D("0")) -> dict:
     """The MFJ liability on the household's figures: ``{"se", "income",
-    "total", "taxable", ...}`` (all Decimal, cents)."""
+    "total", "taxable", ...}`` (all Decimal, cents). ``schedule_b`` is
+    interest + dividends, taxed as ordinary income."""
     se_base = max(D("0"), se_net) * SE_TAXABLE_SHARE
     se = (min(se_base, _ss_wage_base(tax_year)) * SE_SS_RATE
           + se_base * SE_MEDICARE_RATE).quantize(D("0.01"))
@@ -1174,7 +1202,7 @@ def _household_tax(tax_year: int, se_net: Decimal, wages_box1: Decimal,
     qbi_base = max(D("0"), se_net - se / 2 - solo_401k)
     qbi = (qbi_base * QBI_RATE).quantize(D("0.01"))
     std, brackets = _fed_table(tax_year)
-    agi = wages_box1 + se_net - se / 2 - solo_401k + ltcg
+    agi = wages_box1 + se_net - se / 2 - solo_401k + ltcg + schedule_b
     taxable = max(D("0"), agi - qbi - std)
     ordinary = max(D("0"), taxable - max(D("0"), ltcg))
     income = (_bracket_tax(ordinary, brackets)
@@ -1227,9 +1255,11 @@ def _realized_ltcg(tax_year: int, upto: date | None = None) -> Decimal:
 
 
 def _estimated_tax_plan(through: date) -> list[dict]:
-    """Every 1040-ES installment and April balance-due through
-    ``through``: dicts with date, description, notes, income_part,
-    se_part (whole dollars — people round 1040-ES vouchers)."""
+    """Every 1040-ES installment through ``through``: dicts with date,
+    description, notes, income_part, se_part (whole dollars — people
+    round 1040-ES vouchers). The April settlement is not here: it is
+    prepared from the book once the year's rows exist
+    (``settle_federal``)."""
     receipts = _receipts_by_month(through)
     plan: list[dict] = []
     for tax_year in range(YEAR, through.year + 1):
@@ -1281,53 +1311,171 @@ def _estimated_tax_plan(through: date) -> list[dict]:
                 "income_part": installment - se_part, "se_part": se_part,
             })
             paid += installment
-        # The April settle-up on the finished year: liability on the
-        # same model, less everything prepaid, SIGNED (cold audit A2).
-        due = _next_bday(date(tax_year + 1, 4, 15))
-        if due <= through:
-            gross = sum((receipts.get((tax_year, m), D("0"))
-                         for m in range(1, 13)), D("0"))
-            net = max(D("0"), gross - BIZ_EXPENSE_MONTHLY * 12)
-            box1, withheld, _n = _robin_w2(tax_year)
-            ltcg = _realized_ltcg(tax_year)
-            tax = _household_tax(tax_year, net, box1, ltcg)
-            prepaid = withheld + paid
-            balance = (tax["total"] - prepaid).quantize(D("1"))
-            basis = (f"tax ${tax['total']:,.0f} (income ${tax['income']:,.0f}"
-                     f" + SE ${tax['se']:,.0f}) on W-2 wages ${box1:,.0f}, "
-                     f"Schedule C net ${net:,.0f}"
-                     + (f", Schedule D ${ltcg:,.0f}" if ltcg else "")
-                     + f"; prepaid ${prepaid:,.0f} (withholding "
-                     f"${withheld:,.0f} + 1040-ES ${paid:,.0f})")
-            if balance != 0:
-                plan.append({
-                    "date": due, "kind": "balance",
-                    "description": ("IRS USATAXPYMT" if balance > 0
-                                    else "IRS TREAS 310 TAX REF"),
-                    "notes": (f"{tax_year} Form 1040 (MFJ) balance due "
-                              f"${balance:,.0f}: {basis}"
-                              if balance > 0 else
-                              f"{tax_year} Form 1040 (MFJ) refund "
-                              f"${-balance:,.0f}: {basis}"),
-                    "amount": balance,
-                })
     return plan
 
 
-def _federal_liability(tax_year: int, through: date) -> dict | None:
-    """The finished year's liability on the plan's model (what the
-    stability verifier compares the book against), or None while the
-    year is still open."""
-    if date(tax_year, 12, 31) > through:
+PAYROLL_DESCRIPTION = "UW Medicine — payroll (Robin)"
+
+# Full account paths under the book's root (template accounts excluded
+# by construction) for the raw-SQL readers below: ``p.path`` joins on
+# ``p.guid``.
+ACCOUNT_PATHS_SQL = """
+    WITH RECURSIVE p(guid, path) AS (
+        SELECT guid, name FROM accounts
+         WHERE parent_guid = (SELECT root_account_guid FROM books)
+        UNION ALL
+        SELECT a.guid, p.path || ':' || a.name
+          FROM accounts a JOIN p ON a.parent_guid = p.guid)
+"""
+
+
+def _ledger_tax_inputs(book_path: Path, tax_year: int) -> dict:
+    """Everything the finished year's Form 1040 needs, read off the
+    book's own rows (cold audit R2 W1): Schedule C from the LLC's
+    revenue, FX and Expenses:Business accounts (meals at 50%, IRC
+    §274(n)); Schedule B from the interest and dividend accounts;
+    Schedule D from the capital-gains account; Box 1 and withholding
+    from Robin's payroll rows; the 1040-ES installments and any
+    settlement already posted, by their notes. Sums are of split
+    ``quantity`` (the account's own USD — an EUR invoice's revenue leg
+    is USD at the posting rate) aggregated in Decimal."""
+    import sqlite3
+
+    lo, hi = f"{tax_year}-01-01", f"{tax_year}-12-31"
+    con = sqlite3.connect(str(book_path))
+    try:
+        def by_account(where: str, *params) -> dict[str, Decimal]:
+            out: dict[str, Decimal] = {}
+            for path, num, den in con.execute(
+                    ACCOUNT_PATHS_SQL
+                    + "SELECT p.path, s.quantity_num, s.quantity_denom "
+                    "FROM splits s JOIN transactions t ON t.guid = s.tx_guid "
+                    "JOIN p ON p.guid = s.account_guid WHERE " + where,
+                    params):
+                out[path] = out.get(path, D("0")) + D(num) / D(den)
+            return out
+
+        in_year = "date(t.post_date) BETWEEN ? AND ?"
+        year = by_account(in_year, lo, hi)
+        payroll = by_account(in_year + " AND t.description = ?", lo, hi,
+                             PAYROLL_DESCRIPTION)
+        # The 1040-ES Q4 voucher and the settlement post in the NEXT
+        # calendar year: find them by the tax year in their notes.
+        noted = ("EXISTS (SELECT 1 FROM slots sl WHERE sl.obj_guid = "
+                 "t.guid AND sl.name = 'notes' AND sl.string_val LIKE ?)")
+        estimates = by_account(noted, f"Form 1040-ES {tax_year} Q%")
+        settled = by_account(noted, f"{tax_year} Form 1040 (MFJ)%")
+    finally:
+        con.close()
+
+    g = lambda table, key: table.get(key, D("0"))  # noqa: E731
+    revenue = -g(year, LLC_REVENUE)
+    fx = -g(year, FX_GAIN_LOSS)
+    expenses = {path: amt for path, amt in year.items()
+                if path.startswith("Expenses:Business:")}
+    expense_total = sum(expenses.values(), D("0"))
+    meals = g(expenses, EXP_MEALS)
+    meals_disallowed = (meals / 2).quantize(D("0.01"))
+    schedule_c = revenue + fx - expense_total + meals_disallowed
+    interest = -g(year, INTEREST_INCOME)
+    dividends = -g(year, DIVIDENDS)
+    ltcg = -g(year, CAPITAL_GAINS)
+    # Box 1 = gross − §125 premium − HSA − the employee 403(b) deferral;
+    # the UWRP leg on a check carries deferral + match, and the match
+    # is the (negative) Employer Retirement Match income leg.
+    box1 = (-g(payroll, SALARY) - g(payroll, EXP_HEALTH) - g(payroll, HSA)
+            - (g(payroll, UWRP) + g(payroll, EMPLOYER_MATCH)))
+    withheld = g(payroll, EXP_FED)
+    return {
+        "revenue": revenue, "fx": fx, "expenses": expenses,
+        "expense_total": expense_total, "meals": meals,
+        "meals_disallowed": meals_disallowed, "schedule_c": schedule_c,
+        "interest": interest, "dividends": dividends, "ltcg": ltcg,
+        "box1": box1.quantize(D("0.01")), "withheld": withheld,
+        "estimates": g(estimates, EXP_EST_TAX) + g(estimates, EXP_SE_TAX),
+        "settled": g(settled, EXP_FED),
+    }
+
+
+def _ledger_federal_liability(book_path: Path, tax_year: int) -> dict:
+    """The finished year's liability on the household model fed from
+    the book's own rows — what the settlement pays and what the
+    stability verifier recomputes."""
+    inp = _ledger_tax_inputs(book_path, tax_year)
+    tax = _household_tax(tax_year, max(D("0"), inp["schedule_c"]),
+                         inp["box1"], inp["ltcg"],
+                         inp["interest"] + inp["dividends"])
+    return {**inp, **tax}
+
+
+def _federal_settlement(book_path: Path, tax_year: int) -> dict | None:
+    """The April settle-up on the finished year, prepared from the
+    book: liability on the ledger's figures less withholding and the
+    1040-ES rows already posted, SIGNED (cold audit A2), with every
+    line that made the tax in the notes (R2 W1). None when it nets to
+    zero or the year is already settled."""
+    t = _ledger_federal_liability(book_path, tax_year)
+    if t["settled"] != 0:
         return None
-    receipts = _receipts_by_month(through)
-    gross = sum((receipts.get((tax_year, m), D("0")) for m in range(1, 13)),
-                D("0"))
-    net = max(D("0"), gross - BIZ_EXPENSE_MONTHLY * 12)
-    box1, withheld, _n = _robin_w2(tax_year)
-    tax = _household_tax(tax_year, net, box1, _realized_ltcg(tax_year))
-    tax["withholding"] = withheld
-    return tax
+    prepaid = t["withheld"] + t["estimates"]
+    balance = (t["total"] - prepaid).quantize(D("1"))
+    if balance == 0:
+        return None
+    lines = "; ".join(
+        f"{path.rsplit(':', 1)[1]} {amt:,.2f}"
+        for path, amt in sorted(t["expenses"].items(),
+                                key=lambda kv: -kv[1]))
+    fx_word = "gain" if t["fx"] >= 0 else "loss"
+    basis = (
+        f"tax ${t['total']:,.0f} (income ${t['income']:,.0f} + SE "
+        f"${t['se']:,.0f}) on W-2 wages ${t['box1']:,.2f} (Box 1 from the "
+        f"payroll rows), Schedule C net ${t['schedule_c']:,.2f} (LLC "
+        f"revenue ${t['revenue']:,.2f} + FX {fx_word} ${abs(t['fx']):,.2f} "
+        f"− business expenses ${t['expense_total']:,.2f} [{lines}] with "
+        f"meals ${t['meals']:,.2f} deductible at 50%), Schedule B interest "
+        f"${t['interest']:,.2f} + dividends ${t['dividends']:,.2f}, "
+        f"Schedule D ${t['ltcg']:,.2f}; less ½ SE, Solo 401(k) "
+        f"${t['solo_401k']:,.0f}, QBI ${t['qbi']:,.0f} and the "
+        f"${t['std']:,.0f} standard deduction → taxable "
+        f"${t['taxable']:,.0f}; prepaid ${prepaid:,.2f} (withholding "
+        f"${t['withheld']:,.2f} + 1040-ES ${t['estimates']:,.0f})")
+    due = _next_bday(date(tax_year + 1, 4, 15))
+    return {
+        "date": due,
+        "description": ("IRS USATAXPYMT" if balance > 0
+                        else "IRS TREAS 310 TAX REF"),
+        "notes": (f"{tax_year} Form 1040 (MFJ) balance due "
+                  f"${balance:,.0f}: {basis}" if balance > 0 else
+                  f"{tax_year} Form 1040 (MFJ) refund ${-balance:,.0f}: "
+                  f"{basis}"),
+        "splits": [(CHECKING, -balance), (EXP_FED, balance)],
+    }
+
+
+def settle_federal(out_path: Path, cutoff: date, through: date) -> list[str]:
+    """Post the April settlement for every tax year whose due date
+    falls in (``cutoff``, ``through``], each prepared from the book as
+    it stands. ``run_policy`` calls it at the due date, after the
+    streams, the business module, the investments and the policy
+    engine have written the finished year (savings interest and
+    dividends included) and before the month-end that follows.
+    Idempotent: a year already settled is skipped."""
+    log: list[str] = []
+    for tax_year in range(YEAR, through.year + 1):
+        due = _next_bday(date(tax_year + 1, 4, 15))
+        if not (cutoff < due <= through):
+            continue
+        txn = _federal_settlement(out_path, tax_year)
+        if txn is None:
+            log.append(f"TY{tax_year}: already settled or nets to $0")
+            continue
+        write_bulk(out_path, [txn])
+        amt = txn["splits"][1][1]
+        basis = txn["notes"].split(":", 1)[1].strip()
+        log.append(f"TY{tax_year} settled {due}: "
+                   f"{'balance due' if amt > 0 else 'refund'} "
+                   f"${abs(amt):,.0f} — {basis[:90]}…")
+    return log
 
 
 def _bo_tax_plan(through: date) -> list[dict]:
@@ -1350,14 +1498,25 @@ def _bo_tax_plan(through: date) -> list[dict]:
                              else _clamp_day(yr, due_month, 31))
             if due > through or wa_gross <= 0:
                 continue
+            tax = (wa_gross * WA_BO_RATE).quantize(D("0.01"))
+            cap = WA_BO_CREDIT_MONTHLY_MAX * len(months)
+            credit = tax if tax <= cap else max(D("0"), 2 * cap - tax)
+            net = tax - credit
+            basis = (f"Q{q} {yr} combined excise return — service & other "
+                     f"activities: 1.5% on ${wa_gross:,.2f} WA-apportioned "
+                     f"gross (${gross:,.2f} worldwide; {apportion}) = "
+                     f"${tax:,.2f}, less small-business B&O credit "
+                     f"${credit:,.2f} (RCW 82.04.4451 — service filers, "
+                     f"${WA_BO_CREDIT_MONTHLY_MAX:,.0f}/month of the "
+                     f"period; the whole tax when it is at or under the "
+                     f"${cap:,.0f} maximum)")
             plan.append({
                 "date": due,
-                "description": "WA DOR — B&O excise tax",
-                "notes": f"Q{q} {yr} combined excise return — service & "
-                         f"other activities on ${wa_gross:,.2f} "
-                         f"WA-apportioned gross (${gross:,.2f} worldwide; "
-                         f"{apportion})",
-                "amount": (wa_gross * WA_BO_RATE).quantize(D("0.01")),
+                "description": ("WA DOR — B&O excise tax" if net > 0
+                                else "WA DOR — B&O excise return"),
+                "notes": basis + (f" — ${net:,.2f} due" if net > 0 else
+                                  " — $0 due; return filed, no payment"),
+                "amount": net,
             })
         sos = _next_bday(date(yr, LLC_ANNIVERSARY_MONTH, 20))
         if sos <= through:
@@ -1578,26 +1737,19 @@ def gen_recurring(through: date) -> list[dict]:
                 })
 
     # Estimated federal tax at the real IRS deadlines, sized from
-    # annualized SE income with the SE-tax component broken out, plus
-    # the April balance-due on the completed year (audit A3). The
-    # owner's taxes are paid from the household account (audit D1).
+    # annualized SE income with the SE-tax component broken out (audit
+    # A3); the April settlement is prepared from the book later
+    # (``settle_federal``). The owner's taxes are paid from the
+    # household account (audit D1).
     for est in _estimated_tax_plan(through):
-        if est["kind"] == "installment":
-            total = est["income_part"] + est["se_part"]
-            txns.append({
-                "description": est["description"], "date": est["date"],
-                "notes": est["notes"],
-                "splits": [(CHECKING, -total),
-                           (EXP_EST_TAX, est["income_part"]),
-                           (EXP_SE_TAX, est["se_part"])],
-            })
-        else:
-            amt = est["amount"]
-            txns.append({
-                "description": est["description"], "date": est["date"],
-                "notes": est["notes"],
-                "splits": [(CHECKING, -amt), (EXP_FED, amt)],
-            })
+        total = est["income_part"] + est["se_part"]
+        txns.append({
+            "description": est["description"], "date": est["date"],
+            "notes": est["notes"],
+            "splits": [(CHECKING, -total),
+                       (EXP_EST_TAX, est["income_part"]),
+                       (EXP_SE_TAX, est["se_part"])],
+        })
 
     # Washington B&O, the Seattle license, the SOS annual report — the
     # LLC's own taxes and licenses, paid from the LLC (audit A7).
@@ -2445,11 +2597,9 @@ def _business_days(d: date, n: int) -> date:
     remaining = abs(n)
     while remaining:
         d += timedelta(days=step)
-        if d.weekday() < 5:
+        if is_business_day(d, federal_holidays):
             remaining -= 1
-    if d.weekday() >= 5:  # a zero-shift landing on a weekend → Monday
-        d += timedelta(days=7 - d.weekday())
-    return d
+    return _next_bday(d)  # a zero-shift landing on a holiday rolls on
 
 
 def _open_date(anchor: date) -> date:
@@ -4093,13 +4243,14 @@ def _verify_audit(book: GnuCashBook, through: date) -> None:
 
 
 def _verify_stability(book: GnuCashBook, through: date) -> None:
-    """The four horizon-independent invariants (2026-09-17 round): a
+    """The five horizon-independent invariants (2026-09-17 round): a
     book built to any ``--through`` — 2030 included — keeps every card
     under its limit, the household's checking inside the policy band,
-    no document unpaid past terms + 45 days, and the federal tax paid
-    for each finished year within 15% of the plan's liability. Read off
-    the SQLite file and the server's own reports; any violation exits
-    non-zero."""
+    no document unpaid past terms + 45 days, the federal tax paid for
+    each finished year equal (to the dollar) to the liability
+    recomputed from the book's own rows, and no BANK account below
+    zero at any day-end. Read off the SQLite file and the server's own
+    reports; any violation exits non-zero."""
     import sqlite3
 
     print("\n-- (STABILITY) horizon-independent invariants --")
@@ -4180,48 +4331,55 @@ def _verify_stability(book: GnuCashBook, through: date) -> None:
               f"settlement {worst_paid} days past terms, worst open "
               f"{worst_open} days past terms (bound 45)")
 
-        # 4. Federal tax paid vs the plan's liability, per finished year.
+        # 4. Federal tax paid vs the liability recomputed from the
+        #    book's own rows, per settled year: the settlement was
+        #    prepared from those rows and rounded to the dollar, so the
+        #    two agree within $1 or the 1040 was not prepared from the
+        #    books (cold audit R2 W1).
         for yr in range(YEAR, through.year + 1):
-            plan = _federal_liability(yr, through)
-            if plan is None or _next_bday(date(yr + 1, 4, 15)) > through:
+            if _next_bday(date(yr + 1, 4, 15)) > through:
                 continue
-            def _sum(sql, *params):
-                return D(str(con.execute(sql, params).fetchone()[0] or 0))
-            withheld = _sum(
-                "SELECT SUM(s.value_num * 1.0 / s.value_denom) FROM splits s "
-                "JOIN transactions t ON t.guid = s.tx_guid "
-                "JOIN accounts a ON a.guid = s.account_guid "
-                "WHERE a.name = 'Federal' AND t.description LIKE 'UW Medicine%' "
-                "AND date(t.post_date) BETWEEN ? AND ?",
-                f"{yr}-01-01", f"{yr}-12-31")
-            # A transaction's notes live in the slots table.
-            noted = ("EXISTS (SELECT 1 FROM slots sl WHERE sl.obj_guid = t.guid "
-                     "AND sl.name = 'notes' AND sl.string_val LIKE ?)")
-            estimates = _sum(
-                "SELECT SUM(s.value_num * 1.0 / s.value_denom) FROM splits s "
-                "JOIN transactions t ON t.guid = s.tx_guid "
-                "JOIN accounts a ON a.guid = s.account_guid "
-                "WHERE a.name IN ('Estimated Tax Payments', "
-                f"'Self-Employment Tax') AND {noted}",
-                f"Form 1040-ES {yr} Q%")
-            settlement = _sum(
-                "SELECT SUM(s.value_num * 1.0 / s.value_denom) FROM splits s "
-                "JOIN transactions t ON t.guid = s.tx_guid "
-                "JOIN accounts a ON a.guid = s.account_guid "
-                f"WHERE a.name = 'Federal' AND {noted}",
-                f"{yr} Form 1040 (MFJ)%")
-            paid = withheld + estimates + settlement
-            liability = plan["total"]
-            off = abs(paid - liability) / liability if liability else D("0")
-            kind = "refund" if settlement < 0 else "balance due"
+            t = _ledger_federal_liability(book.book_path, yr)
+            paid = t["withheld"] + t["estimates"] + t["settled"]
+            liability = t["total"]
+            off = abs(paid - liability)
+            kind = "refund" if t["settled"] < 0 else "balance due"
             print(f"  S4 TY{yr}: paid ${paid:,.2f} = withholding "
-                  f"${withheld:,.2f} + 1040-ES ${estimates:,.2f} + April "
-                  f"{kind} ${settlement:,.2f}; plan liability "
-                  f"${liability:,.2f} (income ${plan['income']:,.2f} + SE "
-                  f"${plan['se']:,.2f}) → {100 * off:.2f}% off (bound 15%)")
-            if off > D("0.15"):
-                failures.append(f"TY{yr} federal paid {paid} vs liability "
-                                f"{liability} ({100 * off:.1f}% off)")
+                  f"${t['withheld']:,.2f} + 1040-ES ${t['estimates']:,.2f} "
+                  f"+ April {kind} ${t['settled']:,.2f}; ledger liability "
+                  f"${liability:,.2f} (income ${t['income']:,.2f} + SE "
+                  f"${t['se']:,.2f}; Schedule C ${t['schedule_c']:,.2f}, "
+                  f"Schedule B ${t['interest'] + t['dividends']:,.2f}, "
+                  f"Schedule D ${t['ltcg']:,.2f}, Box 1 ${t['box1']:,.2f}) "
+                  f"→ ${off:,.2f} off (bound $1)")
+            if off > D("1"):
+                failures.append(f"TY{yr} federal paid {paid} vs ledger "
+                                f"liability {liability} (${off:,.2f} off)")
+
+        # 5. No BANK account below zero at any day-end, over the whole
+        #    timeline (the policy band checks month-ends only; a
+        #    mid-month 1040-ES or settlement could still overdraw).
+        by_day: dict[tuple[str, str], Decimal] = {}
+        for path, day, num, den in con.execute(
+                ACCOUNT_PATHS_SQL
+                + "SELECT p.path, date(t.post_date), s.quantity_num, "
+                "s.quantity_denom FROM splits s "
+                "JOIN transactions t ON t.guid = s.tx_guid "
+                "JOIN accounts a ON a.guid = s.account_guid "
+                "JOIN p ON p.guid = a.guid WHERE a.account_type = 'BANK'"):
+            by_day[(path, day)] = (by_day.get((path, day), D("0"))
+                                   + D(num) / D(den))
+        running: dict[str, Decimal] = {}
+        low: dict[str, tuple[Decimal, str]] = {}
+        for (path, day), delta in sorted(by_day.items()):
+            running[path] = running.get(path, D("0")) + delta
+            if path not in low or running[path] < low[path][0]:
+                low[path] = (running[path], day)
+        for path, (bal, day) in sorted(low.items()):
+            print(f"  S5 {path.rsplit(':', 1)[1]}: lowest day-end "
+                  f"${bal:,.2f} on {day}")
+            if bal < 0:
+                failures.append(f"{path} below zero: {bal} on {day}")
     finally:
         con.close()
 
@@ -4229,7 +4387,7 @@ def _verify_stability(book: GnuCashBook, through: date) -> None:
         for f in failures:
             print(f"  FAIL: {f}")
         raise SystemExit(f"stability invariants: {len(failures)} violation(s)")
-    print("  all four hold")
+    print("  all five hold")
 
 
 def relativedelta_safe(months: int = 0):
@@ -4359,6 +4517,10 @@ POLICY = PersonaPolicy(
     ensure_rate=ensure_rate,
     # Loans have no statement to reconcile against (review §1).
     no_reconcile=(MORTGAGE, AUTO_LOAN),
+    # ACH settles on Fed business days: weekends and the eleven federal
+    # holidays roll forward (cold audit R2), the same calendar as
+    # ``_next_bday``.
+    holidays=federal_holidays,
     # The LLC (audit B3): invoices settle here, payables and the
     # business card are paid from here, and the month-end draw moves
     # everything above the floor to the household as ONE transfer,
@@ -4376,17 +4538,42 @@ POLICY = PersonaPolicy(
 )
 
 
+def run_policy(policy: PersonaPolicy, out_path: Path, cutoff: date,
+               through: date) -> list[str]:
+    """``continuation.run_policy`` split at each April federal
+    settlement: the loop runs to the day before the 1040 is due, the
+    settlement is prepared from the book as it then stands (the
+    finished year's revenue, expenses, dividends and savings interest
+    are all rows by then), and the loop resumes so the month-end that
+    follows sweeps — or tops up — against the real balance. The
+    segments partition the timeline: month-ends and statement
+    payments fall in exactly one of them. The continuation calls this
+    in place of the bare engine (``continue_book.py``)."""
+    from continuation import run_policy as run_months
+
+    log: list[str] = []
+    start = cutoff
+    for tax_year in range(YEAR, through.year + 1):
+        due = _next_bday(date(tax_year + 1, 4, 15))
+        if not (cutoff < due <= through):
+            continue
+        eve = due - timedelta(days=1)
+        log += run_months(policy, out_path, start, eve)
+        log += settle_federal(out_path, eve, due)
+        start = eve
+    log += run_months(policy, out_path, start, through)
+    return log
+
+
 def run_base_policy(out_path: Path, through: date) -> list[str]:
     """Run the closed-loop policy over the WHOLE base timeline —
     owner's draws, surplus sweeps (savings + quarterly VTSAX), the
-    savings-pile rebalance, savings interest — from 2025-01-01. Card
-    statements are paid by ``run_credit_cards`` (the 2025 narrative
-    needs the carried-balance arcs), so the cards are masked here;
-    everything else is the exact rule set the continuation applies
-    from the frozen edge onward."""
+    savings-pile rebalance, savings interest, the April 1040 from the
+    book — from 2025-01-01. Card statements are paid by
+    ``run_credit_cards`` (the 2025 narrative needs the carried-balance
+    arcs), so the cards are masked here; everything else is the exact
+    rule set the continuation applies from the frozen edge onward."""
     from dataclasses import replace
-
-    from continuation import run_policy
 
     base_policy = replace(POLICY, cards=())
     return run_policy(base_policy, out_path,
@@ -4465,11 +4652,15 @@ def build(out_path: Path, through: date) -> None:
     print(f"  {n} statement payments / interest / fees")
 
     print("\nPhase 7d: closed-loop policy — owner's draws, surplus sweeps, "
-          "savings interest")
+          "savings interest, the April 1040 from the book")
     actions = run_base_policy(out_path, through)
     print(f"  {len(actions)} policy actions; last 4:")
     for line in actions[-4:]:
         print(f"    {line}")
+    print("  April 1040 settlements (prepared from the book at their date):")
+    for line in actions:
+        if line.startswith("TY"):
+            print(f"    {line}")
 
     print("\nPhase 10: budgets")
     n = run_budget(book, through)
