@@ -63,6 +63,9 @@ class CardPolicy:
     interest_account: str | None = None  # expense account for accrual
     # Absolute floor for the repair narrative (default: buffer / 2).
     repair_min: D | None = None
+    # Account the statement is paid FROM (default: the persona's
+    # household checking). A business card is paid by the business.
+    pay_from: str | None = None
 
 
 @dataclass(frozen=True)
@@ -100,7 +103,25 @@ class PersonaPolicy:
     # (bookkeeper review §1: they'd otherwise sit forever in the
     # dashboard's "never reconciled ⚠" count).
     no_reconcile: tuple[str, ...] = ()
+    # The business-entity boundary (Alex, audit B3): the LLC's own
+    # operating account, its working-capital floor, a monthly reserve
+    # that accrues toward the December retirement contribution (reset
+    # in December, when the contribution spends it), and the equity
+    # clearing account each owner's draw passes through. Invoices and
+    # bills settle against ``business_checking`` when it is set; the
+    # month-end draw moves everything above the floor to the household.
+    business_checking: str | None = None
+    business_buffer: D = D("0")
+    business_reserve_monthly: D = D("0")
+    draw_equity: str | None = None
+    # Interest on the savings pile (APY), booked at each month end on
+    # the prior month-end balance. None = the savings earn nothing.
+    savings_apy: D | None = None
+    interest_income: str | None = None
     # Narrative templates. {month} is "%B %Y" of the statement close.
+    desc_draw: str = "Owner's draw — {month}"
+    desc_draw_deposit: str = "Owner's draw deposit — {month}"
+    desc_savings_interest: str = "Savings interest — {month}"
     desc_statement: str = "{label} — {month} statement payment"
     desc_repair_card: str = "{label} — balance payoff (catching up after the summer)"
     desc_sweep: str = "Transfer to savings (monthly surplus sweep)"
@@ -307,9 +328,10 @@ def _pay_card(book: GnuCashBook, policy: PersonaPolicy, card: CardPolicy,
     if payment <= 0:
         return
 
-    # Never overdraft checking for a card payment; cap and warn. In a
-    # healthy book this cannot bind (PIF charges << checking).
-    available = _balance(book, policy.checking, pay_date) - D("100")
+    # Never overdraft the paying account for a card payment; cap and
+    # warn. In a healthy book this cannot bind (PIF charges << cash).
+    pay_from = card.pay_from or policy.checking
+    available = _balance(book, pay_from, pay_date) - D("100")
     if payment > available:
         log.append(f"WARN {card.label}: payment {payment} capped to "
                    f"available {available} on {pay_date}")
@@ -333,7 +355,7 @@ def _pay_card(book: GnuCashBook, policy: PersonaPolicy, card: CardPolicy,
     book.create_transaction(
         description=desc, trans_date=pay_date,
         splits=[
-            {"account": policy.checking, "amount": str(-payment)},
+            {"account": pay_from, "amount": str(-payment)},
             {"account": card.account, "amount": str(payment)},
         ],
         check_duplicates=False,
@@ -425,6 +447,84 @@ def _rebalance(book: GnuCashBook, policy: PersonaPolicy, book_path: Path,
     log.append(f"rebalance savings→invest: {tranche} on {month_end}")
 
 
+def _savings_interest(book: GnuCashBook, policy: PersonaPolicy,
+                      month_end: date, log: list[str]) -> None:
+    """Monthly interest on the savings pile: APY/12 on the balance at
+    the PRIOR month end (so same-day sweeps don't compound within the
+    month), credited on ``month_end``. Idle money earns something
+    (audit B6)."""
+    if policy.savings_apy is None or policy.interest_income is None:
+        return
+    prev = month_end.replace(day=1) - timedelta(days=1)
+    principal = _balance(book, policy.savings, prev)
+    interest = (principal * policy.savings_apy / D("12")).quantize(D("0.01"))
+    if interest <= 0:
+        return
+    book.create_transaction(
+        description=policy.desc_savings_interest.format(
+            month=month_end.strftime("%B %Y")),
+        trans_date=month_end,
+        splits=[
+            {"account": policy.savings, "amount": str(interest)},
+            {"account": policy.interest_income, "amount": str(-interest)},
+        ],
+        check_duplicates=False,
+    )
+    log.append(f"savings interest: {interest} on {month_end}")
+
+
+def _owner_draw(book: GnuCashBook, policy: PersonaPolicy, month_end: date,
+                log: list[str]) -> None:
+    """Month-end owner's draw: everything in the business account above
+    its floor (working capital + the reserve accrued so far this year)
+    moves to the household, rounded down to the hundred. Through the
+    equity clearing account when one is configured: the LLC side
+    debits Owner's Draw, the household side credits it back, so the
+    LLC's register shows the draw against equity and the combined
+    book's net worth is unchanged."""
+    if policy.business_checking is None:
+        return
+    reserve = (policy.business_reserve_monthly * month_end.month
+               if month_end.month != 12 else D("0"))
+    floor = policy.business_buffer + reserve
+    balance = _balance(book, policy.business_checking, month_end)
+    draw = ((balance - floor) / D("100")).to_integral_value(
+        rounding="ROUND_FLOOR") * D("100")
+    if draw < policy.min_sweep:
+        return
+    month = month_end.strftime("%B %Y")
+    if policy.draw_equity is None:
+        book.create_transaction(
+            description=policy.desc_draw.format(month=month),
+            trans_date=month_end,
+            splits=[
+                {"account": policy.business_checking, "amount": str(-draw)},
+                {"account": policy.checking, "amount": str(draw)},
+            ],
+            check_duplicates=False,
+        )
+    else:
+        book.create_transaction(
+            description=policy.desc_draw.format(month=month),
+            trans_date=month_end,
+            splits=[
+                {"account": policy.business_checking, "amount": str(-draw)},
+                {"account": policy.draw_equity, "amount": str(draw)},
+            ],
+            check_duplicates=False,
+        )
+        book.create_transaction(
+            description=policy.desc_draw_deposit.format(month=month),
+            trans_date=month_end,
+            splits=[
+                {"account": policy.draw_equity, "amount": str(-draw)},
+                {"account": policy.checking, "amount": str(draw)},
+            ],
+            check_duplicates=False,
+        )
+    log.append(f"owner's draw: {draw} on {month_end} (floor {floor})")
+
+
 def _card_closes(book: GnuCashBook, card: CardPolicy, cutoff: date,
                  through: date) -> list[date]:
     """Statement close dates from one month before the cutoff's month
@@ -465,6 +565,10 @@ def run_policy(policy: PersonaPolicy, book_path: Path, cutoff: date,
         if kind == "card":
             _pay_card(book, policy, payload, when, cutoff, through, log)
         else:
+            # Interest and the owner's draw land first so the sweep
+            # sees the month's true household surplus.
+            _savings_interest(book, policy, when, log)
+            _owner_draw(book, policy, when, log)
             _sweep(book, policy, book_path, when, log)
             _rebalance(book, policy, book_path, when, log)
     return log
@@ -487,7 +591,10 @@ def settle_documents(policy: PersonaPolicy, book_path: Path, cutoff: date,
     genuinely recent open documents is preserved by construction."""
     log: list[str] = []
     book = GnuCashBook(str(book_path))
-    pay_from = payment_account or policy.checking
+    # Documents are the business's: settle against its account when
+    # the persona keeps one.
+    pay_from = (payment_account or policy.business_checking
+                or policy.checking)
 
     owner_by_type = {"invoice": "customer", "bill": "vendor",
                      "voucher": "employee"}
@@ -700,6 +807,12 @@ def verify_invariants(policy: PersonaPolicy, book_path: Path, cutoff: date,
             warnings.append(
                 f"buffer band: checking {checking} outside "
                 f"[{lo}, {hi}] at {month_end}")
+        if policy.business_checking is not None:
+            business = _balance(book, policy.business_checking, month_end)
+            if business < 0:
+                raise SystemExit(
+                    f"{policy.key}: OVERDRAFT — business checking "
+                    f"{business} at {month_end}")
         for card in policy.cards:
             limit = limits[card.account]
             owed = -_balance(book, card.account, month_end)
