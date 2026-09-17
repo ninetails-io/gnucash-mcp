@@ -122,6 +122,14 @@ class PersonaPolicy:
     # Interest on the savings pile (APY), booked at each month end on
     # the prior month-end balance. None = the savings earn nothing.
     savings_apy: D | None = None
+    # Intra-month checking floor. When set, every month's day-end
+    # balances are walked BEFORE the month-end sweep and a top-up from
+    # savings (back to ``buffer``) is dated on the first day checking
+    # would close under the floor — the transfer a debit-card holder
+    # makes the day the mortgage lands, not at month end (Lin Wei audit
+    # R2: a 储蓄卡 has no overdraft, and the month-end top-up came a
+    # week after the debit had bounced). None = month-end corridor only.
+    floor: D | None = None
     interest_income: str | None = None
     # Narrative templates. {month} is "%B %Y" of the statement close.
     desc_draw: str = "Owner's draw — {month}"
@@ -277,6 +285,41 @@ def _month_charges(book: GnuCashBook, account: str, close: date) -> D:
     return delta if delta > 0 else D("0")
 
 
+def _account_guid(con: sqlite3.Connection, fullname: str) -> str:
+    guid = con.execute("SELECT root_account_guid FROM books").fetchone()[0]
+    for name in fullname.split(":"):
+        row = con.execute(
+            "SELECT guid FROM accounts WHERE parent_guid = ? AND name = ?",
+            (guid, name)).fetchone()
+        if row is None:
+            raise SystemExit(f"no account {fullname!r} in the book")
+        guid = row[0]
+    return guid
+
+
+def daily_net(book_path: Path, account: str, start: date,
+              end: date) -> dict[date, D]:
+    """Net quantity movement of ``account`` per post date, start..end
+    inclusive, voided splits excluded. One query per month instead of
+    one book open per day."""
+    con = sqlite3.connect(str(book_path))
+    try:
+        guid = _account_guid(con, account)
+        rows = con.execute(
+            "SELECT date(t.post_date), s.quantity_num, s.quantity_denom "
+            "FROM splits s JOIN transactions t ON t.guid = s.tx_guid "
+            "WHERE s.account_guid = ? AND s.reconcile_state <> 'v' "
+            "AND date(t.post_date) BETWEEN ? AND ?",
+            (guid, start.isoformat(), end.isoformat())).fetchall()
+    finally:
+        con.close()
+    net: dict[date, D] = {}
+    for post, num, denom in rows:
+        d = date.fromisoformat(post)
+        net[d] = net.get(d, D("0")) + D(num) / D(denom)
+    return net
+
+
 # ── Policy passes ───────────────────────────────────────────────
 
 def _pay_card(book: GnuCashBook, policy: PersonaPolicy, card: CardPolicy,
@@ -385,6 +428,37 @@ def _pay_card(book: GnuCashBook, policy: PersonaPolicy, card: CardPolicy,
     tag = "repair" if is_repair else "pay"
     log.append(f"{tag} {card.label}: {payment} on {pay_date} "
                f"(close {close})")
+
+
+def _floor_topups(book: GnuCashBook, policy: PersonaPolicy, book_path: Path,
+                  start: date, end: date, log: list[str]) -> None:
+    """Walk checking's day-ends over start..end; the first day it would
+    close under ``policy.floor`` gets a same-day top-up from savings
+    back to ``buffer`` (bounded by what savings holds). Runs before the
+    month's sweep, so the sweep sees the topped-up balance."""
+    if policy.floor is None or start > end:
+        return
+    bal = _balance(book, policy.checking, start - timedelta(days=1))
+    net = daily_net(book_path, policy.checking, start, end)
+    d = start
+    while d <= end:
+        bal += net.get(d, D("0"))
+        if bal < policy.floor:
+            available = _balance(book, policy.savings, d)
+            topup = min(policy.buffer - bal, available).quantize(D("0.01"))
+            if topup >= policy.min_sweep:
+                book.create_transaction(
+                    description=policy.desc_topup, trans_date=d,
+                    splits=[
+                        {"account": policy.savings, "amount": str(-topup)},
+                        {"account": policy.checking, "amount": str(topup)},
+                    ],
+                    check_duplicates=False,
+                )
+                bal += topup
+                log.append(f"topup←savings: {topup} on {d} "
+                           f"(day-end under floor {policy.floor})")
+        d += timedelta(days=1)
 
 
 def _sweep(book: GnuCashBook, policy: PersonaPolicy, book_path: Path,
@@ -583,16 +657,25 @@ def run_policy(policy: PersonaPolicy, book_path: Path, cutoff: date,
     events += [(e, "monthend", None) for e in month_ends(cutoff, through)]
     events.sort(key=lambda t: (t[0], t[1]))  # card pass before sweep on ties
 
+    walked = cutoff
     for when, kind, payload in events:
         if kind == "card":
             _pay_card(book, policy, payload, when, cutoff, through, log)
         else:
-            # Interest and the owner's draw land first so the sweep
-            # sees the month's true household surplus.
+            # The floor pass covers the month's days first; then
+            # interest and the owner's draw land so the sweep sees the
+            # month's true household surplus.
+            _floor_topups(book, policy, book_path,
+                          walked + timedelta(days=1), when, log)
             _savings_interest(book, policy, when, log)
             _owner_draw(book, policy, when, log)
             _sweep(book, policy, book_path, when, log)
             _rebalance(book, policy, book_path, when, log)
+            walked = when
+    # A partial last month has no sweep, but its days still get the
+    # floor pass (a build pinned to the 17th holds the invariant too).
+    _floor_topups(book, policy, book_path, walked + timedelta(days=1),
+                  through, log)
     return log
 
 
@@ -918,6 +1001,19 @@ def verify_invariants(policy: PersonaPolicy, book_path: Path, cutoff: date,
                 raise SystemExit(
                     f"{policy.key}: {card.label} owes {owed} over limit "
                     f"{limit} at {month_end}")
+
+    if policy.floor is not None:
+        start = cutoff + timedelta(days=1)
+        bal = _balance(book, policy.checking, cutoff)
+        net = daily_net(book_path, policy.checking, start, through)
+        d = start
+        while d <= through:
+            bal += net.get(d, D("0"))
+            if bal < 0:
+                raise SystemExit(
+                    f"{policy.key}: OVERDRAFT — checking {bal} at day-end "
+                    f"{d}")
+            d += timedelta(days=1)
 
     for card in policy.cards:
         if card.kind != "pif":

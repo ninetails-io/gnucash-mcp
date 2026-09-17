@@ -52,7 +52,7 @@ import random
 import sqlite3
 import sys
 from datetime import date, datetime, timedelta
-from decimal import Decimal
+from decimal import ROUND_CEILING, Decimal
 from pathlib import Path
 
 import piecash
@@ -101,11 +101,21 @@ AUTO_INS_ANNUAL = Decimal("5400")      # ≈ ¥950 交强险 + ¥4,450 商业险
 # mainland companies she contracts to require 专票 for their own input
 # credit, so every 承包 invoice carries VAT regardless of the threshold.
 # Cross-border services (the USD/EUR customers) are export-exempt.
-# 附加税费 ride on the VAT actually due: 城建税 7% + 教育费附加 3% +
-# 地方教育附加 2%, all halved for small-scale taxpayers.
+# 附加税费 ride on the VAT actually due, halved for small-scale
+# taxpayers: 城建税 7% → 3.5%. 教育费附加 3% + 地方教育附加 2% are
+# exempt outright while the quarter's sales stay ≤ ¥300,000
+# (财税〔2016〕12号 — the same threshold the VAT exemption reads), so
+# they only ride along above it (halved too: 6% in all).
 VAT_RATE = D("0.01")
 VAT_EXEMPT_QUARTERLY = D("300000")
-VAT_SURCHARGE_RATE = (D("0.07") + D("0.03") + D("0.02")) * D("0.5")
+VAT_SURCHARGE_SMALL = D("0.07") * D("0.5")                            # 3.5%
+VAT_SURCHARGE_FULL = (D("0.07") + D("0.03") + D("0.02")) * D("0.5")   # 6%
+
+
+def _vat_surcharge(vat: Decimal, under_threshold: bool) -> Decimal:
+    """附加税费 on a quarter's VAT — the one place the rate is chosen."""
+    rate = VAT_SURCHARGE_SMALL if under_threshold else VAT_SURCHARGE_FULL
+    return (vat * rate).quantize(D("0.01"))
 # 经营所得 (sole-proprietor business income), five brackets on annual
 # taxable income: (upper, rate, quick deduction). 费用扣除 ¥60,000/yr.
 # 2023–2027: the portion of taxable income ≤ ¥2,000,000 is taxed at half.
@@ -123,12 +133,13 @@ BIZ_TAX_HALVING_YEARS = range(2023, 2028)
 # ── Payroll bases (audit L4) ────────────────────────────────────
 # 社保 and 公积金 contribute on a FIXED base the employer sets each July
 # from the prior year's average wage — never on the month's overtime.
-# Employee-side rates: 养老 8% + 医疗 2% + 失业 0.5% = 10.5%; 公积金 8%
+# Employee-side rates: 养老 8% + 医疗 2% + 失业 0.3% (the Shenzhen
+# employee rate; 0.5% is the national ceiling) = 10.3%; 公积金 8%
 # (an integer rate — 7.33% was never a legal figure).
 SOCIAL_BASE = D("15000")
-SOCIAL_INS_RATE = D("0.105")
+SOCIAL_INS_RATE = D("0.103")
 HOUSING_FUND_RATE = D("0.08")
-SOCIAL_INS_EMPLOYEE = (SOCIAL_BASE * SOCIAL_INS_RATE).quantize(D("0.01"))  # 1,575
+SOCIAL_INS_EMPLOYEE = (SOCIAL_BASE * SOCIAL_INS_RATE).quantize(D("0.01"))  # 1,545
 HOUSING_FUND_EMPLOYEE = (SOCIAL_BASE * HOUSING_FUND_RATE).quantize(D("0.01"))  # 1,200
 
 # 陈宇 — the business's registered part-time assistant (audit L6): a real
@@ -137,6 +148,21 @@ HOUSING_FUND_EMPLOYEE = (SOCIAL_BASE * HOUSING_FUND_RATE).quantize(D("0.01"))  #
 ASSISTANT = "陈宇"
 ASSISTANT_WAGE = D("3500")
 ASSISTANT_EMPLOYER_SOCIAL_RATE = D("0.15")   # Shenzhen 单位 ≈ 15%
+
+# ── Cash floors (audit round 2, R1/R2) ─────────────────────────
+# 银行储蓄卡 is a debit card — no overdraft exists — so a day-end under
+# CHECKING_FLOOR is topped up from 储蓄账户 THAT day (the policy
+# engine's ``floor``), and a discretionary buy that would leave less
+# than the floor after the day's fixed debits does not fill (she keeps
+# the floor; she does not breach it for an ETF order). The wallets are
+# prepaid:
+# each month's 充值 is sized to the prior month's spend plus a cushion,
+# and a day that would still close under WALLET_FLOOR gets a same-day
+# 余额不足 top-up from checking (fund_wallets).
+CHECKING_FLOOR = D("10000")
+WALLET_TOPUP_DAY = 2
+WALLET_FLOOR = D("500")
+WALLET_CUSHION = D("500")
 
 # ── Chinese calendar (deterministic tables, no lunar library) ───
 # 春节 (lunar New Year's Day), 中秋, 端午 per year the builder can reach.
@@ -1538,24 +1564,9 @@ def gen_recurring() -> list[dict]:
                 "splits": [(ALIPAY, -vet), (EXP_PET_VET, vet)],
             })
 
-    # Monthly mobile-wallet top-ups from checking. WeChat and Alipay
-    # carry most of the daily spend (coffee, delivery, groceries,
-    # utilities, charging, parking); without recurring funding their
-    # small opening floats would go deeply negative over the year.
-    for yy, m in months:
-        d = _clamp_day(yy, m, 2)
-        if not _on_or_before_through(d):
-            continue
-        txns.append({
-            "description": "充值微信钱包",
-            "date": d,
-            "splits": [(CHECKING, D("-4500")), (WECHAT, D("4500"))],
-        })
-        txns.append({
-            "description": "充值支付宝",
-            "date": d,
-            "splits": [(CHECKING, D("-4000")), (ALIPAY, D("4000"))],
-        })
+    # Mobile-wallet top-ups are NOT drawn here: they are computed from
+    # the book once every wallet spend is written (fund_wallets; audit
+    # R1 — a fixed ¥4,000 a month left 支付宝 negative for 165 days).
 
     # Yearly — Spring Festival red envelopes on 除夕 (lunar table), and
     # the auto-insurance renewal (交强险+商业险, one annual premium on the
@@ -2049,6 +2060,9 @@ def gen_personal_life() -> list[dict]:
     #    春节回乡 → 国庆出游 → international client visit (US Pacific Trade /
     #    Europe Handelskontor München). The light seasonal travel in
     #    Phase 6 stays intact; these are the bigger periodic anchors.
+    #    A client visit is a business trip: it books to 经营支出:差旅 so
+    #    the tax engine deducts it (audit R3 — ¥14k a year of client
+    #    travel sat in the household bucket and was taxed as profit).
     trip_specs = [
         ("出差 美国 Pacific Trade (机票+酒店)", CMB_CARD, 6000, 8000),
         ("出差 德国 Handelskontor München (机票+酒店)", CMB_CARD, 6000, 8000),
@@ -2061,7 +2075,7 @@ def gen_personal_life() -> list[dict]:
         if _on_or_before_through(tday):
             amt = _spend(rng,lo, hi)
             txns.append({"description": desc, "date": tday,
-                         "splits": [(src, -amt), (EXP_TRAVEL, amt)]})
+                         "splits": [(src, -amt), (EXP_BIZ_TRAVEL, amt)]})
         nm = cur.month - 1 + 5  # +5 months
         cur = date(cur.year + nm // 12, nm % 12 + 1, 1)
         trip_idx += 1
@@ -2629,14 +2643,60 @@ def _whole_units(budget: Decimal, price: Decimal, lot: int) -> Decimal:
     return Decimal(units)
 
 
-def run_investments(out_path: Path, since: date | None = None) -> dict:
+def _checking_after(out_path: Path, when: date,
+                    pending: list[tuple[date, Decimal]]) -> Decimal:
+    """银行储蓄卡's day-end balance on ``when`` as the book holds it,
+    less this run's not-yet-saved debits dated on or before it."""
+    bal = D(str(GnuCashBook(str(out_path)).get_balance(
+        CHECKING, as_of_date=when)))
+    return bal - sum((c for d, c in pending if d <= when), D("0"))
+
+
+def run_investments(out_path: Path, since: date | None = None,
+                    until: date | None = None, gate: bool = False) -> dict:
     """Monthly DCA, quarterly trades, and dividends. Direct piecash.
 
     ``since`` (continuation mode): skip every event dated on or before
-    it — those trades and lots already exist in the frozen prefix."""
+    it — those trades and lots already exist in the frozen prefix.
+    ``until`` bounds the window: the base build runs one month at a
+    time, interleaved with the policy engine, so ``gate`` can judge a
+    discretionary buy against the checking balance the month really
+    has — after that day's fixed debits, after the previous month-end's
+    sweep. A buy that would leave less than CHECKING_FLOOR does not
+    fill (audit R2: the ¥14,040 ETF order on mortgage day)."""
     cut = since or date(YEAR, 1, 1) - timedelta(days=1)
+    end = until or THROUGH
+    counts: dict = {"txns": 0, "lots": 0, "skipped": []}
+    # Gate decisions read the book BEFORE piecash opens it for writing
+    # (the server's reader would otherwise meet the write lock); this
+    # run's own DCA debits are subtracted by hand.
+    pending: list[tuple[date, Decimal]] = []
+    dca = [("510300", D("2000")), ("159915", D("1000"))]
+    for d in dca_dates():
+        if cut < d <= end:
+            for sym, budget in dca:
+                price = real_price(sym, d)
+                units = _whole_units(budget, price, ROUND_LOT[sym])
+                pending.append((d, (units * price).quantize(D("0.01"))))
+    trades = []
+    for m, day, action, sym, shares in INVESTMENT_TRADES:
+        d = trade_date(m, day)
+        if not cut < d <= end:
+            continue
+        if gate and action == "buy":
+            price = real_price(sym, d)
+            cost = (shares * price).quantize(D("0.01"))
+            cost += _commission(cost) if sym == "300750" else D("0")
+            left = _checking_after(out_path, d, pending) - cost
+            if left < CHECKING_FLOOR:
+                counts["skipped"].append(
+                    f"买入 {shares} {sym} @ ¥{price} on {d}: 银行储蓄卡 would "
+                    f"close at {left:,.2f} after the day's debits, under "
+                    f"the ¥{CHECKING_FLOOR:,.0f} floor")
+                continue
+            pending.append((d, cost))
+        trades.append((m, day, action, sym, shares))
     book = piecash.open_book(str(out_path), readonly=False, do_backup=False)
-    counts = {"txns": 0, "lots": 0}
     try:
         cny = book.default_currency
         acct = {a.fullname: a for a in book.accounts}
@@ -2653,10 +2713,9 @@ def run_investments(out_path: Path, since: date | None = None) -> dict:
         # price at the buy date sets units and booked value, so the lot cost
         # basis reflects actual history and holdings stay whole. Runs every
         # month through THROUGH so DCA continues into the present.
-        dca = [("510300", D("2000")), ("159915", D("1000"))]
         for d in dca_dates():
             yy, m = d.year, d.month
-            if d <= cut:
+            if not cut < d <= end:
                 continue
             for sym, budget in dca:
                 price = real_price(sym, d)
@@ -2682,10 +2741,8 @@ def run_investments(out_path: Path, since: date | None = None) -> dict:
         # Quarterly trades: shares fixed in INVESTMENT_TRADES; the price
         # is the real market close at the trade date (same quote the
         # price layer wrote), so booked value == shares × real price.
-        for m, day, action, sym, shares in INVESTMENT_TRADES:
+        for m, day, action, sym, shares in trades:
             d = trade_date(m, day)
-            if d <= cut:
-                continue
             price = real_price(sym, d)
             inv_acct = acct[ACCT_BY_SYMBOL[sym]]
             cny_amt = (shares * price).quantize(D("0.01"))
@@ -2759,7 +2816,7 @@ def run_investments(out_path: Path, since: date | None = None) -> dict:
             (8, 15, "宁德时代 现金分红", D("300")),    # 100 sh × ~¥3
         ]
         for m, day, desc, amt in dividends:
-            if date(YEAR, m, day) <= cut:
+            if not cut < date(YEAR, m, day) <= end:
                 continue
             piecash.Transaction(
                 currency=cny, description=desc, post_date=date(YEAR, m, day),
@@ -3108,6 +3165,90 @@ def gen_volume() -> list[dict]:
     return txns
 
 
+# ── Phase 13b: Wallet funding computed from the book ────────────
+#
+# 微信支付 and 支付宝 are prepaid wallets (type BANK, no credit line):
+# a balance under zero cannot exist (audit R1). Funding is read from
+# each wallet's own history — the month's 充值 lands on the 2nd, sized
+# so the balance covers the prior month's spend plus a cushion, and a
+# day that would still close under WALLET_FLOOR gets a same-day
+# 余额不足 top-up. Idempotent (a month already carrying its 充值 is
+# left alone), so the continuation runs it as a book repair.
+
+WALLET_DESC = {WECHAT: "充值微信钱包", ALIPAY: "充值支付宝"}
+WALLET_FIRST_LOAD = {WECHAT: D("4500"), ALIPAY: D("4000")}  # the pre-book habit
+
+
+def _ceil_to(x: Decimal, step: Decimal) -> Decimal:
+    return (x / step).to_integral_value(rounding=ROUND_CEILING) * step
+
+
+def fund_wallets(out_path: Path, since: date, through: date) -> list[str]:
+    """Write every wallet 充值 due after ``since`` through ``through``
+    (the phase note above). Returns one log line per wallet."""
+    con = sqlite3.connect(str(out_path))
+    try:
+        rows = _ledger_rows(con)
+    finally:
+        con.close()
+    txns: list[dict] = []
+    log: list[str] = []
+    for wallet in (WECHAT, ALIPAY):
+        desc = WALLET_DESC[wallet]
+        opening = D("0")
+        net: dict[date, Decimal] = {}
+        spend: dict[tuple[int, int], Decimal] = {}
+        loaded: set[tuple[int, int]] = set()
+        for _g, post, tdesc, splits in rows:
+            for fn, _mn, qty, state in splits:
+                if fn != wallet or state == "v":
+                    continue
+                if post <= since:
+                    opening += qty
+                else:
+                    net[post] = net.get(post, D("0")) + qty
+                if qty < 0:
+                    ym = (post.year, post.month)
+                    spend[ym] = spend.get(ym, D("0")) - qty
+                if tdesc == desc:
+                    loaded.add((post.year, post.month))
+        bal = opening
+        monthly = adhoc = 0
+        d = since + timedelta(days=1)
+        while d <= through:
+            if d.day == WALLET_TOPUP_DAY and (d.year, d.month) not in loaded:
+                prev = ((d.year - 1, 12) if d.month == 1
+                        else (d.year, d.month - 1))
+                prior = spend.get(prev)
+                if prior is None:
+                    amount, notes = WALLET_FIRST_LOAD[wallet], None
+                else:
+                    target = _ceil_to(prior, D("100")) + WALLET_CUSHION
+                    amount = _ceil_to(target - bal, D("100"))
+                    notes = f"按上月支出 ¥{prior} 充值"
+                if amount >= D("100"):
+                    txns.append({
+                        "description": desc, "date": d, "notes": notes,
+                        "splits": [(CHECKING, -amount), (wallet, amount)],
+                    })
+                    bal += amount
+                    monthly += 1
+            bal += net.get(d, D("0"))
+            if bal < WALLET_FLOOR:
+                amount = _ceil_to(WALLET_FLOOR + D("1000") - bal, D("500"))
+                txns.append({
+                    "description": f"{desc}（余额不足）", "date": d,
+                    "splits": [(CHECKING, -amount), (wallet, amount)],
+                })
+                bal += amount
+                adhoc += 1
+            d += timedelta(days=1)
+        log.append(f"{wallet.split(':')[-1]}: {monthly} monthly 充值, "
+                   f"{adhoc} 余额不足 top-ups (floor ¥{WALLET_FLOOR})")
+    write_bulk(out_path, txns)
+    return log
+
+
 # ── Phase 14: Taxes computed from the ledger ────────────────────
 #
 # Nothing here is a constant amount. The quarterly VAT return reads the
@@ -3259,13 +3400,16 @@ def tax_transactions(out_path: Path) -> tuple[list[dict], dict]:
                 if not exempt:
                     vat += normal_base * VAT_RATE
                 vat = vat.quantize(D("0.01"))
-                surcharge = (vat * VAT_SURCHARGE_RATE).quantize(D("0.01"))
+                surcharge = _vat_surcharge(vat, exempt)
                 total = vat + surcharge
                 notes = (f"{yy}年Q{q} 专票销售额（不含税）¥{special_base}，"
                          f"普票 ¥{normal_base}"
                          + ("（季度销售额未超 30 万，免征）" if exempt else "")
                          + f"，跨境服务出口 ¥{r['export']}（免税）；"
-                         f"增值税 ¥{vat} + 附加税费 ¥{surcharge}")
+                         f"增值税 ¥{vat} + 附加税费 ¥{surcharge}"
+                         + ("（城建税 3.5%；教育费附加、地方教育附加免征）"
+                            if exempt else
+                            "（城建税+教育费附加+地方教育附加 6%）"))
                 txns.append({
                     "description": "增值税及附加 季度申报缴款",
                     "date": vat_date, "notes": notes,
@@ -3610,6 +3754,11 @@ def _verify_invariants(out_path: Path, tax_summary: dict) -> None:
         paths = _ledger_account_paths(con)
         limits = {paths[g][0]: D(v["credit_limit"]) for g, v in slots.items()
                   if g in paths and "credit_limit" in v}
+        bank_accounts = sorted(
+            paths[g][0] for (g,) in con.execute(
+                "SELECT guid FROM accounts "
+                "WHERE account_type IN ('BANK', 'CASH')")
+            if g in paths)
         invoices = con.execute(
             "SELECT i.id, i.date_posted, bt.duedays, i.post_lot, i.currency "
             "FROM invoices i LEFT JOIN billterms bt ON bt.guid = i.terms "
@@ -3657,6 +3806,27 @@ def _verify_invariants(out_path: Path, tax_summary: dict) -> None:
     if out_of_band:
         raise SystemExit(f"INVARIANT: checking outside band at "
                          f"{out_of_band[:3]}")
+
+    # 2b. No BANK- or CASH-type account under zero at ANY day-end
+    # (audit round 2, R1/R2): the wallets are prepaid, 现金 is cash,
+    # 银行储蓄卡 has no overdraft.
+    for path in bank_accounts:
+        net: dict[date, Decimal] = {}
+        for _g, post, _d, splits in rows:
+            for fn, _mn, qty, state in splits:
+                if fn == path and state != "v":
+                    net[post] = net.get(post, D("0")) + qty
+        bal = D("0")
+        low: tuple[Decimal, date | None] = (D("0"), None)
+        for day in sorted(net):
+            bal += net[day]
+            if low[1] is None or bal < low[0]:
+                low = (bal, day)
+        print(f"  bank ≥ 0 every day-end: {path.split(':')[-1]} min "
+              f"{low[0]:,.2f} on {low[1]} "
+              f"{'OK' if low[0] >= 0 else 'NEGATIVE'}")
+        if low[0] < 0:
+            raise SystemExit(f"INVARIANT: {path} at {low[0]} on {low[1]}")
 
     # 3. No invoice unpaid beyond terms + 45 days at any month-end.
     late: list[tuple] = []
@@ -3716,7 +3886,8 @@ def _verify_invariants(out_path: Path, tax_summary: dict) -> None:
             vat = sb * VAT_RATE + (nb * VAT_RATE
                                    if sb + nb > VAT_EXEMPT_QUARTERLY else 0)
             vat = vat.quantize(D("0.01"))
-            implied_vat += vat + (vat * VAT_SURCHARGE_RATE).quantize(D("0.01"))
+            implied_vat += vat + _vat_surcharge(
+                vat, sb + nb <= VAT_EXEMPT_QUARTERLY)
         rev = sum((sum(revenue.get((yy, q), zero).values())
                    for q in range(1, qf + 1)), D("0"))
         exp = sum((expenses.get((yy, q), D("0")) for q in range(1, qf + 1)),
@@ -4132,6 +4303,13 @@ def hsbc_payoff_repair(out_path: Path, cutoff: date,
     return [f"汇丰 settled HK${owed_hkd} (¥{owed_cny}) on {when}"]
 
 
+def lin_wei_repairs(out_path: Path, cutoff: date, through: date) -> list[str]:
+    """Continuation-side book repairs: the 汇丰 payoff, then wallet
+    funding for the continued months (fund_wallets is idempotent)."""
+    return (hsbc_payoff_repair(out_path, cutoff, through)
+            + fund_wallets(out_path, cutoff, through))
+
+
 def continue_business(book: GnuCashBook, through: date,
                       since: date) -> dict:
     global THROUGH
@@ -4180,7 +4358,9 @@ POLICY = PersonaPolicy(
     min_sweep=D("500"),
     invest=continuation_invest,
     ensure_rate=ensure_rate,
-    book_repairs=hsbc_payoff_repair,
+    book_repairs=lin_wei_repairs,
+    # 储蓄卡: a day-end under the floor is topped up THAT day (R2).
+    floor=CHECKING_FLOOR,
     # Loans have no statement to reconcile against (review §1).
     no_reconcile=(MORTGAGE, AUTO_LOAN),
     # 储蓄账户 earns a demand-deposit rate, monthly (audit P7).
@@ -4196,20 +4376,37 @@ POLICY = PersonaPolicy(
 )
 
 
-def run_base_policy(out_path: Path) -> list[str]:
+def run_base_policy(out_path: Path) -> tuple[list[str], dict]:
     """Run the closed-loop policy over the WHOLE base timeline — surplus
     sweeps (savings + quarterly 沪深300), the savings-pile rebalance,
-    savings interest — from 2025-01-01. Card statements are paid by
-    run_credit_cards (the 2025 narrative needs the ICBC catch-up arc),
-    so the cards are masked here; everything else is the exact rule
-    set the continuation applies from the frozen edge onward."""
+    savings interest, floor top-ups — from 2025-01-01, one month at a
+    time with that month's investments written first, so a
+    discretionary buy is gated on the checking balance the month
+    really has (the previous sweep has already happened; audit R2).
+    Card statements are paid by run_credit_cards (the 2025 narrative
+    needs the ICBC catch-up arc), so the cards are masked here;
+    everything else is the exact rule set the continuation applies
+    from the frozen edge onward."""
     from dataclasses import replace
 
-    from continuation import run_policy
+    from continuation import month_ends, run_policy
 
     base_policy = replace(POLICY, cards=())
-    return run_policy(base_policy, out_path,
-                      date(YEAR, 1, 1) - timedelta(days=1), THROUGH)
+    start = date(YEAR, 1, 1) - timedelta(days=1)
+    edges = list(month_ends(start, THROUGH))
+    if not edges or edges[-1] != THROUGH:
+        edges.append(THROUGH)
+    actions: list[str] = []
+    inv: dict = {"txns": 0, "lots": 0, "skipped": []}
+    prev = start
+    for edge in edges:
+        counts = run_investments(out_path, since=prev, until=edge, gate=True)
+        inv["txns"] += counts["txns"]
+        inv["lots"] += counts["lots"]
+        inv["skipped"] += counts["skipped"]
+        actions += run_policy(base_policy, out_path, prev, edge)
+        prev = edge
+    return actions, inv
 
 
 # ── Driver ──────────────────────────────────────────────────────
@@ -4258,10 +4455,6 @@ def build(out_path: Path) -> None:
     business = run_business(book)
     print(f"  {business}")
 
-    print("\nPhase 8: investments")
-    inv_counts = run_investments(out_path)
-    print(f"  {inv_counts}")
-
     print("\nPhase 9a: HSBC HKD card charges")
     n = write_bulk(out_path, gen_hsbc_charges())
     print(f"  {n} HKD charges")
@@ -4277,6 +4470,11 @@ def build(out_path: Path) -> None:
     print("\nPhase 13: volume stress")
     n = write_bulk(out_path, gen_volume())
     print(f"  {n} volume transactions")
+
+    print("\nPhase 13b: wallet funding computed from the book")
+    for line in fund_wallets(out_path, date(YEAR, 1, 1) - timedelta(days=1),
+                             THROUGH):
+        print(f"  {line}")
 
     # Everything below READS the book: taxes from the posted revenue and
     # 经营支出, statements from the real running card balances, sweeps
@@ -4298,9 +4496,18 @@ def build(out_path: Path) -> None:
     n = run_credit_cards(out_path)
     print(f"  {n} statement payments / interest")
 
-    print("\nPhase 7d: closed-loop policy — surplus sweeps, savings interest")
-    actions = run_base_policy(out_path)
-    print(f"  {len(actions)} policy actions; last 4:")
+    print("\nPhase 7d + 8: closed-loop policy month by month — investments "
+          "gated on checking, floor top-ups, surplus sweeps, savings interest")
+    actions, inv_counts = run_base_policy(out_path)
+    print(f"  investments: {inv_counts['txns']} txns, {inv_counts['lots']} "
+          f"lots; {len(inv_counts['skipped'])} buys did not fill")
+    for line in inv_counts["skipped"]:
+        print(f"    skipped: {line}")
+    floor_topups = [a for a in actions if "floor" in a]
+    print(f"  {len(actions)} policy actions; {len(floor_topups)} floor top-ups:")
+    for line in floor_topups:
+        print(f"    {line}")
+    print("  last 4 actions:")
     for line in actions[-4:]:
         print(f"    {line}")
 
