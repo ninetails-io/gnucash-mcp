@@ -26,8 +26,11 @@ What the book does the way a German Steuerberater expects (cold audit
   invoice through A/R — one gap-free chronological sequence across all
   customers (§14 UStG / GoBD), Leistungszeitraum in the notes, output
   VAT at posting (1776/1771) and cleared by the USt-VA of the posting
-  month. Licence-only invoices (Einräumung von Nutzungsrechten) carry
-  7% (§12 Abs. 2 Nr. 7c UStG); everything else 19%. EU-B2B services
+  month. Licence-only invoices (Einräumung von Nutzungsrechten, 7%,
+  §12 Abs. 2 Nr. 7c UStG) go only to the publisher, one per work; the
+  rights on a brewery's label or a café's wall are Nebenleistung to the
+  Gebrauchsgrafik — a line on the 19% design invoice, never a 7%
+  invoice (cold audit R2 N2). Everything else 19%. EU-B2B services
   are Reverse Charge on 8336, Drittland services on 8338.
 - **One payee → tax-treatment table** (``PAYEES``) that every variable
   expense passes through: domestic 19% (1576) and 7% (1571 — Bahn
@@ -36,7 +39,10 @@ What the book does the way a German Steuerberater expects (cold audit
   foreign hotels and flights); §13b Reverse Charge for EU and
   Drittland SaaS/ads (net to expense, 1787 credit + 1577 debit, VA
   Kz. 46/47/67); Bewirtung 70/30 (4650/4654) with Anlass and
-  Teilnehmer on every row; private items to 1800.
+  Teilnehmer on every row; private items to 1800. Geschenke: one per
+  Empfänger per Wirtschaftsjahr, the recipient-year total against the
+  €50 net cap (§4 Abs. 5 Nr. 1 EStG) — over it, the gift goes gross to
+  4665 with no VSt (§15 Abs. 1a UStG); Weihnachten only in December (R2 N1).
 - **A monthly USt-Voranmeldung** on the 10th (rolled to the next
   Bankarbeitstag): Zahllast = the prior month's 1776/1771/1787 output
   minus its 1576/1571/1577 input, derived from the book, cleared
@@ -47,7 +53,8 @@ What the book does the way a German Steuerberater expects (cold audit
   simulated Bescheid for year Y−1 lands on 12 August of Y, adjusts the
   running quarters and settles Y−1 on 15 September. Everything from 2025
   on is derived from the book's own EÜR; only the 2024 Bescheid figures
-  are constants.
+  are constants. Each month's Finanzamt block is moved from the
+  Postbank Steuerrücklage the Bankarbeitstag before its first due date.
 - The Pkw stays a business asset (BLP €32,000 gross ↔ AK €26,890.76
   net ↔ AfA €4,481.79/yr) with the 1%-Regelung private-use imputation
   every month (1880 against 8924/8920 + 1776) and linear AfA to 4832
@@ -76,6 +83,7 @@ import calendar
 import hashlib
 import os
 import random
+import re
 import sqlite3
 from datetime import date, timedelta
 from decimal import Decimal as D, ROUND_HALF_UP, ROUND_FLOOR
@@ -164,6 +172,8 @@ AFA_KFZ = "Aufwendungen 2/4:Abschreibungen:4832 Abschreibungen auf Kfz"   # ADD 
 STROM = "Aufwendungen 2/4:Raumkosten:4240 Gas, Wasser, Strom (Verwaltung, Vertrieb)"
 WERKZEUG = "Aufwendungen 2/4:verschiedene Kosten:4985 Werkzeuge und Kleingeräte"
 AUFMERK = "Aufwendungen 2/4:Werbe-/Reisekosten:4653 Aufmerksamkeiten"
+NICHT_ABZ = ("Aufwendungen 2/4:Werbe-/Reisekosten:4665 nicht abzugsfähige Betriebsausg. "
+             "aus Werbe-, Repräs.- u. Reisekosten")
 BUECHER = "Aufwendungen 2/4:verschiedene Kosten:4940 Zeitschriften, Bücher"
 KFZ_BETRIEB = "Aufwendungen 2/4:Kfz-Kosten:4530 laufende Kfz-Betriebskosten"
 KFZ_STEUER = "Aufwendungen 2/4:Kfz-Kosten:4510 Kfz-Steuer"
@@ -535,7 +545,10 @@ PKW_OPENING = PKW_AK - pkw_afa(PKW_FIRST_AFA_YEAR)                   # 22,408.97
 
 OPENING_BALANCES = [
     (BANKKONTO, D("18400")),
-    (POSTBANK, D("3250")),
+    # The Tagesgeld is the Steuerrücklage: on 1 January it holds the
+    # Q1 Vorauszahlung the 2024 Bescheid fixed (8,000, drawn on the
+    # Bankarbeitstag before 10 March) plus the 3,250 that stays.
+    (POSTBANK, D("11250")),
     (PKW, PKW_OPENING),
     (KFZ_FIN, D("-16500")),
 ]
@@ -1020,6 +1033,52 @@ BUSINESS = [
 ]
 
 
+# N1: Geschenke. §4 Abs. 5 Nr. 1 EStG caps the deductible gifts per
+# Empfänger and Wirtschaftsjahr at €50 net — a Freigrenze on the
+# recipient-year TOTAL, not a per-gift limit. The persona gives one
+# gift per recipient per year and keeps an accumulator per
+# (recipient, year); a gift that would push the total over the cap is
+# booked gross to 4665 (nicht abziehbar, and with it the VSt — §15
+# Abs. 1a UStG), so 4653 only ever carries what is deductible. The
+# Anlass is drawn from the calendar: Weihnachten only in December,
+# Geburtstag or Projektabschluss otherwise, and never two
+# Projektabschluss gifts to one recipient within a month.
+GESCHENK_CAP = D("50")
+
+
+def _anlass(day: date, client: str, last_abschluss: dict, rng) -> str:
+    if day.month == 12:
+        return "Weihnachten"
+    options = ["Geburtstag", "Projektabschluss"]
+    last = last_abschluss.get(client)
+    if last is not None and (day - last).days < 31:
+        options = ["Geburtstag"]
+    anlass = rng.choice(options)
+    if anlass == "Projektabschluss":
+        last_abschluss[client] = day
+    return anlass
+
+
+def _gift(day: date, payee: str, gross: D, client: str, anlass: str,
+          gifted: dict) -> dict:
+    """One Geschenk, routed by the recipient-year total: 4653 with VSt
+    while the total stays ≤ €50 net, 4665 gross (no VSt) once it would
+    not. The note states the computed total, not an assertion."""
+    _, treatment, _ = PAYEES[("aufmerk", payee)]
+    net, _ = _vat_split(gross, _RATE[treatment])
+    who = CONTACTS[client]
+    key = (who, day.year)
+    total = gifted.get(key, D("0")) + net
+    gifted[key] = total
+    head = f"Geschenk an {who} ({client}), Anlass: {anlass}; Geschenke an {who} {day.year}: "
+    if total <= GESCHENK_CAP:
+        note = head + f"{total} € netto ≤ 50 € (§4 Abs. 5 Nr. 1 EStG) — abziehbar"
+        return _book_expense(day, "aufmerk", payee, gross, note)
+    note = (head + f"{total} € netto > 50 € (§4 Abs. 5 Nr. 1 EStG) — nicht abziehbar, "
+            "kein Vorsteuerabzug (§15 Abs. 1a UStG)")
+    return _tx(day, payee, [(BANKKONTO, -gross), (NICHT_ABZ, gross)], note)
+
+
 def gen_variable() -> list[dict]:
     """Lumpy seeded business spend with real merchant names, every row
     through the payee table (its VAT treatment) and carrying the note a
@@ -1027,6 +1086,8 @@ def gen_variable() -> list[dict]:
     rng = random.Random(SEED + 6)
     txns = []
     clients = list(CONTACTS)
+    gifted: dict[tuple[str, int], D] = {}     # (recipient, year) → net total
+    last_abschluss: dict[str, date] = {}
     for first in iter_months():
         for category, lo, hi, avg, names in BUSINESS:
             for _ in range(_lumpy(rng, avg)):
@@ -1050,11 +1111,15 @@ def gen_variable() -> list[dict]:
                     txns.append(_book_expense(day, category, payee, gross, note, description=desc))
                     continue
                 if category == "aufmerk":
-                    client = rng.choice(clients)
-                    note = (f"Geschenk an {CONTACTS[client]} ({client}), Anlass: "
-                            f"{rng.choice(['Projektabschluss', 'Geburtstag', 'Weihnachten', 'Jubiläum'])}; "
-                            "≤ 50 € netto (§4 Abs. 5 Nr. 1 EStG)")
-                    txns.append(_book_expense(day, category, payee, gross, note))
+                    # One gift per recipient per Wirtschaftsjahr: a
+                    # recipient already gifted this year is not given
+                    # another; the last three are kept for Weihnachten.
+                    open_clients = [c for c in clients if (CONTACTS[c], day.year) not in gifted]
+                    if len(open_clients) <= (0 if day.month == 12 else 3):
+                        continue
+                    client = rng.choice(open_clients)
+                    anlass = _anlass(day, client, last_abschluss, rng)
+                    txns.append(_gift(day, payee, gross, client, anlass, gifted))
                     continue
                 if category == "reise":
                     client = rng.choice(clients)
@@ -1078,6 +1143,16 @@ def gen_variable() -> list[dict]:
                 else:  # tanken
                     note = "Tankbeleg Pkw (Benzin)" if payee != "Parkhaus Stachus" else "Parken Kundentermin Innenstadt"
                 txns.append(_book_expense(day, category, payee, gross, note, description=desc))
+        if first.month == 12:
+            # Weihnachten: a small present to the clients who had none
+            # this year — each still one per recipient-year, under the cap.
+            for client in clients:
+                if (CONTACTS[client], first.year) in gifted or rng.random() < 0.5:
+                    continue
+                day = day_in(first, rng.randint(8, 19))
+                payee = rng.choice(["Confiserie Rottenhöfer", "Dallmayr"])
+                gross = _cents(rng, 18, 45)
+                txns.append(_gift(day, payee, gross, client, "Weihnachten", gifted))
     return txns
 
 
@@ -1275,27 +1350,60 @@ CUSTOMERS = {
 RC_NOTE = "Steuerschuldnerschaft des Leistungsempfängers (Reverse Charge, §13b UStG)"
 LIZENZ_NOTE = ("Einräumung zeitlich und räumlich beschränkter Nutzungsrechte — "
                "Hauptleistung ist die Urheberrechtsübertragung (§12 Abs. 2 Nr. 7c UStG, 7%)")
+RIGHTS_NOTE = ("Nutzungsrechte als Nebenleistung zur Gebrauchsgrafik — einheitliche "
+               "Leistung, 19% (UStAE 12.7 Abs. 18; BFH XI R 28/13)")
 
-# Projects per customer for the invoice pool; ``lizenz`` items are the
-# 7% licence-only invoices (P10: licence is the Hauptleistung).
+# 19% design projects per customer, the invoice pool.
 PROJECTS = {
-    "stadtmarketing": (["Plakatkampagne Stadtgründungsfest", "Broschüre Radlhauptstadt München",
-                        "Social-Media-Templates Tourismus", "Messewand ITB"], []),
-    "biobackhaus": (["Verpackungsdesign Brotlinie", "Filialplakate Saison",
-                     "Speisekarten-Relaunch", "Etiketten Bio-Sortiment"], []),
-    "vogel": (["Praxis-Logo und Geschäftsausstattung", "Website-Layout Praxis",
-               "Patientenflyer Prophylaxe"], []),
-    "lindner": (["Wettbewerbsplakate Wohnquartier", "Portfolio-Broschüre",
-                 "Bauschild-Grafik"], []),
-    "tollwood": (["Festivalplakat Sommer", "Programmheft Layout", "Lageplan-Grafik"], []),
-    "kosmos": (["Speisekarte und Getränkekarte", "Event-Plakate"],
-               ["Illustration Wandmotiv Gastraum"]),
-    "aukofer": (["Etikettenserie Festbier", "Anzeigenkampagne Sommer"],
-                ["Illustration Sudhaus-Motiv"]),
-    "lindberg": (["Katalog Frühjahr/Sommer", "Schaufenster-Grafik", "Newsletter-Templates"], []),
-    "atelier": ([], ["Illustrationsserie Donauufer", "Illustration Kinderbuch",
-                     "Illustrationsserie Jahreszeiten"]),
+    "stadtmarketing": ["Plakatkampagne Stadtgründungsfest", "Broschüre Radlhauptstadt München",
+                       "Social-Media-Templates Tourismus", "Messewand ITB"],
+    "biobackhaus": ["Verpackungsdesign Brotlinie", "Filialplakate Saison",
+                    "Speisekarten-Relaunch", "Etiketten Bio-Sortiment"],
+    "vogel": ["Praxis-Logo und Geschäftsausstattung", "Website-Layout Praxis",
+              "Patientenflyer Prophylaxe"],
+    "lindner": ["Wettbewerbsplakate Wohnquartier", "Portfolio-Broschüre",
+                "Bauschild-Grafik"],
+    "tollwood": ["Festivalplakat Sommer", "Programmheft Layout", "Lageplan-Grafik"],
+    "kosmos": ["Speisekarte und Getränkekarte", "Event-Plakate", "Wandgestaltung Gastraum"],
+    "aukofer": ["Etikettenserie Festbier", "Anzeigenkampagne Sommer", "Sudhaus-Illustration Etiketten"],
+    "lindberg": ["Katalog Frühjahr/Sommer", "Schaufenster-Grafik", "Newsletter-Templates"],
 }
+# N2 (cold audit R2): the 7% of §12 Abs. 2 Nr. 7c UStG is for a
+# publisher licensing illustration — the copyright transfer is the
+# wesentlicher Zweck. Atelier Donau's programme brings a few new works
+# a year; each is licensed ONCE (a licence is granted once or per
+# Laufzeit, never re-invoiced at a new price). A brewery's label motif
+# and a café's wall are Gebrauchsgrafik: the rights are Nebenleistung,
+# folded into the 19% design invoice as a line, one line per work.
+ATELIER_WERKE = ["Illustrationsserie Donauufer (Kalender {next})",
+                 "Illustration Kinderbuch, Bd. {vol}",
+                 "Illustrationsserie Jahreszeiten {year}",
+                 "Cover-Illustration Herbstprogramm {year}",
+                 "Illustrationen Wanderführer Bayerischer Wald ({year})"]
+RIGHTS_WERKE = {   # customer → one Gebrauchsgrafik motif per year
+    "aukofer": ["Illustration Sudhaus-Motiv (Etiketten, Anzeigen)",
+                "Illustration Hopfengarten-Motiv (Etiketten Saisonbier)",
+                "Illustration Kelheimer Altstadt (Jubiläumsetikett)",
+                "Illustration Brauereipferde (Festbier-Serie)",
+                "Illustration Donaudurchbruch (Etiketten Radler)",
+                "Illustration Sudhaus bei Nacht (Anzeigen)"],
+    "kosmos": ["Illustration Wandmotiv Gastraum",
+               "Illustration Wandmotiv Terrasse",
+               "Illustrationen Speisekarte (Vignetten)",
+               "Illustration Wandmotiv Bar",
+               "Illustration Jubiläumsplakat",
+               "Illustrationen Getränkekarte (Vignetten)"],
+}
+
+
+def _atelier_werke(year: int) -> list[str]:
+    return [w.format(year=year, next=year + 1, vol=year - YEAR + 1) for w in ATELIER_WERKE]
+
+
+def _rights_werk(key: str, year: int) -> str:
+    werke = RIGHTS_WERKE[key]
+    i = year - YEAR
+    return werke[i] if i < len(werke) else f"{werke[i % len(werke)]} — {year}"
 _SHORT = {"verlag": "Verlag Bergblick", "atelier": "Atelier Donau",
           "stadtmarketing": "Stadtmarketing München", "biobackhaus": "BioBackhaus",
           "vogel": "Praxis Dr. Vogel", "lindner": "Architekturbüro Lindner",
@@ -1317,63 +1425,77 @@ def _invoice_plan() -> list[dict]:
     Bankarbeitstag; a few run past Net 14, none past Net 14 + 45."""
     rng = random.Random(SEED + 9)
     plan: list[dict] = []
-    pool = [k for k in PROJECTS if k != "atelier"]
-    lizenz_pool = [k for k, (_, liz) in PROJECTS.items() if liz]
+    pool = list(PROJECTS)
+    unlicensed: dict[int, list[str]] = {}     # year → publisher works not yet licensed
+    folded: set[tuple[str, int]] = set()       # (customer, year) whose rights line is on an invoice
 
     def _pay(opened: date) -> date:
         return bankday(opened + timedelta(days=int(rng.triangular(3, 32, 10))))
+
+    def _entry(account: str, description: str, net: D, rate: str, notes: str = "") -> dict:
+        taxtable = {"19": "USt 19%", "7": "USt 7%"}.get(rate)
+        gross = (net * (1 + D(rate) / 100)).quantize(D("0.01"))
+        return dict(account=account, description=description, price=net,
+                    taxtable=taxtable, notes=notes, gross=gross)
+
+    def _spec(key: str, opened: date, entries: list[dict], notes: str, *,
+              ar: str = AR, currency: str = "EUR", pay: date | None = None) -> dict:
+        return dict(customer=key, opened=opened, currency=currency, ar=ar, notes=notes,
+                    entries=entries,
+                    pay=(pay or _pay(opened), sum(e["gross"] for e in entries)))
 
     for first in iter_months():
         # The retainer — 2,400 net in 2025, +100 each year.
         opened = weekday_in(first, 5)
         net = D("2400") + D("100") * (first.year - YEAR)
-        plan.append(dict(customer="verlag", opened=opened, currency="EUR",
-                         account=REV19, description=f"Editorial-Design {first:%m/%Y} (Retainer)",
-                         price=net, taxtable="USt 19%", ar=AR,
-                         notes=f"Leistungszeitraum: {first:%m/%Y}",
-                         pay=(_pay(opened), (net * D("1.19")).quantize(D("0.01")))))
+        plan.append(_spec("verlag", opened,
+                          [_entry(REV19, f"Editorial-Design {first:%m/%Y} (Retainer)", net, "19")],
+                          f"Leistungszeitraum: {first:%m/%Y}"))
         # Project invoices from the pool — a Munich senior-designer
         # volume: the book must carry the ESt and a ceiling-level
-        # Krankenkasse and still sweep a surplus.
+        # Krankenkasse and still sweep a surplus. A fifth of the draws
+        # are licences — to the publisher, while its year still has an
+        # unlicensed work; otherwise the draw is a 19% design job.
+        werke = unlicensed.setdefault(first.year, _atelier_werke(first.year))
         for _ in range(rng.randint(4, 6)):
             net = D(rng.randint(1200, 3000))
             lizenz = rng.random() < 0.2
-            key = rng.choice(lizenz_pool if lizenz else pool)
-            projects, lizenzen = PROJECTS[key]
             opened = weekday_in(first, rng.randint(2, 26))
-            if lizenz:
-                title = rng.choice(lizenzen)
-                plan.append(dict(customer=key, opened=opened, currency="EUR",
-                                 account=REV7, description=f"Einräumung von Nutzungsrechten — {title}",
-                                 price=net, taxtable="USt 7%", ar=AR,
-                                 notes=f"Leistungszeitraum: {first:%m/%Y}. {LIZENZ_NOTE}",
-                                 entry_notes=LIZENZ_NOTE,
-                                 pay=(_pay(opened), (net * D("1.07")).quantize(D("0.01")))))
-            else:
-                plan.append(dict(customer=key, opened=opened, currency="EUR",
-                                 account=REV19, description=rng.choice(projects),
-                                 price=net, taxtable="USt 19%", ar=AR,
-                                 notes=f"Leistungszeitraum: {first:%m/%Y}",
-                                 pay=(_pay(opened), (net * D("1.19")).quantize(D("0.01")))))
+            if lizenz and werke:
+                title = werke.pop(rng.randrange(len(werke)))
+                laufzeit = f"Laufzeit {first.year}–{first.year + 4}, Print- und E-Book-Ausgabe"
+                plan.append(_spec("atelier", opened,
+                                  [_entry(REV7, f"Einräumung von Nutzungsrechten — {title}", net, "7",
+                                          f"{LIZENZ_NOTE}; {laufzeit}")],
+                                  f"Leistungszeitraum: {first:%m/%Y}. {LIZENZ_NOTE}; {laufzeit}"))
+                continue
+            key = rng.choice(pool)
+            entries = [_entry(REV19, rng.choice(PROJECTS[key]), net, "19")]
+            if key in RIGHTS_WERKE and (key, first.year) not in folded:
+                # The year's illustration work: rights as a line on the
+                # design invoice that delivers it (Nebenleistung, 19%).
+                folded.add((key, first.year))
+                rights = D(rng.randint(600, 1400))
+                entries.append(_entry(REV19, f"Nutzungsrechte — {_rights_werk(key, first.year)}",
+                                      rights, "19", RIGHTS_NOTE))
+            plan.append(_spec(key, opened, entries, f"Leistungszeitraum: {first:%m/%Y}"))
     # EU B2B, Reverse Charge (S6 / R2): no tax line, 8336 — the May
     # Corporate Design and the November Messestand, every year.
     for year in range(YEAR, THROUGH.year + 1):
         for opened, paid, desc, net in (
                 (date(year, 5, 14), date(year, 5, 30), "Corporate Design Relaunch", D("2900")),
                 (date(year, 11, 6), date(year, 11, 21), "Messestand-Grafik Wien", D("1750"))):
-            plan.append(dict(customer="wien", opened=opened, currency="EUR",
-                             account=REV_EU_B2B, description=f"{desc} — {RC_NOTE}",
-                             price=net, taxtable=None, ar=AR, notes=RC_NOTE,
-                             pay=(bankday(paid), net)))
+            plan.append(_spec("wien", opened, [_entry(REV_EU_B2B, f"{desc} — {RC_NOTE}", net, "0")],
+                              RC_NOTE, pay=bankday(paid)))
     # THE ACCEPTANCE TEST (R3): USD client (Drittland, 8338), post & pay
     # at different EUR/USD rates -> realized FX into a type-resolved
     # INCOME child (German leaf under GNUCASH_LOCALE=de).
-    plan.append(dict(customer="lumen", opened=US_POST, currency="USD",
-                     account=REV_DRITTLAND, description="Brand identity system (Drittland, §3a Abs. 2 UStG)",
-                     price=D("3500"), taxtable=None, ar=AR_USD,
-                     notes="Leistungszeitraum: 08/2025. Nicht steuerbar in Deutschland (§3a Abs. 2 UStG)",
-                     pay=(US_PAY, D("3500"))))
-    plan.sort(key=lambda p: (p["opened"], p["customer"], p["description"]))
+    plan.append(_spec("lumen", US_POST,
+                      [_entry(REV_DRITTLAND, "Brand identity system (Drittland, §3a Abs. 2 UStG)",
+                              D("3500"), "0")],
+                      "Leistungszeitraum: 08/2025. Nicht steuerbar in Deutschland (§3a Abs. 2 UStG)",
+                      ar=AR_USD, currency="USD", pay=US_PAY))
+    plan.sort(key=lambda p: (p["opened"], p["customer"], p["entries"][0]["description"]))
     return plan
 
 
@@ -1438,10 +1560,11 @@ def run_business(book: GnuCashBook, since: date | None = None) -> dict:
                                   date_opened=spec["opened"].isoformat(),
                                   currency=spec["currency"], term="Net 14",
                                   notes=spec.get("notes", ""))
-        book.add_invoice_entry(invoice_id=inv["id"], account=spec["account"],
-                               description=spec["description"], quantity="1",
-                               price=str(spec["price"]), taxtable=spec["taxtable"],
-                               notes=spec.get("entry_notes", ""))
+        for entry in spec["entries"]:
+            book.add_invoice_entry(invoice_id=inv["id"], account=entry["account"],
+                                   description=entry["description"], quantity="1",
+                                   price=str(entry["price"]), taxtable=entry["taxtable"],
+                                   notes=entry["notes"])
         book.post_invoice(invoice_id=inv["id"], post_account=spec["ar"],
                           post_date=spec["opened"].isoformat(), owner_type="customer")
         counts["invoices"] += 1
@@ -1559,6 +1682,7 @@ def run_ust_va(out_path: Path, since: date | None = None) -> int:
 EST_DESC = "Finanzamt München ESt-Vorauszahlung"
 EST_NACHTRAG_DESC = "Finanzamt München nachträgliche ESt-Vorauszahlung"
 EST_ABRECHNUNG_DESC = "Finanzamt München ESt-Abrechnung"
+STEUERRUECKLAGE_DESC = "Umbuchung von Postbank (Steuerrücklage ESt)"
 # The one pre-book year: Gewinn and Sonderausgaben (the Krankenkasse at
 # the 2024 ceiling) lt. Bescheid 2024, and the quarterly Vorauszahlung
 # that stood at the start of 2025 (set by the 2023 Bescheid).
@@ -1702,18 +1826,48 @@ def run_est(out_path: Path, since: date | None = None) -> int:
     Privatsteuern (an Erstattung reverses). Year by year, so each
     settlement reads the Vorauszahlungen the book already holds.
     Idempotent by description; ``since`` restricts to the continuation
-    window."""
+    window.
+
+    The ESt is paid out of the Postbank Steuerrücklage, not the
+    Bankkonto's corridor: every month with a Finanzamt Lastschrift
+    (the quarterly Vorauszahlung; in September also the nachträgliche
+    Anpassung and the Abrechnung) gets ONE Umbuchung Postbank →
+    Bankkonto on the Bankarbeitstag before its first due date, for
+    the month's positive rows (an Erstattung needs no cover).
+    ``POLICY.savings_target`` is sized for it."""
     n = 0
     for year in range(YEAR, THROUGH.year + 1):
         rows, _, _ = est_schedule(out_path, year)
+        blocks: dict[int, list[tuple[date, str, D]]] = {}
+        for when, desc, amount in rows:
+            if amount > 0:
+                blocks.setdefault(when.month, []).append((when, desc, amount))
         book = piecash.open_book(str(out_path), readonly=False, do_backup=False)
         try:
             eur = book.default_currency
             acct = {a.fullname: a for a in book.accounts}
             done = {tx.description for tx in book.transactions
-                    if tx.description.startswith("Finanzamt München ESt")}
+                    if tx.description.startswith(("Finanzamt München ESt", STEUERRUECKLAGE_DESC))}
+
+            def _due(when: date) -> bool:
+                return when <= THROUGH and (since is None or when > since)
+
+            for month, block in sorted(blocks.items()):
+                first_due = min(w for w, _, _ in block)
+                desc = f"{STEUERRUECKLAGE_DESC} {month:02d}/{year}"
+                if not _due(first_due) or desc in done:
+                    continue
+                total = sum(a for _, _, a in block)
+                covered = ", ".join(d.removeprefix("Finanzamt München ").split(" (")[0]
+                                    for _, d, _ in block)
+                piecash.Transaction(
+                    currency=eur, description=desc, post_date=bankday_back(first_due - timedelta(days=1)),
+                    notes=f"Deckung des Bankkontos aus der Steuerrücklage für: {covered}",
+                    splits=[piecash.Split(account=acct[POSTBANK], value=-total),
+                            piecash.Split(account=acct[BANKKONTO], value=total)])
+                n += 1
             for when, desc, amount in rows:
-                if when > THROUGH or (since is not None and when <= since) or desc in done:
+                if not _due(when) or desc in done:
                     continue
                 if amount == 0:
                     continue
@@ -2034,6 +2188,70 @@ def verify(out_path: Path) -> None:
     assert not stale, f"documents unpaid beyond Net 14 + 45 days: {stale}"
     print(f"✓ I4: {len(outstanding)} documents open, none past Net 14 + 45 days")
 
+    # I5: no BANK account below zero at any DAY-end (the month-end band
+    # above is coarser; a real Kontoauszug shows every Wertstellung).
+    with book.open() as b:
+        template = book._template_account_guids(b)
+        day_min = {}
+        for a in b.accounts:
+            if a.type != "BANK" or a.guid in template:
+                continue
+            by_day: dict[date, D] = {}
+            for sp in a.splits:
+                d = sp.transaction.post_date
+                by_day[d] = by_day.get(d, D("0")) + D(str(sp.quantity))
+            running, worst = D("0"), (D("0"), None)
+            for d in sorted(by_day):
+                running += by_day[d]
+                if worst[1] is None or running < worst[0]:
+                    worst = (running, d)
+            day_min[a.name] = worst
+    for name, (bal, on) in day_min.items():
+        assert bal >= 0, f"{name} below zero at day-end {on}: {bal}"
+    print("✓ I5: no BANK account below zero at any day-end — " +
+          "; ".join(f"{n} min €{bal} ({on})" for n, (bal, on) in sorted(day_min.items())))
+
+    # N1: Geschenke — one per Empfänger per Wirtschaftsjahr across 4653
+    # and 4665, the 4653 recipient-year total ≤ €50 net, the note's
+    # stated total equal to the computed one, Weihnachten only in
+    # December, and no VSt leg on a 4665 gift.
+    con = sqlite3.connect(str(out_path))
+    try:
+        gifts = con.execute(
+            "SELECT date(t.post_date), a.name, n.string_val, s.value_num, s.value_denom, t.description, "
+            "EXISTS (SELECT 1 FROM splits v JOIN accounts va ON va.guid = v.account_guid "
+            "        WHERE v.tx_guid = t.guid AND (va.name LIKE '1576 %' OR va.name LIKE '1571 %')) "
+            "FROM splits s JOIN accounts a ON a.guid = s.account_guid "
+            "JOIN transactions t ON t.guid = s.tx_guid "
+            "JOIN slots n ON n.obj_guid = t.guid AND n.name = 'notes' "
+            "WHERE a.name LIKE '4653 %' OR a.name LIKE '4665 %'").fetchall()
+    finally:
+        con.close()
+    per_year: dict[tuple[str, str], list] = {}
+    for day, leaf, note, num, den, payee, _ in gifts:
+        m = re.match(r"Geschenk an (.+?) \(.*Anlass: (\w+);.*: ([\d.]+) € netto", note)
+        assert m, f"gift note not in the computed form: {note!r}"
+        booked = D(num) / D(den)
+        # 4653 carries the net (VSt on 1576/1571); 4665 carries the
+        # gross, the VSt being non-deductible with the gift.
+        net = booked if leaf.startswith("4653") else \
+            _vat_split(booked, _RATE[PAYEES[("aufmerk", payee)][1]])[0]
+        per_year.setdefault((m.group(1), day[:4]), []).append((day, leaf, m.group(2), D(m.group(3)), net))
+    for (who, year), rows in per_year.items():
+        assert len(rows) == 1, f"{who} {year}: {len(rows)} gifts, the persona gives one"
+        day, leaf, anlass, stated, net = rows[0]
+        assert (anlass == "Weihnachten") == (day[5:7] == "12"), f"{who} {day}: Anlass {anlass}"
+        assert stated == net, f"{who} {year}: note says {stated}, booked {net}"
+        if leaf.startswith("4653"):
+            assert net <= GESCHENK_CAP, f"{who} {year}: 4653 total {net} > 50"
+        else:
+            assert net > GESCHENK_CAP, f"{who} {year}: {net} on 4665 though ≤ 50"
+    for g in gifts:
+        assert (g[1].startswith("4653")) == bool(g[6]), f"VSt leg wrong on {g[1]} {g[0]}"
+    n4665 = sum(1 for g in gifts if g[1].startswith("4665"))
+    print(f"✓ N1: {len(gifts)} Geschenke, one per Empfänger-Jahr ({len(per_year)} pairs), "
+          f"4653 ≤ €50 net each; {n4665} over the cap on 4665 without VSt; Weihnachten only in December")
+
 
 # ── Continuation hooks (closed-loop policy layer) ───────────────
 # Persona wiring for scripts/synthetic_book/continue_book.py. Sabine
@@ -2243,17 +2461,20 @@ POLICY = PersonaPolicy(
     key="sabine", currency="EUR",
     checking=BANKKONTO,                # the thin flow account
     savings=POSTBANK,                  # the accumulating parking account
-    # Corridor midpoint: a quarterly ESt-Vorauszahlung, the USt-VA, the
-    # Hypothek, the Krankenkasse and the rent all land in the first ten
-    # days of a quarter month — the month-end floor must carry them.
+    # Corridor midpoint: the USt-VA, the Hypothek, the Krankenkasse and
+    # the rent all land in the first ten days of a month — the month-end
+    # floor must carry them. The ESt does NOT ride the corridor: each
+    # Finanzamt block is moved in from the Steuerrücklage the
+    # Bankarbeitstag before (``run_est``).
     buffer=D("15000"),
     cards=(),
     savings_share=D("1"),              # surplus parks in Postbank whole
     invest_months=(3, 6, 9, 12),
     # Postbank is also the Steuerrücklage: the September Nachzahlung and
-    # the quarterly Vorauszahlungen are topped up from it, so it skims
-    # to the ETF only above a reserve that covers them.
+    # the quarterly Vorauszahlungen are drawn from it (``run_est``), so
+    # it skims to the ETF only above a reserve that covers them.
     savings_target=D("20000"),
+    savings_floor=D("500"),            # the Tagesgeld is never emptied to the cent
     rebalance_tranche=D("2000"),       # modest — steady state suffices
     max_monthly_sweep=D("6000"),
     min_sweep=D("100"),

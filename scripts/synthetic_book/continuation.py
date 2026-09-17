@@ -85,6 +85,11 @@ class PersonaPolicy:
     rebalance_tranche: D            # per-quarter savings→invest amount
     max_monthly_sweep: D            # staging cap (repair pacing)
     min_sweep: D                    # ignore dribble surpluses below this
+    # The corridor top-up never empties savings past this — nobody runs
+    # a Tagesgeld to the cent, and a savings account drained to zero
+    # at a month-end is overdrawn by the first card row or the
+    # month-end interest the redate leaves behind. 0 = no floor.
+    savings_floor: D = D("0")
     # invest(book_path, when, amount, source_path) writes the persona's
     # investment purchase (lot-per-sweep etc.). None = surplus goes to
     # savings only.
@@ -394,7 +399,7 @@ def _sweep(book: GnuCashBook, policy: PersonaPolicy, book_path: Path,
     # person makes when checking runs thin — Sabine's Bankkonto lives
     # this way). The sweep is the HIGH side of the same corridor.
     if checking < policy.buffer * D("0.5"):
-        available = _balance(book, policy.savings, month_end)
+        available = _balance(book, policy.savings, month_end) - policy.savings_floor
         topup = min(policy.buffer - checking, available).quantize(D("0.01"))
         if topup >= policy.min_sweep:
             book.create_transaction(
