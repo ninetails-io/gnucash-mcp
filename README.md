@@ -27,14 +27,14 @@ years of activity, mixed currencies, customers, invoices,
 budgets, the works. Walk through one in five minutes; if it
 clicks, point the server at your own book and you're done.
 
-The samples are living books: the committed copies are frozen at
-their last update, and the closed-loop updater
-(`scripts/synthetic_book/continue_book.py <persona>`) brings any
-of them current through today — statement payments from real
-balances, invoices settled, accounts reconciled. The bundle ships
-them current as of its build day. An un-updated copy just looks
-like a book after a vacation — stale prices, pending scheduled
-transactions — which is realistic too.
+What the repo commits is each persona's chart-only base — the
+accounts, nothing dated, about 230 KB. One command
+(`uv run python scripts/synthetic_book/rebuild_all.py --skip-refresh`)
+builds all three into full books through today, deterministically:
+statement payments from real balances, invoices settled, accounts
+reconciled, every row in the shapes GnuCash desktop reads. The
+bundle ships them built as of its build day, so a bundle user never
+runs anything.
 
 ---
 
@@ -125,9 +125,10 @@ You don't need to be a developer. You need:
 
 ## Try it without risking anything
 
-The repo ships three sample books — fully-populated synthetic
-ledgers you can talk to without touching your real data. Pick
-one, point the server at it, and start asking questions.
+The repo ships three sample personas — synthetic ledgers you can
+talk to without touching your real data. The bundle carries them
+fully built; from a clone, one build command produces them (below).
+Pick one, point the server at it, and start asking questions.
 
 ### `samples/alex-chen-morales.gnucash` — Personal + freelance
 
@@ -214,13 +215,17 @@ exception: if an update changes *dependencies*, run
 
 ### 2. Make a working copy of a sample book
 
-The server writes audit logs and auto-backups alongside the
-book file. You don't want either of those committed back to the
-repo, so copy the book somewhere outside the repo first:
+The committed sample is a chart-only base; build the full book
+first (about a minute, offline). The server then writes audit logs
+and auto-backups alongside the book file, and you don't want either
+committed back to the repo, so copy the built book somewhere outside
+it:
 
 ```bash
+cd gnucash-mcp
+uv run python scripts/synthetic_book/rebuild_all.py --skip-refresh --only alex --no-promote
 mkdir -p ~/gnucash-mcp-scratch
-cp gnucash-mcp/samples/alex-chen-morales.gnucash ~/gnucash-mcp-scratch/alex.gnucash
+cp samples/alex.generated.gnucash ~/gnucash-mcp-scratch/alex.gnucash
 ```
 
 ### 3. Tell Claude Desktop about the server
