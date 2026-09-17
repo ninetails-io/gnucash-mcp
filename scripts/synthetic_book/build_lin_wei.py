@@ -3112,14 +3112,21 @@ def run_edge_cases(book: GnuCashBook, out_path: Path) -> dict:
     # 5. Internal transfers between mobile-payment accounts.
     write_bulk(out_path, [
         {
-            "description": "充值微信钱包 (Checking → WeChat Pay)",
+            "description": "充值微信钱包",
             "date": date(YEAR, 5, 10),
             "splits": [(CHECKING, D("-5000")), (WECHAT, D("5000"))],
         },
+        # WeChat balance cannot be sent to Alipay; the real path is a
+        # 提现 to the bank card and a 充值 from it (audit R3-1).
         {
-            "description": "微信转支付宝 (WeChat → Alipay)",
+            "description": "微信零钱提现",
             "date": date(YEAR, 5, 11),
-            "splits": [(WECHAT, D("-3000")), (ALIPAY, D("3000"))],
+            "splits": [(WECHAT, D("-3000")), (CHECKING, D("3000"))],
+        },
+        {
+            "description": "充值支付宝",
+            "date": date(YEAR, 5, 11),
+            "splits": [(CHECKING, D("-3000")), (ALIPAY, D("3000"))],
         },
     ])
     return info
