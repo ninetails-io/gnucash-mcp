@@ -3799,27 +3799,29 @@ def run_base_policy(out_path: Path, through: date) -> list[str]:
 
 # ── Driver ──────────────────────────────────────────────────────
 
-def build(out_path: Path, through: date) -> None:
-    print(f"Building Alex Chen-Morales book at: {out_path}")
-    print(f"Activity runs 2025-01-01 → {through.isoformat()} (THROUGH)")
-
-    print("\nPhase 1: book file + commodities + monthly prices")
+def build_base(out_path: Path) -> None:
+    """Commodities, chart, account slots — nothing dated."""
+    print(f"Building Alex Chen-Morales base at: {out_path}")
+    print("\nPhase 1: book file + commodities")
     create_book_file(out_path)
+    print("\nPhase 2: chart of accounts")
+    n_acct = create_accounts(out_path)
+    print(f"  {n_acct} accounts created")
+    set_account_slots(GnuCashBook(str(out_path)))
+    print("  account slots set")
+
+
+def build(out_path: Path, through: date) -> None:
+    build_base(out_path)
+    print(f"Activity runs 2025-01-01 → {through.isoformat()} (THROUGH)")
+    print("\nPhase 1b: prices")
     n_prices = add_prices(out_path)
     # Real prices on every trade / invoice settle date.
     event_dates = (investment_event_price_dates(through)
                    + business_event_price_dates(through))
     n_event = add_event_prices(out_path, event_dates)
-    print(f"  commodities + {n_prices} monthly prices + "
-          f"{n_event} event prices")
-
-    print("\nPhase 2: chart of accounts")
-    n_acct = create_accounts(out_path)
-    print(f"  {n_acct} accounts created")
-
+    print(f"  {n_prices} monthly prices + {n_event} event prices")
     book = GnuCashBook(str(out_path))
-    set_account_slots(book)
-    print("  account slots set")
 
     print("\nPhase 3: opening balances + investment lots")
     opening_balances(out_path)
@@ -3910,6 +3912,10 @@ def main() -> None:
         "--through", default=None,
         help="Run activity through this date (YYYY-MM-DD). "
              "Default: today.")
+    parser.add_argument(
+        "--chart-only", action="store_true",
+        help="Write the chart-only base (commodities, accounts, slots; "
+             "nothing dated), VACUUMed, and stop.")
     args = parser.parse_args()
     if args.through:
         THROUGH = date.fromisoformat(args.through)
@@ -3917,6 +3923,11 @@ def main() -> None:
     out_path = Path(args.out).resolve()
     if out_path == PROTECTED.resolve():
         raise SystemExit(f"REFUSING to write to protected book: {PROTECTED}")
+    if args.chart_only:
+        from base_book import vacuum
+        build_base(out_path)
+        print(f"  base VACUUMed: {vacuum(out_path):,} bytes")
+        return
     build(out_path, THROUGH)
 
 

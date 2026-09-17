@@ -3189,21 +3189,24 @@ POLICY = PersonaPolicy(
 
 # ── Driver ──────────────────────────────────────────────────────
 
-def build(out_path: Path) -> None:
-    print(f"Building Lin Wei book at: {out_path}")
-
+def build_base(out_path: Path) -> None:
+    """Commodities, chart, account slots — nothing dated."""
+    print(f"Building Lin Wei base at: {out_path}")
     print("\nPhase 1: book file + commodities")
     create_book_file(out_path)
-    n_prices = add_prices(out_path)
-    print(f"  commodities + {n_prices} prices created")
-
     print("\nPhase 2: chart of accounts")
     n_acct = create_accounts(out_path)
     print(f"  {n_acct} accounts created")
-
-    book = GnuCashBook(str(out_path))
-    set_account_slots(book)
+    set_account_slots(GnuCashBook(str(out_path)))
     print("  account slots set")
+
+
+def build(out_path: Path) -> None:
+    build_base(out_path)
+    print("\nPhase 1b: prices")
+    n_prices = add_prices(out_path)
+    print(f"  {n_prices} prices created")
+    book = GnuCashBook(str(out_path))
 
     print("\nPhase 3: opening balances + investment lots")
     opening_balances(out_path)
@@ -3275,6 +3278,10 @@ def main() -> None:
         "--through", default=None, metavar="YYYY-MM-DD",
         help="Pin the end of the activity timeline for a deterministic run. "
              "Defaults to today (so the book always has recent activity).")
+    parser.add_argument(
+        "--chart-only", action="store_true",
+        help="Write the chart-only base (commodities, accounts, slots; "
+             "nothing dated), VACUUMed, and stop.")
     args = parser.parse_args()
     if args.through:
         THROUGH = date.fromisoformat(args.through)
@@ -3284,6 +3291,11 @@ def main() -> None:
     out_path = Path(args.out).resolve()
     if out_path == PROTECTED.resolve():
         raise SystemExit(f"REFUSING to write to protected book: {PROTECTED}")
+    if args.chart_only:
+        from base_book import vacuum
+        build_base(out_path)
+        print(f"  base VACUUMed: {vacuum(out_path):,} bytes")
+        return
     print(f"Activity timeline runs 2025-01-01 → THROUGH={THROUGH}")
     build(out_path)
 

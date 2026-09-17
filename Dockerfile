@@ -24,15 +24,14 @@ COPY src ./src
 COPY samples/alex-chen-morales.gnucash samples/lin-wei.gnucash samples/sabine-brenner.gnucash ./samples/
 RUN uv sync --frozen --no-dev
 
-# Bring the demo books current through the build date, the way CI
-# does for the MCPB bundle: the closed-loop updater extends each
-# frozen book deterministically, priced from the committed offline
-# rates cache — no network, and the prefix-integrity check makes
-# every image build a regression test of the updater itself. The
-# /tmp pre-continue backups are build-layer junk; drop them.
+# Generate the demo books through the build date, the way CI does
+# for the MCPB bundle: samples/ holds chart-only bases, and the
+# builders regenerate every transaction from them deterministically,
+# priced from the committed offline rates cache — no network. The
+# /tmp promotion backups are build-layer junk; drop them.
 COPY scripts/synthetic_book ./scripts/synthetic_book
-RUN uv run --no-sync python scripts/synthetic_book/rebuild_all.py --continue-only \
-    && rm -f /tmp/pre-continue-*
+RUN uv run --no-sync python scripts/synthetic_book/rebuild_all.py --skip-refresh --force \
+    && rm -rf /tmp/sample-books-pre-rebuild-*
 
 ENV GNUCASH_BOOK_PATH=/app/samples/alex-chen-morales.gnucash:/app/samples/lin-wei.gnucash:/app/samples/sabine-brenner.gnucash
 

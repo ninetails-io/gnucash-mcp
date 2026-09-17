@@ -1330,21 +1330,29 @@ POLICY = PersonaPolicy(
 
 # ── Driver ──────────────────────────────────────────────────────
 
+def build_base(out_path: Path) -> None:
+    """Commodities, SKR03 chart, account slots — nothing dated."""
+    os.environ["GNUCASH_LOCALE"] = "de_DE.UTF-8"
+    print(f"Building Sabine base at: {out_path}")
+    print("\nPhase 1: book + commodities")
+    create_book_file(out_path)
+    print("\nPhase 2: SKR03 chart of accounts")
+    print(f"  {create_accounts(out_path)} accounts")
+    set_account_slots(GnuCashBook(str(out_path)))
+    print("  loan slots set")
+
+
 def build(out_path: Path) -> None:
     # Sabine runs a German-locale system, so the server names auto-created
     # accounts in German (Tier-D): the FX gain/loss leaf becomes
     # "Realisierter Gewinn/Verlust", not the English fallback that a
     # locale-less run would pick on a numbered SKR03 chart.
     os.environ["GNUCASH_LOCALE"] = "de_DE.UTF-8"
-    print(f"Building Sabine book at: {out_path}  (THROUGH={THROUGH})")
-    print("\nPhase 1: book + commodities + prices")
-    create_book_file(out_path)
+    build_base(out_path)
+    print(f"  (THROUGH={THROUGH})")
+    print("\nPhase 1b: prices")
     print(f"  {add_prices(out_path)} prices")
-    print("\nPhase 2: SKR03 chart of accounts")
-    print(f"  {create_accounts(out_path)} accounts")
     book = GnuCashBook(str(out_path))
-    set_account_slots(book)
-    print("  loan slots set")
     print("\nPhase 3: opening balances + ETF lot")
     opening_balances(out_path)
     print("\nPhase 4: recurring (rent, utilities, subs, loans, 1%-Regelung)")
@@ -1379,6 +1387,10 @@ def main() -> None:
     p.add_argument("--out", default=str(DEFAULT_OUT))
     p.add_argument("--through", default=None, metavar="YYYY-MM-DD",
                    help="Pin the timeline end for a deterministic run (default: today).")
+    p.add_argument(
+        "--chart-only", action="store_true",
+        help="Write the chart-only base (commodities, accounts, slots; "
+             "nothing dated), VACUUMed, and stop.")
     a = p.parse_args()
     if a.through:
         THROUGH = date.fromisoformat(a.through)
@@ -1387,6 +1399,11 @@ def main() -> None:
     out = Path(a.out).resolve()
     if out == PROTECTED.resolve():
         raise SystemExit(f"REFUSING to write protected book: {PROTECTED}")
+    if a.chart_only:
+        from base_book import vacuum
+        build_base(out)
+        print(f"  base VACUUMed: {vacuum(out):,} bytes")
+        return
     build(out)
 
 

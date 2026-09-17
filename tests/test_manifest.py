@@ -75,14 +75,25 @@ class TestManifestContract:
         env = manifest["server"]["mcp_config"]["env"]
         assert env["GNUCASH_DEMO_DIR"] == "${__dirname}/samples"
 
-    def test_mcpbignore_negations_name_real_books(self):
-        """Each !samples/... re-inclusion must exist on disk, or the
-        pack silently ships fewer demo books than intended."""
-        negations = [
+    def test_mcpbignore_negations_name_the_built_books(self):
+        """Each !samples/... re-inclusion must be a book the builders
+        produce (nothing under samples/ is committed; CI builds the
+        books before packing), or the pack silently ships fewer demo
+        books than intended."""
+        import sys
+
+        negations = {
             line[1:].strip()
             for line in (_ROOT / ".mcpbignore").read_text().splitlines()
             if line.startswith("!")
-        ]
+        }
         assert negations, "expected demo-book negations in .mcpbignore"
-        for rel in negations:
-            assert (_ROOT / rel).is_file(), f"negated but missing: {rel}"
+        scripts = str(_ROOT / "scripts" / "synthetic_book")
+        sys.path.insert(0, scripts)
+        try:
+            import rebuild_all
+            built = {f"samples/{b.canonical}" for b in rebuild_all.BOOKS}
+        finally:
+            sys.path.remove(scripts)
+            sys.modules.pop("rebuild_all", None)
+        assert negations == built, (negations, built)

@@ -5,6 +5,7 @@ Entries are terse by design: what changed, one line each, PR numbers where they 
 ## Unreleased
 
 ### Added
+- **Demo books rebuilt on GnuCash's own shapes, and audited.** Each persona's generator was reworked against a domain audit — Alex as an IRS-minded read, Lin Wei as a Chinese household, Sabine as German tax books — so the books an ordinary user opens carry no wash sale, no employee without payroll, no VAT that never clears, no abolished tax, no private mortgage interest against the business. No sample book is committed any more: the builders are the samples, and the bundle, the Glama image, and any clone build the three books from nothing, deterministically, on the storage shapes desktop reads.
 - **Database-backed books** — `GNUCASH_BOOK_URI` / `--book-uri` serve a book GnuCash keeps in PostgreSQL or MySQL/MariaDB instead of a SQLite file; every tool works unchanged. Drivers ship as extras: `pip install "gnucash-mcp[postgres]"` or `"gnucash-mcp[mysql]"`. PostgreSQL contributed by @vchatela (#175, requested in #174); MySQL/MariaDB in #181.
 - Both dialects are proven against real servers: the database test class runs once per dialect, and CI carries a `postgres:16` job and a `mariadb:11` job beside the three-Python suite (#175, #181).
 - `_gnc_bool` — one coercion for GnuCash's INTEGER flag columns, contract-locked; a Python bool never reaches storage on any backend (#175).

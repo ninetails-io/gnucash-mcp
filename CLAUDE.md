@@ -322,6 +322,30 @@ Established chokepoints and the rule each one owns:
   one audit renderer names what converted. Reads never write. A new
   converter for a shape we shipped wrong goes here, not on its own
   module's writes.
+- `_lot_is_closed` / `_lot_cache_flag` — the one reader of
+  `lots.is_closed`, ported from `gnc_lot_is_closed`. GnuCash keeps
+  the flag as a tri-state: `1` and `0` are cached answers, and
+  `LOT_CLOSED_UNKNOWN (-1)` means "compute from the balance", which
+  is what desktop leaves on every lot it touches. The reader resolves
+  -1 the way GnuCash does (no splits → open; zero balance → closed);
+  `_lot_cache_flag` stores the computed answer before any
+  `split.lot = lot`, because piecash's guard tests the raw column.
+  Writers use the named constants. Locked by `test_lot_closed.py`,
+  grep-the-source in both directions.
+- `_ordered_splits` / `_txn_sort_key` — how a transaction's legs and
+  a listing's rows are ordered. Splits follow GnuCash's own
+  `xaccTransSortSplits` (non-negative value first), then account
+  path, then GUID; rows sort by post date, entry time, GUID. Every
+  list with ties (schedules, upcoming, dashboard previews, lots)
+  carries a data-derived tie-break. The point is backend
+  independence: SQLite and InnoDB return rows in different orders,
+  and a book renders identically on both only when no renderer
+  leans on the storage order.
+- `_DailyFileHandler` — the audit and debug writers open the day's
+  file by path on every record, with `_local_day` as the one clock.
+  That makes the log robust to a file being moved or removed
+  underneath a running server (it comes back at the path, with its
+  header) and rolls to the next day's file without a restart.
 - `_parse_owner_type`, `_commodity_quantum`, `_is_market_price`,
   `_effective_owner_type` — same story, smaller surface.
 
@@ -567,12 +591,18 @@ Three layers:
 - **Tool-level integration** in `tests/test_tools.py` — exercises the
   MCP registration path (tool → book method → result serialization).
 - **Persona-based integration** via `scripts/synthetic_book/*.py`.
-  Phase scripts build a realistic multi-year book exercising most
-  tool paths. Reporting regressions surface here before unit tests
-  catch them. Three synthetic personas ship under `samples/`: Alex
-  (USD-default, full feature exercise), Lin Wei (CNY-default,
-  zh_CN chart, multi-currency stress), and Sabine Brenner
-  (EUR-default, German SKR03 chart — the i18n bug-class oracle).
+  One builder per persona generates a realistic multi-year book
+  exercising most tool paths. Reporting regressions surface here
+  before unit tests catch them. Three personas: Alex (USD-default,
+  full feature exercise, audited as an IRS-minded read), Lin Wei
+  (CNY-default, zh_CN chart, multi-currency stress), and Sabine
+  Brenner (EUR-default, German SKR03 chart — the i18n bug-class
+  oracle). **No book is committed**: `samples/*.gnucash` is
+  ignored, the chart is code, and `rebuild_all.py --skip-refresh`
+  builds all three from nothing through today, deterministically;
+  CI does the same for the bundle and the Glama image. Each
+  builder's `--chart-only` writes just the chart in seconds, and
+  `tests/test_demo_bases.py` checks it on every run.
 
 **Migrating tests across a behavior break.** When a change closes a
 creation path (e.g. the v1.5.0 currency-mismatch post refusal),
@@ -611,6 +641,30 @@ CI's `postgres` job does the same against a `postgres:16` service
 container. A dialect bug that SQLite hides — the bool-in-an-INTEGER-
 column class above — only ever shows up there.
 
+**MySQL / MariaDB coverage.** The same class runs a second time as
+`TestMySQLBackend` under `GNUCASH_TEST_MYSQL_URI` (one body,
+`_RealDatabaseTests`; the subclasses differ only in URI, dump tool,
+and the live-connection query). Locally, against a Homebrew or
+Docker MariaDB, on a database the fixture may DROP — never the one
+holding a real book:
+
+```bash
+GNUCASH_TEST_MYSQL_URI=mysql+pymysql://gnucash:gnucash@127.0.0.1:3306/gnucash_test \
+  uv run --extra dev --extra mysql pytest -q tests/test_db_backend.py
+```
+
+CI's `mysql` job runs it against a `mariadb:11` service container.
+
+**A desktop-saved copy is an oracle.** GnuCash desktop's File → Save
+As into a database re-serializes every row through GnuCash's own
+backend: KVP children under their frame's full path, lot flags reset
+to UNKNOWN, rows in primary-key order. Diffing every read tool
+between the committed file and that copy — 24 calls, identical except
+the `Book:` line is the pass — checks the server against desktop's
+serializer directly, which no server-only book can. Run it for any
+branch that touches storage or a backend; the harness shape is in
+`feedback_desktop_saved_copy_is_an_oracle` (memory) and takes minutes.
+
 ---
 
 ## Development conventions
@@ -621,6 +675,33 @@ column class above — only ever shows up there.
 - Conventional-commits style prefixes (`feat(budgets):`,
   `fix(core):`).
 - No attribution lines.
+
+**Who the message is for** (added 2026-09-12, after reading all 900
+subjects back). The first 900 commits were written by Claude with no
+guidance on audience, and the log shows it: 137 subjects over 72
+characters, most of them two-clause sentences addressed to someone
+who was in the session. The rules that were missing:
+
+- **The subject is for a stranger.** Fifty characters, seventy-two
+  hard cap, one clause. It names the change, not the moment it was
+  found. No house vocabulary (loop, battery, ruling, cousin, the
+  bookkeeper's rounds), no review IDs (`SB-6`, `HP-7`), no session or
+  persona names, no metaphors. "fix(budgets): store GnuCash's natural
+  sign" is right; "the un-blooming in 1.4.4" is a letter title.
+- **The body carries the story.** What changed and why, then the
+  pointers: the review ID, the spec path, the bookkeeper round that
+  found it. The narrative of discovery lives here or in
+  `CLAUDE.local.md`, never in the subject.
+- **A merge subject is the PR title with its number, never the
+  branch name.** PRs merge with `--merge` and no squash, so
+  `git log --first-parent` IS the release history — and 43 of the
+  first 48 merge commits on develop read `Merge pull request #N from
+  ninetails-io/…`, which tells a reviewer nothing. Set it on every
+  merge: `gh pr merge N --merge --delete-branch --subject
+  "feat(mcpb): one-click Claude Desktop bundle (#N)"`. First-parent
+  should read as a changelog without opening a single PR.
+- **Changelog edits ride the commit that earns them.** A separate
+  `docs(changelog):` commit is for a release pass, not for every fix.
 
 ### Pull requests
 
@@ -695,24 +776,19 @@ history operation destroys real work. Rules:
    a first-time visitor's click lands here, so the headline
    workflow must reflect the current release, not the one before
    it.
-3. **Sample books are NOT regenerated per release** (policy since
-   v1.4.2 — each committed regeneration permanently grows every
-   future clone, and stable books are better byte-identity
-   oracles). They ship as frozen demos; stale-price warnings and
-   pending scheduled transactions accumulating between
-   regenerations is expected. Regenerate
-   (`scripts/synthetic_book/phase_<N>.py`, in order) only when
-   phase scripts gain coverage for new features, or when
-   date-decay warrants it — and treat it as a deliberate,
-   capture-rig-invalidating event. For before/after report
-   verification, capture against the committed books at HEAD (or
-   generate locally and capture both sides same-machine).
+3. **No sample book is committed** (ruling 2026-09-17, replacing
+   the frozen-demo policy of v1.4.2–v1.4.4 and the last of the
+   binary blobs). The builders are the samples: CI builds the three
+   books from nothing at bundle time, and so does any clone. Report
+   numbers re-anchor on (generator version, cache version,
+   `--through`), not on committed bytes: for before/after
+   verification, build both sides same-machine at the same
+   `--through`.
    **The market-data cache IS refreshed per release** (standing as
    of v1.4.4): `uv run python scripts/synthetic_book/market_data.py
    --refresh --through <release date>` and commit the updated
-   `market_data_cache.json` — CI's demo-book continuation and every
-   clone-side `continue_book.py` run read it, and a stale cache
-   caps how current the living demo books can be.
+   `market_data_cache.json` — every build reads it, and a stale
+   cache caps how current the demo books can be.
 4. Tester/bookkeeper signoff on develop.
 5. **Satisfy Dependabot** — Dependabot scans only the default
    branch, so open alerts persist until a release lands; clearing

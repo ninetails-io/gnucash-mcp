@@ -1,171 +1,97 @@
 # Sample Books
 
-Three synthetic GnuCash books that ship with the MCP server. Each
-represents a fully-populated persona with realistic multi-year
-activity — enough to exercise every tool the server exposes, plus
-enough variety (currencies, languages, business activity, lots,
-budgets) to act as living documentation of what the server can do.
+Three synthetic GnuCash personas ship with the server as **code**:
+nothing under `samples/` is committed but this file. The builders
+under `scripts/synthetic_book/` create each book from nothing and
+generate years of activity deterministically, priced from the
+committed market-data cache, so the demo a stranger opens was built
+by current code on GnuCash's own storage shapes, through the day it
+was built. The MCPB bundle and the Glama image build them at build
+time; a clone builds them with one command.
 
-These books are **fictional**. The names, addresses, account
-numbers, and amounts are invented. Use them freely.
+These books are **fictional**. Names, addresses, tax IDs, account
+numbers, and amounts are invented; tax IDs are well-formed and
+deliberately invalid. Use them freely.
 
----
+## Building the books
+
+```bash
+uv run python scripts/synthetic_book/rebuild_all.py --skip-refresh
+```
+
+builds all three through today, verifies each, and places them at
+the canonical paths in `samples/` (ignored by git). CI does the same
+for the MCPB bundle and the Glama image on every build.
+`--through YYYY-MM-DD` pins the timeline; `--only alex` builds one;
+`--no-promote` leaves the results at `samples/*.generated.gnucash`.
+To bring a built book forward later without rebuilding,
+`continue_book.py` extends it from its last day. Each builder's
+`--chart-only` writes just the chart (seconds); `tests/test_demo_bases.py`
+checks that chart on every run.
 
 ## alex-chen-morales.gnucash
 
-Seattle-based independent software contractor with a US LLC. Tests
-the **USD-default** path through every feature the server supports.
+Seattle software contractor with a single-member LLC (Cascade Code
+LLC) and a spouse on a hospital payroll. **USD default**, with EUR
+and CAD receivables. Built: about 2,350 transactions over 2025 to the
+build date, 108 accounts.
 
-- **Default currency:** USD (with EUR, GBP, CAD also in the book)
-- **Accounts:** 141
-- **Transactions:** ~2,475
-- **Period covered:** 2025–2026
+- W-2 paycheck with federal, Social Security, Medicare, Washington
+  PFML, WA Cares and L&I deductions, a 403(b) deferral and match;
+  the LLC pays quarterly estimated tax sized from its income, plus an
+  April balance due
+- The LLC has its own checking account; owner's draws and
+  contributions cross to the household through equity
+- Customers in USD, EUR (Berlin Digital GmbH, the cross-currency FX
+  regression case) and CAD; a 1099 subcontractor billed through A/P;
+  Washington B&O tax and the Seattle license
+- Brokerage lots in VTSAX, VBTLX, AAPL and MSFT, an ETH position, an
+  HSA, a Solo 401(k); dividends and interest scale with holdings
+- A mortgage, an auto loan, two credit cards paid at the statement
+  balance, with interest in the months a balance carried
+- Scheduled transactions, two annual budgets, reconciliation through
+  the last full month
 
-What's in here:
-
-- W-2 income from a primary employer plus contractor income through
-  the LLC
-- A brokerage account holding **VTSAX**, **VBTLX**, **AAPL**, and
-  **MSFT**, plus a small **ETH** position — cost-basis tracking
-  via lots
-- A 401(k) with employer match
-- A mortgage, a car loan, two credit cards
-- **Four customers** spanning USD, EUR, GBP, and CAD: Emerald
-  Analytics, Sound Transit Data Team, Berlin Digital GmbH, and
-  Nord Analytique. The cross-currency invoices exercise the
-  realized FX gain/loss path on rate drift between post-date and
-  pay-date.
-- **Two vendors** (JetBrains, BookkeepingCo) and **one employee**
-  (Sam Rivera) — exercises the create_employee path
-- Recurring scheduled transactions for rent, utilities, payroll,
-  loan payments
-- A monthly budget with mid-year revisions
-- Reconciliation history on the checking account through 2025-Q4
-
-This is the canonical "all-features" book — if you want to see what
-``get_book_summary`` looks like with every section populated, open
-this one.
+Audited as an IRS-minded read on 2026-09-11
+(`specs/v1.5/testing/AUDIT_ALEX_IRS_2026-09-11.md`).
 
 ## lin-wei.gnucash (林微)
 
-Shenzhen-based small-business owner running a cross-border e-commerce
-operation. Tests the **CNY-default** path with multi-currency
-activity, validating that the server works end-to-end on a
-non-USD-default book.
+Shenzhen cross-border e-commerce seller whose spouse (周子航) is on a
+hospital payroll. A **native zh_CN chart, CNY default**, with USD,
+EUR and HKD in the book. Built: about 2,900 transactions, 88
+accounts.
 
-- **Default currency:** CNY (人民币 — with USD, EUR, HKD also in the book)
-- **Accounts:** 105
-- **Transactions:** ~1,960
-- **Period covered:** 2025
+- WeChat Pay and Alipay as bank accounts beside a debit card
+  (银行储蓄卡); 住房公积金 flows on the spouse's salary
+- Quarterly VAT and surcharges (增值税及附加) and personal business
+  income tax prepayments
+- USD and EUR receivables in a CNY book; an HKD credit card; a USD
+  vendor bill (the two mandatory FX regression cases)
+- A-share and ETF holdings in round lots; a registered employee (陈宇)
+- Seasonal utilities, scattered schedule days, and a cat named 字节
 
-What's in here:
-
-- **Three customers** mixing scripts and currencies:
-  深圳跨境电商有限公司 (CNY, exercises the audit log's UTF-8
-  handling), Pacific Trade Solutions (USD), Handelskontor München
-  GmbH (EUR). The foreign-currency invoices exercise the FX
-  gain/loss recognition path on rate drift between post-date
-  and pay-date.
-- **Three vendors** also bilingual: 阿里云 Alibaba Cloud, JetBrains,
-  and 优客工场 UrWork
-- Domestic Chinese investments: 茅台 (Moutai, ticker 600519),
-  宁德时代 (CATL, ticker 300750), and ETFs (沪深300 / 510300 and
-  创业板 / 159915)
-- A mortgage at LPR-based 3.85% APR, an auto loan at 4.9%, two
-  domestic credit cards (CMB, ICBC) — exercises the
-  ``debt_payoff_plan`` amortization path for non-USD books
-- Mixed payment platforms: traditional checking + 支付宝 (Alipay)
-  + 微信支付 (WeChat Pay)
-
-Built specifically to surface non-USD-default bugs — the multi-
-currency correctness sweep in v1.2.1 used this book as the
-verification harness.
-
----
+Audited as a Chinese household on 2026-09-01
+(`specs/v1.5/testing/BOOKKEEPER_REVIEW_DEMO_GENERATORS.md` §6).
 
 ## sabine-brenner.gnucash
 
-Munich freelance Grafikdesignerin (Einzelunternehmerin) running the
-authentic DATEV **SKR03** chart. Tests the **natively localized
-account hierarchy** path: German, numbered account names with **no
-English account named "Income"/"Imbalance"/"mortgage"** anywhere, so
-every tool that keys off an English name is exercised against a book
-where that assumption fails.
+Munich freelance designer, one book in two zones: **SKR03 business
+ranges** feeding the EÜR, and a private branch for the residence, its
+mortgage and an ETF, connected through Privatentnahmen and
+Privateinlagen. **EUR default**, USD for a Drittland client. Built:
+about 1,700 transactions, 119 accounts.
 
-- **Default currency:** EUR (with USD in the book for a US client)
-- **Accounts:** 110 (the shipped `acctchrt_skr03` verbatim + a few
-  German-named additions: Hypothek, Kfz-Finanzierung, fixed assets,
-  an ETF depot, a localized Ausgleichskonto)
-- **Transactions:** ~1,450
-- **Period covered:** 2025 → 2026
+- Live VAT: 1776 Umsatzsteuer and 1576 Vorsteuer cleared by a monthly
+  USt-Voranmeldung computed from the book's own figures
+- Sequential invoice numbers in date order; customers with master
+  data; Drittland and EU reverse-charge revenue on their own accounts
+- The Pkw as a business asset with the monthly 1%-Regelung and
+  year-end AfA; a Kfz loan
+- Three schedules, a budget, and the €48.50 "Unklare Lastschrift
+  (noch zu klären)" the dashboard flags: the onboarding hook, kept on
+  purpose
 
-What's in here:
-
-- **German VAT (USt) invoicing** through taxtables — 19% on design
-  services (`8400 Erlöse USt. 19%`) and the reduced 7% rate on
-  licensing/Nutzungsrechte (`8300`), with output VAT to `1776`/`1771`
-  and reclaimable input VAT (Vorsteuer) to `1576`.
-- **A USD-paying export client** (Lumen Labs Inc.) — invoiced in USD,
-  posted and paid at different EUR/USD rates, so realized FX gain/loss
-  is recognized into a top-level-INCOME child **resolved by type** and
-  named in German (`Erlöse u. Erträge 2/8:Realisierter Gewinn/Verlust`)
-  — the book is built under `GNUCASH_LOCALE=de_DE`, as a German user's
-  system would be.
-- **Sole-proprietor equity flows:** monthly Privatentnahme instead of
-  salary; opening balances via the SKR03 `Anfangsbestand`.
-- **A Hypothek and a Kfz-Finanzierung** with `apr` + `loan_term_months`
-  slots — exercises `debt_payoff_plan` with no English "mortgage"
-  keyword in sight.
-- **A localized Ausgleichskonto-EUR** carrying a small balance, so the
-  dashboard's data-integrity warning fires on a *German* Imbalance
-  name (the structural Tier-C detector).
-- **A real bank statement, not category labels.** Spending carries
-  actual merchant names (REWE, SHELL München, DHL, Deutsche Bahn,
-  Netflix) with lumpy month-to-month cadence — busy months and quiet
-  ones, not a flat recurring pattern.
-- **Personal life, itemized.** Groceries, dining, the Krankenkasse,
-  streaming, and household spend post to `1800 Privatentnahme` /
-  `1830 Sonderausgaben` — the Girokonto reads like a real freelancer's
-  while the book stays strictly business-only.
-- **A monthly MSCI World ETF Sparplan** (IWDA.AS — what German
-  investors actually buy under MiFID II) building cost-basis lots.
-
-Built to convert the i18n bug class from invisible to a failing test:
-net worth agrees to the cent across `get_book_summary` /
-`balance_sheet` / `net_worth`, all classification is by account type,
-and the cross-currency FX path settles instead of throwing.
-
----
-
-## How to point the server at a sample book
-
-```bash
-export GNUCASH_BOOK_PATH=$(pwd)/samples/alex-chen-morales.gnucash
-uv run python -m gnucash_mcp
-```
-
-Or for Claude Desktop / Claude Code, point the configured book path
-at the file. **You probably want to copy the file out of the repo
-first** — the server writes audit logs and creates auto-backups
-alongside the book file, and you don't want either committed back.
-A workflow that works:
-
-```bash
-cp samples/alex-chen-morales.gnucash ~/scratch/alex.gnucash
-export GNUCASH_BOOK_PATH=~/scratch/alex.gnucash
-```
-
----
-
-## How these were built
-
-All three books were generated by the phase scripts in
-``scripts/synthetic_book/`` (one persona per script set) and
-extensively iterated by hand against the live MCP server during
-v1.2.1 development. Re-running the scripts from scratch produces
-deterministic output — so if you want to see the exact pipeline
-that built these, that's the recipe.
-
-The books shipped here are the post-iteration state, vacuumed via
-``sqlite3 ... 'VACUUM'`` so SQLite's free-page list doesn't
-inflate the file size. They've passed ``PRAGMA integrity_check``.
+Audited as German tax books on 2026-09-01 (§7 of the same review).
+The i18n oracle: numbered accounts defeat English-name matching, so
+every server path that resolves accounts by type is exercised here.
