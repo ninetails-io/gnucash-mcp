@@ -123,13 +123,14 @@ class PersonaPolicy:
     desc_draw_deposit: str = "Owner's draw deposit — {month}"
     desc_savings_interest: str = "Savings interest — {month}"
     desc_statement: str = "{label} — {month} statement payment"
-    desc_repair_card: str = "{label} — balance payoff (catching up after the summer)"
+    desc_repair_card: str = "Balance payoff — catching up after the summer"
     desc_sweep: str = "Transfer to savings (monthly surplus sweep)"
     desc_repair_sweep: str = "Transfer to savings — accumulated surplus"
     desc_topup: str = "Transfer from savings (checking top-up)"
     desc_interest: str = "{label} — interest"
     # A statement payment this many times the trailing month's charges
-    # (or larger) gets the repair narrative instead of the routine one.
+    # (or larger) gets the repair narrative (as the transaction's
+    # notes) alongside the routine description.
     repair_factor: D = D("3")
 
 
@@ -138,6 +139,17 @@ class PersonaPolicy:
 def _seeded(persona: str, purpose: str, anchor: date, lo: int, hi: int) -> int:
     rng = random.Random(f"{persona}:{purpose}:{anchor.isoformat()}")
     return rng.randint(lo, hi)
+
+
+def business_day(d: date) -> date:
+    """``d`` rolled forward off a weekend to the next Monday. Card
+    statement payments and document settlements are ACH movements and
+    post on business days (Alex cold audit C3); month-end interest
+    credits and the closed-loop transfers stay on the calendar day the
+    engine reads them at, deliberately."""
+    if d.weekday() >= 5:
+        d += timedelta(days=7 - d.weekday())
+    return d
 
 
 def month_ends(after: date, through: date) -> Iterator[date]:
@@ -269,7 +281,7 @@ def _pay_card(book: GnuCashBook, policy: PersonaPolicy, card: CardPolicy,
     cycle closing at ``close``. No-ops when the payment would land in
     the frozen prefix or past the horizon."""
     pay_lag = _seeded(policy.key, f"paylag:{card.label}", close, 3, 7)
-    pay_date = close + timedelta(days=pay_lag)
+    pay_date = business_day(close + timedelta(days=pay_lag))
     if pay_date <= cutoff or pay_date > through:
         return
 
@@ -349,11 +361,16 @@ def _pay_card(book: GnuCashBook, policy: PersonaPolicy, card: CardPolicy,
     is_repair = (trailing > 0
                  and payment >= trailing * policy.repair_factor
                  and payment >= repair_min)
-    desc_tpl = policy.desc_repair_card if is_repair else policy.desc_statement
-    desc = desc_tpl.format(label=card.label, month=close.strftime("%B %Y"))
+    # The bank line is the plain statement payment; the repair story
+    # goes in the notes (Alex cold audit C4 — plot never lives in a
+    # description).
+    month = close.strftime("%B %Y")
+    desc = policy.desc_statement.format(label=card.label, month=month)
+    notes = (policy.desc_repair_card.format(label=card.label, month=month)
+             if is_repair else None)
 
     book.create_transaction(
-        description=desc, trans_date=pay_date,
+        description=desc, trans_date=pay_date, notes=notes,
         splits=[
             {"account": pay_from, "amount": str(-payment)},
             {"account": card.account, "amount": str(payment)},
@@ -612,6 +629,7 @@ def settle_documents(policy: PersonaPolicy, book_path: Path, cutoff: date,
         if pay_date <= cutoff:
             pay_date = cutoff + timedelta(
                 days=_seeded(policy.key, "settle-late", posted, 4, 12))
+        pay_date = business_day(pay_date)
         if pay_date > through:
             continue  # stays open — the recent window
         amount = D(str(doc.get("amount_due", "0")))
@@ -643,10 +661,16 @@ def reconcile_through(policy: PersonaPolicy, book_path: Path,
     open month leaves the natural first conversation ("this month's
     statement is ready to enter").
 
-    Dogfoods ``reconcile_account`` in bulk mode: the statement balance
-    is computed from the book (non-voided split quantities through the
-    statement date), so the server's own tie check verifies the sweep.
-    Idempotent — an account with nothing unreconciled is skipped."""
+    One ``reconcile_account`` call PER STATEMENT (Alex cold audit C1: a
+    single stamp across twenty months of statements is a generation
+    artifact — every reconciled split carries the date of the statement
+    that cleared it). Bank and cash accounts close at month-end; a card
+    closes on its ``statement_close_day`` slot. Dogfoods bulk mode: the
+    statement balance is computed from the book (non-voided split
+    quantities through the statement date), so the server's own tie
+    check verifies every sweep. Idempotent — a statement with nothing
+    unreconciled is skipped, so a continued book stamps only its new
+    months."""
     import piecash
 
     stmt = date(through.year, through.month, 1) - timedelta(days=1)
@@ -658,9 +682,11 @@ def reconcile_through(policy: PersonaPolicy, book_path: Path,
     for fullname in policy.no_reconcile:
         book.set_account_slot(fullname, "no_reconcile", "true")
 
-    # Enumerate reconcilable accounts + compute statement balances in
-    # one readonly pass (Decimal aggregation in Python — never in SQL).
-    targets: list[tuple[str, D, int]] = []
+    close_days = {card.account: card.close_day_default for card in policy.cards}
+
+    # Enumerate reconcilable accounts + their split ledgers in one
+    # readonly pass (Decimal aggregation in Python — never in SQL).
+    targets: list[tuple[str, str, list[tuple[date, D, bool]]]] = []
     gc_book = piecash.open_book(str(book_path), readonly=True,
                                 open_if_lock=True)
     try:
@@ -677,32 +703,99 @@ def reconcile_through(policy: PersonaPolicy, book_path: Path,
                 root = root.parent
             if root is template_root:
                 continue
-            balance = D("0")
-            pending = 0
+            rows: list[tuple[date, D, bool]] = []
             for split in account.splits:
                 if split.reconcile_state == "v":
                     continue
                 post = split.transaction.post_date
                 if post is None or post > stmt:
                     continue
-                balance += D(str(split.quantity))
-                if split.reconcile_state != "y":
-                    pending += 1
-            targets.append((account.fullname, balance, pending))
+                rows.append((post, D(str(split.quantity)),
+                             split.reconcile_state == "y"))
+            rows.sort(key=lambda r: r[0])
+            targets.append((account.fullname, account.type, rows))
     finally:
         gc_book.close()
 
     book = GnuCashBook(str(book_path))
-    for fullname, balance, pending in targets:
-        if pending == 0:
+    for fullname, atype, rows in targets:
+        if not rows:
             continue
-        result = book.reconcile_account(
-            fullname, statement_date=stmt, statement_balance=str(balance),
-            reconcile_all=True,
-        )
-        log.append(f"reconciled {fullname} through {stmt}: "
-                   f"{result.get('splits_reconciled')} splits")
+        close_day = None
+        if atype == "CREDIT":
+            close_day = _slot_int(book, fullname, "statement_close_day",
+                                  close_days.get(fullname, 31))
+        # Statement dates from the account's first activity to ``stmt``.
+        first = rows[0][0]
+        y, m = first.year, first.month
+        statements: list[date] = []
+        while True:
+            s = (_clamp_day(y, m, 31) if close_day is None
+                 else _clamp_day(y, m, close_day))
+            if s > stmt:
+                break
+            if s >= first:
+                statements.append(s)
+            y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+        n_calls = n_splits = 0
+        last: date | None = None
+        for s in statements:
+            balance = sum((q for post, q, _y in rows if post <= s), D("0"))
+            pending = [i for i, (post, _q, done) in enumerate(rows)
+                       if post <= s and not done]
+            if not pending:
+                continue
+            result = book.reconcile_account(
+                fullname, statement_date=s, statement_balance=str(balance),
+                reconcile_all=True,
+            )
+            for i in pending:
+                post, q, _done = rows[i]
+                rows[i] = (post, q, True)
+            n_calls += 1
+            n_splits += int(result.get("splits_reconciled") or 0)
+            last = s
+        if n_calls:
+            log.append(f"reconciled {fullname}: {n_splits} splits across "
+                       f"{n_calls} statements, last {last}")
     return log
+
+
+# ── Entry timestamps ────────────────────────────────────────────
+
+def stamp_enter_dates(book_path: Path, after: date | None = None) -> int:
+    """Set every transaction's ``enter_date`` to its POST DAY (noon UTC
+    plus a few seconds of write order), so a generated book does not
+    say every row was keyed in at the build moment (Alex cold audit
+    item 5, 2026-09-17). Rows posted at or before ``after`` are left
+    alone — the frozen prefix is never rewritten. The clone-side
+    updater does not call this: its rows really are entered when it
+    runs. Same-day rows keep the order they were written in (the
+    server's listing sort reads ``enter_date`` to break post-date
+    ties). Returns the number of rows rewritten."""
+    con = sqlite3.connect(str(book_path))
+    try:
+        rows = con.execute(
+            "SELECT guid, date(post_date) AS d, enter_date FROM transactions "
+            "ORDER BY date(post_date), enter_date, guid"
+        ).fetchall()
+        updates: list[tuple[str, str]] = []
+        day, k = None, 0
+        for guid, d, _entered in rows:
+            if after is not None and date.fromisoformat(d) <= after:
+                continue
+            if d != day:
+                day, k = d, 0
+            secs = 12 * 3600 + k * 23
+            stamp = f"{d} {secs // 3600:02d}:{secs % 3600 // 60:02d}:{secs % 60:02d}"
+            updates.append((stamp, guid))
+            k += 1
+        con.executemany(
+            "UPDATE transactions SET enter_date = ? WHERE guid = ?", updates)
+        con.commit()
+    finally:
+        con.close()
+    return len(updates)
 
 
 # ── Scheduled-transaction cursors (bookkeeper review §2) ────────
@@ -828,7 +921,7 @@ def verify_invariants(policy: PersonaPolicy, book_path: Path, cutoff: date,
         # that landed during the payment lag — a fraction of a cycle.
         for close in _card_closes(book, card, cutoff, through):
             lag = _seeded(policy.key, f"paylag:{card.label}", close, 3, 7)
-            pay_date = close + timedelta(days=lag)
+            pay_date = business_day(close + timedelta(days=lag))
             if pay_date <= cutoff or pay_date > through:
                 continue
             residual = -_balance(book, card.account, pay_date)
