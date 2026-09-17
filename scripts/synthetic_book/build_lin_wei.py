@@ -25,7 +25,15 @@ round lots, priced only from the offline market cache. The cat is 字节. Bills
 land on their own days, 电费 follows Shenzhen's summer air-conditioning curve,
 contracting income has irregular gaps, and the open receivables carry staggered
 ages. The shape traces to the Gemini/bookkeeper domain audit (G1–G11) in
-``specs/v1.5/testing/BOOKKEEPER_REVIEW_DEMO_GENERATORS.md`` §6.
+``specs/v1.5/testing/BOOKKEEPER_REVIEW_DEMO_GENERATORS.md`` §6 and the cold
+audit ``specs/v1.5/testing/AUDIT_LIN_WEI_COLD_2026-09-17.md`` (round 2):
+every tax figure is computed from the ledger (quarterly VAT with the
+small-scale exemption and 专票 rule, cumulative 经营所得 prepayments, the
+March 汇算清缴), payroll bases are fixed, the assistant 陈宇 is paid, every
+big-company contract is an invoice, card statements are paid from the
+running balance (interest only while a balance carries), the HKD card is
+repaid by 购汇, and the calendar follows the lunar table, the exchange's
+trading days and the banks' business days.
 
 SAFETY: this script writes ONLY to ``samples/lin-wei.generated.gnucash`` (the
 ``--out`` path). It NEVER touches the bookkeeper-validated
@@ -39,9 +47,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import random
+import sqlite3
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -65,16 +75,159 @@ SEED = 20250101
 VOLUME_TXN_COUNT = 320  # Phase 13 small WeChat/Alipay transactions
 
 YEAR = 2025
+D = Decimal
 
 # Recurring-calendar anchors shared by the SX templates (Phase 4) and the
 # instantiated history (Phase 5), so the forward schedule and the ledger
 # agree on the day each bill lands.
+#
+# A small-scale VAT taxpayer files quarterly, within 15 days AFTER the
+# quarter ends — January, April, July, October (audit L1: the old
+# Mar/Jun/Sep/Dec filings do not exist). 经营所得 prepays on the same
+# cadence; the annual 汇算清缴 settles the prior year by March 31.
 TAX_VAT_DAY = 12                     # 增值税及附加 quarterly filing
 TAX_PIT_DAY = 14                     # 经营所得 quarterly prepayment
-TAX_VAT_START = f"{YEAR}-03-{TAX_VAT_DAY:02d}"
-TAX_PIT_START = f"{YEAR}-03-{TAX_PIT_DAY:02d}"
+TAX_SETTLE_DAY = 20                  # 经营所得 汇算清缴 (March)
+TAX_VAT_START = f"{YEAR}-04-{TAX_VAT_DAY:02d}"
+TAX_PIT_START = f"{YEAR}-04-{TAX_PIT_DAY:02d}"
+TAX_SETTLE_START = f"{YEAR + 1}-03-{TAX_SETTLE_DAY:02d}"
 AUTO_INS_RENEWAL = date(YEAR, 5, 20)   # policy anniversary (交强险+商业险)
 AUTO_INS_ANNUAL = Decimal("5400")      # ≈ ¥950 交强险 + ¥4,450 商业险
+
+# ── Tax engine parameters (all AMOUNTS are derived from the ledger) ──
+#
+# VAT, 小规模纳税人 (2023–2027 policy): 1% levy; a quarter whose 普票
+# sales ≤ ¥300,000 is exempt — but 专票 sales never are, and the big
+# mainland companies she contracts to require 专票 for their own input
+# credit, so every 承包 invoice carries VAT regardless of the threshold.
+# Cross-border services (the USD/EUR customers) are export-exempt.
+# 附加税费 ride on the VAT actually due: 城建税 7% + 教育费附加 3% +
+# 地方教育附加 2%, all halved for small-scale taxpayers.
+VAT_RATE = D("0.01")
+VAT_EXEMPT_QUARTERLY = D("300000")
+VAT_SURCHARGE_RATE = (D("0.07") + D("0.03") + D("0.02")) * D("0.5")
+# 经营所得 (sole-proprietor business income), five brackets on annual
+# taxable income: (upper, rate, quick deduction). 费用扣除 ¥60,000/yr.
+# 2023–2027: the portion of taxable income ≤ ¥2,000,000 is taxed at half.
+BIZ_TAX_BRACKETS = [
+    (D("30000"), D("0.05"), D("0")),
+    (D("90000"), D("0.10"), D("1500")),
+    (D("300000"), D("0.20"), D("10500")),
+    (D("500000"), D("0.30"), D("40500")),
+    (D("99999999999"), D("0.35"), D("65500")),
+]
+BIZ_TAX_ANNUAL_DEDUCTION = D("60000")
+BIZ_TAX_HALVING_CAP = D("2000000")
+BIZ_TAX_HALVING_YEARS = range(2023, 2028)
+
+# ── Payroll bases (audit L4) ────────────────────────────────────
+# 社保 and 公积金 contribute on a FIXED base the employer sets each July
+# from the prior year's average wage — never on the month's overtime.
+# Employee-side rates: 养老 8% + 医疗 2% + 失业 0.5% = 10.5%; 公积金 8%
+# (an integer rate — 7.33% was never a legal figure).
+SOCIAL_BASE = D("15000")
+SOCIAL_INS_RATE = D("0.105")
+HOUSING_FUND_RATE = D("0.08")
+SOCIAL_INS_EMPLOYEE = (SOCIAL_BASE * SOCIAL_INS_RATE).quantize(D("0.01"))  # 1,575
+HOUSING_FUND_EMPLOYEE = (SOCIAL_BASE * HOUSING_FUND_RATE).quantize(D("0.01"))  # 1,200
+
+# 陈宇 — the business's registered part-time assistant (audit L6): a real
+# wage on the 10th, employee 社保 withheld, employer 社保 as a business
+# expense. Below the ¥5,000 起征点, so no 个税 is withheld.
+ASSISTANT = "陈宇"
+ASSISTANT_WAGE = D("3500")
+ASSISTANT_EMPLOYER_SOCIAL_RATE = D("0.15")   # Shenzhen 单位 ≈ 15%
+
+# ── Chinese calendar (deterministic tables, no lunar library) ───
+# 春节 (lunar New Year's Day), 中秋, 端午 per year the builder can reach.
+# A build past 2030 needs the table extended — better a loud KeyError
+# than a 春节 in the wrong month.
+LUNAR_NEW_YEAR = {
+    2025: date(2025, 1, 29), 2026: date(2026, 2, 17), 2027: date(2027, 2, 6),
+    2028: date(2028, 1, 26), 2029: date(2029, 2, 13), 2030: date(2030, 2, 3),
+    2031: date(2031, 1, 23), 2032: date(2032, 2, 11),
+}
+MID_AUTUMN = {
+    2025: date(2025, 10, 6), 2026: date(2026, 9, 25), 2027: date(2027, 9, 15),
+    2028: date(2028, 10, 3), 2029: date(2029, 9, 22), 2030: date(2030, 9, 12),
+    2031: date(2031, 10, 1), 2032: date(2032, 9, 19),
+}
+DRAGON_BOAT = {
+    2025: date(2025, 5, 31), 2026: date(2026, 6, 19), 2027: date(2027, 6, 9),
+    2028: date(2028, 5, 28), 2029: date(2029, 6, 16), 2030: date(2030, 6, 5),
+    2031: date(2031, 6, 24), 2032: date(2032, 6, 12),
+}
+QINGMING = {
+    2025: date(2025, 4, 4), 2026: date(2026, 4, 5), 2027: date(2027, 4, 5),
+    2028: date(2028, 4, 4), 2029: date(2029, 4, 4), 2030: date(2030, 4, 5),
+    2031: date(2031, 4, 5), 2032: date(2032, 4, 4),
+}
+
+
+def spring_festival(year: int) -> date:
+    """The generators iterate only years in range, so a year past the
+    table is a build horizon we never planned for — fail loud."""
+    return LUNAR_NEW_YEAR[year]
+
+
+def _span(start: date, days: int) -> set[date]:
+    return {start + timedelta(days=i) for i in range(days)}
+
+
+def cn_public_holidays(year: int) -> set[date]:
+    """Statutory closures (banks and the exchanges): 元旦, 春节 除夕→初七,
+    清明, 劳动节, 端午, 中秋, 国庆. The 2025/2026 windows match the State
+    Council notices; later years follow the same shape. A year past the
+    lunar table (a payment run that spills into the January after the
+    horizon) keeps the fixed-date holidays only."""
+    days: set[date] = {date(year, 1, 1)}
+    days |= _span(date(year, 5, 1), 5)
+    days |= _span(date(year, 10, 1), 7)
+    if year in LUNAR_NEW_YEAR:
+        days |= _span(LUNAR_NEW_YEAR[year] - timedelta(days=1), 8)  # 除夕..初七
+        days |= _span(QINGMING[year], 3)
+        days |= _span(DRAGON_BOAT[year], 3)
+        days |= _span(MID_AUTUMN[year], 3)
+    return days
+
+
+def is_business_day(d: date) -> bool:
+    return d.weekday() < 5 and d not in cn_public_holidays(d.year)
+
+
+def next_business_day(d: date) -> date:
+    """Roll a bank posting off a weekend/holiday to the next business
+    day (audit §6: card charges keep their calendar date; bank postings
+    do not clear on a Sunday)."""
+    while not is_business_day(d):
+        d += timedelta(days=1)
+    return d
+
+
+def next_trading_day(d: date) -> date:
+    """The exchange calendar is the public-holiday calendar plus
+    weekends — an ETF 定投 cannot fill on 2025-05-01 (audit L9)."""
+    return next_business_day(d)
+
+
+def away_windows(year: int) -> list[tuple[date, date, str]]:
+    """Days the household is OUT of Shenzhen (inclusive ranges): 回乡
+    for 春节 (from 腊月二十七 through 初五), the 劳动节 short trip, the
+    国庆 trip. Shenzhen daily spend is suppressed inside these windows
+    and hometown/holiday spend takes its place (audit P5)."""
+    ny = spring_festival(year)
+    return [
+        (ny - timedelta(days=3), ny + timedelta(days=5), "春节回乡"),
+        (date(year, 5, 1), date(year, 5, 3), "劳动节"),
+        (date(year, 10, 1), date(year, 10, 5), "国庆"),
+    ]
+
+
+def away_label(d: date) -> str | None:
+    for start, end, label in away_windows(d.year):
+        if start <= d <= end:
+            return label
+    return None
 
 # The household's two earners. 林微 runs the cross-border e-commerce
 # development business (every invoice, contract deposit, and business
@@ -114,8 +267,6 @@ THROUGH = date.today()
 # still resolve to the last real quote. The monthly price-snapshot series
 # runs through max(END, THROUGH) so every reporting date has a price row.
 END = date(2026, 6, 30)
-
-D = Decimal
 
 # Shared offline market-data accessor (real historical quotes, committed
 # cache, no network). Loaded once at import; used everywhere a real price
@@ -185,6 +336,7 @@ DIVIDENDS = "收入:投资收益:股息"
 CAPITAL_GAINS = "收入:投资收益:资本利得"
 HOUSING_FUND_INCOME = "收入:住房公积金收入"
 REIMBURSEMENTS = "收入:报销收入"
+INTEREST_INCOME = "收入:利息收入"
 
 EXP_PROP_MGMT = "支出:住房:物业管理费"
 EXP_MORTGAGE_INT = "支出:利息:房贷利息"
@@ -221,6 +373,15 @@ EXP_CHARITY = "支出:慈善捐款"
 EXP_CLOUD = "支出:经营支出:云服务器"
 EXP_SOFTWARE = "支出:经营支出:软件"
 EXP_COWORKING = "支出:经营支出:联合办公"
+EXP_BIZ_WAGES = "支出:经营支出:工资"
+EXP_BIZ_SOCIAL = "支出:经营支出:社保（单位）"
+EXP_OFFICE_EQUIP = "支出:经营支出:办公设备"
+EXP_OFFICE_SUPPLIES = "支出:经营支出:办公用品"
+EXP_BIZ_SERVICES = "支出:经营支出:代理记账"
+EXP_BIZ_TRAVEL = "支出:经营支出:差旅"
+EXP_BIZ = "支出:经营支出"
+EXP_TRADING_FEES = "支出:交易费用"
+EXP_TRANSPORT = "支出:交通"
 EXP_MISC = "支出:杂项"
 EXP_MEDICAL = "支出:医疗"
 EXP_ENTERTAINMENT = "支出:娱乐"
@@ -254,29 +415,49 @@ INVESTMENT_TRADES = [
     (12, 15, "sell", "159915", D("2000")),
 ]
 
-# Cross-currency transaction dates that need a fresh FX quote on file:
-# every customer-invoice and vendor-bill post & pay date whose currency
-# differs from CNY, plus the HKD credit-card charge / payment dates.
-# Tuple: (foreign_currency, date). Built once at import; consumed by the
-# price layer (add_prices) and asserted against the generators that
-# create the matching transactions. Keeping these as the single source of
-# truth keeps prices and transactions on identical dates.
-CROSS_CCY_FX_DATES: list[tuple[str, date]] = []
-
-# Pacific Trade: USD invoices opened on the 5th, paid the 5th of the
-# following month (Dec rolls into Jan 2026). Matches PACIFIC_PLAN below.
+# Cross-currency documents. Every USD/EUR retainer invoice follows the
+# same calendar EVERY year the timeline reaches (audit P4: the foreign
+# customers went silent for the first half of 2026): Pacific Trade opens
+# on the 5th and pays the 5th of the following month; Handelskontor
+# München opens the 8th and pays the 8th of the next month. Payments
+# roll to a business day. The price layer lays a real quote on each
+# open/pay date, so post_invoice/pay_invoice never trip the freshness
+# guard and every paid invoice books a real realized FX gain/loss.
 PACIFIC_PLAN = [(3, "3000"), (6, "3000"), (9, "4500"), (12, "3000")]
-for _m, _amt in PACIFIC_PLAN:
-    CROSS_CCY_FX_DATES.append(("USD", date(YEAR, _m, 5)))
-    _pm = _m + 1 if _m < 12 else 1
-    _py = YEAR if _m < 12 else YEAR + 1
-    CROSS_CCY_FX_DATES.append(("USD", date(_py, _pm, 5)))
-
-# Munich: EUR invoices opened the 8th, paid the 8th of the next month.
 MUNICH_PLAN = [(4, "2500"), (8, "3800"), (11, "2500")]
-for _m, _amt in MUNICH_PLAN:
-    CROSS_CCY_FX_DATES.append(("EUR", date(YEAR, _m, 8)))
-    CROSS_CCY_FX_DATES.append(("EUR", date(YEAR, _m + 1, 8)))
+
+
+def years_in_range() -> list[int]:
+    return list(range(YEAR, THROUGH.year + 1))
+
+
+def foreign_invoice_plans() -> list[dict]:
+    """Every cross-currency invoice OPENED on or before THROUGH, with
+    its scheduled payment date (which may fall past THROUGH — then the
+    invoice stays open, the way a living A/R ledger reads)."""
+    plans: list[dict] = []
+    for yy in years_in_range():
+        for m, amt in PACIFIC_PLAN:
+            open_d = date(yy, m, 5)
+            pay_y, pay_m = (yy + 1, 1) if m == 12 else (yy, m + 1)
+            plans.append({
+                "customer": "pacific", "currency": "USD", "amount": amt,
+                "open": open_d,
+                "pay": next_business_day(date(pay_y, pay_m, 5)),
+                "desc": f"{open_d.strftime('%B %Y')} cross-border app "
+                        f"engagement",
+                "job": m == 9,
+            })
+        for m, amt in MUNICH_PLAN:
+            open_d = date(yy, m, 8)
+            plans.append({
+                "customer": "munich", "currency": "EUR", "amount": amt,
+                "open": open_d,
+                "pay": next_business_day(date(yy, m + 1, 8)),
+                "desc": f"{open_d.strftime('%B %Y')} Softwareentwicklung",
+                "job": m == 11,
+            })
+    return [p for p in plans if p["open"] <= THROUGH]
 
 # JetBrains: the USD bill is RE-DATED at build time to the 1st of THROUGH's
 # month (a date that carries a monthly USD/CNY snapshot), so it no longer
@@ -313,17 +494,36 @@ def open_document_fx_dates() -> list[tuple[str, date]]:
         ("EUR", open_document_date("munich_wartung")),
     ]
 
-# HSBC HKD card charge + payment dates (cross-currency splits booked at
-# the real HKD/CNY rate). Matches HSBC_CHARGES / HSBC_PAYMENT below.
-HSBC_CHARGES = [
-    (date(YEAR, 3, 14), "香港 海港城购物", D("3200")),
-    (date(YEAR, 7, 8), "香港 莎莎化妆品", D("1800")),
-    (date(YEAR, 10, 20), "香港 苹果旗舰店配件", D("2460")),
+# HSBC HKD card — the FOREIGN-currency liability regression case. A few
+# Hong Kong trips a year (the same three anchors every year, amounts
+# noised), each charge booked at the real HKD/CNY rate; every statement
+# is then repaid IN FULL the following month by 购汇 from 银行储蓄卡
+# (run_hsbc_statements — audit P2: HK$6,460 carried for eleven months
+# with no interest was the old shape). Categories per audit P3.
+HSBC_CLOSE_DAY = 8
+HSBC_TRIPS = [  # (month, day, description, HKD, expense account)
+    (3, 14, "香港 海港城购物", D("3200"), EXP_CLOTHING),
+    (7, 8, "香港 莎莎化妆品", D("1800"), EXP_PERSONAL_CARE),
+    (10, 20, "香港 苹果旗舰店配件", D("2460"), EXP_MISC),
 ]
-HSBC_PAYMENT = (date(YEAR, 11, 5), D("1000"))
-for _dt, _desc, _amt in HSBC_CHARGES:
-    CROSS_CCY_FX_DATES.append(("HKD", _dt))
-CROSS_CCY_FX_DATES.append(("HKD", HSBC_PAYMENT[0]))
+
+
+def hsbc_charges() -> list[tuple[date, str, Decimal, str]]:
+    """(date, description, HKD amount, expense account) for every HK
+    charge on or before THROUGH. 2025 keeps the original three amounts;
+    later years noise them ±15% on a per-year seeded stream."""
+    out: list[tuple[date, str, Decimal, str]] = []
+    for yy in years_in_range():
+        rng = random.Random(f"{SEED}:hsbc:{yy}")
+        for m, day, desc, hkd, acct in HSBC_TRIPS:
+            dt = date(yy, m, day)
+            if dt > THROUGH:
+                continue
+            amt = hkd if yy == YEAR else (
+                hkd * D(str(round(rng.uniform(0.85, 1.15), 3)))
+            ).quantize(D("1"))
+            out.append((dt, desc, amt, acct))
+    return out
 
 # Per-symbol display quantization for the *booked* CNY value of a price
 # record. FX to four decimals (GnuCash convention), per-share securities
@@ -459,25 +659,45 @@ def add_prices(out_path: Path) -> int:
     return count
 
 
+def dca_dates() -> list[date]:
+    """The monthly 定投 fill dates: the first TRADING day of each month
+    through THROUGH (audit L9 — 24 of 42 fills sat on closed days)."""
+    out: list[date] = []
+    for yy, m in iter_months():
+        d = next_trading_day(date(yy, m, 1))
+        if d <= THROUGH:
+            out.append(d)
+    return out
+
+
+def trade_date(m: int, day: int) -> date:
+    """A discretionary trade's fill date, rolled to a trading day."""
+    return next_trading_day(date(YEAR, m, day))
+
+
 def security_price_dates() -> list[tuple[str, date]]:
     """(mnemonic, date) pairs for every investment buy/sell + DCA date."""
     pairs: list[tuple[str, date]] = []
-    # Monthly DCA on the 1st (CSI300 + ChiNext). The 1st already has a
-    # monthly snapshot, but include for clarity/robustness.
-    for m in range(1, 13):
+    for d in dca_dates():
         for sym in ("510300", "159915"):
-            pairs.append((sym, date(YEAR, m, 1)))
-    # Quarterly discretionary trades.
+            pairs.append((sym, d))
     for m, day, _action, sym, _shares in INVESTMENT_TRADES:
-        pairs.append((sym, date(YEAR, m, day)))
+        pairs.append((sym, trade_date(m, day)))
     return pairs
 
 
 def fx_price_dates() -> list[tuple[str, date]]:
-    """(foreign, date) pairs for every cross-currency post/pay + HKD txn date."""
+    """(foreign, date) pairs for every cross-currency post/pay + HKD
+    charge date. HSBC statement payments add their own rows at build
+    time (run_hsbc_statements) because their dates come from the
+    book's statement cycle."""
     pairs: list[tuple[str, date]] = []
-    for cur, when in CROSS_CCY_FX_DATES:
-        pairs.append((cur, when))
+    for plan in foreign_invoice_plans():
+        pairs.append((plan["currency"], plan["open"]))
+        if plan["pay"] <= THROUGH:
+            pairs.append((plan["currency"], plan["pay"]))
+    for dt, _desc, _amt, _acct in hsbc_charges():
+        pairs.append(("HKD", dt))
     pairs.extend(open_document_fx_dates())
     return pairs
 
@@ -534,6 +754,7 @@ ACCOUNTS = [
     ("资本利得", "INCOME", "收入:投资收益", "CNY", "CURRENCY", False),
     ("住房公积金收入", "INCOME", "收入", "CNY", "CURRENCY", False),
     ("报销收入", "INCOME", "收入", "CNY", "CURRENCY", False),
+    ("利息收入", "INCOME", "收入", "CNY", "CURRENCY", False),
     # The realized FX gain/loss account is intentionally NOT pre-created:
     # pay_invoice auto-creates it on the first cross-currency settlement,
     # under the top-level INCOME account resolved by TYPE, with a localized
@@ -583,6 +804,14 @@ ACCOUNTS = [
     ("云服务器", "EXPENSE", "支出:经营支出", "CNY", "CURRENCY", False),
     ("软件", "EXPENSE", "支出:经营支出", "CNY", "CURRENCY", False),
     ("联合办公", "EXPENSE", "支出:经营支出", "CNY", "CURRENCY", False),
+    ("工资", "EXPENSE", "支出:经营支出", "CNY", "CURRENCY", False),
+    ("社保（单位）", "EXPENSE", "支出:经营支出", "CNY", "CURRENCY", False),
+    ("办公设备", "EXPENSE", "支出:经营支出", "CNY", "CURRENCY", False),
+    ("办公用品", "EXPENSE", "支出:经营支出", "CNY", "CURRENCY", False),
+    ("代理记账", "EXPENSE", "支出:经营支出", "CNY", "CURRENCY", False),
+    ("差旅", "EXPENSE", "支出:经营支出", "CNY", "CURRENCY", False),
+    ("交易费用", "EXPENSE", "支出", "CNY", "CURRENCY", False),
+    ("交通", "EXPENSE", "支出", "CNY", "CURRENCY", False),
     ("利息", "EXPENSE", "支出", "CNY", "CURRENCY", True),
     ("信用卡利息", "EXPENSE", "支出:利息", "CNY", "CURRENCY", False),
     ("房贷利息", "EXPENSE", "支出:利息", "CNY", "CURRENCY", False),
@@ -639,6 +868,8 @@ def set_account_slots(book: GnuCashBook) -> None:
     book.set_account_slot(CMB_CARD, "statement_close_day", "25")
     book.set_account_slot(HSBC_CARD, "apr", "21.0")
     book.set_account_slot(HSBC_CARD, "credit_limit", "60000")  # HKD terms
+    book.set_account_slot(HSBC_CARD, "statement_close_day",
+                          str(HSBC_CLOSE_DAY))
     book.set_account_slot(MORTGAGE, "apr", "3.85")
     book.set_account_slot(AUTO_LOAN, "apr", "4.90")
     # Loans opt out of the reconciliation surface — no statement
@@ -759,6 +990,7 @@ def write_bulk(out_path: Path, txns: list[dict]) -> int:
             piecash.Transaction(
                 currency=cur,
                 description=t["description"],
+                notes=t.get("notes"),
                 post_date=t["date"],
                 splits=splits,
             )
@@ -873,14 +1105,15 @@ MERCHANT_CATEGORY: dict[str, str] = {
     # Groceries / convenience / warehouse → Groceries (correct)
     "盒马鲜生": EXP_GROCERIES,
     "盒马": EXP_GROCERIES,
-    "便利蜂": EXP_GROCERIES,
+    "美宜佳": EXP_GROCERIES,
     "7-11便利店": EXP_GROCERIES,
-    "全家便利店": EXP_GROCERIES,
+    "天虹微喔": EXP_GROCERIES,
     "山姆会员店": EXP_GROCERIES,
-    # Transport — there is no Transport account, so the correct home is Auto.
-    # Ride-hail and bike-share both book to Auto:Parking consistently.
-    "滴滴出行": EXP_PARKING,
-    "共享单车": EXP_PARKING,
+    # Transport: ride-hail, bike-share and the metro all book to 交通
+    # (audit P11 — they used to sit under 汽车:停车费).
+    "滴滴出行": EXP_TRANSPORT,
+    "共享单车": EXP_TRANSPORT,
+    "深圳地铁": EXP_TRANSPORT,
     "EV充电": EXP_CHARGING,
     # ── Deliberate sticky miscategorization (always wrong, always same) ──
     "自动贩卖机": EXP_MISC,         # vending: stale auto-rule → Misc, every time
@@ -974,13 +1207,31 @@ def create_scheduled_templates(book: GnuCashBook) -> int:
         count += 1
 
     # Monthly salary — the spouse's 事业单位 payslip (gross, withholdings,
-    # net to the debit card), paid once a month.
+    # net to the debit card), paid once a month. The template shows a
+    # base month: fixed-base 社保/公积金, first-bracket 个税.
+    base_tax = (SOCIAL_BASE - SOCIAL_INS_EMPLOYEE - HOUSING_FUND_EMPLOYEE
+                - IIT_MONTHLY_DEDUCTION) * D("0.03")
+    base_net = (SOCIAL_BASE - SOCIAL_INS_EMPLOYEE - HOUSING_FUND_EMPLOYEE
+                - base_tax)
     sx(f"{SPOUSE}工资", SALARY_DESC, [
-        {"account": SALARY, "amount": "-15000"},
-        {"account": CHECKING, "amount": "11800"},
-        {"account": EXP_INCOME_TAX, "amount": "450"},
-        {"account": EXP_SOCIAL, "amount": "1650"},
-        {"account": HOUSING_FUND, "amount": "1100"},
+        {"account": SALARY, "amount": f"-{SOCIAL_BASE}"},
+        {"account": CHECKING, "amount": str(base_net)},
+        {"account": EXP_INCOME_TAX, "amount": str(base_tax)},
+        {"account": EXP_SOCIAL, "amount": str(SOCIAL_INS_EMPLOYEE)},
+        {"account": HOUSING_FUND, "amount": str(HOUSING_FUND_EMPLOYEE)},
+    ], "monthly", start_date=f"{YEAR}-01-{SALARY_DAY:02d}")
+
+    # The business's part-time assistant: wage + 社保 remitted on the
+    # 10th (audit L6 — a registered employee with no payroll was a
+    # phantom).
+    emp_social = (ASSISTANT_WAGE * SOCIAL_INS_RATE).quantize(D("0.01"))
+    er_social = (ASSISTANT_WAGE * ASSISTANT_EMPLOYER_SOCIAL_RATE
+                 ).quantize(D("0.01"))
+    sx(f"{ASSISTANT}工资", f"{ASSISTANT} 工资 + 社保缴纳", [
+        {"account": CHECKING,
+         "amount": f"-{ASSISTANT_WAGE + er_social}"},
+        {"account": EXP_BIZ_WAGES, "amount": str(ASSISTANT_WAGE)},
+        {"account": EXP_BIZ_SOCIAL, "amount": str(er_social)},
     ], "monthly", start_date=f"{YEAR}-01-{SALARY_DAY:02d}")
 
     sx("房贷还款", "房贷还款", [
@@ -989,11 +1240,16 @@ def create_scheduled_templates(book: GnuCashBook) -> int:
         {"account": MORTGAGE, "amount": "5817"},
     ], "monthly", start_date=f"{YEAR}-01-{MORTGAGE_DAY:02d}")
 
-    sx("车贷还款", "车贷还款", [
-        {"account": CHECKING, "amount": "-2400"},
-        {"account": EXP_AUTO_INT, "amount": "490"},
-        {"account": AUTO_LOAN, "amount": "1910"},
-    ], "monthly", start_date=f"{YEAR}-01-{AUTO_LOAN_DAY:02d}")
+    # The car loan retires on its own; the schedule ends with it.
+    book.create_scheduled_transaction(
+        name="车贷还款", description="车贷还款", splits=[
+            {"account": CHECKING, "amount": "-2400"},
+            {"account": EXP_AUTO_INT, "amount": "490"},
+            {"account": AUTO_LOAN, "amount": "1910"},
+        ], start_date=f"{YEAR}-01-{AUTO_LOAN_DAY:02d}", frequency="monthly",
+        end_date=auto_loan_payoff_date().isoformat(), enabled=True,
+    )
+    count += 1
 
     # One calendar for the templates and the ledger: each bill's schedule
     # starts on the same day-of-month its history lands on.
@@ -1003,30 +1259,36 @@ def create_scheduled_templates(book: GnuCashBook) -> int:
             {"account": dst, "amount": str(amt)},
         ], "monthly", start_date=f"{YEAR}-01-{day:02d}")
 
-    # Quarterly — the two filings a sole proprietor actually makes
-    # (Mar/Jun/Sep/Dec, inside the 1st–15th declaration window).
+    # Quarterly — the two filings a sole proprietor actually makes, in
+    # the 15-day window AFTER each quarter closes (Jan/Apr/Jul/Oct).
+    # The template amounts are placeholders; the ledger's instances are
+    # computed from the book by run_taxes.
     sx("增值税及附加 季度申报", "增值税及附加 季度申报缴款", [
-        {"account": CHECKING, "amount": "-2200"},
-        {"account": EXP_VAT, "amount": "2200"},
+        {"account": CHECKING, "amount": "-700"},
+        {"account": EXP_VAT, "amount": "700"},
     ], "quarterly", start_date=TAX_VAT_START)
     sx("经营所得 季度预缴", "经营所得个人所得税 季度预缴", [
-        {"account": CHECKING, "amount": "-5800"},
-        {"account": EXP_BIZ_INCOME_TAX, "amount": "5800"},
+        {"account": CHECKING, "amount": "-10000"},
+        {"account": EXP_BIZ_INCOME_TAX, "amount": "10000"},
     ], "quarterly", start_date=TAX_PIT_START)
-    sx("宠物体检", "字节季度体检", [
-        {"account": ALIPAY, "amount": "-500"},
-        {"account": EXP_PET_VET, "amount": "500"},
-    ], "quarterly", start_date=f"{YEAR}-02-{PET_VET_DAY:02d}")
+    # Annual 汇算清缴 of the prior year's 经营所得, by March 31.
+    sx("经营所得 汇算清缴", "经营所得个人所得税 年度汇算清缴", [
+        {"account": CHECKING, "amount": "-3000"},
+        {"account": EXP_BIZ_INCOME_TAX, "amount": "3000"},
+    ], "yearly", start_date=TAX_SETTLE_START)
+    # 字节's vaccination + check-up is annual (audit P12).
+    sx("宠物体检", "字节年度疫苗体检", [
+        {"account": ALIPAY, "amount": "-800"},
+        {"account": EXP_PET_VET, "amount": "800"},
+    ], "yearly", start_date=f"{YEAR}-03-08")
 
-    # Yearly
+    # Yearly. 红包 go out on 除夕 — the schedule anchors on 2025's and
+    # the ledger follows the lunar table each year.
     sx("春节红包", "春节红包", [
         {"account": CHECKING, "amount": "-6000"},
         {"account": EXP_GIFTS, "amount": "6000"},
-    ], "yearly", start_date="2025-02-01")
-    sx("车辆年检", "年检", [
-        {"account": CHECKING, "amount": "-300"},
-        {"account": EXP_AUTO_INS, "amount": "300"},
-    ], "yearly", start_date="2025-03-01")
+    ], "yearly",
+       start_date=(spring_festival(YEAR) - timedelta(days=1)).isoformat())
     # 交强险 + 商业险 renew together once a year (never monthly).
     sx("车险", "平安车险 交强险+商业险 (年缴)", [
         {"account": CHECKING, "amount": f"-{AUTO_INS_ANNUAL}"},
@@ -1055,14 +1317,38 @@ def _amort(base_int: Decimal, base_pri: Decimal, payment: Decimal,
     return m_int, m_pri
 
 
+AUTO_LOAN_OPENING = D("120000")
+
+
+def auto_loan_schedule() -> list[tuple[Decimal, Decimal]]:
+    """(interest, principal) for every 车贷 instalment from 2025-01 until
+    the ¥120,000 balance is retired — the last instalment is whatever
+    principal remains. Independent of THROUGH, so a 2030 build stops
+    paying the moment the loan is gone instead of driving the liability
+    negative."""
+    out: list[tuple[Decimal, Decimal]] = []
+    remaining = AUTO_LOAN_OPENING
+    elapsed = 0
+    while remaining > 0:
+        m_int, m_pri = _amort(D("490"), D("1910"), D("2400"), D("8"), elapsed)
+        m_pri = min(m_pri, remaining)
+        out.append((m_int, m_pri))
+        remaining -= m_pri
+        elapsed += 1
+    return out
+
+
+def auto_loan_payoff_date() -> date:
+    n = len(auto_loan_schedule())
+    yy, mm = YEAR + (n - 1) // 12, (n - 1) % 12 + 1
+    return next_business_day(_clamp_day(yy, mm, AUTO_LOAN_DAY))
+
+
 # ── Payroll withholding (rate-based, cumulative IIT) ─────────────
 
-# Employee-side statutory rates as a fraction of gross. These track gross
-# month-to-month, so overtime/bonus months withhold more than base months —
-# unlike the old frozen 1650/1100 constants. Calibrated so a base ¥15,000
-# gross lands near the prior figures (social 1650, housing 1100).
-SOCIAL_INS_RATE = D("0.110")     # 五险 employee portion ≈ 11% of gross
-HOUSING_FUND_RATE = D("0.0733")  # 公积金 employee portion ≈ 7.33% of gross
+# 社保/公积金 rates and the fixed base live in the configuration block
+# at the top of the file (SOCIAL_BASE, SOCIAL_INS_RATE,
+# HOUSING_FUND_RATE). Withholding follows gross only through 个税.
 IIT_MONTHLY_DEDUCTION = D("5000")  # 起征点 ¥60,000/yr = ¥5,000/mo standard
 
 # China's cumulative-withholding (累计预扣法) annual brackets on cumulative
@@ -1095,7 +1381,6 @@ def gen_recurring() -> list[dict]:
     rng = random.Random(SEED + 5)
 
     months = list(iter_months())
-    start_ym = (YEAR, 1)
 
     # Cumulative-withholding state, reset each calendar year. Tracks YTD
     # taxable income and YTD tax already withheld so each month's IIT is the
@@ -1103,18 +1388,29 @@ def gen_recurring() -> list[dict]:
     cum_taxable_by_year: dict[int, Decimal] = {}
     cum_tax_by_year: dict[int, Decimal] = {}
 
+    # 陈宇's payroll: individual 社保 withheld from the wage, employer 社保
+    # on top, both remitted with the wage on payday.
+    emp_social = (ASSISTANT_WAGE * SOCIAL_INS_RATE).quantize(D("0.01"))
+    er_social = (ASSISTANT_WAGE * ASSISTANT_EMPLOYER_SOCIAL_RATE
+                 ).quantize(D("0.01"))
+
+    # 住房公积金 running balance, for the annual 结息 on June 30 (audit P7).
+    hf_balance = dict(OPENING_BALANCES)[HOUSING_FUND]
+    auto_schedule = auto_loan_schedule()
+
     for elapsed, (yy, m) in enumerate(months):
-        # Salary on the 10th, with overtime every 3rd month.
-        d15 = _clamp_day(yy, m, SALARY_DAY)
-        if _on_or_before_through(d15):
+        # Salary on the 10th (a bank posting — rolls off a weekend or
+        # holiday to the next business day), with overtime every 3rd
+        # month. 社保/公积金 sit on the FIXED base; only gross, 个税 and
+        # net move with overtime (audit L4).
+        pay_day = next_business_day(_clamp_day(yy, m, SALARY_DAY))
+        if _on_or_before_through(pay_day):
             overtime = D("0")
             if m % 3 == 0:
                 overtime = D(str(rng.randint(500, 1500)))
-            gross = D("15000") + overtime
-
-            # Statutory deductions track gross (so overtime months differ).
-            social = (gross * SOCIAL_INS_RATE).quantize(D("1"))
-            housing = (gross * HOUSING_FUND_RATE).quantize(D("1"))
+            gross = SOCIAL_BASE + overtime
+            social = SOCIAL_INS_EMPLOYEE
+            housing = HOUSING_FUND_EMPLOYEE
 
             # Cumulative-withholding IIT: this month's tax is the YTD tax owed
             # on cumulative taxable income minus tax already withheld YTD.
@@ -1133,7 +1429,7 @@ def gen_recurring() -> list[dict]:
             txns.append({
                 "description": SALARY_DESC + (
                     f" (含加班 ¥{overtime})" if overtime else ""),
-                "date": d15,
+                "date": pay_day,
                 "splits": [
                     (SALARY, -gross),
                     (CHECKING, net),
@@ -1142,21 +1438,47 @@ def gen_recurring() -> list[dict]:
                     (HOUSING_FUND, housing),
                 ],
             })
-            # Housing fund employer match income (forced savings) — matches
-            # the employee contribution, so it tracks gross too.
+            # Housing fund employer match (forced savings) — same fixed base.
             txns.append({
                 "description": f"住房公积金 单位缴存 ({SPOUSE})",
-                "date": d15,
+                "date": pay_day,
                 "splits": [
                     (HOUSING_FUND, housing),
                     (HOUSING_FUND_INCOME, -housing),
                 ],
             })
+            hf_balance += housing * 2
 
-        # Mortgage on the 18th, auto loan on the 8th. Level payment,
-        # interest/principal mix shifts each month as the loan amortizes
-        # (across multiple years).
-        d5 = _clamp_day(yy, m, MORTGAGE_DAY)
+            # The assistant's wage + 社保, same payday.
+            txns.append({
+                "description": f"{ASSISTANT} 工资 + 社保缴纳",
+                "date": pay_day,
+                "notes": (f"工资 ¥{ASSISTANT_WAGE}，代扣个人社保 ¥{emp_social}，"
+                          f"单位社保 ¥{er_social}"),
+                "splits": [
+                    (CHECKING, -(ASSISTANT_WAGE + er_social)),
+                    (EXP_BIZ_WAGES, ASSISTANT_WAGE),
+                    (EXP_BIZ_SOCIAL, er_social),
+                ],
+            })
+
+        # 公积金 annual 结息 (June 30, 1.5% on the balance).
+        if m == 6:
+            d_int = date(yy, 6, 30)
+            if _on_or_before_through(d_int) and d_int >= date(YEAR, 1, 1):
+                interest = (hf_balance * D("0.015")).quantize(D("0.01"))
+                txns.append({
+                    "description": "住房公积金 年度结息",
+                    "date": d_int,
+                    "splits": [(HOUSING_FUND, interest),
+                               (INTEREST_INCOME, -interest)],
+                })
+                hf_balance += interest
+
+        # Mortgage on the 18th, auto loan on the 8th (bank autopay — rolls
+        # to a business day). Level payment, interest/principal mix
+        # shifts each month as the loan amortizes (across multiple years).
+        d5 = next_business_day(_clamp_day(yy, m, MORTGAGE_DAY))
         if _on_or_before_through(d5):
             m_int, m_pri = _amort(
                 D("8983"), D("5817"), D("14800"), D("19"), elapsed)
@@ -1169,10 +1491,9 @@ def gen_recurring() -> list[dict]:
                     (MORTGAGE, m_pri),
                 ],
             })
-        d5 = _clamp_day(yy, m, AUTO_LOAN_DAY)
-        if _on_or_before_through(d5):
-            a_int, a_pri = _amort(
-                D("490"), D("1910"), D("2400"), D("8"), elapsed)
+        d5 = next_business_day(_clamp_day(yy, m, AUTO_LOAN_DAY))
+        if _on_or_before_through(d5) and elapsed < len(auto_schedule):
+            a_int, a_pri = auto_schedule[elapsed]
             txns.append({
                 "description": "车贷还款",
                 "date": d5,
@@ -1186,12 +1507,15 @@ def gen_recurring() -> list[dict]:
     # Monthly bills, on the calendar the templates share. Each variable
     # bill draws from its OWN seeded stream, one draw per month whether or
     # not the month is written, so a (bill, month) amount is the same on a
-    # fresh build and on a continuation replay.
+    # fresh build and on a continuation replay. Bank-debited bills roll to
+    # a business day; wallet and card autopays keep their calendar date.
     for name, desc, src, dst, amt, day in MONTHLY_BILLS:
         rng_bill = random.Random(f"{SEED}:bill:{name}")
         for yy, m in months:
             amount = _variable_bill_amount(name, amt, m, rng_bill)
             d = _clamp_day(yy, m, day)
+            if src == CHECKING:
+                d = next_business_day(d)
             if not _on_or_before_through(d):
                 continue
             txns.append({
@@ -1200,41 +1524,19 @@ def gen_recurring() -> list[dict]:
                 "splits": [(src, -amount), (dst, amount)],
             })
 
-    # Quarterly tax filings (Mar/Jun/Sep/Dec): VAT + surcharges on the
-    # 12th, 经营所得 income-tax prepayment on the 14th — both inside the
-    # 1st–15th declaration window, on their own days. Amounts follow the
-    # quarter's actual sales/profit, so they vary (dedicated RNG).
-    # Quarterly pet vet (Feb/May/Aug/Nov, 10th).
-    rng_tax = random.Random(f"{SEED}:tax")
+    # 字节's annual vaccination + check-up (March 8; what the vet finds
+    # varies). The quarterly filings live in run_taxes — they are
+    # computed from the ledger, not drawn.
     rng_pet = random.Random(f"{SEED}:pet")
-    for yy, m in months:
-        if m in (3, 6, 9, 12):
-            vat = _spend(rng_tax, 1800, 2600)
-            pit = _spend(rng_tax, 5200, 6400)
-            d = _clamp_day(yy, m, TAX_VAT_DAY)
-            if _on_or_before_through(d):
-                txns.append({
-                    "description": "增值税及附加 季度申报缴款",
-                    "date": d,
-                    "splits": [(CHECKING, -vat), (EXP_VAT, vat)],
-                })
-            d = _clamp_day(yy, m, TAX_PIT_DAY)
-            if _on_or_before_through(d):
-                txns.append({
-                    "description": "经营所得个人所得税 季度预缴",
-                    "date": d,
-                    "splits": [(CHECKING, -pit), (EXP_BIZ_INCOME_TAX, pit)],
-                })
-        if m in (2, 5, 8, 11):
-            # 字节's check-up: what the vet finds varies (G11).
-            vet = _spend(rng_pet, 380, 680)
-            d = _clamp_day(yy, m, PET_VET_DAY)
-            if _on_or_before_through(d):
-                txns.append({
-                    "description": "字节季度体检",
-                    "date": d,
-                    "splits": [(ALIPAY, -vet), (EXP_PET_VET, vet)],
-                })
+    for yy in sorted({y for y, _ in months}):
+        vet = _spend(rng_pet, 650, 950)
+        d = date(yy, 3, 8)
+        if date(YEAR, 1, 1) <= d <= THROUGH:
+            txns.append({
+                "description": "字节年度疫苗体检",
+                "date": d,
+                "splits": [(ALIPAY, -vet), (EXP_PET_VET, vet)],
+            })
 
     # Monthly mobile-wallet top-ups from checking. WeChat and Alipay
     # carry most of the daily spend (coffee, delivery, groceries,
@@ -1255,26 +1557,22 @@ def gen_recurring() -> list[dict]:
             "splits": [(CHECKING, D("-4000")), (ALIPAY, D("4000"))],
         })
 
-    # Yearly — Spring Festival red envelopes (Feb 1), vehicle inspection
-    # (Mar 1), and the auto-insurance renewal (交强险+商业险, one annual
-    # premium on the policy anniversary), each year in range.
+    # Yearly — Spring Festival red envelopes on 除夕 (lunar table), and
+    # the auto-insurance renewal (交强险+商业险, one annual premium on the
+    # policy anniversary), each year in range. The car is 免检 for its
+    # first six years, so there is no 年检 fee (audit P12).
     years = sorted({yy for yy, _ in months})
     for yy in years:
-        d = date(yy, 2, 1)
+        d = spring_festival(yy) - timedelta(days=1)
         if date(YEAR, 1, 1) <= d <= THROUGH:
             txns.append({
                 "description": "春节红包",
                 "date": d,
+                "notes": f"{yy} 除夕 长辈+晚辈红包",
                 "splits": [(CHECKING, D("-6000")), (EXP_GIFTS, D("6000"))],
             })
-        d = date(yy, 3, 1)
-        if date(YEAR, 1, 1) <= d <= THROUGH:
-            txns.append({
-                "description": "车辆年检",
-                "date": d,
-                "splits": [(CHECKING, D("-300")), (EXP_AUTO_INS, D("300"))],
-            })
-        d = date(yy, AUTO_INS_RENEWAL.month, AUTO_INS_RENEWAL.day)
+        d = next_business_day(
+            date(yy, AUTO_INS_RENEWAL.month, AUTO_INS_RENEWAL.day))
         if date(YEAR, 1, 1) <= d <= THROUGH:
             txns.append({
                 "description": "平安车险 交强险+商业险 (年缴)",
@@ -1287,170 +1585,181 @@ def gen_recurring() -> list[dict]:
 
 # ── Phase 6: Daily/weekly patterns + seasonal one-offs ──────────
 
+# Per-weekday habit probabilities, Monday → Sunday. A week has a SHAPE,
+# not a timetable (audit A1: coffee 99/102/101/99/99/11/16, delivery on
+# Tue/Thu/Sat only, charging always on Wednesday): coffee is a workday
+# thing that spills into weekends, delivery peaks on tired weeknights and
+# lazy weekends, the car charges whenever the battery is low, the big
+# grocery run is a weekend errand.
+COFFEE_P = [0.82, 0.85, 0.85, 0.85, 0.80, 0.35, 0.25]
+DELIVERY_P = [0.40, 0.45, 0.40, 0.45, 0.50, 0.55, 0.50]
+CONVENIENCE_P = [0.70, 0.70, 0.70, 0.70, 0.70, 0.55, 0.50]
+CHARGING_P = [0.14, 0.14, 0.14, 0.14, 0.16, 0.14, 0.14]
+HEMA_P = [0.05, 0.05, 0.05, 0.05, 0.10, 0.45, 0.50]
+
+# Shenzhen convenience chains (audit P9 — 便利蜂 has no Shenzhen footprint).
+CONVENIENCE_VENDORS = ["美宜佳", "7-11便利店", "天虹微喔"]
+
+# What the household spends on while AWAY (inside an away window the
+# Shenzhen habits above are suppressed): the hometown week, the 劳动节
+# and 国庆 trips. (description, expense, low, high).
+HOLIDAY_SPEND = {
+    "春节回乡": [
+        ("老家 餐馆 家宴", EXP_DINING, 120, 380),
+        ("走亲访友 礼品", EXP_GIFTS, 150, 400),
+        ("老家 超市 年货", EXP_GROCERIES, 60, 220),
+        ("县城 打车", EXP_TRANSPORT, 15, 45),
+    ],
+    "劳动节": [
+        ("景区门票", EXP_TRAVEL, 80, 200),
+        ("民宿 住宿", EXP_TRAVEL, 300, 600),
+        ("当地餐馆", EXP_DINING, 80, 260),
+    ],
+    "国庆": [
+        ("景区门票", EXP_TRAVEL, 80, 220),
+        ("酒店 住宿", EXP_TRAVEL, 350, 700),
+        ("当地餐馆", EXP_DINING, 90, 300),
+        ("特产 伴手礼", EXP_GIFTS, 100, 300),
+    ],
+}
+
+
+def seasonal_events(yy: int) -> list[tuple[date, str, str, str, Decimal]]:
+    """The household's holiday calendar for one year, driven by the lunar
+    table: 年货 the week before 春节, the 回乡 train BEFORE 春节 and the
+    return after 初五, 清明/劳动节/国庆 outings, 月饼 ahead of 中秋, the
+    year-end donation, and the shopping-festival habits."""
+    ny = spring_festival(yy)
+    return [
+        (ny - timedelta(days=9), "年货采购", ALIPAY, EXP_GROCERIES, D("2500")),
+        (ny - timedelta(days=3), "春节回乡 高铁 (深圳→老家)", CHECKING,
+         EXP_TRAVEL, D("1260")),
+        (ny + timedelta(days=5), "返深 高铁 (老家→深圳)", CHECKING,
+         EXP_TRAVEL, D("1260")),
+        (date(yy, 3, 20), "春装", CMB_CARD, EXP_CLOTHING, D("900")),
+        (QINGMING[yy], "清明节 出行", CHECKING, EXP_TRAVEL, D("1500")),
+        (date(yy, 5, 1), "劳动节 短途旅行", CHECKING, EXP_TRAVEL, D("2800")),
+        (date(yy, 5, 28), "618预售", ALIPAY, EXP_CLOTHING, D("900")),
+        (date(yy, 7, 15), "台风季备货", ALIPAY, EXP_MISC, D("400")),
+        (MID_AUTUMN[yy] - timedelta(days=6), "中秋月饼礼盒", ALIPAY,
+         EXP_GIFTS, D("1800")),
+        (date(yy, 10, 1), "国庆节旅行", CHECKING, EXP_TRAVEL, D("4500")),
+        (date(yy, 10, 25), "双十一定金", ALIPAY, EXP_CLOTHING, D("500")),
+        (date(yy, 12, 20), "节日礼物", ALIPAY, EXP_GIFTS, D("2000")),
+        (date(yy, 12, 28), "年末慈善捐款", CHECKING, EXP_CHARITY, D("1000")),
+    ]
+
+
 def gen_daily_weekly() -> list[dict]:
     txns: list[dict] = []
     rng = random.Random(SEED + 6)
 
-    # Weekday Luckin Coffee + daily convenience store + 3x/week Meituan.
-    # Runs continuously from 2025-01-01 through THROUGH (today unless pinned)
-    # so the most recent weeks always carry fresh spend — no data cliff.
+    # Day by day from 2025-01-01 through THROUGH. Every habit draws once
+    # per day whether or not it fires, so a (habit, day) outcome is the
+    # same on a fresh build and on a continuation replay.
     d = date(YEAR, 1, 1)
-    end = THROUGH
-    day_idx = 0
-    while d <= end:
+    while d <= THROUGH:
         wd = d.weekday()
-        if wd < 5:  # weekday coffee
-            amt = _spend(rng, 15, 22)
-            vend = "瑞幸咖啡"
+        away = away_label(d)
+        r_coffee, r_conv, r_deliv, r_hema, r_charge, r_holiday = (
+            rng.random() for _ in range(6))
+        if away is None:
+            if r_coffee < COFFEE_P[wd]:
+                amt = _spend(rng, 15, 22)
+                vend = "瑞幸咖啡"
+                txns.append({
+                    "description": vend, "date": d,
+                    "splits": [(WECHAT, -amt),
+                               (merchant_category(vend, EXP_DINING), amt)],
+                })
+            if r_conv < CONVENIENCE_P[wd]:
+                amt = _spend(rng, 18, 35)
+                vend = rng.choice(CONVENIENCE_VENDORS)
+                txns.append({
+                    "description": vend, "date": d,
+                    "splits": [(WECHAT, -amt),
+                               (merchant_category(vend, EXP_GROCERIES), amt)],
+                })
+            if r_deliv < DELIVERY_P[wd]:
+                amt = _spend(rng, 28, 48)
+                vend = "美团外卖"
+                txns.append({
+                    "description": vend, "date": d,
+                    "splits": [(ALIPAY, -amt),
+                               (merchant_category(vend, EXP_DINING), amt)],
+                })
+            if r_hema < HEMA_P[wd]:
+                amt = _spend(rng, 300, 420)
+                vend = "盒马鲜生"
+                txns.append({
+                    "description": vend, "date": d,
+                    "splits": [(ALIPAY, -amt),
+                               (merchant_category(vend, EXP_GROCERIES), amt)],
+                })
+            if r_charge < CHARGING_P[wd]:
+                amt = _spend(rng, 60, 100)
+                vend = "EV充电"
+                txns.append({
+                    "description": vend, "date": d,
+                    "splits": [(WECHAT, -amt),
+                               (merchant_category(vend, EXP_CHARGING), amt)],
+                })
+        elif r_holiday < 0.65:
+            desc, acct, lo, hi = rng.choice(HOLIDAY_SPEND[away])
+            amt = _spend(rng, lo, hi)
             txns.append({
-                "description": vend,
-                "date": d,
-                "splits": [(WECHAT, -amt),
-                           (merchant_category(vend, EXP_DINING), amt)],
+                "description": desc, "date": d,
+                "splits": [(WECHAT, -amt), (acct, amt)],
             })
-        # convenience store most days
-        if day_idx % 1 == 0 and rng.random() < 0.7:
-            amt = _spend(rng, 18, 35)
-            vend = rng.choice(["便利蜂", "7-11便利店", "全家便利店"])
-            txns.append({
-                "description": vend,
-                "date": d,
-                "splits": [(WECHAT, -amt),
-                           (merchant_category(vend, EXP_GROCERIES), amt)],
-            })
-        if wd in (1, 3, 5):  # Meituan delivery 3x/week
-            amt = _spend(rng, 28, 48)
-            vend = "美团外卖"
-            txns.append({
-                "description": vend,
-                "date": d,
-                "splits": [(ALIPAY, -amt),
-                           (merchant_category(vend, EXP_DINING), amt)],
-            })
-        if wd == 6:  # weekly Hema groceries
-            amt = _spend(rng, 300, 420)
-            vend = "盒马鲜生"
-            txns.append({
-                "description": vend,
-                "date": d,
-                "splits": [(ALIPAY, -amt),
-                           (merchant_category(vend, EXP_GROCERIES), amt)],
-            })
-        if wd == 2:  # weekly EV charging
-            amt = _spend(rng, 60, 100)
-            vend = "EV充电"
-            txns.append({
-                "description": vend,
-                "date": d,
-                "splits": [(WECHAT, -amt),
-                           (merchant_category(vend, EXP_CHARGING), amt)],
-            })
-        d = date.fromordinal(d.toordinal() + 1)
-        day_idx += 1
+        d += timedelta(days=1)
 
-    # Monthly Sam's Club on ICBC card — every month in range.
+    # Monthly 山姆 run on the ICBC card — around the 12th, never ON the
+    # 12th every month (audit A5).
     for yy, m in iter_months():
-        sc = _clamp_day(yy, m, 12)
+        sc = _clamp_day(yy, m, 12 + rng.randint(-3, 3))
+        amt = _spend(rng, 420, 580)
+        while away_label(sc) is not None:   # not while out of town
+            sc += timedelta(days=7)
         if not _on_or_before_through(sc):
             continue
-        amt = _spend(rng, 420, 580)
         vend = "山姆会员店"
         txns.append({
-            "description": vend,
-            "date": sc,
+            "description": vend, "date": sc,
             "splits": [(ICBC_CARD, -amt),
                        (merchant_category(vend, EXP_GROCERIES), amt)],
         })
 
-    # Repeating seasonal anchors for every FULL year after 2025 that the
-    # timeline reaches (the 2025 calendar below is hand-curated). Keeps later
-    # years from looking sparse vs. 2025 while staying date-bounded.
-    extra_years = sorted(
-        {yy for yy, _ in iter_months()} - {YEAR}
-    )
-    for yy in extra_years:
-        recurring_seasonal = [
-            (date(yy, 1, 20), "年货采购", ALIPAY, EXP_GROCERIES, D("2500")),
-            (date(yy, 2, 10), "春节旅行 回乡", CHECKING, EXP_TRAVEL, D("3500")),
-            (date(yy, 4, 5), "清明节 出行", CHECKING, EXP_TRAVEL, D("1500")),
-            (date(yy, 5, 1), "劳动节 短途旅行", CHECKING, EXP_TRAVEL, D("2800")),
-            (date(yy, 9, 10), "中秋月饼礼盒", ALIPAY, EXP_GIFTS, D("1800")),
-            (date(yy, 10, 2), "国庆节旅行", CHECKING, EXP_TRAVEL, D("4500")),
-            (date(yy, 12, 28), "年末慈善捐款", CHECKING, EXP_CHARITY, D("1000")),
-        ]
-        for dt, desc, src, dst, amt in recurring_seasonal:
-            if _on_or_before_through(dt):
+    # The holiday calendar, every year the timeline reaches, plus the
+    # 618 / 双十一 order bursts.
+    for yy in years_in_range():
+        for dt, desc, src, dst, amt in seasonal_events(yy):
+            if date(YEAR, 1, 1) <= dt <= THROUGH:
                 txns.append({
-                    "description": desc,
-                    "date": dt,
+                    "description": desc, "date": dt,
                     "splits": [(src, -amt), (dst, amt)],
                 })
-        # 618 + Double 11 for the extra year — trimmed to match the 2025
-        # hand-curated calendar below (¥1,150 / ¥1,700) now that the Phase 6b
-        # near-monthly Clothing baseline carries more of the annual total.
         for i, amt in enumerate([D("450"), D("400"), D("300")]):
             dt = date(yy, 6, 10 + i)
             if _on_or_before_through(dt):
                 txns.append({
-                    "description": f"618购物节 第{i+1}单",
-                    "date": dt,
+                    "description": f"618购物节 第{i+1}单", "date": dt,
                     "splits": [(ALIPAY, -amt), (EXP_CLOTHING, amt)],
                 })
         for i, amt in enumerate([D("500"), D("450"), D("400"), D("350")]):
             dt = date(yy, 11, 11 + (i // 2))
             if _on_or_before_through(dt):
                 txns.append({
-                    "description": f"双十一 第{i+1}单",
-                    "date": dt,
+                    "description": f"双十一 第{i+1}单", "date": dt,
                     "splits": [(ICBC_CARD, -amt), (EXP_CLOTHING, amt)],
                 })
 
-    # Seasonal one-offs (Chinese calendar) — 2025 hand-curated calendar.
-    seasonal = [
-        (date(YEAR, 1, 20), "年货采购", ALIPAY, EXP_GROCERIES, D("2500")),
-        (date(YEAR, 2, 10), "春节旅行 回乡", CHECKING, EXP_TRAVEL, D("3500")),
-        (date(YEAR, 3, 8), "字节年度疫苗体检", ALIPAY, EXP_PET_VET, D("800")),
-        (date(YEAR, 3, 20), "春装", CMB_CARD, EXP_CLOTHING, D("900")),
-        (date(YEAR, 4, 5), "清明节 出行", CHECKING, EXP_TRAVEL, D("1500")),
-        (date(YEAR, 5, 1), "劳动节 短途旅行", CHECKING, EXP_TRAVEL, D("2800")),
-        (date(YEAR, 5, 28), "618预售", ALIPAY, EXP_CLOTHING, D("900")),
-        (date(YEAR, 7, 15), "台风季备货", ALIPAY, EXP_MISC, D("400")),
-        (date(YEAR, 8, 20), "办公新显示器", CMB_CARD, EXP_SOFTWARE, D("2800")),
-        (date(YEAR, 9, 10), "中秋月饼礼盒", ALIPAY, EXP_GIFTS, D("1800")),
-        (date(YEAR, 10, 2), "国庆节旅行", CHECKING, EXP_TRAVEL, D("4500")),
-        (date(YEAR, 10, 25), "双十一定金", ALIPAY, EXP_CLOTHING, D("500")),
-        (date(YEAR, 12, 20), "节日礼物", ALIPAY, EXP_GIFTS, D("2000")),
-        (date(YEAR, 12, 28), "年末慈善捐款", CHECKING, EXP_CHARITY, D("1000")),
-    ]
-    for dt, desc, src, dst, amt in seasonal:
+    # One-off equipment: the office monitor (2025 only — a purchase, not
+    # a habit), booked as 办公设备 (audit P13).
+    if _on_or_before_through(date(YEAR, 8, 20)):
         txns.append({
-            "description": desc,
-            "date": dt,
-            "splits": [(src, -amt), (dst, amt)],
+            "description": "办公新显示器", "date": date(YEAR, 8, 20),
+            "splits": [(CMB_CARD, D("-2800")), (EXP_OFFICE_EQUIP, D("2800"))],
         })
-
-    # 618 (June) spread across 3 transactions (¥1,150). Trimmed from the
-    # original 5-order ¥3,200 haul so the higher near-monthly Clothing baseline
-    # (Phase 6b) doesn't push the annual Clothing average past the ~¥1,000/mo
-    # band — the seasonal texture stays, the spike just carries less of it.
-    june_amts = [D("450"), D("400"), D("300")]
-    for i, amt in enumerate(june_amts):
-        txns.append({
-            "description": f"618购物节 第{i+1}单",
-            "date": date(YEAR, 6, 10 + i),
-            "splits": [(ALIPAY, -amt), (EXP_CLOTHING, amt)],
-        })
-
-    # Double 11 (November) spread across 4 transactions (¥1,700). Trimmed from
-    # the original 8-order ¥5,500 haul for the same reason as 618 above.
-    nov_amts = [D("500"), D("450"), D("400"), D("350")]
-    for i, amt in enumerate(nov_amts):
-        txns.append({
-            "description": f"双十一 第{i+1}单",
-            "date": date(YEAR, 11, 11 + (i // 2)),
-            "splits": [(ICBC_CARD, -amt), (EXP_CLOTHING, amt)],
-        })
-
     return txns
 
 
@@ -1473,14 +1782,38 @@ CONCERT_VENDORS = [
     "演唱会门票 (深圳湾体育中心)", "音乐节 (大运中心)",
     "话剧 (保利剧院)", "脱口秀专场 (笑友剧场)",
 ]
-GIFT_OCCASIONS = [
-    "同事生日礼物", "朋友生日红包", "侄女生日礼物", "乔迁之礼",
-    "满月红包", "探病果篮", "伴手礼",
+# Named events are drawn WITHOUT replacement (audit A4: 表妹 married
+# three times). Birthdays and 伴手礼 recur every year (a per-year pool);
+# a wedding, a 满月, a 乔迁 or a hospital visit happens to a given person
+# once, so those pools are drawn down across the WHOLE timeline.
+GIFT_OCCASIONS_YEARLY = [
+    "同事 小张 生日礼物", "同事 老刘 生日礼物", "朋友 阿May 生日红包",
+    "侄女 生日礼物", "外甥 生日礼物", "客户 伴手礼", "老家 伴手礼",
+    "师姐 生日礼物", "健身搭子 生日礼物", "父亲 生日礼物", "婆婆 生日礼物",
+]
+GIFT_OCCASIONS_ONCE = [
+    "表哥 乔迁之礼", "大学室友 乔迁之礼", "高中同学 满月红包",
+    "前同事 满月红包", "邻居 探病果篮", "舅舅 探病果篮", "同事 升职贺礼",
+    "师妹 乔迁之礼", "老乡 满月红包", "姑姑 探病果篮", "同事 小赵 满月红包",
+    "表姐 乔迁之礼", "发小 升职贺礼", "堂哥 满月红包", "阿姨 探病果篮",
+    "前领导 荣休贺礼", "球友 乔迁之礼", "同学 开业花篮", "邻居 满月红包",
+    "客户 Kevin 乔迁之礼", "师兄 探病果篮", "表妹 满月红包",
 ]
 WEDDING_OCCASIONS = [
-    "婚礼红包 (大学同学)", "婚礼红包 (前同事)", "婚礼随礼 (表妹)",
-    "婚礼红包 (老乡)",
+    "婚礼红包 (大学同学 王磊)", "婚礼红包 (前同事 陈静)", "婚礼随礼 (表妹)",
+    "婚礼红包 (老乡 李涛)", "婚礼红包 (高中同学 周婷)", "婚礼随礼 (表弟)",
+    "婚礼红包 (同事 小赵)", "婚礼红包 (研究生同学 刘洋)",
+    "婚礼红包 (客户 Kevin)", "婚礼随礼 (堂妹)", "婚礼红包 (球友 阿强)",
+    "婚礼红包 (邻居家儿子)", "婚礼红包 (同事 小张)", "婚礼随礼 (表姐)",
+    "婚礼红包 (发小 大鹏)", "婚礼红包 (大学同学 张楠)", "婚礼随礼 (堂弟)",
+    "婚礼红包 (前同事 老周)", "婚礼红包 (师妹 林小雨)", "婚礼红包 (健身教练)",
+    "婚礼红包 (高中同学 吴昊)", "婚礼随礼 (侄子)", "婚礼红包 (客户 Anna)",
+    "婚礼红包 (老乡 赵倩)", "婚礼红包 (研究生同学 孙悦)", "婚礼随礼 (堂姐)",
+    "婚礼红包 (球友 小胖)", "婚礼红包 (邻居家女儿)",
 ]
+# Nightlife has a weekend shape (Mon → Sun weights; audit A1 had bars
+# and KTV on Mon/Tue/Sun only).
+ENTERTAINMENT_DOW_W = [0.5, 0.5, 0.6, 0.8, 2.0, 2.5, 1.5]
 ONLINE_RETAIL_VENDORS = ["淘宝", "京东商城", "拼多多", "天猫超市"]
 
 # Tech-consultant learning: course platforms + technical books + meetups.
@@ -1498,7 +1831,7 @@ EDUCATION_MEETUP_VENDORS = [
 # Recurring digital subscriptions a Shenzhen tech worker actually pays for.
 # (mostly steady monthly autopay; VPN essential for cross-border work.)
 SUBSCRIPTION_VENDORS = [
-    ("VPN 服务 年付分摊", 28, 45),       # cross-border VPN (essential)
+    ("阿里云盘 会员", 18, 25),            # cloud drive (audit L7)
     ("iCloud 储存 200GB", 21, 21),       # Apple iCloud monthly
     ("知乎盐选 会员", 19, 25),            # Zhihu premium
     ("得到 知识会员", 25, 38),            # DeDao premium
@@ -1569,31 +1902,42 @@ def gen_personal_life() -> list[dict]:
     #    春节红包 (¥6,000 yearly, Phase 5), 中秋月饼礼盒 (¥1,800, Sep) and
     #    节日礼物 (¥2,000, Dec) — do NOT duplicate those. This layers a
     #    small monthly habit + scattered 婚礼红包 / occasion gifts on top.
+    gift_pool: dict[int, list[str]] = {}
+    once_pool = rng.sample(GIFT_OCCASIONS_ONCE, k=len(GIFT_OCCASIONS_ONCE))
     for yy, m in iter_months(start):
+        if yy not in gift_pool:
+            gift_pool[yy] = rng.sample(GIFT_OCCASIONS_YEARLY,
+                                       k=len(GIFT_OCCASIONS_YEARLY))
         # Skip Sep (中秋 carried) and Dec (节日礼物 carried) for the
         # baseline so we don't pile on top of the big named events.
         if m in (9, 12):
             continue
         if rng.random() < 0.85:  # ~5 of every 6 months get a small gift
             day = _clamp_day(yy, m, rng.randint(3, 26))
+            # Every third gift is a once-in-a-lifetime occasion while the
+            # pool lasts; the rest are the yearly birthdays.
+            use_once = once_pool and rng.random() < 0.34
+            occasion = once_pool.pop() if use_once else gift_pool[yy].pop()
             if _on_or_before_through(day):
                 amt = _spend(rng,120, 350)
-                txns.append({"description": rng.choice(GIFT_OCCASIONS),
+                txns.append({"description": occasion,
                              "date": day,
                              "splits": [(WECHAT, -amt), (EXP_GIFTS, amt)]})
     # 婚礼红包: 3-4 weddings a year, spread across non-春节 months, each
     # ¥800-1,600 — the lumpy occasions that make any 5-month window catch
-    # at least one.
+    # at least one. Each year's couples are distinct people.
+    couples_pool = rng.sample(WEDDING_OCCASIONS, k=len(WEDDING_OCCASIONS))
     for yy in sorted({y for y, _ in iter_months(start)}):
         n_weddings = rng.randint(3, 4)
         pool = [3, 4, 5, 6, 7, 8, 10, 11]
         chosen = rng.sample(pool, k=min(n_weddings, len(pool)))
-        for m in chosen:
+        couples = [couples_pool.pop() for _ in chosen if couples_pool]
+        for m, who in zip(chosen, couples):
             day = _clamp_day(yy, m, rng.randint(3, 26))
             if not _on_or_before_through(day):
                 continue
             amt = _spend(rng,800, 1600)
-            txns.append({"description": rng.choice(WEDDING_OCCASIONS),
+            txns.append({"description": who,
                          "date": day,
                          "splits": [(CHECKING, -amt), (EXP_GIFTS, amt)]})
 
@@ -1618,20 +1962,21 @@ def gen_personal_life() -> list[dict]:
 
     # ── Entertainment (NEW): weekly-ish outings (~¥80-200) on WeChat/Alipay ──
     #    + occasional 演唱会 / festival spike (~¥600-1,200) twice a year.
-    d = start
+    d = start - timedelta(days=start.weekday())  # the Monday of week 1
     while d <= THROUGH:
-        # ~3 outings a month (skip ~1 week in 5), jittered onto a
-        # Fri-Sun evening.
-        if rng.random() < 0.80:
-            day = date.fromordinal(d.toordinal() + rng.randint(4, 6))
-            if _on_or_before_through(day):
-                amt = _spend(rng,80, 200)
-                src = rng.choice([WECHAT, ALIPAY])
-                txns.append({"description": rng.choice(ENTERTAINMENT_VENDORS),
-                             "date": day,
-                             "splits": [(src, -amt),
-                                        (EXP_ENTERTAINMENT, amt)]})
-        d = date.fromordinal(d.toordinal() + 7)
+        # ~3 outings a month (skip ~1 week in 5), on a weekday drawn
+        # from the nightlife shape (Fri/Sat heavy, never a fixed slot).
+        fires = rng.random() < 0.80
+        offset = rng.choices(range(7), weights=ENTERTAINMENT_DOW_W)[0]
+        day = d + timedelta(days=offset)
+        if fires and start <= day <= THROUGH and away_label(day) is None:
+            amt = _spend(rng,80, 200)
+            src = rng.choice([WECHAT, ALIPAY])
+            txns.append({"description": rng.choice(ENTERTAINMENT_VENDORS),
+                         "date": day,
+                         "splits": [(src, -amt),
+                                    (EXP_ENTERTAINMENT, amt)]})
+        d += timedelta(days=7)
     # 演唱会 / 音乐节 spikes: spring (May) + fall (Oct), each year, on the
     # CMB card (bigger discretionary charge).
     for yy in sorted({y for y, _ in iter_months(start)}):
@@ -1705,13 +2050,11 @@ def gen_personal_life() -> list[dict]:
     #    Europe Handelskontor München). The light seasonal travel in
     #    Phase 6 stays intact; these are the bigger periodic anchors.
     trip_specs = [
-        ("春节回乡 高铁+住宿 (深圳→老家)", CHECKING, 3000, 5000),
-        ("国庆出游 机票+酒店 (云南/三亚)", CHECKING, 4000, 7000),
         ("出差 美国 Pacific Trade (机票+酒店)", CMB_CARD, 6000, 8000),
         ("出差 德国 Handelskontor München (机票+酒店)", CMB_CARD, 6000, 8000),
     ]
     trip_idx = 0
-    cur = date(YEAR, 2, 1)
+    cur = date(YEAR, 4, 1)
     while cur <= THROUGH:
         tday = _clamp_day(cur.year, cur.month, rng.randint(8, 22))
         desc, src, lo, hi = trip_specs[trip_idx % len(trip_specs)]
@@ -1826,33 +2169,40 @@ def gen_personal_life() -> list[dict]:
     return txns
 
 
-# ── Phase 7a: Direct CNY contractor income ──────────────────────
+# ── Phase 7a: Contract engagements (invoiced through A/R) ───────
 
-# Clients Lin Wei contracts to directly (outside the invoiced business
-# module). Each year strings 2–4-month engagements together with 1–3
-# idle months falling wherever the pipeline ran dry — not on a fixed
-# beat (G9: the old calendar went quiet every 4th month like clockwork).
+# The big mainland companies Lin Wei contracts to. Every progress payment
+# is an INVOICE to a named customer, posted to 收入:承包收入 and carrying a
+# 增值税专用发票 note — that is where the VAT and 经营所得 bases come from
+# (audit L5: 199,000 of 2025 revenue used to land in the bank with no
+# 发票, and no reader could tell who the contracting party was).
 CONTRACT_CLIENTS = [
-    "华为云 外包", "腾讯 小程序项目", "字节跳动 数据看板", "美团 商家App",
-    "平安科技 风控看板", "大疆 内部工具", "顺丰科技 小程序",
+    "华为云", "腾讯", "字节跳动", "美团",
+    "平安科技", "大疆", "顺丰科技",
 ]
+CONTRACT_PROJECTS = {
+    "华为云": "外包开发", "腾讯": "小程序项目", "字节跳动": "数据看板",
+    "美团": "商家App", "平安科技": "风控看板", "大疆": "内部工具",
+    "顺丰科技": "小程序",
+}
 
 
-def gen_contractor_income() -> list[dict]:
-    """Monthly progress payments per engagement, a 尾款 (final payment)
-    bump when an engagement runs its full course, and irregular gaps.
-    Each year draws from its own seeded stream, so a year's calendar is
-    the same on a fresh build and on a continuation replay."""
-    txns: list[dict] = []
-    years = sorted({yy for yy, _ in iter_months()})
-    for yy in years:
+def contract_invoice_plans() -> list[dict]:
+    """Monthly progress invoices per engagement (Net 15, opened ~12 days
+    before the client's payment run), a 尾款 bump when an engagement
+    runs its full course, and irregular idle months falling wherever
+    the pipeline ran dry (G9). Each year draws from its own seeded
+    stream, so a year's calendar is the same on a fresh build and on a
+    continuation replay. Only invoices opened on or before THROUGH."""
+    plans: list[dict] = []
+    for yy in years_in_range():
         rng = random.Random(f"{SEED}:contract:{yy}")
         n_gaps = rng.choice([1, 2, 2, 3])
         gaps = set(rng.sample(range(1, 13), n_gaps))
         clients = CONTRACT_CLIENTS[:]
         rng.shuffle(clients)
         client_idx = 0
-        engagement = None   # (client, monthly_amount, pay_day, months_left)
+        engagement = None   # [client, monthly_amount, pay_day, months_left]
         for m in range(1, 13):
             if m in gaps:
                 engagement = None
@@ -1866,19 +2216,21 @@ def gen_contractor_income() -> list[dict]:
             client, amt, pay_day, left = engagement
             left -= 1
             final = left == 0
-            desc = f"{client} 尾款" if final else f"{client} 合同款"
+            stage = "尾款" if final else "进度款"
             amount = amt + (D(str(rng.choice([0, 2000, 4000])))
                             if final else D("0"))
             engagement = None if final else [client, amt, pay_day, left]
-            d = _clamp_day(yy, m, pay_day)
-            if not (date(YEAR, 1, 1) <= d <= THROUGH):
+            pay = next_business_day(_clamp_day(yy, m, pay_day))
+            open_d = next_business_day(pay - timedelta(days=12))
+            if open_d > THROUGH:
                 continue
-            txns.append({
-                "description": desc,
-                "date": d,
-                "splits": [(CHECKING, amount), (CONTRACTOR, -amount)],
+            plans.append({
+                "client": client, "open": open_d, "pay": pay,
+                "amount": amount,
+                "desc": (f"{date(yy, m, 1).strftime('%Y年%m月')} "
+                         f"{CONTRACT_PROJECTS[client]} {stage}"),
             })
-    return txns
+    return plans
 
 
 # ── Phase 7b: Business module (customers, vendors, invoices, bills)
@@ -1904,11 +2256,40 @@ def _job_by_name(book: GnuCashBook, name: str) -> dict:
     raise SystemExit(f"continuation: job {name!r} not found in book")
 
 
-def run_business(book: GnuCashBook, since: date | None = None) -> dict:
-    """Create billterms, customers, vendors, invoices, and bills.
+def _employee_by_name(book: GnuCashBook, name: str) -> dict:
+    env = book.list_employees(compact=False, limit=250)
+    rows = next((v for v in env.values() if isinstance(v, list)), [])
+    for row in rows:
+        if row.get("name") == name:
+            return row
+    raise SystemExit(f"continuation: employee {name!r} not found in book")
 
-    Returns a small dict of counts plus the JetBrains bill id (for
-    verification).
+
+# The Shenzhen retainer: ¥12,000/month in 2025, renewed each January at
+# +5% (rounded to the hundred) — a contract that keeps running (audit P4).
+def shenzhen_retainer(yy: int) -> Decimal:
+    raised = D("12000") * (D("1.05") ** (yy - YEAR))
+    return (raised / D("100")).to_integral_value(rounding="ROUND_HALF_UP") * D("100")
+
+
+# Bills that are NOT card charges (audit A2: 优客工场 and 阿里云 were both
+# billed AND charged to the card for the same service). The vendors on
+# the bill path are paid by bank transfer only.
+BOOKKEEPING_FEE = D("900")          # quarterly 代理记账
+HARDWARE_BILLS = [                  # (month, day, description, amount, account)
+    (3, 15, "机械键盘 + 显示器支架", D("1280"), EXP_OFFICE_EQUIP),
+    (9, 15, "打印纸 / 墨盒 / 网线", D("460"), EXP_OFFICE_SUPPLIES),
+]
+# 陈宇's expense claims — two vouchers a year through the voucher module.
+ASSISTANT_VOUCHERS = [              # (month, day, description, amount, account)
+    (4, 18, "客户拜访 交通+餐费", D("386.50"), EXP_BIZ_TRAVEL),
+    (10, 22, "办公耗材 自购报销", D("263.80"), EXP_OFFICE_SUPPLIES),
+]
+
+
+def run_business(book: GnuCashBook, since: date | None = None) -> dict:
+    """Create billterms, customers, vendors, the employee, jobs, and
+    every invoice / bill / voucher through THROUGH.
 
     ``since`` (continuation mode): entities and jobs already exist in
     the frozen prefix — look them up instead of creating; emit only
@@ -1916,7 +2297,7 @@ def run_business(book: GnuCashBook, since: date | None = None) -> dict:
     "recent open" document while its predecessor is still outstanding.
     """
     counts = {"customers": 0, "vendors": 0, "invoices": 0, "bills": 0,
-              "terms": 0}
+              "vouchers": 0, "terms": 0}
 
     open_owner_names: set[str] = set()
     if since is None:
@@ -1929,38 +2310,34 @@ def run_business(book: GnuCashBook, since: date | None = None) -> dict:
                              description="10天内付款享2%折扣")
         counts["terms"] = 3
 
-        # Customers.
         shenzhen = book.create_customer(
             name="深圳跨境电商有限公司", currency="CNY",
-            notes="本地跨境电商客户, Net 30")
+            notes="本地跨境电商客户, 月度运维+开发 retainer, Net 30")
         pacific = book.create_customer(
             name="Pacific Trade Solutions", currency="USD",
             notes="美国客户, 移动应用外包, Net 30")
         munich = book.create_customer(
             name="Handelskontor München GmbH", currency="EUR",
             notes="德国客户, ERP 集成项目, Net 30")
-        counts["customers"] = 3
+        contract_customers = {
+            name: book.create_customer(
+                name=name, currency="CNY",
+                notes=f"{CONTRACT_PROJECTS[name]} 外包, 开具增值税专用发票, Net 15")
+            for name in CONTRACT_CLIENTS
+        }
+        counts["customers"] = 3 + len(contract_customers)
 
-        # Vendors.
-        alibaba = book.create_vendor(
-            name="阿里云", currency="CNY", notes="云服务")
+        bookkeeper = book.create_vendor(
+            name="深圳博源代理记账", currency="CNY", notes="代理记账 季度服务费")
+        hardware = book.create_vendor(
+            name="华强北 赛格电子", currency="CNY", notes="办公设备/耗材")
         jetbrains = book.create_vendor(
-            name="JetBrains", currency="USD",
-            notes="IDE 年度订阅")
-        urwork = book.create_vendor(
-            name="优客工场", currency="CNY", notes="联合办公空间")
+            name="JetBrains", currency="USD", notes="IDE 年度订阅")
         counts["vendors"] = 3
 
-        # 陈宇 — the business's part-time assistant (bookkeeper review
-        # §3 registered him so the employee register isn't empty). Not
-        # the spouse: the household salary schedule is 周子航's.
-        book.create_employee(name="陈宇", currency="CNY")
+        assistant = book.create_employee(name=ASSISTANT, currency="CNY")
         counts["employees"] = 1
 
-        # Jobs — multi-invoice projects (owner_type=job over customers),
-        # matching the prior hand-built book's 3 active jobs. A couple of
-        # invoices below attach to these via job_id so get_job_report has
-        # data.
         job_sz = book.create_job(
             owner_id=shenzhen["id"], owner_type="customer",
             name="跨境电商平台改版", reference="SZ-2025-01")
@@ -1975,9 +2352,12 @@ def run_business(book: GnuCashBook, since: date | None = None) -> dict:
         shenzhen = _party_by_name(book, "深圳跨境电商有限公司")
         pacific = _party_by_name(book, "Pacific Trade Solutions")
         munich = _party_by_name(book, "Handelskontor München GmbH")
-        alibaba = _party_by_name(book, "阿里云")
+        contract_customers = {name: _party_by_name(book, name)
+                              for name in CONTRACT_CLIENTS}
+        bookkeeper = _party_by_name(book, "深圳博源代理记账")
+        hardware = _party_by_name(book, "华强北 赛格电子")
         jetbrains = _party_by_name(book, "JetBrains")
-        urwork = _party_by_name(book, "优客工场")
+        assistant = _employee_by_name(book, ASSISTANT)
         job_sz = _job_by_name(book, "跨境电商平台改版")
         job_pacific = _job_by_name(book, "Pacific Mobile App v2")
         job_munich = _job_by_name(book, "München ERP-Integration")
@@ -1986,62 +2366,63 @@ def run_business(book: GnuCashBook, since: date | None = None) -> dict:
             doc.get("owner_name") for doc in env.get("invoices", [])
         }
 
-    def run_invoice(customer_id, date_open, date_pay,
-                    amount, description, currency, post_account,
-                    pay=True, job_id=None):
-        """Create → post → (optionally) pay a customer invoice.
-
-        ``date_open`` / ``date_pay`` are ``date`` objects. When ``pay`` is
-        False the invoice is posted but left OUTSTANDING (a receivables
-        demo surface). ``job_id`` groups the invoice under a Job.
-        """
+    def run_invoice(customer_id, date_open, date_pay, amount, description,
+                    currency, post_account, revenue_account=LLC_REVENUE,
+                    term="Net 30", pay=True, job_id=None, notes=""):
+        """Create → post → (optionally) pay a customer invoice. ``pay``
+        is honoured only when ``date_pay`` is on or before THROUGH —
+        an invoice whose payment run hasn't happened yet stays open."""
         if since is not None and date_open <= since:
             return None
         inv = book.create_invoice(
             customer_id=customer_id, date_opened=date_open.isoformat(),
-            currency=currency, term="Net 30", job_id=job_id,
+            currency=currency, term=term, job_id=job_id, notes=notes,
         )
         book.add_invoice_entry(
-            invoice_id=inv["id"], account=LLC_REVENUE,
-            description=description, quantity="1", price=amount,
+            invoice_id=inv["id"], account=revenue_account,
+            description=description, quantity="1", price=str(amount),
         )
         # No force needed: add_prices() lays real FX quotes on cross-currency
-        # post & pay dates (CROSS_CCY_FX_DATES) plus a monthly snapshot on the
-        # 1st of every month through THROUGH, so the 90-day freshness guard is
-        # always satisfied with a true market rate. The post→pay rate drift
-        # books a real realized FX gain/loss on paid invoices.
+        # post & pay dates plus a monthly snapshot on the 1st of every month
+        # through THROUGH, so the freshness guard is always satisfied with a
+        # true market rate. The post→pay rate drift books a real realized
+        # FX gain/loss on paid invoices.
         book.post_invoice(
             invoice_id=inv["id"], post_account=post_account,
             post_date=date_open.isoformat(), owner_type="customer",
         )
-        if pay:
+        if pay and date_pay <= THROUGH:
             book.pay_invoice(
                 invoice_id=inv["id"], payment_account=CHECKING,
-                amount=amount, payment_date=date_pay.isoformat(),
+                amount=str(amount), payment_date=date_pay.isoformat(),
                 owner_type="customer",
             )
         counts["invoices"] += 1
         return inv["id"]
 
-    # Open documents anchor to THROUGH with staggered ages (OPEN_DOC_AGE),
-    # each on its own post date; the cross-currency ones carry a real quote
-    # laid on that date by the price layer. JetBrains keeps the 1st of
-    # THROUGH's month (a monthly snapshot date).
     recent_open = date(THROUGH.year, THROUGH.month, 1)
 
-    # Shenzhen (CNY): ¥12,000/month for all of 2025, PAID. The first two
-    # months attach to the cross-border-platform job (multi-invoice project).
-    for m in range(1, 13):
-        run_invoice(
-            shenzhen["id"], date(YEAR, m, 1), date(YEAR, m, 28), "12000",
-            f"{date(YEAR, m, 1).strftime('%Y年%m月')} 移动应用开发",
-            "CNY", AR_CNY,
-            job_id=(job_sz["id"] if m in (1, 2) else None),
-        )
+    # Shenzhen (CNY): the monthly retainer, every year the timeline
+    # reaches, invoiced on the first business day and paid on the 28th's
+    # business day. The first two 2025 months attach to the platform job.
+    for yy in years_in_range():
+        fee = shenzhen_retainer(yy)
+        for m in range(1, 13):
+            open_d = next_business_day(date(yy, m, 1))
+            if open_d > THROUGH:
+                break
+            run_invoice(
+                shenzhen["id"], open_d,
+                next_business_day(date(yy, m, 28)), fee,
+                f"{date(yy, m, 1).strftime('%Y年%m月')} 移动应用开发与运维",
+                "CNY", AR_CNY,
+                job_id=(job_sz["id"] if (yy, m) in ((YEAR, 1), (YEAR, 2))
+                        else None),
+                notes=(f"{yy} 年度合同续签，月费 ¥{fee}" if m == 1 and yy > YEAR
+                       else ""),
+            )
     # Shenzhen OUTSTANDING (CNY A/R demo surface): a milestone just past
     # due and a maintenance invoice not yet due, both unpaid.
-    # Continuation: skipped while a Shenzhen document is still outstanding
-    # (don't stack open invoices).
     if "深圳跨境电商有限公司" not in open_owner_names:
         sz_ms = open_document_date("sz_milestone")
         run_invoice(
@@ -2054,17 +2435,17 @@ def run_business(book: GnuCashBook, since: date | None = None) -> dict:
             f"{sz_mt.strftime('%Y年%m月')} 运维支持",
             "CNY", AR_CNY, pay=False)
 
-    # Pacific Trade (USD → AR USD): the 2025 plan is PAID cross-currency to
-    # CNY (PACIFIC_PLAN shares dates with the price layer). The Q3 batch
-    # attaches to the Pacific job. One recent USD invoice is left OUTSTANDING.
-    for m, amt in PACIFIC_PLAN:
-        pay_m = m + 1 if m < 12 else 1
-        pay_yr = YEAR if m < 12 else YEAR + 1
+    # Pacific Trade (USD → AR USD) and München (EUR → AR EUR): the same
+    # calendar every year, paid cross-currency into CNY.
+    for plan in foreign_invoice_plans():
+        if plan["customer"] == "pacific":
+            cust, post_acct, job = pacific, AR_USD, job_pacific
+        else:
+            cust, post_acct, job = munich, AR_EUR, job_munich
         run_invoice(
-            pacific["id"], date(YEAR, m, 5), date(pay_yr, pay_m, 5), amt,
-            f"{date(YEAR, m, 1).strftime('%B %Y')} cross-border app engagement",
-            "USD", AR_USD,
-            job_id=(job_pacific["id"] if m == 9 else None),
+            cust["id"], plan["open"], plan["pay"], plan["amount"],
+            plan["desc"], plan["currency"], post_acct,
+            job_id=(job["id"] if plan["job"] else None),
         )
     if "Pacific Trade Solutions" not in open_owner_names:
         pac = open_document_date("pacific")
@@ -2072,17 +2453,6 @@ def run_business(book: GnuCashBook, since: date | None = None) -> dict:
             pacific["id"], pac, pac, "5200",
             f"{pac.strftime('%B %Y')} retainer + change requests",
             "USD", AR_USD, pay=False, job_id=job_pacific["id"])
-
-    # Munich (EUR → AR EUR): the 2025 plan is PAID cross-currency to CNY.
-    # One older + one recent EUR invoice are left OUTSTANDING.
-    for m, amt in MUNICH_PLAN:
-        pay_m = m + 1
-        run_invoice(
-            munich["id"], date(YEAR, m, 8), date(YEAR, pay_m, 8), amt,
-            f"{date(YEAR, m, 1).strftime('%B %Y')} Softwareentwicklung",
-            "EUR", AR_EUR,
-            job_id=(job_munich["id"] if m == 11 else None),
-        )
     if "Handelskontor München GmbH" not in open_owner_names:
         mp2 = open_document_date("munich_p2")
         run_invoice(
@@ -2094,6 +2464,15 @@ def run_business(book: GnuCashBook, since: date | None = None) -> dict:
             munich["id"], mw, mw, "2800",
             f"{mw.strftime('%B %Y')} Wartung",
             "EUR", AR_EUR, pay=False)
+
+    # Contract engagements (CNY, Net 15, 专票) to 承包收入.
+    for plan in contract_invoice_plans():
+        run_invoice(
+            contract_customers[plan["client"]]["id"], plan["open"],
+            plan["pay"], plan["amount"], plan["desc"], "CNY", AR_CNY,
+            revenue_account=CONTRACTOR, term="Net 15",
+            notes="增值税专用发票（征收率 1%）",
+        )
 
     # Vendor bills.
     def run_bill(vendor_id, date_open, date_pay, amount,
@@ -2108,37 +2487,39 @@ def run_business(book: GnuCashBook, since: date | None = None) -> dict:
         )
         book.add_bill_entry(
             bill_id=bill["id"], account=expense_account,
-            description=description, quantity="1", price=amount,
+            description=description, quantity="1", price=str(amount),
         )
-        # No force: a real FX quote sits on every cross-currency post/pay
-        # date (CROSS_CCY_FX_DATES) plus the monthly snapshots through THROUGH.
-        # CNY bills don't convert at all.
         book.post_invoice(
             invoice_id=bill["id"], post_account=post_account,
             post_date=date_open.isoformat(), owner_type="vendor",
         )
-        if pay:
+        if pay and date_pay <= THROUGH:
             book.pay_invoice(
                 invoice_id=bill["id"], payment_account=payment_account,
-                amount=amount, payment_date=date_pay.isoformat(),
+                amount=str(amount), payment_date=date_pay.isoformat(),
                 owner_type="vendor",
             )
         counts["bills"] += 1
         return bill["id"]
 
-    # Alibaba Cloud: a couple of CNY bills through the business module
-    # (the monthly recurring cloud charge in Phase 5 is the day-to-day;
-    # these exercise the vendor-bill path explicitly).
-    for m in (4, 10):
-        run_bill(alibaba["id"], date(YEAR, m, 2), date(YEAR, m, 20), "350",
-                 f"{date(YEAR, m, 1).strftime('%Y年%m月')} 云服务器",
-                 EXP_CLOUD, "CNY")
-
-    # UrWork: CNY bills.
-    for m in (2, 8):
-        run_bill(urwork["id"], date(YEAR, m, 3), date(YEAR, m, 18), "1500",
-                 f"{date(YEAR, m, 1).strftime('%Y年%m月')} 工位租赁",
-                 EXP_COWORKING, "CNY")
+    for yy in years_in_range():
+        # 代理记账 quarterly service fee, billed early in the quarter.
+        for m in (1, 4, 7, 10):
+            open_d = next_business_day(date(yy, m, 6))
+            if open_d > THROUGH:
+                continue
+            run_bill(bookkeeper["id"], open_d,
+                     next_business_day(open_d + timedelta(days=12)),
+                     BOOKKEEPING_FEE,
+                     f"{yy}年 第{(m - 1) // 3 + 1}季度 代理记账服务费",
+                     EXP_BIZ_SERVICES, "CNY")
+        for m, day, desc, amount, acct in HARDWARE_BILLS:
+            open_d = next_business_day(date(yy, m, day))
+            if open_d > THROUGH:
+                continue
+            run_bill(hardware["id"], open_d,
+                     next_business_day(open_d + timedelta(days=9)),
+                     amount, desc, acct, "CNY")
 
     # JetBrains US$249 — the foreign-currency PAYABLE case (M2).
     # RE-DATED to a recent month (the 1st of THROUGH's month, which
@@ -2147,15 +2528,10 @@ def run_business(book: GnuCashBook, since: date | None = None) -> dict:
     # corruption. Posted to the USD A/P subledger: post_invoice
     # refuses a document/post-account commodity mismatch since
     # v1.5.0 (battery ruling 1 — per-currency payables are correct
-    # practice, and the demo models it). Reports convert the USD
-    # balance at report time, so M2's foreign-currency-payable
-    # coverage holds; any warning-era mismatched postings in the
-    # frozen prefix remain as old-book coverage.
+    # practice, and the demo models it).
     jetbrains_post = recent_open
     jetbrains_bill_id = None
     if "JetBrains" not in open_owner_names:
-        # Lazy-create the subledger: the frozen prefix predates it,
-        # and a fresh full build needs it too.
         try:
             existing = book.get_account(AP_USD)
         except Exception:
@@ -2177,6 +2553,37 @@ def run_business(book: GnuCashBook, since: date | None = None) -> dict:
             EXP_SOFTWARE, "USD", pay=False, post_account=AP_USD,
         )
 
+    # 陈宇's expense vouchers: two a year, posted to A/P and reimbursed
+    # from the bank account (audit L6 — the voucher module was
+    # otherwise unexercised in this book).
+    for yy in years_in_range():
+        for m, day, desc, amount, acct in ASSISTANT_VOUCHERS:
+            open_d = next_business_day(date(yy, m, day))
+            if open_d > THROUGH:
+                continue
+            if since is not None and open_d <= since:
+                continue
+            voucher = book.create_voucher(
+                employee_id=assistant["id"], date_opened=open_d.isoformat(),
+                currency="CNY", term="Net 15",
+            )
+            book.add_voucher_entry(
+                voucher_id=voucher["id"], account=acct,
+                description=desc, quantity="1", price=str(amount),
+            )
+            book.post_invoice(
+                invoice_id=voucher["id"], post_account=AP,
+                post_date=open_d.isoformat(), owner_type="employee",
+            )
+            pay_d = next_business_day(open_d + timedelta(days=7))
+            if pay_d <= THROUGH:
+                book.pay_invoice(
+                    invoice_id=voucher["id"], payment_account=CHECKING,
+                    amount=str(amount), payment_date=pay_d.isoformat(),
+                    owner_type="employee",
+                )
+            counts["vouchers"] += 1
+
     counts["jetbrains_bill_id"] = jetbrains_bill_id
     return counts
 
@@ -2195,6 +2602,18 @@ FRACTION = {"300750": 100, "510300": 10000, "159915": 10000}
 # to a target budget, never a CNY amount divided by price (fractional or
 # odd-lot holdings are impossible on the SSE/SZSE).
 ROUND_LOT = {"300750": 100, "510300": 100, "159915": 100}
+
+# A-share trading costs (audit L8): 印花税 0.05% on the SELL side of
+# stocks (ETFs are exempt), broker commission 0.025% with a ¥5 minimum
+# on stock trades both ways. ETF 定投 rides the broker's zero-minimum
+# fund plan, so the DCA fills carry no fee line.
+STAMP_DUTY_RATE = D("0.0005")
+COMMISSION_RATE = D("0.00025")
+COMMISSION_MIN = D("5")
+
+
+def _commission(gross: Decimal) -> Decimal:
+    return max(COMMISSION_MIN, (gross * COMMISSION_RATE).quantize(D("0.01")))
 
 
 def _whole_units(budget: Decimal, price: Decimal, lot: int) -> Decimal:
@@ -2235,9 +2654,9 @@ def run_investments(out_path: Path, since: date | None = None) -> dict:
         # basis reflects actual history and holdings stay whole. Runs every
         # month through THROUGH so DCA continues into the present.
         dca = [("510300", D("2000")), ("159915", D("1000"))]
-        for yy, m in iter_months():
-            d = _clamp_day(yy, m, 1)
-            if not _on_or_before_through(d) or d <= cut:
+        for d in dca_dates():
+            yy, m = d.year, d.month
+            if d <= cut:
                 continue
             for sym, budget in dca:
                 price = real_price(sym, d)
@@ -2264,23 +2683,32 @@ def run_investments(out_path: Path, since: date | None = None) -> dict:
         # is the real market close at the trade date (same quote the
         # price layer wrote), so booked value == shares × real price.
         for m, day, action, sym, shares in INVESTMENT_TRADES:
-            d = date(YEAR, m, day)
+            d = trade_date(m, day)
             if d <= cut:
                 continue
             price = real_price(sym, d)
             inv_acct = acct[ACCT_BY_SYMBOL[sym]]
             cny_amt = (shares * price).quantize(D("0.01"))
+            is_stock = sym == "300750"
+            fee = _commission(cny_amt) if is_stock else D("0")
             if action == "buy":
                 lot = piecash.Lot(
-                    title=f"{sym} {d.isoformat()} purchase", account=inv_acct,
-                    notes=f"{shares} 股 @ ¥{price}", is_closed=0,
+                    title=f"{sym} {d.isoformat()} 买入", account=inv_acct,
+                    notes=f"{shares} 股 @ ¥{price}" + (
+                        f"，佣金 ¥{fee}" if fee else ""),
+                    is_closed=0,
                 )
                 inv_split = piecash.Split(
                     account=inv_acct, value=cny_amt, quantity=shares)
-                cash_split = piecash.Split(account=acct[CHECKING], value=-cny_amt)
+                cash_split = piecash.Split(account=acct[CHECKING],
+                                           value=-(cny_amt + fee))
+                splits = [inv_split, cash_split]
+                if fee:
+                    splits.append(piecash.Split(account=acct[EXP_TRADING_FEES],
+                                                value=fee))
                 piecash.Transaction(
                     currency=cny, description=f"买入 {shares} {sym} @ ¥{price}",
-                    post_date=d, splits=[inv_split, cash_split],
+                    post_date=d, splits=splits,
                 )
                 inv_split.lot = lot
                 counts["lots"] += 1
@@ -2301,16 +2729,27 @@ def run_investments(out_path: Path, since: date | None = None) -> dict:
                 #   (−cost_basis) + cny_amt + (−realized_pl)
                 #   = −cost_basis + cny_amt − (cny_amt − cost_basis) = 0.
                 realized_pl = cny_amt - cost_basis
+                # Sell-side costs: 印花税 + 佣金 come out of the proceeds
+                # and book to 交易费用; the gain is measured on the gross.
+                stamp = ((cny_amt * STAMP_DUTY_RATE).quantize(D("0.01"))
+                         if is_stock else D("0"))
+                fees = stamp + fee
                 inv_split = piecash.Split(
                     account=inv_acct, value=-cost_basis, quantity=-shares)
-                cash_split = piecash.Split(account=acct[CHECKING], value=cny_amt)
+                cash_split = piecash.Split(account=acct[CHECKING],
+                                           value=cny_amt - fees)
                 gain_split = piecash.Split(
                     account=acct[CAPITAL_GAINS], value=-realized_pl)
+                splits = [inv_split, cash_split, gain_split]
+                if fees:
+                    splits.append(piecash.Split(account=acct[EXP_TRADING_FEES],
+                                                value=fees))
                 # Defensive: the synthetic data must balance to the fen.
-                assert (-cost_basis) + cny_amt + (-realized_pl) == 0
+                assert (-cost_basis) + (cny_amt - fees) + (-realized_pl) + fees == 0
                 piecash.Transaction(
                     currency=cny, description=f"卖出 {shares} {sym} @ ¥{price}",
-                    post_date=d, splits=[inv_split, cash_split, gain_split],
+                    notes=(f"印花税 ¥{stamp}，佣金 ¥{fee}" if fees else None),
+                    post_date=d, splits=splits,
                 )
                 inv_split.lot = lot
             counts["txns"] += 1
@@ -2337,89 +2776,172 @@ def run_investments(out_path: Path, since: date | None = None) -> dict:
     return counts
 
 
-# ── Phase 9: Credit card lifecycle ──────────────────────────────
+# ── Phase 9: Credit cards ───────────────────────────────────────
 
-def gen_credit_cards() -> list[dict]:
-    """ICBC payoff arc, CMB monthly + Sep late fee, HSBC HKD charges."""
+def gen_hsbc_charges() -> list[dict]:
+    """The HSBC HKD card's charges — FOREIGN-currency liability (H1). All
+    splits in HKD; the transaction currency is HKD and the offsetting
+    CNY expense split carries a HKD value (txn currency) + CNY quantity
+    (account commodity) at the REAL HKD/CNY rate on the charge date (a
+    matching quote is on file via fx_price_dates)."""
     txns: list[dict] = []
-
-    # ICBC: interest Jan-Apr, payments toward payoff by May.
-    icbc_interest = [(1, D("130")), (2, D("100")), (3, D("70")), (4, D("35"))]
-    for m, amt in icbc_interest:
-        txns.append({
-            "description": "工商银行信用卡 利息",
-            "date": date(YEAR, m, 18),
-            "splits": [(ICBC_CARD, -amt), (EXP_CC_INT, amt)],
-        })
-    icbc_payments = [(1, D("2500")), (2, D("2500")), (3, D("2500")),
-                     (4, D("2500")), (5, D("3000"))]
-    for m, amt in icbc_payments:
-        txns.append({
-            "description": "工商银行信用卡 还款",
-            "date": date(YEAR, m, 22),
-            "splits": [(CHECKING, -amt), (ICBC_CARD, amt)],
-        })
-
-    # CMB: monthly statement payment (continues every month through THROUGH so
-    # the recurring Alibaba+coworking charges keep getting paid off);
-    # September 2025 late fee + interest.
-    for yy, m in iter_months():
-        d = _clamp_day(yy, m, 25)
-        if not _on_or_before_through(d):
-            continue
-        amt = D("1850")  # covers monthly Alibaba+coworking charges
-        txns.append({
-            "description": "招商银行信用卡 还款",
-            "date": d,
-            "splits": [(CHECKING, -amt), (CMB_CARD, amt)],
-        })
-    txns.append({
-        "description": "招商银行信用卡 滞纳金",
-        "date": date(YEAR, 9, 26),
-        "splits": [(CMB_CARD, D("-50")), (EXP_CC_INT, D("50"))],
-    })
-    txns.append({
-        "description": "招商银行信用卡 逾期利息",
-        "date": date(YEAR, 9, 26),
-        "splits": [(CMB_CARD, D("-180")), (EXP_CC_INT, D("180"))],
-    })
-
-    # HSBC HKD card — FOREIGN-currency liability (H1). All splits in HKD;
-    # the transaction currency is HKD and the offsetting CNY account split
-    # carries a HKD value (txn currency) + CNY quantity (account
-    # commodity). We keep ~HK$6,460 net balance by charging more than is
-    # paid. Each charge's CNY quantity uses the REAL HKD/CNY rate on the
-    # charge date (a matching quote is on file via CROSS_CCY_FX_DATES); the
-    # report-time valuation re-converts at the latest rate regardless.
-    for dt, desc, hkd_amt in HSBC_CHARGES:
+    for dt, desc, hkd_amt, acct in hsbc_charges():
         rate = md_fx_cny("HKD", dt)
         cny_val = (hkd_amt * rate).quantize(D("0.01"))
         txns.append({
             "description": desc,
             "date": dt,
             "currency": "HKD",
+            "notes": f"HK${hkd_amt} @ {rate} CNY/HKD",
             "splits": [
-                # Liability split: HKD card, value in HKD (txn currency).
                 (HSBC_CARD, -hkd_amt),
-                # Expense split: CNY account, value in HKD (txn currency),
-                # quantity in CNY (account commodity) at the real rate.
-                (EXP_GROCERIES, hkd_amt, cny_val),
+                (acct, hkd_amt, cny_val),
             ],
         })
-    # One partial payment (HKD): pay HK$1,000, leaving ~HK$6,460.
-    pay_dt, pay_hkd = HSBC_PAYMENT
-    pay_rate = md_fx_cny("HKD", pay_dt)
-    pay_cny = (pay_hkd * pay_rate).quantize(D("0.01"))
-    txns.append({
-        "description": "汇丰 港币卡 还款",
-        "date": pay_dt,
-        "currency": "HKD",
-        "splits": [
-            (HSBC_CARD, pay_hkd),          # liability down (HKD)
-            (CHECKING, -pay_hkd, -pay_cny),  # CNY checking, HKD value / CNY qty
-        ],
-    })
     return txns
+
+
+def run_hsbc_statements(out_path: Path) -> int:
+    """Pay every HSBC statement IN FULL by 购汇 from 银行储蓄卡 on a
+    business day 5–9 days after the close (audit P2). The statement
+    balance is the card's running HKD balance at the close; the CNY
+    quantity is the real HKD/CNY rate on the payment date, which the
+    price layer records on that date."""
+    from continuation import _seeded
+
+    rows = [(dt, -amt) for dt, _desc, amt, _acct in hsbc_charges()]
+    txns: list[dict] = []
+    price_dates: list[tuple[str, date]] = []
+    y, m = YEAR, 1
+    while True:
+        close = _clamp_day(y, m, HSBC_CLOSE_DAY)
+        lag = _seeded("lin-wei", "paylag:汇丰港币信用卡", close, 5, 9)
+        pay = next_business_day(close + timedelta(days=lag))
+        if pay > THROUGH:
+            break
+        owed = -sum((v for d, v in rows if d <= close), D("0"))
+        if owed > 0:
+            rate = md_fx_cny("HKD", pay)
+            cny = (owed * rate).quantize(D("0.01"))
+            txns.append({
+                "description": "汇丰 港币卡 还款（购汇）",
+                "date": pay,
+                "currency": "HKD",
+                "notes": (f"{close.strftime('%Y-%m')} 账单 HK${owed} 全额还清，"
+                          f"购汇 @ {rate}"),
+                "splits": [
+                    (HSBC_CARD, owed),             # liability down (HKD)
+                    (CHECKING, -owed, -cny),       # HKD value / CNY quantity
+                ],
+            })
+            rows.append((pay, owed))
+            price_dates.append(("HKD", pay))
+        y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+    _add_price_rows(out_path, price_dates)
+    return write_bulk(out_path, txns)
+
+
+def _card_running(book, path: str) -> list[tuple[date, Decimal]]:
+    """(date, value) for every split on a card account, in date order."""
+    acct = {a.fullname: a for a in book.accounts}
+    rows: list[tuple[date, Decimal]] = []
+    for sp in acct[path].splits:
+        post = sp.transaction.post_date
+        if hasattr(post, "date"):
+            post = post.date()
+        rows.append((post, Decimal(str(sp.value))))
+    rows.sort()
+    return rows
+
+
+# The ICBC opening arrears (¥8,500) are paid down ¥1,500 a cycle with
+# interest on the carried balance until clear, then the card is paid in
+# full like 招商. The CMB card is paid in full from the first statement.
+ICBC_CATCHUP = D("1500")
+CARD_TERMS = [  # (account, label, statement close day)
+    (CMB_CARD, "招商银行信用卡", 25),
+    (ICBC_CARD, "工商银行信用卡", 20),
+]
+
+
+def run_credit_cards(out_path: Path) -> int:
+    """Statement payments (and carried-balance interest) for the two
+    CNY cards from the first 2025 close through the last close whose
+    payment lands inside THROUGH. Reads the charges already in the
+    book and walks the cycles sequentially, so each payment is the true
+    statement balance and interest posts only in a month a balance
+    actually carried (audit P1)."""
+    from continuation import _seeded
+
+    gc = piecash.open_book(str(out_path), readonly=True, open_if_lock=True)
+    try:
+        charges = {acct: _card_running(gc, acct) for acct, _l, _c in CARD_TERMS}
+        aprs = {}
+        for acct, _l, _c in CARD_TERMS:
+            slots = {sl.name: sl.value for sl in
+                     next(a for a in gc.accounts if a.fullname == acct).slots}
+            aprs[acct] = D(str(slots.get("apr", "18.25")))
+    finally:
+        gc.close()
+
+    txns: list[dict] = []
+    for acct, label, close_day in CARD_TERMS:
+        rows = list(charges[acct])
+        apr = aprs[acct]
+
+        def balance_at(when: date) -> Decimal:
+            return -sum((v for d, v in rows if d <= when), D("0"))
+
+        y, m = YEAR, 1
+        carried = D("0")
+        # The ICBC opening arrears are paid down in instalments; once
+        # cleared the card is paid in full for good (a later big cycle
+        # is not new arrears).
+        catching_up = acct == ICBC_CARD
+        while True:
+            close = _clamp_day(y, m, close_day)
+            pay_lag = _seeded("lin-wei", f"paylag:{label}", close, 3, 7)
+            pay_date = close + timedelta(days=pay_lag)
+            if pay_date > THROUGH:
+                break
+            if carried > 0:
+                interest = (carried * apr / D("100") / D("12")).quantize(
+                    D("0.01"))
+                if interest > 0:
+                    txns.append({
+                        "description": f"{label} 利息",
+                        "date": close,
+                        "notes": f"上期未还 ¥{carried} 按年化 {apr}% 计息",
+                        "splits": [(acct, -interest), (EXP_CC_INT, interest)],
+                    })
+                    rows.append((close, -interest))
+                    rows.sort()
+            owed = balance_at(close)
+            if owed <= 0:
+                carried = D("0")
+                y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+                continue
+            if catching_up and owed > ICBC_CATCHUP:
+                payment = ICBC_CATCHUP
+                desc = f"{label} 还款（分期清偿欠款）"
+            elif catching_up:
+                payment = owed
+                desc = f"{label} 还款（结清欠款）"
+                catching_up = False
+            else:
+                payment = owed
+                desc = f"{label} 还款"
+            payment = payment.quantize(D("0.01"))
+            txns.append({
+                "description": desc, "date": pay_date,
+                "notes": f"{close.strftime('%Y-%m')} 账单 ¥{owed}",
+                "splits": [(CHECKING, -payment), (acct, payment)],
+            })
+            rows.append((pay_date, payment))
+            rows.sort()
+            carried = owed - payment
+            y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+    return write_bulk(out_path, txns)
 
 
 # ── Phase 10: Budget ────────────────────────────────────────────
@@ -2490,7 +3012,8 @@ def run_edge_cases(book: GnuCashBook, out_path: Path) -> dict:
     book.void_transaction(guid=void_res["guid"], reason="重复付款, 作废")
     info["voided_guid"] = void_res["guid"]
 
-    # 2. Recategorized: ¥450 Office Supplies → Misc, then replace to Software.
+    # 2. Recategorized: ¥450 办公用品 → 杂项 by mistake, then replace_splits
+    #    to 经营支出:办公用品 (audit P13).
     recat = book.create_transaction(
         description="办公用品",
         trans_date=date(YEAR, 4, 20),
@@ -2504,7 +3027,7 @@ def run_edge_cases(book: GnuCashBook, out_path: Path) -> dict:
         guid=recat["guid"],
         splits=[
             {"account": CMB_CARD, "amount": "-450"},
-            {"account": EXP_SOFTWARE, "amount": "450"},
+            {"account": EXP_OFFICE_SUPPLIES, "amount": "450"},
         ],
     )
     info["recategorized_guid"] = recat["guid"]
@@ -2547,8 +3070,13 @@ def run_edge_cases(book: GnuCashBook, out_path: Path) -> dict:
 
 # ── Phase 13: Volume stress ─────────────────────────────────────
 
-VOLUME_VENDORS = ["瑞幸咖啡", "便利蜂", "全家便利店", "美团外卖",
-                  "饿了么外卖", "滴滴出行", "共享单车", "自动贩卖机"]
+# Small wallet spend. Commuting (滴滴/单车/地铁) is a workday thing; the
+# weekend list drops it. Every line rides WeChat or Alipay — nobody pays
+# a vending machine from a bank card (audit P10).
+VOLUME_WEEKDAY = ["瑞幸咖啡", "美宜佳", "天虹微喔", "美团外卖", "饿了么外卖",
+                  "滴滴出行", "共享单车", "深圳地铁", "自动贩卖机"]
+VOLUME_WEEKEND = ["瑞幸咖啡", "美宜佳", "天虹微喔", "美团外卖", "饿了么外卖",
+                  "滴滴出行", "自动贩卖机"]
 
 
 def gen_volume() -> list[dict]:
@@ -2562,8 +3090,12 @@ def gen_volume() -> list[dict]:
     count = max(VOLUME_TXN_COUNT, round(VOLUME_TXN_COUNT * days / 365))
     for _ in range(count):
         dt = date.fromordinal(start + rng.randint(0, span))
-        vendor = rng.choice(VOLUME_VENDORS)
+        pool = VOLUME_WEEKEND if dt.weekday() >= 5 else VOLUME_WEEKDAY
+        vendor = rng.choice(pool)
         amt = _spend(rng, 5, 80)
+        src = rng.choice([WECHAT, WECHAT, ALIPAY])
+        if away_label(dt) is not None:
+            continue
         # Category is the merchant's canonical bucket — consistent every time,
         # including the sticky vending-machine→Misc miscategorization. No more
         # per-transaction random scatter across Dining/Misc.
@@ -2571,51 +3103,333 @@ def gen_volume() -> list[dict]:
         txns.append({
             "description": vendor,
             "date": dt,
-            "splits": [(CHECKING, -amt), (category, amt)],
+            "splits": [(src, -amt), (category, amt)],
         })
     return txns
 
 
+# ── Phase 14: Taxes computed from the ledger ────────────────────
+#
+# Nothing here is a constant amount. The quarterly VAT return reads the
+# quarter's sales by 发票 class (专票 / 普票 / export) from the posted
+# invoices; the 经营所得 prepayment reads cumulative revenue and 经营支出
+# from the same ledger and applies the five-bracket table with the
+# 2023–2027 halving; the March 汇算清缴 settles the prior year with the
+# deductions that are only claimed annually. Every figure is written
+# into the transaction's notes so a reader can re-derive it.
+
+ANNUAL_ONLY_DEDUCTIONS = D("21600")   # 赡养老人 ¥18,000 + 继续教育 ¥3,600
+
+
+def _ledger_account_paths(con: sqlite3.Connection) -> dict[str, tuple[str, str]]:
+    """guid → (fullname, commodity mnemonic) for every account under the
+    book's root; template accounts (under GnuCash's template root) are
+    left out, so template rows never count as activity."""
+    root = con.execute("SELECT root_account_guid FROM books").fetchone()[0]
+    rows = con.execute(
+        "SELECT a.guid, a.name, a.parent_guid, c.mnemonic FROM accounts a "
+        "LEFT JOIN commodities c ON c.guid = a.commodity_guid").fetchall()
+    by_guid = {g: (n, pg, mn) for g, n, pg, mn in rows}
+    paths: dict[str, tuple[str, str] | None] = {}
+
+    def path(g):
+        if g in paths:
+            return paths[g]
+        name, parent, mn = by_guid[g]
+        if parent is None:
+            paths[g] = None
+        elif parent == root:
+            paths[g] = (name, mn)
+        else:
+            up = path(parent)
+            paths[g] = None if up is None else (f"{up[0]}:{name}", mn)
+        return paths[g]
+
+    return {g: path(g) for g in by_guid if path(g) is not None}
+
+
+def _ledger_rows(con: sqlite3.Connection):
+    """[(txn_guid, post_date, description, [(fullname, mnemonic,
+    quantity, reconcile_state), ...])] for every ledger transaction."""
+    paths = _ledger_account_paths(con)
+    rows = con.execute(
+        "SELECT t.guid, t.post_date, t.description, s.account_guid, "
+        "s.quantity_num, s.quantity_denom, s.reconcile_state "
+        "FROM splits s JOIN transactions t ON t.guid = s.tx_guid "
+        "ORDER BY t.post_date, t.guid").fetchall()
+    txns: dict[str, list] = {}
+    order: list[str] = []
+    for guid, post, desc, acct, qn, qd, state in rows:
+        if acct not in paths:
+            continue
+        if guid not in txns:
+            txns[guid] = [guid, date.fromisoformat(post[:10]), desc, []]
+            order.append(guid)
+        fullname, mn = paths[acct]
+        txns[guid][3].append((fullname, mn, D(qn) / D(qd), state))
+    return [txns[g] for g in order]
+
+
+def _quarter(d: date) -> tuple[int, int]:
+    return d.year, (d.month - 1) // 3 + 1
+
+
+def _ledger_by_quarter(out_path: Path) -> tuple[dict, dict]:
+    """(revenue, expenses) per (year, quarter). ``revenue[q]`` splits
+    into 专票 (承包收入 — the big-company contracts), 普票 (domestic
+    个体经营收入) and export (个体经营收入 settled through a foreign-
+    currency A/R). Expenses are everything under 支出:经营支出."""
+    con = sqlite3.connect(str(out_path))
+    try:
+        rows = _ledger_rows(con)
+    finally:
+        con.close()
+    revenue: dict[tuple[int, int], dict[str, Decimal]] = {}
+    expenses: dict[tuple[int, int], Decimal] = {}
+    for _guid, post, _desc, splits in rows:
+        q = _quarter(post)
+        ar_foreign = any(
+            fn.startswith("资产:应收款项:") and mn != "CNY"
+            for fn, mn, _qty, _st in splits)
+        for fn, _mn, qty, state in splits:
+            if state == "v":
+                continue
+            if fn == CONTRACTOR:
+                klass = "special"
+            elif fn == LLC_REVENUE:
+                klass = "export" if ar_foreign else "normal"
+            elif fn.startswith(EXP_BIZ + ":"):
+                expenses[q] = expenses.get(q, D("0")) + qty
+                continue
+            else:
+                continue
+            bucket = revenue.setdefault(
+                q, {"special": D("0"), "normal": D("0"), "export": D("0")})
+            bucket[klass] += -qty
+    return revenue, expenses
+
+
+def _biz_income_tax(taxable: Decimal, year: int) -> Decimal:
+    """经营所得 tax on annual taxable income, with the 2023–2027 halving
+    on the portion up to ¥2,000,000."""
+    if taxable <= 0:
+        return D("0")
+
+    def bracket(x: Decimal) -> Decimal:
+        for upper, rate, quick in BIZ_TAX_BRACKETS:
+            if x <= upper:
+                return x * rate - quick
+        raise AssertionError("open-ended top bracket")
+
+    tax = bracket(taxable)
+    if year in BIZ_TAX_HALVING_YEARS:
+        tax -= bracket(min(taxable, BIZ_TAX_HALVING_CAP)) * D("0.5")
+    return tax.quantize(D("0.01"))
+
+
+def _filing_dates(yy: int, q: int) -> tuple[date, date]:
+    """(VAT filing date, 经营所得 prepayment date) for quarter q of yy —
+    the 12th/14th of the month after the quarter, on a business day."""
+    fy, fm = (yy + 1, 1) if q == 4 else (yy, 3 * q + 1)
+    return (next_business_day(date(fy, fm, TAX_VAT_DAY)),
+            next_business_day(date(fy, fm, TAX_PIT_DAY)))
+
+
+def tax_transactions(out_path: Path) -> tuple[list[dict], dict]:
+    """Every VAT return, 经营所得 prepayment and 汇算清缴 due on or
+    before THROUGH, computed from the book as built so far. Returns the
+    transactions and a per-year summary used by the report."""
+    revenue, expenses = _ledger_by_quarter(out_path)
+    txns: list[dict] = []
+    summary: dict[int, dict] = {}
+    zero = {"special": D("0"), "normal": D("0"), "export": D("0")}
+    for yy in years_in_range():
+        paid = D("0")
+        vat_year = D("0")
+        quarters_filed = 0
+        for q in (1, 2, 3, 4):
+            vat_date, pit_date = _filing_dates(yy, q)
+            r = revenue.get((yy, q), zero)
+            if vat_date <= THROUGH:
+                special_base = (r["special"] / D("1.01")).quantize(D("0.01"))
+                normal_base = (r["normal"] / D("1.01")).quantize(D("0.01"))
+                domestic = special_base + normal_base
+                exempt = domestic <= VAT_EXEMPT_QUARTERLY
+                vat = special_base * VAT_RATE
+                if not exempt:
+                    vat += normal_base * VAT_RATE
+                vat = vat.quantize(D("0.01"))
+                surcharge = (vat * VAT_SURCHARGE_RATE).quantize(D("0.01"))
+                total = vat + surcharge
+                notes = (f"{yy}年Q{q} 专票销售额（不含税）¥{special_base}，"
+                         f"普票 ¥{normal_base}"
+                         + ("（季度销售额未超 30 万，免征）" if exempt else "")
+                         + f"，跨境服务出口 ¥{r['export']}（免税）；"
+                         f"增值税 ¥{vat} + 附加税费 ¥{surcharge}")
+                txns.append({
+                    "description": "增值税及附加 季度申报缴款",
+                    "date": vat_date, "notes": notes,
+                    "splits": [(CHECKING, -total), (EXP_VAT, total)],
+                })
+                vat_year += total
+            if pit_date <= THROUGH:
+                rev_ytd = sum((sum(revenue.get((yy, qq), zero).values())
+                               for qq in range(1, q + 1)), D("0"))
+                exp_ytd = sum((expenses.get((yy, qq), D("0"))
+                               for qq in range(1, q + 1)), D("0"))
+                deduction = (BIZ_TAX_ANNUAL_DEDUCTION * 3 * q / 12
+                             ).quantize(D("0.01"))
+                taxable = rev_ytd - exp_ytd - deduction
+                cum_tax = _biz_income_tax(taxable, yy)
+                prepay = max(D("0"), cum_tax - paid).quantize(D("0.01"))
+                notes = (f"{yy}年 1–{3 * q}月 累计收入 ¥{rev_ytd} − 成本费用 "
+                         f"¥{exp_ytd} − 费用扣除 ¥{deduction} = 累计应纳税所得额 "
+                         f"¥{taxable}；累计应纳税额 ¥{cum_tax}"
+                         + ("（≤200万部分减半）" if yy in BIZ_TAX_HALVING_YEARS
+                            else "")
+                         + f"，已预缴 ¥{paid}，本期预缴 ¥{prepay}")
+                txns.append({
+                    "description": "经营所得个人所得税 季度预缴",
+                    "date": pit_date, "notes": notes,
+                    "splits": [(CHECKING, -prepay),
+                               (EXP_BIZ_INCOME_TAX, prepay)],
+                })
+                paid += prepay
+                quarters_filed = q
+        settle_date = next_business_day(date(yy + 1, 3, TAX_SETTLE_DAY))
+        settlement = D("0")
+        annual = None
+        if settle_date <= THROUGH:
+            rev_y = sum((sum(revenue.get((yy, qq), zero).values())
+                         for qq in range(1, 5)), D("0"))
+            exp_y = sum((expenses.get((yy, qq), D("0"))
+                         for qq in range(1, 5)), D("0"))
+            taxable = (rev_y - exp_y - BIZ_TAX_ANNUAL_DEDUCTION
+                       - ANNUAL_ONLY_DEDUCTIONS)
+            annual = _biz_income_tax(taxable, yy)
+            settlement = (annual - paid).quantize(D("0.01"))
+            if settlement != 0:
+                kind = "补税" if settlement > 0 else "退税"
+                txns.append({
+                    "description": "经营所得个人所得税 年度汇算清缴",
+                    "date": settle_date,
+                    "notes": (f"{yy}年度汇算清缴：收入 ¥{rev_y} − 成本费用 ¥{exp_y}"
+                              f" − 费用扣除 ¥{BIZ_TAX_ANNUAL_DEDUCTION} − 专项附加扣除 "
+                              f"¥{ANNUAL_ONLY_DEDUCTIONS}（赡养老人、继续教育）= "
+                              f"应纳税所得额 ¥{taxable}；应纳税额 ¥{annual}，"
+                              f"已预缴 ¥{paid}，{kind} ¥{abs(settlement)}"),
+                    "splits": [(CHECKING, -settlement),
+                               (EXP_BIZ_INCOME_TAX, settlement)],
+                })
+        summary[yy] = {
+            "vat": vat_year, "pit_prepaid": paid, "pit_settlement": settlement,
+            "pit_annual": annual, "quarters_filed": quarters_filed,
+        }
+    return txns, summary
+
+
+def run_taxes(out_path: Path) -> dict:
+    txns, summary = tax_transactions(out_path)
+    n = write_bulk(out_path, txns)
+    summary["written"] = n
+    return summary
+
+
 # ── Phase 11: Reconciliation ────────────────────────────────────
 
-def run_reconciliation(book: GnuCashBook) -> None:
-    """Reconcile only the first months of 2025 for checking.
+def run_reconciliation(out_path: Path) -> list[str]:
+    """The bookkeeper's posture (review §1): every bank / wallet / card
+    account reconciled through the last FULL month, the current month
+    left open as the demo's work item (audit A7 — the bank used to be
+    frozen at 2025-03-30)."""
+    from continuation import reconcile_through
+    return reconcile_through(POLICY, out_path, THROUGH)
 
-    A realistic personal book is never fully reconciled — the bookkeeper
-    catches up the bank account for a few early months and then falls behind,
-    leaving hundreds-to-thousands of unreconciled splits. We reconcile
-    checking through the end of March 2025 only; everything after stays
-    unreconciled.
-    """
-    for label, through, stmt_date in [
-        ("January", date(YEAR, 1, 31), date(YEAR, 1, 31)),
-        ("February", date(YEAR, 2, 28), date(YEAR, 2, 28)),
-        ("March", date(YEAR, 3, 31), date(YEAR, 3, 31)),
-    ]:
-        # Compute the reconciled balance through the date and reconcile
-        # everything unreconciled up to it.
-        bal = book.get_balance(CHECKING, as_of_date=through)
-        try:
-            book.reconcile_account(
-                account_name=CHECKING,
-                statement_date=stmt_date,
-                statement_balance=str(bal),
-                reconcile_all=True,
-                through_date=through,
-            )
-        except Exception as exc:  # noqa: BLE001
-            print(f"  Reconciliation {label} skipped: {exc}")
+
+# ── Entry timestamps ────────────────────────────────────────────
+
+def stamp_entry_dates(out_path: Path) -> int:
+    """``enter_date`` = the post date plus a few hours, not the build
+    moment (audit round 2, item 7). piecash and the server both stamp
+    ``datetime.now()`` on every write; a book whose 2,900 rows were all
+    entered in the same minute is a generator's fingerprint. The offset
+    is a hash of (post_date, description), so the stamp is stable
+    across rebuilds."""
+    con = sqlite3.connect(str(out_path))
+    try:
+        rows = con.execute(
+            "SELECT guid, post_date, description FROM transactions").fetchall()
+        for guid, post, desc in rows:
+            if not post:
+                continue
+            base = datetime.strptime(post[:19], "%Y-%m-%d %H:%M:%S")
+            h = int(hashlib.sha1(f"{post}|{desc}".encode()).hexdigest(), 16)
+            entered = base + timedelta(hours=1 + h % 9, minutes=(h >> 8) % 60,
+                                       seconds=(h >> 16) % 60)
+            con.execute("UPDATE transactions SET enter_date = ? WHERE guid = ?",
+                        (entered.strftime("%Y-%m-%d %H:%M:%S"), guid))
+        con.commit()
+    finally:
+        con.close()
+    return len(rows)
 
 
 # ── Scheduled-transaction state (kept ENABLED) ──────────────────
 
-def set_schedule_state(out_path: Path) -> None:
-    """Stamp SX cursors via the shared engine rule: everything current,
-    at most ONE schedule overdue and only when it "just came due" (3-7
-    days -- bookkeeper review §2). Replaces the fixed two-overdue-index
-    scheme, whose hooks aged into reading as neglect."""
-    from continuation import advance_sx
-    return advance_sx(out_path, THROUGH)
+def _sx_instances(ledger, template_desc: str) -> list:
+    """The ledger transactions that are instances of a schedule: same
+    description, or the description plus a parenthesised suffix (the
+    overtime months of the payslip)."""
+    return [t for t in ledger
+            if (t.description == template_desc
+                or t.description.startswith(template_desc + " ("))
+            and t.post_date <= THROUGH]
+
+
+def set_schedule_state(out_path: Path) -> dict:
+    """``last_occur`` = the latest POSTED instance of each schedule, and
+    every instance stamped with GnuCash's ``from-sched-xaction`` slot
+    (audit A3: 经营所得 季度预缴 sat at 2026-06-14 with its September
+    instance in the ledger, so the dashboard called it overdue). A
+    schedule with no instance yet keeps ``last_occur`` empty."""
+    info = {"schedules": 0, "instances": 0, "unposted": []}
+    stamps: list[tuple[str, str]] = []   # (txn guid, sx guid)
+    gc = piecash.open_book(str(out_path), readonly=False, do_backup=False)
+    try:
+        ledger = _ledger_txns(gc)
+        for sx in gc.session.query(piecash.ScheduledTransaction).all():
+            tmpl = sx.template_account
+            tmpl_txns = {sp.transaction for sp in tmpl.splits}
+            desc = (next(iter(tmpl_txns)).description
+                    if tmpl_txns else sx.name)
+            instances = _sx_instances(ledger, desc)
+            sx.enabled = 1
+            sx.last_occur = (max(t.post_date for t in instances)
+                             if instances else None)
+            if not instances:
+                info["unposted"].append(sx.name)
+            stamps.extend((t.guid, sx.guid) for t in instances)
+            info["schedules"] += 1
+        gc.save()
+    finally:
+        gc.close()
+    # The instance stamp, exactly as desktop (and the server's
+    # create_transaction_from_scheduled) writes it: a bare GUID slot.
+    con = sqlite3.connect(str(out_path))
+    try:
+        have = {row[0] for row in con.execute(
+            "SELECT obj_guid FROM slots WHERE name = 'from-sched-xaction'")}
+        for txn_guid, sx_guid in stamps:
+            if txn_guid in have:
+                continue
+            con.execute(
+                "INSERT INTO slots (obj_guid, name, slot_type, guid_val) "
+                "VALUES (?, 'from-sched-xaction', 9, ?)", (txn_guid, sx_guid))
+            info["instances"] += 1
+        con.commit()
+    finally:
+        con.close()
+    return info
 
 
 # ── Verification ────────────────────────────────────────────────
@@ -2649,8 +3463,8 @@ def _verify_realism(out_path: Path) -> None:
         # 1. Cents on consumer spend. Sample ~20 daily-spend transactions and
         #    report the fraction carrying non-zero jiao/fen.
         consumer_merchants = (
-            "瑞幸", "美团外卖", "饿了么", "盒马", "便利蜂", "7-11",
-            "全家便利店", "山姆", "滴滴出行", "共享单车", "自动贩卖机",
+            "瑞幸", "美团外卖", "饿了么", "盒马", "美宜佳", "7-11",
+            "天虹微喔", "山姆", "滴滴出行", "共享单车", "自动贩卖机",
             "EV充电",
         )
         consumer = [t for t in txns
@@ -2709,7 +3523,7 @@ def _verify_realism(out_path: Path) -> None:
             exp = [s for s in t.splits
                    if s.account.fullname.startswith("支出:")]
             for s in exp:
-                for key in ("瑞幸", "美团外卖", "饿了么", "盒马", "便利蜂",
+                for key in ("瑞幸", "美团外卖", "饿了么", "盒马", "美宜佳",
                             "滴滴出行", "共享单车", "自动贩卖机", "山姆",
                             "EV充电"):
                     if t.description.startswith(key):
@@ -2754,11 +3568,206 @@ def _verify_realism(out_path: Path) -> None:
         book.close()
 
 
-def verify(out_path: Path, business: dict) -> None:
+def _month_ends_through(through: date) -> list[date]:
+    out: list[date] = []
+    y, m = YEAR, 1
+    while True:
+        nxt = date(y + 1, 1, 1) if m == 12 else date(y, m + 1, 1)
+        end = nxt - timedelta(days=1)
+        if end > through:
+            return out
+        out.append(end)
+        y, m = nxt.year, nxt.month
+
+
+def _running_balance(rows, fullname: str):
+    """A ``bal_at(date)`` closure over the ledger rows for one account
+    (non-voided quantities, cumulative by post date)."""
+    events = sorted(
+        (post, qty) for _g, post, _d, splits in rows
+        for fn, _mn, qty, state in splits
+        if fn == fullname and state != "v")
+
+    def bal_at(when: date) -> Decimal:
+        return sum((q for d, q in events if d <= when), D("0"))
+    return bal_at
+
+
+def _verify_invariants(out_path: Path, tax_summary: dict) -> None:
+    """Round-2 invariants over every month-end of the timeline. Each
+    raises SystemExit on violation; the values are printed either way
+    so the build log carries the evidence."""
+    print("\n-- Invariants over every month-end (audit round 2) --")
+    con = sqlite3.connect(str(out_path))
+    try:
+        rows = _ledger_rows(con)
+        slots = {}
+        for obj, name, sval in con.execute(
+                "SELECT s.obj_guid, s.name, "
+                "COALESCE(s.string_val, CAST(s.int64_val AS TEXT)) "
+                "FROM slots s WHERE s.name IN ('credit_limit')"):
+            slots.setdefault(obj, {})[name] = sval
+        paths = _ledger_account_paths(con)
+        limits = {paths[g][0]: D(v["credit_limit"]) for g, v in slots.items()
+                  if g in paths and "credit_limit" in v}
+        invoices = con.execute(
+            "SELECT i.id, i.date_posted, bt.duedays, i.post_lot, i.currency "
+            "FROM invoices i LEFT JOIN billterms bt ON bt.guid = i.terms "
+            "WHERE i.date_posted IS NOT NULL AND i.date_posted <> ''"
+        ).fetchall()
+        lot_splits = {}
+        for lot, post, qn, qd, state in con.execute(
+                "SELECT s.lot_guid, t.post_date, s.quantity_num, "
+                "s.quantity_denom, s.reconcile_state FROM splits s "
+                "JOIN transactions t ON t.guid = s.tx_guid "
+                "WHERE s.lot_guid IS NOT NULL"):
+            lot_splits.setdefault(lot, []).append(
+                (date.fromisoformat(post[:10]), D(qn) / D(qd), state))
+    finally:
+        con.close()
+    month_ends = _month_ends_through(THROUGH)
+    checkpoints = month_ends + ([THROUGH] if THROUGH not in month_ends else [])
+
+    # 1. Every credit card ≤ its credit_limit slot.
+    worst: dict[str, tuple[Decimal, date]] = {}
+    for card in (CMB_CARD, ICBC_CARD, HSBC_CARD):
+        bal_at = _running_balance(rows, card)
+        limit = limits.get(card)
+        for me in checkpoints:
+            owed = -bal_at(me)
+            if card not in worst or owed > worst[card][0]:
+                worst[card] = (owed, me)
+            if limit is not None and owed > limit:
+                raise SystemExit(f"INVARIANT: {card} owes {owed} over limit "
+                                 f"{limit} at {me}")
+    for card, (owed, me) in worst.items():
+        print(f"  card ≤ limit: {card.split(':')[-1]} peak owed {owed:,.2f} "
+              f"on {me} (limit {limits.get(card)}) OK")
+
+    # 2. 银行储蓄卡 inside the policy band at every month-end.
+    lo, hi = POLICY.buffer * D("0.5"), POLICY.buffer * D("3")
+    bal_at = _running_balance(rows, CHECKING)
+    band = [(me, bal_at(me)) for me in month_ends]
+    out_of_band = [(me, b) for me, b in band if not (lo <= b <= hi)]
+    mn = min(band, key=lambda t: t[1]) if band else None
+    mx = max(band, key=lambda t: t[1]) if band else None
+    print(f"  checking band [{lo:,.0f}, {hi:,.0f}]: min {mn[1]:,.2f} on "
+          f"{mn[0]}, max {mx[1]:,.2f} on {mx[0]}; "
+          f"{len(out_of_band)} month-ends outside")
+    if out_of_band:
+        raise SystemExit(f"INVARIANT: checking outside band at "
+                         f"{out_of_band[:3]}")
+
+    # 3. No invoice unpaid beyond terms + 45 days at any month-end.
+    late: list[tuple] = []
+    max_age = (0, None)
+    for inv_id, posted, duedays, lot, cur in invoices:
+        posted_d = date.fromisoformat(posted[:10])
+        due = posted_d + timedelta(days=int(duedays or 30))
+        legs = lot_splits.get(lot, [])
+        balance = sum((q for _d, q, st in legs if st != "v"), D("0"))
+        paid_on = max((d for d, _q, _st in legs), default=None)
+        settled = paid_on if balance == 0 and len(legs) > 1 else None
+        for me in checkpoints:
+            if posted_d > me:
+                continue
+            if settled is not None and settled <= me:
+                continue
+            age = (me - due).days
+            if age > max_age[0]:
+                max_age = (age, inv_id)
+            if age > 45:
+                late.append((inv_id, posted_d, due, me))
+    print(f"  invoices: {len(invoices)} posted; oldest past-due age at any "
+          f"checkpoint {max_age[0]} days (#{max_age[1]}); "
+          f"{len(late)} beyond terms+45 OK" if not late else
+          f"  invoices: {len(late)} beyond terms+45: {late[:3]}")
+    if late:
+        raise SystemExit("INVARIANT: invoice unpaid beyond terms + 45 days")
+
+    # 4. VAT + 经营所得 booked within 15% of what the ledger implies.
+    revenue, expenses = _ledger_by_quarter(out_path)
+    zero = {"special": D("0"), "normal": D("0"), "export": D("0")}
+    booked_vat: dict[int, Decimal] = {}
+    booked_pit: dict[int, Decimal] = {}
+    for _g, post, desc, splits in rows:
+        for fn, _mn, qty, state in splits:
+            if state == "v":
+                continue
+            if fn == EXP_VAT:
+                # A return filed in month M covers the quarter ending in
+                # M-1: January's covers the prior year's Q4.
+                yr = post.year - 1 if post.month == 1 else post.year
+                booked_vat[yr] = booked_vat.get(yr, D("0")) + qty
+            elif fn == EXP_BIZ_INCOME_TAX:
+                yr = post.year - 1 if post.month in (1, 3) else post.year
+                booked_pit[yr] = booked_pit.get(yr, D("0")) + qty
+    for yy in years_in_range():
+        s_ = tax_summary.get(yy, {})
+        qf = s_.get("quarters_filed", 0)
+        if qf == 0:
+            continue
+        # Implied VAT: recomputed from the ledger, quarter by quarter.
+        implied_vat = D("0")
+        for q in range(1, qf + 1):
+            r = revenue.get((yy, q), zero)
+            sb = (r["special"] / D("1.01")).quantize(D("0.01"))
+            nb = (r["normal"] / D("1.01")).quantize(D("0.01"))
+            vat = sb * VAT_RATE + (nb * VAT_RATE
+                                   if sb + nb > VAT_EXEMPT_QUARTERLY else 0)
+            vat = vat.quantize(D("0.01"))
+            implied_vat += vat + (vat * VAT_SURCHARGE_RATE).quantize(D("0.01"))
+        rev = sum((sum(revenue.get((yy, q), zero).values())
+                   for q in range(1, qf + 1)), D("0"))
+        exp = sum((expenses.get((yy, q), D("0")) for q in range(1, qf + 1)),
+                  D("0"))
+        settled = s_.get("pit_annual") is not None
+        deductions = (BIZ_TAX_ANNUAL_DEDUCTION + ANNUAL_ONLY_DEDUCTIONS
+                      if settled else BIZ_TAX_ANNUAL_DEDUCTION * 3 * qf / 12)
+        implied_pit = _biz_income_tax(rev - exp - deductions, yy)
+        got_vat = booked_vat.get(yy, D("0"))
+        got_pit = booked_pit.get(yy, D("0"))
+        implied = implied_vat + implied_pit
+        got = got_vat + got_pit
+        dev = (abs(got - implied) / implied * 100) if implied else D("0")
+        print(f"  tax {yy} (Q1–Q{qf}{', settled' if settled else ''}): "
+              f"VAT+附加 booked {got_vat:,.2f} vs implied {implied_vat:,.2f}; "
+              f"经营所得 booked {got_pit:,.2f} vs implied {implied_pit:,.2f}; "
+              f"deviation {dev:.2f}%")
+        if implied and dev > 15:
+            raise SystemExit(f"INVARIANT: {yy} tax booked {got} vs implied "
+                             f"{implied} ({dev:.1f}%)")
+
+    # A3: every schedule's cursor is its latest posted instance.
+    gc = piecash.open_book(str(out_path), readonly=True, open_if_lock=True)
+    try:
+        ledger = _ledger_txns(gc)
+        bad = []
+        for sx in gc.session.query(piecash.ScheduledTransaction).all():
+            tmpl_txns = {sp.transaction for sp in sx.template_account.splits}
+            desc = next(iter(tmpl_txns)).description if tmpl_txns else sx.name
+            inst = _sx_instances(ledger, desc)
+            want = max((t.post_date for t in inst), default=None)
+            have = sx.last_occur
+            if hasattr(have, "date") and have is not None:
+                have = have.date()
+            if want != have:
+                bad.append((sx.name, have, want))
+        n_sx = gc.session.query(piecash.ScheduledTransaction).count()
+    finally:
+        gc.close()
+    print(f"  schedules: {n_sx} cursors == latest posted instance"
+          f"{' OK' if not bad else ' MISMATCH ' + str(bad)}")
+    if bad:
+        raise SystemExit("INVARIANT: last_occur != latest posted instance")
+
+
+def verify(out_path: Path, business: dict, tax_summary: dict | None = None) -> None:
     print("\n" + "=" * 64)
     print("VERIFICATION")
     print("=" * 64)
     book = GnuCashBook(str(out_path))
+    _verify_invariants(out_path, tax_summary or {})
 
     # Covers all activity through the present (THROUGH) as well as the cached
     # price horizon (END). Prices forward-fill past END.
@@ -2984,14 +3993,13 @@ from continuation import CardPolicy, PersonaPolicy  # noqa: E402
 
 def continuation_txns(through: date) -> list[dict]:
     """The deterministic streams continuation replays (spec §2.2).
-    ``gen_credit_cards`` is deliberately absent — the policy layer
-    derives payments and interest from the book itself; the HSBC HKD
-    card's scripted arc stays prefix history ("leave 汇丰",
-    DRIFT_ANALYSIS)."""
+    Card statements, taxes and sweeps are deliberately absent — the
+    policy layer derives payments from the book itself, and
+    hsbc_payoff_repair settles the HKD card in narrative."""
     global THROUGH
     THROUGH = through
     return (gen_recurring() + gen_daily_weekly() + gen_personal_life()
-            + gen_contractor_income() + gen_volume())
+            + gen_hsbc_charges() + gen_volume())
 
 
 def _add_price_rows(out_path: Path, pairs: list[tuple[str, date]]) -> int:
@@ -3151,22 +4159,18 @@ POLICY = PersonaPolicy(
     checking=CHECKING, savings=SAVINGS,
     buffer=D("40000"),                 # DRIFT_ANALYSIS: measured floor
     cards=(
-        # 招商: the deliberate revolver — pays down to 50% of its
-        # ¥80,000 limit on first contact (¥7,817, DRIFT ANALYSIS), then
-        # minimum-plus payments hold it at the bound; interest accrues.
-        CardPolicy(account=CMB_CARD, label="招商银行信用卡", kind="revolver",
-                   close_day_default=25, bound_utilization=D("0.50"),
-                   payment_plus=D("600"), accrue_interest=True,
-                   interest_account=EXP_CC_INT),
-        # 工商: the nobody-pays-this card. max_payment turns the ¥7.2k
-        # arrears into a ¥1,500/month catch-up (DRIFT prescription);
-        # once cleared the floor payment covers each cycle's charges.
-        CardPolicy(account=ICBC_CARD, label="工商银行信用卡", kind="revolver",
-                   close_day_default=20, payment_plus=D("1400"),
-                   max_payment=D("1500"), accrue_interest=True,
-                   interest_account=EXP_CC_INT),
-        # 汇丰 HKD card: left alone by policy (DRIFT: static, scripted
-        # prefix history).
+        # Both CNY cards are paid in full at every statement (audit P1).
+        # The base build's 2025 arc — the ICBC opening arrears paid down
+        # ¥1,500 a cycle with interest — is run_credit_cards' narrative;
+        # from the frozen edge onward the continuation pays the true
+        # statement balance.
+        CardPolicy(account=CMB_CARD, label="招商银行信用卡", kind="pif",
+                   close_day_default=25),
+        CardPolicy(account=ICBC_CARD, label="工商银行信用卡", kind="pif",
+                   close_day_default=20),
+        # 汇丰 HKD card: statements are 购汇 repayments (a cross-currency
+        # write the engine doesn't do) — run_hsbc_statements in the base
+        # build, hsbc_payoff_repair in continuation.
     ),
     savings_share=D("0.60"),           # thin sweeps — she stays cash-tight
     invest_months=(3, 6, 9, 12),
@@ -3179,12 +4183,33 @@ POLICY = PersonaPolicy(
     book_repairs=hsbc_payoff_repair,
     # Loans have no statement to reconcile against (review §1).
     no_reconcile=(MORTGAGE, AUTO_LOAN),
+    # 储蓄账户 earns a demand-deposit rate, monthly (audit P7).
+    savings_apy=D("0.015"),
+    interest_income=INTEREST_INCOME,
     desc_statement="{label} 还款",
     desc_repair_card="{label} 还款（清理累积欠款）",
     desc_sweep="转入储蓄账户（月度结余）",
     desc_repair_sweep="转入储蓄账户（结余归集）",
+    desc_topup="储蓄账户转入（补足日常余额）",
+    desc_savings_interest="储蓄账户 利息",
     desc_interest="{label} 利息",
 )
+
+
+def run_base_policy(out_path: Path) -> list[str]:
+    """Run the closed-loop policy over the WHOLE base timeline — surplus
+    sweeps (savings + quarterly 沪深300), the savings-pile rebalance,
+    savings interest — from 2025-01-01. Card statements are paid by
+    run_credit_cards (the 2025 narrative needs the ICBC catch-up arc),
+    so the cards are masked here; everything else is the exact rule
+    set the continuation applies from the frozen edge onward."""
+    from dataclasses import replace
+
+    from continuation import run_policy
+
+    base_policy = replace(POLICY, cards=())
+    return run_policy(base_policy, out_path,
+                      date(YEAR, 1, 1) - timedelta(days=1), THROUGH)
 
 
 # ── Driver ──────────────────────────────────────────────────────
@@ -3229,11 +4254,7 @@ def build(out_path: Path) -> None:
     n = write_bulk(out_path, gen_personal_life())
     print(f"  {n} personal-life transactions")
 
-    print("\nPhase 7a: direct contractor income")
-    n = write_bulk(out_path, gen_contractor_income())
-    print(f"  {n} contractor deposits")
-
-    print("\nPhase 7b: business module")
+    print("\nPhase 7: business module (every client through A/R)")
     business = run_business(book)
     print(f"  {business}")
 
@@ -3241,9 +4262,9 @@ def build(out_path: Path) -> None:
     inv_counts = run_investments(out_path)
     print(f"  {inv_counts}")
 
-    print("\nPhase 9: credit card lifecycle")
-    n = write_bulk(out_path, gen_credit_cards())
-    print(f"  {n} credit-card transactions")
+    print("\nPhase 9a: HSBC HKD card charges")
+    n = write_bulk(out_path, gen_hsbc_charges())
+    print(f"  {n} HKD charges")
 
     print("\nPhase 10: budget")
     run_budget(book)
@@ -3257,15 +4278,54 @@ def build(out_path: Path) -> None:
     n = write_bulk(out_path, gen_volume())
     print(f"  {n} volume transactions")
 
-    print("\nPhase 11: reconciliation")
-    run_reconciliation(book)
-    print("  reconciliation done")
+    # Everything below READS the book: taxes from the posted revenue and
+    # 经营支出, statements from the real running card balances, sweeps
+    # from the household's real surplus.
+    print("\nPhase 14: taxes computed from the ledger")
+    tax_summary = run_taxes(out_path)
+    for yy in years_in_range():
+        s_ = tax_summary[yy]
+        print(f"  {yy}: VAT+附加 {s_['vat']:,.2f}; 经营所得 prepaid "
+              f"{s_['pit_prepaid']:,.2f}, 汇算清缴 {s_['pit_settlement']:,.2f}"
+              f" (Q1–Q{s_['quarters_filed']})")
+    print(f"  {tax_summary['written']} tax transactions")
 
-    print("\nScheduled-transaction state (kept enabled)")
-    set_schedule_state(out_path)
-    print("  scheduled transactions left enabled with realistic last_occur")
+    print("\nPhase 9b: HSBC statements paid in full by 购汇")
+    n = run_hsbc_statements(out_path)
+    print(f"  {n} HKD statement payments")
 
-    verify(out_path, business)
+    print("\nPhase 9c: CNY card statements (computed from the book)")
+    n = run_credit_cards(out_path)
+    print(f"  {n} statement payments / interest")
+
+    print("\nPhase 7d: closed-loop policy — surplus sweeps, savings interest")
+    actions = run_base_policy(out_path)
+    print(f"  {len(actions)} policy actions; last 4:")
+    for line in actions[-4:]:
+        print(f"    {line}")
+
+    print("\nPhase 11: reconciliation posture (through the last full month)")
+    for line in run_reconciliation(out_path):
+        print(f"  {line}")
+
+    print("\nEntry timestamps")
+    n = stamp_entry_dates(out_path)
+    print(f"  {n} transactions entered on their post date")
+
+    print("\nScheduled-transaction state (cursor = latest posted instance)")
+    sx_state = set_schedule_state(out_path)
+    print(f"  {sx_state}")
+
+    print("\nContinuation invariants over the base timeline")
+    from continuation import verify_invariants
+    warnings = verify_invariants(POLICY, out_path,
+                                 date(YEAR, 1, 1) - timedelta(days=1), THROUGH)
+    for w in warnings:
+        print(f"  WARN: {w}")
+    if not warnings:
+        print("  clean")
+
+    verify(out_path, business, tax_summary)
     print("\nDone.")
 
 
