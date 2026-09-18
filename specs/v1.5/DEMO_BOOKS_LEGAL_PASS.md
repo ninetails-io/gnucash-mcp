@@ -146,3 +146,85 @@ blob guard's only exception, and the last binary blobs in the tree.
 Each builder keeps `--chart-only` as a seconds-long validity mode,
 exercised by `tests/test_demo_bases.py`. Ruling 0.2 stands: report
 numbers re-anchor on (generator version, cache version, --through).
+
+## Round 2 — 2026-09-17, against the cold audits
+
+Three cold audits of the round-1 builds (`testing/AUDIT_*_COLD_2026-09-17.md`)
+found the chart-and-persona layer fixed and the layer under it exposed:
+tax mechanics derived from constants instead of the ledger, and cards
+that spiral wherever a builder does not run the policy engine from
+day one. Round 2, one commit per persona on the branch:
+
+- **Sabine** — a payee → tax-treatment table (domestic 19%/7%,
+  exempt, §13b EU/Drittland, Bewirtung 70/30 with notes, private)
+  that every variable row goes through; the USt-VA clears all six VAT
+  accounts; ESt-Vorauszahlungen and settlements from the EÜR; every
+  revenue receipt invoice-posted (Sollversteuerung); Hypothekenzinsen
+  as a drawing under Privatkapital; bank postings on Bankarbeitstage.
+- **Lin Wei** — VAT/附加 and 经营所得 computed from posted revenue
+  and expenses by quarter (small-scale exemption, cumulative method,
+  汇算清缴) and filed the month after quarter end; fixed 社保/公积金
+  bases; 陈宇 on a real part-time wage with employer 社保 and
+  vouchers; the policy engine from 2025-01-01 with statement-balance
+  card payments, interest where a balance carries, HKD repaid via
+  购汇; contracting receipts as 专票 invoices; weekday sampling,
+  lunar 春节, 印花税, trading-day 定投.
+- **Alex** — the two remaining arithmetic lines (Seattle B&O on the
+  whole apportioned base once over the threshold; the April
+  settlement derived with sign from one household model); WA B&O
+  apportioned to WA clients; the shared realism items; the
+  reconciliation and business-day helpers moved into
+  `continuation.py` so every builder inherits them.
+- **All three** — `enter_date` = posting day; four stability
+  invariants in each builder's `verify()` over every month-end
+  (cards ≤ limit, cash within band, tax paid within 15% of the
+  ledger's implied liability, no document past terms + 45 days),
+  proven on builds through 2030-12-31: 72 month-ends, all four hold,
+  in each book.
+
+A second set of cold audits, scoped to "would not sign" and
+high-severity implausibility only, runs on the round-2 books and is
+the pass criterion.
+
+## Round 3 — 2026-09-17, against the second-pass audits
+
+Scope "would not sign" only. Seven items across three books, all
+persona rules or tax-model inputs, none structural. Landed as three
+commits (3abb1a9, 3a14470, a3bcb02): Sabine's gift cap per recipient
+and year with breaches to 4665, one 7% licence per work and only to
+the publisher, a tax-reserve draw from Postbank before each ESt due
+date; Lin Wei's wallets sized to spend and topped up on demand,
+discretionary buys gated on the checking floor, client trips as 差旅,
+教育费附加 exempt under the threshold; Alex's 1040 prepared from the
+ledger's own rows (Schedule B and C from the book, the settlement
+note listing every line), the WA B&O small-business credit ($0
+returns still filed), federal holidays in the business-day calendar.
+Every builder's verify() now also asserts no bank or cash account
+below zero at any day-end. Each round-3 build reproduced by the
+maintainer's session before landing; the merged engine's five-year
+builds and a third cold pass are the remaining gates.
+
+## Rounds 4–5 — 2026-09-17, the identifier layer
+
+A fourth reader (Gemini, `docs/SYNTHETIC_BOOKS_TAX_AUDIT_REPORT.md`)
+and the third-pass audits converged on the last layer: statutory
+detail a native filer's bank or tax portal would reject, none of it
+moving a balance. Alex: the settlement note states the accrual
+method; WA B&O applies the throw-out rule; the Seattle return shares
+that premise (both factors 1.00); the LLC top-up comes from personal
+checking; engine transfers fall on business days. Sabine: the device
+catalogue draws without repeats at real prices with printers among the
+Peripheriegeräte; a December-2024 tail; florists at 7%; every fill-up
+a business expense. Lin Wei: a 对公账户 for invoices, 结汇 and tax
+filings with owner's draws; the payroll row withholds and remits;
+技术服务收入 under a registered 个体工商户; 免税备案 and 涉外收入申报
+references; 发票 notes on every expense; then (round 5) the SAFE
+services code, 数电票 numbering, a checksum-valid credit code, one
+备案 per contract, and 普票 references on the retainer.
+
+Fourth-pass verdicts: Sabine würde unterschreiben; Alex signs once the
+Seattle return matched (fixed); Lin Wei passes once the identifiers do
+(round 5). All rounds landed by the maintainer's session after
+reproducing each build; five-year builds hold every invariant on the
+final engine. What remains is the desktop gate and the release
+checklist.
