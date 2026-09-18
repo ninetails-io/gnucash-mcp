@@ -900,7 +900,7 @@ def _device(day: date, payee: str, item: str, gross: D, *,
       R 6.13 EStR) — it can never be a GWG whatever it costs. The
       catalogue keeps every peripheral under €250 net, so it is a
       Sofortaufwand on 4985 and no Anlagekonto is involved.
-    * a **selbständig nutzbares** item (NAS, Drucker, Tablet, Kamera,
+    * a **selbständig nutzbares** item (NAS, Tablet, Kamera,
       Projektor, Bürostuhl, Kopfhörer) above €250 and up to €800 net is
       a GWG on 4855 and gets the next number of that year's laufend
       geführtes GWG-Verzeichnis (§6 Abs. 2 S. 4 EStG); below €250 it is
@@ -1097,10 +1097,10 @@ DEVICES: dict[str, tuple[int, int, bool]] = {
     "USB-Hub mit Netzteil": (40, 90, False),
     # Selbständig nutzbar — GWG above €250 net, Sofortaufwand below
     "Studio-Kopfhörer": (150, 320, True),
-    "Etikettendrucker": (120, 260, True),
+    "Etikettendrucker": (120, 240, False),
     "NAS-Festplatte 8 TB": (300, 650, True),
-    "Laserdrucker (s/w, Duplex)": (250, 480, True),
-    "Fotodrucker A3+ (Proofs)": (450, 780, True),
+    "Laserdrucker (s/w, Duplex)": (150, 245, False),
+    "Fotodrucker A3 (Proofs)": (180, 249, False),
     "Tablet (Kundenpräsentation)": (450, 700, True),
     "Diensthandy (Vorjahresmodell)": (400, 780, True),
     "Digitalkamera (Produktfotos)": (400, 780, True),
@@ -1418,13 +1418,13 @@ P_GROCERIES = ["REWE", "EDEKA", "LIDL", "ALDI Süd", "Vollcorner Bio", "dm-droge
 P_DINING = ["Hofbräuhaus", "L'Osteria", "Vapiano", "Wirtshaus zur Brez'n", "dean&david"]
 P_COFFEE = ["Starbucks", "Café Glockenspiel", "Man Versus Machine", "Bäckerei Rischart", "Döner Imbiss Schwabing"]
 P_HOUSE = ["IKEA Brunnthal", "Höffner", "MediaMarkt", "Amazon.de", "OBI Baumarkt"]
-P_TRANSPORT = ["MVG München", "Deutsche Bahn", "FREENOW", "ARAL"]
+P_TRANSPORT = ["MVG München", "Deutsche Bahn", "FREENOW"]
 P_MISC = ["Apotheke am Markt", "Friseur Schnittstelle", "Body & Soul Fitness", "Cinemaxx", "Müller Drogerie"]
 P_SUBS = [("Netflix", "12.99"), ("Spotify", "10.99"), ("Amazon Prime", "8.99")]
 # Chains with branches (A2) among the personal merchants.
 P_BRANCHES = {"REWE", "EDEKA", "LIDL", "ALDI Süd", "dm-drogerie", "Rossmann", "L'Osteria",
               "Vapiano", "dean&david", "Starbucks", "Bäckerei Rischart", "MediaMarkt",
-              "OBI Baumarkt", "ARAL", "Müller Drogerie", "Cinemaxx", "Hugendubel", "Gravis",
+              "OBI Baumarkt", "Müller Drogerie", "Cinemaxx", "Hugendubel", "Gravis",
               "McPaper", "Vinzenzmurr", "SHELL", "Sixt"}
 
 
