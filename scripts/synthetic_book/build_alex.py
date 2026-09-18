@@ -709,17 +709,20 @@ def opening_balances(out_path: Path) -> None:
             splits=splits,
         )
 
-        # The owner's working-capital top-up.
+        # The owner's working-capital top-up: a transfer from the
+        # household's checking, not equity from nowhere — every cash
+        # account is in this one book, so the money has a source. The
+        # LLC's opening balance already carries the 1/1 position.
         piecash.Transaction(
             currency=usd,
             description="Owner's contribution — Cascade Code LLC working capital",
             notes="January working-capital top-up ahead of the Q1 "
-                  "receivables lag",
+                  "receivables lag, transferred from personal checking",
             post_date=date(YEAR, 1, 2),
             enter_date=_enter_stamp(date(YEAR, 1, 2)),
             splits=[
                 piecash.Split(account=acct[LLC_CHECKING], value=LLC_OPENING),
-                piecash.Split(account=acct[OWNER_CONTRIB], value=-LLC_OPENING),
+                piecash.Split(account=acct[CHECKING], value=-LLC_OPENING),
             ],
         )
 
@@ -1563,11 +1566,14 @@ def _bo_tax_plan(through: date) -> list[dict]:
         if annual <= through:
             gross = sum((receipts.get((yr, m), D("0"))
                          for m in range(1, 13)), D("0"))
-            base = sum((wa_receipts.get((yr, m), D("0"))
-                        for m in range(1, 13)), D("0"))
-            # The $100K is an exemption threshold, not a deduction: over
-            # it, the rate applies to the whole apportioned base (SMC
-            # 5.45.050; cold audit A1).
+            # Same premise as the six state returns: the LLC has nexus
+            # only in Washington, its one worker sits in Seattle, so
+            # both city factors (payroll and service income, RCW
+            # 35.102.130 / SMC 5.45.081, throw-out applied) are 1.00
+            # and the taxable base is worldwide gross. The $100K is an
+            # exemption threshold, not a deduction: over it, the rate
+            # applies to the whole base (SMC 5.45.050).
+            base = gross
             if gross > SEATTLE_BO_THRESHOLD and base > 0:
                 plan.append({
                     "date": annual,
@@ -1576,9 +1582,12 @@ def _bo_tax_plan(through: date) -> list[dict]:
                              f"${gross:,.2f} exceeds the "
                              f"${SEATTLE_BO_THRESHOLD:,.0f} exemption "
                              f"threshold; 0.427% service rate on the "
-                             f"Seattle-apportioned base ${base:,.2f} "
-                             f"(service-income factor, SMC 5.45.081 — "
-                             f"Emerald Analytics, Sound Transit)",
+                             f"full base ${base:,.2f}: payroll factor "
+                             f"1.00 (sole worker in Seattle) and "
+                             f"service-income factor 1.00 after the "
+                             f"throw-out of non-nexus receipts (RCW "
+                             f"35.102.130, SMC 5.45.081), consistent "
+                             f"with the WA DOR returns",
                     "amount": (base * SEATTLE_BO_RATE).quantize(D("0.01")),
                 })
     return plan
