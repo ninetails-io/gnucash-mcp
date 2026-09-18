@@ -14,12 +14,21 @@ two mandatory FX regression cases (the HSBC HKD credit card and the JetBrains
 US$249 vendor bill) are built so both surface in CNY on every report.
 
 The household (Shenzhen, a native zh_CN chart): 林微 runs a cross-border
-e-commerce development business — every invoice, contract deposit, and business
-expense is hers, and her quarterly filings are 增值税及附加 plus the 经营所得
+e-commerce development business as a REGISTERED 个体工商户 — 深圳市林微电子商务
+工作室, 统一社会信用代码 92440300MA5FQ2X7J8 (well-formed, deliberately not a real
+registration). That registration is what makes her 经营所得 treatment legitimate:
+an unregistered individual contracting with 腾讯/大疆/顺丰 would be reassessed as
+劳务报酬所得 at 20–40% with no small-business halving (cross-model tax audit §3.2).
+Every invoice she raises carries the 工作室's name, her 专票 are issued under its
+税号, and the business banks through its own 对公账户 (招商银行对公账户) — domestic
+receipts and the 结汇 of foreign receipts land there, business bills, 陈宇's payroll
+and every tax filing are paid from there, and the household is funded by a monthly
+业主提款 to 银行储蓄卡 rather than by commingling (§3.1: 私户收款 under 金税四期 is
+an AML/tax-evasion trigger). Her quarterly filings are 增值税及附加 plus the 经营所得
 income-tax prepayment. Her spouse 周子航 is on staff at 深圳市人民医院, a public
 institution whose employees may not run a side business, so the salaried income
-with social-insurance and 住房公积金 withholding is his. Everyday money moves on
-a bank debit card (银行储蓄卡) that funds WeChat Pay and Alipay. The portfolio is
+with social-insurance and 住房公积金 withholding is his. Everyday household money
+moves on a bank debit card (银行储蓄卡) that funds WeChat Pay and Alipay. The portfolio is
 宁德时代 in 100-share lots plus two ETFs, every position a whole number of 一手
 round lots, priced only from the offline market cache. The cat is 字节. Bills
 land on their own days, 电费 follows Shenzhen's summer air-conditioning curve,
@@ -145,6 +154,38 @@ HOUSING_FUND_EMPLOYEE = (SOCIAL_BASE * HOUSING_FUND_RATE).quantize(D("0.01"))  #
 # 陈宇 — the business's registered part-time assistant (audit L6): a real
 # wage on the 10th, employee 社保 withheld, employer 社保 as a business
 # expense. Below the ¥5,000 起征点, so no 个税 is withheld.
+# The registered 个体工商户 behind every invoice, 专票 and 发票 抬头. The
+# 统一社会信用代码 is WELL-FORMED (9 市场监管 + 2 个体工商户 + 440300 深圳 +
+# 9-char 组织机构代码 + check digit) and DELIBERATELY INVALID — the check
+# digit does not verify, so it can never collide with a real registration.
+BIZ_NAME = "深圳市林微电子商务工作室"
+BIZ_USCC = "92440300MA5FQ2X7J8"
+
+
+def _fapiao(key: str) -> tuple[str, str]:
+    """A 发票代码 / 发票号码 pair, deterministic in ``key``.
+
+    Well-formed (12-digit 代码 opening on 深圳's 0440319 prefix, 8-digit
+    号码) and deliberately fictional — no synthetic book should carry a
+    number that could match a real 发票 on anyone's 电子税务局 record.
+    """
+    rng = random.Random(f"{SEED}:fapiao:{key}")
+    return (f"0440319{rng.randint(10000, 99999)}",
+            f"{rng.randint(10000000, 99999999)}")
+
+
+def fapiao_note(key: str, kind: str = "增值税普通发票",
+                extra: str = "") -> str:
+    """The 税前扣除凭证 line every 经营支出 row carries: which 发票 backs
+    the deduction, and that it is made out to the registered 工作室 —
+    without it a Chinese auditor disallows the expense outright
+    (cross-model tax audit §3.4)."""
+    code, number = _fapiao(key)
+    note = (f"{kind} 代码 {code} 号码 {number}；"
+            f"抬头 {BIZ_NAME}（统一社会信用代码 {BIZ_USCC}）")
+    return f"{note}；{extra}" if extra else note
+
+
 ASSISTANT = "陈宇"
 ASSISTANT_WAGE = D("3500")
 ASSISTANT_EMPLOYER_SOCIAL_RATE = D("0.15")   # Shenzhen 单位 ≈ 15%
@@ -326,6 +367,11 @@ def md_fx_cny(foreign: str, when: date) -> Decimal:
 # personal "checking"; the WeChat/Alipay rails below sit on top of it.
 CHECKING = "资产:流动资产:银行储蓄卡"
 SAVINGS = "资产:流动资产:储蓄账户"
+# The 个体工商户's 对公账户 (cross-model tax audit §3.1 / §4B bug 1): every
+# domestic invoice receipt and every 结汇 of a foreign receipt lands here,
+# every business bill / payroll / tax filing is paid from here, and the
+# household is funded from here by a monthly 业主提款.
+BIZ_CHECKING = "资产:流动资产:招商银行对公账户"
 CASH = "资产:流动资产:现金"
 WECHAT = "资产:流动资产:微信支付"
 ALIPAY = "资产:流动资产:支付宝"
@@ -354,9 +400,14 @@ AP = "负债:应付账款"
 AP_USD = "负债:应付账款（美元）"
 
 OPENING = "所有者权益:期初余额"
+DRAW_EQUITY = "所有者权益:业主提款"
 
 SALARY = "收入:工资"  # the spouse's payslip (see SPOUSE above)
-CONTRACTOR = "收入:承包收入"
+# 技术服务收入, NOT 承包收入: a 个体工商户 invoicing enterprise clients for
+# software work earns 经营所得 from technical services. "承包收入" reads as
+# labour contracting and invites reclassification to 劳务报酬所得 at 20–40%
+# without the ≤200万 halving (cross-model tax audit §3.2 / §4B bug 2).
+CONTRACTOR = "收入:技术服务收入"
 LLC_REVENUE = "收入:个体经营收入"
 DIVIDENDS = "收入:投资收益:股息"
 CAPITAL_GAINS = "收入:投资收益:资本利得"
@@ -743,6 +794,7 @@ ACCOUNTS = [
     ("资产", "ASSET", None, "CNY", "CURRENCY", True),
     ("流动资产", "ASSET", "资产", "CNY", "CURRENCY", True),
     ("银行储蓄卡", "BANK", "资产:流动资产", "CNY", "CURRENCY", False),
+    ("招商银行对公账户", "BANK", "资产:流动资产", "CNY", "CURRENCY", False),
     ("储蓄账户", "BANK", "资产:流动资产", "CNY", "CURRENCY", False),
     ("现金", "CASH", "资产:流动资产", "CNY", "CURRENCY", False),
     ("微信支付", "BANK", "资产:流动资产", "CNY", "CURRENCY", False),
@@ -773,7 +825,7 @@ ACCOUNTS = [
     # 收入 (Income)
     ("收入", "INCOME", None, "CNY", "CURRENCY", True),
     ("工资", "INCOME", "收入", "CNY", "CURRENCY", False),
-    ("承包收入", "INCOME", "收入", "CNY", "CURRENCY", False),
+    ("技术服务收入", "INCOME", "收入", "CNY", "CURRENCY", False),
     ("个体经营收入", "INCOME", "收入", "CNY", "CURRENCY", False),
     ("投资收益", "INCOME", "收入", "CNY", "CURRENCY", True),
     ("股息", "INCOME", "收入:投资收益", "CNY", "CURRENCY", False),
@@ -847,6 +899,7 @@ ACCOUNTS = [
     # 所有者权益 (Equity)
     ("所有者权益", "EQUITY", None, "CNY", "CURRENCY", True),
     ("期初余额", "EQUITY", "所有者权益", "CNY", "CURRENCY", False),
+    ("业主提款", "EQUITY", "所有者权益", "CNY", "CURRENCY", False),
 ]
 
 
@@ -909,6 +962,7 @@ def set_account_slots(book: GnuCashBook) -> None:
 # (account_path, balance_cny)  — opening balances via equity offset.
 OPENING_BALANCES = [
     (CHECKING, D("85000")),
+    (BIZ_CHECKING, D("60000")),   # the 工作室's working capital
     (SAVINGS, D("150000")),
     (CASH, D("2000")),
     (WECHAT, D("3500")),
@@ -1253,11 +1307,13 @@ def create_scheduled_templates(book: GnuCashBook) -> int:
     emp_social = (ASSISTANT_WAGE * SOCIAL_INS_RATE).quantize(D("0.01"))
     er_social = (ASSISTANT_WAGE * ASSISTANT_EMPLOYER_SOCIAL_RATE
                  ).quantize(D("0.01"))
-    sx(f"{ASSISTANT}工资", f"{ASSISTANT} 工资 + 社保缴纳", [
-        {"account": CHECKING,
-         "amount": f"-{ASSISTANT_WAGE + er_social}"},
+    sx(f"{ASSISTANT}工资", f"{ASSISTANT} 工资发放及社保代扣代缴", [
         {"account": EXP_BIZ_WAGES, "amount": str(ASSISTANT_WAGE)},
         {"account": EXP_BIZ_SOCIAL, "amount": str(er_social)},
+        {"account": BIZ_CHECKING,
+         "amount": f"-{ASSISTANT_WAGE - emp_social}"},
+        {"account": BIZ_CHECKING,
+         "amount": f"-{emp_social + er_social}"},
     ], "monthly", start_date=f"{YEAR}-01-{SALARY_DAY:02d}")
 
     sx("房贷还款", "房贷还款", [
@@ -1290,16 +1346,16 @@ def create_scheduled_templates(book: GnuCashBook) -> int:
     # The template amounts are placeholders; the ledger's instances are
     # computed from the book by run_taxes.
     sx("增值税及附加 季度申报", "增值税及附加 季度申报缴款", [
-        {"account": CHECKING, "amount": "-700"},
+        {"account": BIZ_CHECKING, "amount": "-700"},
         {"account": EXP_VAT, "amount": "700"},
     ], "quarterly", start_date=TAX_VAT_START)
     sx("经营所得 季度预缴", "经营所得个人所得税 季度预缴", [
-        {"account": CHECKING, "amount": "-10000"},
+        {"account": BIZ_CHECKING, "amount": "-10000"},
         {"account": EXP_BIZ_INCOME_TAX, "amount": "10000"},
     ], "quarterly", start_date=TAX_PIT_START)
     # Annual 汇算清缴 of the prior year's 经营所得, by March 31.
     sx("经营所得 汇算清缴", "经营所得个人所得税 年度汇算清缴", [
-        {"account": CHECKING, "amount": "-3000"},
+        {"account": BIZ_CHECKING, "amount": "-3000"},
         {"account": EXP_BIZ_INCOME_TAX, "amount": "3000"},
     ], "yearly", start_date=TAX_SETTLE_START)
     # 字节's vaccination + check-up is annual (audit P12).
@@ -1475,16 +1531,28 @@ def gen_recurring() -> list[dict]:
             })
             hf_balance += housing * 2
 
-            # The assistant's wage + 社保, same payday.
+            # The assistant's wage + 社保, same payday, out of the
+            # 工作室's 对公账户. FOUR legs, because 代扣代缴 means the
+            # employee's own 社保 share never reaches him: gross wage and
+            # the employer share are the two expenses, the net wage goes
+            # to 陈宇 and the two social-insurance shares together go to
+            # the 社保局 (cross-model tax audit §3.5 — the old three-leg
+            # row paid the bank 应发 + 单位 while its note claimed a
+            # 代扣, so the withheld share was never withheld from
+            # anything).
+            net_wage = ASSISTANT_WAGE - emp_social
             txns.append({
-                "description": f"{ASSISTANT} 工资 + 社保缴纳",
+                "description": f"{ASSISTANT} 工资发放及社保代扣代缴",
                 "date": pay_day,
-                "notes": (f"工资 ¥{ASSISTANT_WAGE}，代扣个人社保 ¥{emp_social}，"
-                          f"单位社保 ¥{er_social}"),
+                "notes": (f"应发工资 ¥{ASSISTANT_WAGE}，代扣个人社保 "
+                          f"¥{emp_social}，实发 ¥{net_wage}；"
+                          f"单位社保 ¥{er_social}，合计缴纳社保 "
+                          f"¥{emp_social + er_social}"),
                 "splits": [
-                    (CHECKING, -(ASSISTANT_WAGE + er_social)),
                     (EXP_BIZ_WAGES, ASSISTANT_WAGE),
                     (EXP_BIZ_SOCIAL, er_social),
+                    (BIZ_CHECKING, -net_wage),
+                    (BIZ_CHECKING, -(emp_social + er_social)),
                 ],
             })
 
@@ -1547,6 +1615,11 @@ def gen_recurring() -> list[dict]:
             txns.append({
                 "description": desc,
                 "date": d,
+                # A business bill paid on a personal card is still
+                # deductible — but only against a 发票 made out to the
+                # 工作室 (cross-model tax audit §3.4).
+                "notes": (fapiao_note(f"{name}:{yy}-{m:02d}")
+                          if dst.startswith(EXP_BIZ + ":") else None),
                 "splits": [(src, -amount), (dst, amount)],
             })
 
@@ -1769,6 +1842,8 @@ def gen_daily_weekly() -> list[dict]:
     if _on_or_before_through(date(YEAR, 8, 20)):
         txns.append({
             "description": "办公新显示器", "date": date(YEAR, 8, 20),
+            "notes": fapiao_note("办公设备:显示器",
+                                 extra="27寸 4K 显示器，一次性计入当期成本"),
             "splits": [(CMB_CARD, D("-2800")), (EXP_OFFICE_EQUIP, D("2800"))],
         })
     return txns
@@ -2075,6 +2150,9 @@ def gen_personal_life() -> list[dict]:
         if _on_or_before_through(tday):
             amt = _spend(rng,lo, hi)
             txns.append({"description": desc, "date": tday,
+                         "notes": fapiao_note(
+                             f"差旅:{tday.isoformat()}", "差旅电子发票",
+                             extra="机票行程单 + 酒店发票，客户拜访"),
                          "splits": [(src, -amt), (EXP_BIZ_TRAVEL, amt)]})
         nm = cur.month - 1 + 5  # +5 months
         cur = date(cur.year + nm // 12, nm % 12 + 1, 1)
@@ -2247,6 +2325,42 @@ def contract_invoice_plans() -> list[dict]:
     return plans
 
 
+# Export-service documentation (cross-model tax audit §3.3). Cross-border
+# VAT exemption is NOT automatic: 财税〔2016〕36号 附件4 and 国家税务总局公告
+# 2016年第29号 require a filed 跨境应税行为免税备案, a written foreign
+# contract, and proof the service is consumed outside China; the receipt
+# itself must clear SAFE's 涉外收入申报 on the way into a 对公账户.
+EXPORT_FILING = {
+    "pacific": ("PTS", "Pacific Trade Solutions Inc.（美国）"),
+    "munich": ("HKM", "Handelskontor München GmbH（德国）"),
+}
+
+
+def export_invoice_note(customer: str, when: date) -> str:
+    """The 免税备案 reference and contract number an export invoice
+    carries, deterministic in (customer, open date)."""
+    prefix, party = EXPORT_FILING[customer]
+    rng = random.Random(f"{SEED}:export:{customer}:{when.isoformat()}")
+    contract = f"{prefix}-{when.year}-{when.month:02d}{rng.randint(1, 9)}"
+    filing = f"深税跨境备〔{when.year}〕第{rng.randint(1000, 9999)}号"
+    return (f"跨境应税行为免税备案 {filing}；合同编号 {contract}"
+            f"（{party}）；服务完全在境外消费，适用增值税免税"
+            f"（财税〔2016〕36号 附件4、国家税务总局公告2016年第29号）；"
+            f"开票方 {BIZ_NAME}（统一社会信用代码 {BIZ_USCC}）")
+
+
+def settlement_note(customer: str, when: date, amount: str,
+                    currency: str) -> str:
+    """The 涉外收入申报 line on a 结汇 row: what SAFE sees when the
+    foreign receipt is converted and credited to the 对公账户."""
+    prefix, party = EXPORT_FILING[customer]
+    rng = random.Random(f"{SEED}:settle:{customer}:{when.isoformat()}")
+    return (f"涉外收入申报 编号 {when.year}{rng.randint(100000, 999999)}；"
+            f"付款方 {party}；收汇 {currency} {amount}，按当日汇率结汇入"
+            f"{BIZ_CHECKING.split(':')[-1]}；交易编码 121010"
+            f"（电信、计算机和信息服务）；合同项下服务出口")
+
+
 # ── Phase 7b: Business module (customers, vendors, invoices, bills)
 
 def _party_by_name(book: GnuCashBook, name: str) -> dict:
@@ -2312,6 +2426,13 @@ def run_business(book: GnuCashBook, since: date | None = None) -> dict:
     """
     counts = {"customers": 0, "vendors": 0, "invoices": 0, "bills": 0,
               "vouchers": 0, "terms": 0}
+    # (transaction guid prefix, notes) for rows the business module
+    # creates through the document tools — the 结汇 receipts and every
+    # posting transaction that lands in 经营支出. Document ``notes`` sit
+    # on the invoice record; the LEDGER row needs its own, because the
+    # 发票 / 涉外收入申报 evidence is what a reader opens the register
+    # for. Applied in one pass at the end (one book open).
+    txn_notes: list[tuple[str, str]] = []
 
     open_owner_names: set[str] = set()
     if since is None:
@@ -2382,7 +2503,8 @@ def run_business(book: GnuCashBook, since: date | None = None) -> dict:
 
     def run_invoice(customer_id, date_open, date_pay, amount, description,
                     currency, post_account, revenue_account=LLC_REVENUE,
-                    term="Net 30", pay=True, job_id=None, notes=""):
+                    term="Net 30", pay=True, job_id=None, notes="",
+                    settle_desc=None, settle_note=None, settle_memo=None):
         """Create → post → (optionally) pay a customer invoice. ``pay``
         is honoured only when ``date_pay`` is on or before THROUGH —
         an invoice whose payment run hasn't happened yet stays open."""
@@ -2406,11 +2528,19 @@ def run_business(book: GnuCashBook, since: date | None = None) -> dict:
             post_date=date_open.isoformat(), owner_type="customer",
         )
         if pay and date_pay <= THROUGH:
-            book.pay_invoice(
-                invoice_id=inv["id"], payment_account=CHECKING,
+            # Every client receipt lands in the 工作室's 对公账户 —
+            # domestic transfers directly, foreign receipts as a 结汇
+            # at the day's rate (cross-model tax audit §3.1: enterprise
+            # payments into a personal card are the 私户收款 finding).
+            paid = book.pay_invoice(
+                invoice_id=inv["id"], payment_account=BIZ_CHECKING,
                 amount=str(amount), payment_date=date_pay.isoformat(),
                 owner_type="customer",
+                description=settle_desc,
+                memo=(settle_memo or ""),
             )
+            if settle_note:
+                txn_notes.append((paid["transaction_guid"], settle_note))
         counts["invoices"] += 1
         return inv["id"]
 
@@ -2460,53 +2590,77 @@ def run_business(book: GnuCashBook, since: date | None = None) -> dict:
             cust["id"], plan["open"], plan["pay"], plan["amount"],
             plan["desc"], plan["currency"], post_acct,
             job_id=(job["id"] if plan["job"] else None),
+            notes=export_invoice_note(plan["customer"], plan["open"]),
+            settle_desc=f"结汇入账 — {cust['name']}",
+            settle_note=settlement_note(
+                plan["customer"], plan["pay"], plan["amount"],
+                plan["currency"]),
+            settle_memo=f"{plan['currency']} {plan['amount']} 结汇",
         )
     if "Pacific Trade Solutions" not in open_owner_names:
         pac = open_document_date("pacific")
         run_invoice(
             pacific["id"], pac, pac, "5200",
             f"{pac.strftime('%B %Y')} retainer + change requests",
-            "USD", AR_USD, pay=False, job_id=job_pacific["id"])
+            "USD", AR_USD, pay=False, job_id=job_pacific["id"],
+            notes=export_invoice_note("pacific", pac))
     if "Handelskontor München GmbH" not in open_owner_names:
         mp2 = open_document_date("munich_p2")
         run_invoice(
             munich["id"], mp2, mp2, "4100",
             f"{mp2.strftime('%B %Y')} ERP-Integration Phase 2",
-            "EUR", AR_EUR, pay=False, job_id=job_munich["id"])
+            "EUR", AR_EUR, pay=False, job_id=job_munich["id"],
+            notes=export_invoice_note("munich", mp2))
         mw = open_document_date("munich_wartung")
         run_invoice(
             munich["id"], mw, mw, "2800",
             f"{mw.strftime('%B %Y')} Wartung",
-            "EUR", AR_EUR, pay=False)
+            "EUR", AR_EUR, pay=False,
+            notes=export_invoice_note("munich", mw))
 
-    # Contract engagements (CNY, Net 15, 专票) to 承包收入.
+    # Contract engagements (CNY, Net 15, 专票) to 技术服务收入. The
+    # 专票 is issued BY the registered 工作室 — that is what makes the
+    # income 经营所得 rather than 劳务报酬所得 (tax audit §3.2).
     for plan in contract_invoice_plans():
+        code, number = _fapiao(
+            f"专票:{plan['client']}:{plan['open'].isoformat()}")
         run_invoice(
             contract_customers[plan["client"]]["id"], plan["open"],
             plan["pay"], plan["amount"], plan["desc"], "CNY", AR_CNY,
             revenue_account=CONTRACTOR, term="Net 15",
-            notes="增值税专用发票（征收率 1%）",
+            notes=(f"增值税专用发票（征收率 1%）代码 {code} 号码 {number}；"
+                   f"销方 {BIZ_NAME}（统一社会信用代码 {BIZ_USCC}）；"
+                   f"技术服务费，款项汇入对公账户"),
         )
 
     # Vendor bills.
     def run_bill(vendor_id, date_open, date_pay, amount,
                  description, expense_account, currency,
-                 payment_account=CHECKING, pay=True, post_account=AP):
-        """Create → post → (optionally) pay a vendor bill. Dates are ``date``."""
+                 payment_account=BIZ_CHECKING, pay=True, post_account=AP,
+                 notes=""):
+        """Create → post → (optionally) pay a vendor bill. Dates are ``date``.
+
+        ``notes`` is the 税前扣除凭证 evidence: it goes on the bill
+        document AND on the posting transaction, which is the row that
+        carries the 经营支出 split a reader (or an auditor) opens the
+        register for.
+        """
         if since is not None and date_open <= since:
             return None
         bill = book.create_bill(
             vendor_id=vendor_id, date_opened=date_open.isoformat(),
-            currency=currency, term="Net 30",
+            currency=currency, term="Net 30", notes=notes,
         )
         book.add_bill_entry(
             bill_id=bill["id"], account=expense_account,
             description=description, quantity="1", price=str(amount),
         )
-        book.post_invoice(
+        posted = book.post_invoice(
             invoice_id=bill["id"], post_account=post_account,
             post_date=date_open.isoformat(), owner_type="vendor",
         )
+        if notes:
+            txn_notes.append((posted["transaction_guid"], notes))
         if pay and date_pay <= THROUGH:
             book.pay_invoice(
                 invoice_id=bill["id"], payment_account=payment_account,
@@ -2526,14 +2680,20 @@ def run_business(book: GnuCashBook, since: date | None = None) -> dict:
                      next_business_day(open_d + timedelta(days=12)),
                      BOOKKEEPING_FEE,
                      f"{yy}年 第{(m - 1) // 3 + 1}季度 代理记账服务费",
-                     EXP_BIZ_SERVICES, "CNY")
+                     EXP_BIZ_SERVICES, "CNY",
+                     notes=fapiao_note(
+                         f"代理记账:{yy}Q{(m - 1) // 3 + 1}",
+                         extra="深圳博源代理记账 开具，对公转账支付"))
         for m, day, desc, amount, acct in HARDWARE_BILLS:
             open_d = next_business_day(date(yy, m, day))
             if open_d > THROUGH:
                 continue
             run_bill(hardware["id"], open_d,
                      next_business_day(open_d + timedelta(days=9)),
-                     amount, desc, acct, "CNY")
+                     amount, desc, acct, "CNY",
+                     notes=fapiao_note(
+                         f"赛格电子:{yy}-{m:02d}",
+                         extra="华强北 赛格电子 开具，对公转账支付"))
 
     # JetBrains US$249 — the foreign-currency PAYABLE case (M2).
     # RE-DATED to a recent month (the 1st of THROUGH's month, which
@@ -2565,6 +2725,14 @@ def run_business(book: GnuCashBook, since: date | None = None) -> dict:
             jetbrains["id"], jetbrains_post, jetbrains_post, "249",
             "JetBrains All Products Pack (annual subscription)",
             EXP_SOFTWARE, "USD", pay=False, post_account=AP_USD,
+            # A foreign supplier issues no Chinese 发票. 国家税务总局公告
+            # 2018年第28号 第十一条: the deduction voucher for an overseas
+            # purchase is the invoice plus the payment record.
+            notes=(f"境外采购：JetBrains s.r.o. 形式发票 "
+                   f"INV-{jetbrains_post.year}-0{jetbrains_post.month:02d}"
+                   f"41；境外单位不开具中国发票，凭合同及付汇凭证税前扣除"
+                   f"（国家税务总局公告2018年第28号 第十一条）；抬头 "
+                   f"{BIZ_NAME}"),
         )
 
     # 陈宇's expense vouchers: two a year, posted to A/P and reimbursed
@@ -2585,18 +2753,38 @@ def run_business(book: GnuCashBook, since: date | None = None) -> dict:
                 voucher_id=voucher["id"], account=acct,
                 description=desc, quantity="1", price=str(amount),
             )
-            book.post_invoice(
+            posted = book.post_invoice(
                 invoice_id=voucher["id"], post_account=AP,
                 post_date=open_d.isoformat(), owner_type="employee",
             )
+            kind = ("差旅电子发票" if acct == EXP_BIZ_TRAVEL
+                    else "增值税普通发票")
+            txn_notes.append((posted["transaction_guid"], fapiao_note(
+                f"报销:{ASSISTANT}:{yy}-{m:02d}", kind,
+                extra=f"{ASSISTANT} 垫付，凭票报销")))
             pay_d = next_business_day(open_d + timedelta(days=7))
             if pay_d <= THROUGH:
                 book.pay_invoice(
-                    invoice_id=voucher["id"], payment_account=CHECKING,
+                    invoice_id=voucher["id"], payment_account=BIZ_CHECKING,
                     amount=str(amount), payment_date=pay_d.isoformat(),
                     owner_type="employee",
                 )
             counts["vouchers"] += 1
+
+    # One book open for every note the document tools could not carry.
+    if txn_notes:
+        with book.open(readonly=False) as b:
+            pending = dict(txn_notes)
+            for txn in b.transactions:
+                for prefix in list(pending):
+                    if txn.guid.startswith(prefix):
+                        txn.notes = pending.pop(prefix)
+            if pending:
+                raise SystemExit(
+                    f"run_business: {len(pending)} transaction(s) not found "
+                    f"for their notes: {sorted(pending)[:3]}")
+            b.save()
+    counts["notes"] = len(txn_notes)
 
     counts["jetbrains_bill_id"] = jetbrains_bill_id
     return counts
@@ -3074,6 +3262,7 @@ def run_edge_cases(book: GnuCashBook, out_path: Path) -> dict:
     recat = book.create_transaction(
         description="办公用品",
         trans_date=date(YEAR, 4, 20),
+        notes=fapiao_note("办公用品:2025-04", extra="错记杂项，已更正科目"),
         splits=[
             {"account": CMB_CARD, "amount": "-450"},
             {"account": EXP_MISC, "amount": "450"},
@@ -3420,7 +3609,7 @@ def tax_transactions(out_path: Path) -> tuple[list[dict], dict]:
                 txns.append({
                     "description": "增值税及附加 季度申报缴款",
                     "date": vat_date, "notes": notes,
-                    "splits": [(CHECKING, -total), (EXP_VAT, total)],
+                    "splits": [(BIZ_CHECKING, -total), (EXP_VAT, total)],
                 })
                 vat_year += total
             if pit_date <= THROUGH:
@@ -3442,7 +3631,7 @@ def tax_transactions(out_path: Path) -> tuple[list[dict], dict]:
                 txns.append({
                     "description": "经营所得个人所得税 季度预缴",
                     "date": pit_date, "notes": notes,
-                    "splits": [(CHECKING, -prepay),
+                    "splits": [(BIZ_CHECKING, -prepay),
                                (EXP_BIZ_INCOME_TAX, prepay)],
                 })
                 paid += prepay
@@ -3469,7 +3658,7 @@ def tax_transactions(out_path: Path) -> tuple[list[dict], dict]:
                               f"¥{ANNUAL_ONLY_DEDUCTIONS}（赡养老人、继续教育）= "
                               f"应纳税所得额 ¥{taxable}；应纳税额 ¥{annual}，"
                               f"已预缴 ¥{paid}，{kind} ¥{abs(settlement)}"),
-                    "splits": [(CHECKING, -settlement),
+                    "splits": [(BIZ_CHECKING, -settlement),
                                (EXP_BIZ_INCOME_TAX, settlement)],
                 })
         summary[yy] = {
@@ -3771,6 +3960,11 @@ def _verify_invariants(out_path: Path, tax_summary: dict) -> None:
             "FROM invoices i LEFT JOIN billterms bt ON bt.guid = i.terms "
             "WHERE i.date_posted IS NOT NULL AND i.date_posted <> ''"
         ).fetchall()
+        notes_by_txn = {
+            g: (v or "") for g, v in con.execute(
+                "SELECT obj_guid, string_val FROM slots "
+                "WHERE name = 'notes'")
+        }
         lot_splits = {}
         for lot, post, qn, qd, state in con.execute(
                 "SELECT s.lot_guid, t.post_date, s.quantity_num, "
@@ -3816,7 +4010,11 @@ def _verify_invariants(out_path: Path, tax_summary: dict) -> None:
 
     # 2b. No BANK- or CASH-type account under zero at ANY day-end
     # (audit round 2, R1/R2): the wallets are prepaid, 现金 is cash,
-    # 银行储蓄卡 has no overdraft.
+    # 银行储蓄卡 has no overdraft — and since round 4 the list is read
+    # from the book's own BANK/CASH accounts, so 招商银行对公账户 is
+    # covered by construction: a 对公账户 that goes overdrawn between
+    # the month-end 业主提款 and the next receipt would be the whole
+    # separation story failing.
     for path in bank_accounts:
         net: dict[date, Decimal] = {}
         for _g, post, _d, splits in rows:
@@ -3834,6 +4032,27 @@ def _verify_invariants(out_path: Path, tax_summary: dict) -> None:
               f"{'OK' if low[0] >= 0 else 'NEGATIVE'}")
         if low[0] < 0:
             raise SystemExit(f"INVARIANT: {path} at {low[0]} on {low[1]}")
+
+    # 2c. Every 经营支出 row carries its 税前扣除凭证 — a 发票 代码/号码,
+    # the 跨境/境外采购 equivalent, or the payroll 代扣代缴 breakdown.
+    # A Chinese auditor disallows an undocumented deduction outright
+    # (cross-model tax audit §3.4), so an unnoted row is a build error.
+    biz_rows = 0
+    undocumented: list[tuple[date, str]] = []
+    for guid, post, desc, splits in rows:
+        if not any(fn.startswith(EXP_BIZ + ":") and state != "v"
+                   for fn, _mn, _q, state in splits):
+            continue
+        biz_rows += 1
+        if not notes_by_txn.get(guid, "").strip():
+            undocumented.append((post, desc))
+    print(f"  经营支出 rows documented: "
+          f"{biz_rows - len(undocumented)}/{biz_rows}; "
+          f"{len(undocumented)} without a 发票/凭证 note")
+    if undocumented:
+        raise SystemExit(
+            f"INVARIANT: {len(undocumented)} 经营支出 rows carry no "
+            f"deduction voucher: {undocumented[:3]}")
 
     # 3. No invoice unpaid beyond terms + 45 days at any month-end.
     late: list[tuple] = []
@@ -4031,6 +4250,33 @@ def verify(out_path: Path, business: dict, tax_summary: dict | None = None) -> N
                 "monthly net", "runway", "burn", "month net",
                 "净", "跑道", "月")):
             print(f"  {line.strip()}")
+
+    # The 个体工商户 boundary: the 对公账户 carries the business, the
+    # household is funded by the month-end 业主提款 (tax audit §3.1).
+    print("\n-- 个体工商户 separation (对公账户 + 业主提款) --")
+    print(f"  {BIZ_NAME}（{BIZ_USCC}）")
+    print(f"  {BIZ_CHECKING}: {book.get_balance(BIZ_CHECKING, as_of_date=as_of)}")
+    print(f"  {DRAW_EQUITY}: "
+          f"{book.get_balance(DRAW_EQUITY, as_of_date=as_of)} (zero — a "
+          f"clearing account)")
+    with book.open() as _b:
+        ledger = _ledger_txns(_b)
+        draws = [t for t in ledger
+                 if t.description.startswith("业主提款（对公账户）")]
+        # QUANTITY, not value: a 结汇 receipt's transaction currency is
+        # USD/EUR, so ``value`` on the 对公账户 leg is foreign. Quantity
+        # is always the account's own commodity (CNY).
+        total_draw = sum(
+            (-D(str(s.quantity)) for t in draws for s in t.splits
+             if s.account.fullname == BIZ_CHECKING), D("0"))
+        biz_splits = [
+            D(str(s.quantity)) for t in ledger for s in t.splits
+            if s.account.fullname == BIZ_CHECKING
+            and s.reconcile_state != "v"]
+        inflow = sum((q for q in biz_splits if q > 0), D("0"))
+        outflow = sum((-q for q in biz_splits if q < 0), D("0"))
+    print(f"  业主提款 rows: {len(draws)}, total ¥{total_draw:,.2f}")
+    print(f"  对公账户 lifetime: in ¥{inflow:,.2f} / out ¥{outflow:,.2f}")
 
     # Receivables across all three A/R commodities (outstanding invoices).
     print("\n-- Outstanding receivables (CNY / USD / EUR A/R) --")
@@ -4368,6 +4614,16 @@ POLICY = PersonaPolicy(
     book_repairs=lin_wei_repairs,
     # 储蓄卡: a day-end under the floor is topped up THAT day (R2).
     floor=CHECKING_FLOOR,
+    # The settlement calendar: 银行 transfers do not clear on a weekend
+    # or a 法定节假日, so the engine's own moves (the month-end sweep,
+    # the 业主提款, a floor top-up) post on the last business day on or
+    # before the day they are decided on — the same lunar/State-Council
+    # table ``next_business_day`` rolls the ledger's own rows with.
+    # A top-up decided INSIDE 国庆 keeps its calendar day: rolling it
+    # back would land it in the month already walked (``ach_date``'s
+    # not-before guard), and the money has to be there for the day-end
+    # that needed it.
+    holidays=lambda year: frozenset(cn_public_holidays(year)),
     # Loans have no statement to reconcile against (review §1).
     no_reconcile=(MORTGAGE, AUTO_LOAN),
     # 储蓄账户 earns a demand-deposit rate, monthly (audit P7).
@@ -4380,6 +4636,20 @@ POLICY = PersonaPolicy(
     desc_topup="储蓄账户转入（补足日常余额）",
     desc_savings_interest="储蓄账户 利息",
     desc_interest="{label} 利息",
+    # The 个体工商户 boundary (cross-model tax audit §3.1). Client
+    # receipts and the 结汇 of foreign receipts land in the 对公账户;
+    # bills, 陈宇's payroll and every filing are paid from it; the
+    # household is funded by a month-end 业主提款 of everything above
+    # the working-capital floor, which carries a reserve that grows
+    # through the year so the next quarterly 增值税 / 经营所得 filing is
+    # always already funded (reset each December, when the Q4 filing's
+    # money has been set aside and the year starts over).
+    business_checking=BIZ_CHECKING,
+    business_buffer=D("35000"),
+    business_reserve_monthly=D("1500"),
+    draw_equity=DRAW_EQUITY,
+    desc_draw="业主提款（对公账户）",
+    desc_draw_deposit="业主提款 存入个人账户",
 )
 
 
