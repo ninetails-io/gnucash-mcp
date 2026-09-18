@@ -15,8 +15,9 @@ US$249 vendor bill) are built so both surface in CNY on every report.
 
 The household (Shenzhen, a native zh_CN chart): 林微 runs a cross-border
 e-commerce development business as a REGISTERED 个体工商户 — 深圳市林微电子商务
-工作室, 统一社会信用代码 92440300MA5FQ2X7J8 (well-formed, deliberately not a real
-registration). That registration is what makes her 经营所得 treatment legitimate:
+工作室, 统一社会信用代码 92440300MA5FQ2X7J0 (well-formed, GB 32100-2015
+checksum-valid, and deliberately not a real registration). That registration is
+what makes her 经营所得 treatment legitimate:
 an unregistered individual contracting with 腾讯/大疆/顺丰 would be reassessed as
 劳务报酬所得 at 20–40% with no small-business halving (cross-model tax audit §3.2).
 Every invoice she raises carries the 工作室's name, her 专票 are issued under its
@@ -154,34 +155,62 @@ HOUSING_FUND_EMPLOYEE = (SOCIAL_BASE * HOUSING_FUND_RATE).quantize(D("0.01"))  #
 # 陈宇 — the business's registered part-time assistant (audit L6): a real
 # wage on the 10th, employee 社保 withheld, employer 社保 as a business
 # expense. Below the ¥5,000 起征点, so no 个税 is withheld.
-# The registered 个体工商户 behind every invoice, 专票 and 发票 抬头. The
-# 统一社会信用代码 is WELL-FORMED (9 市场监管 + 2 个体工商户 + 440300 深圳 +
-# 9-char 组织机构代码 + check digit) and DELIBERATELY INVALID — the check
-# digit does not verify, so it can never collide with a real registration.
+# The registered 个体工商户 behind every invoice, 专票 and 发票 抬头.
+#
+# GB 32100-2015 附录A: the 18th character of a 统一社会信用代码 is a mod-31
+# check over the first 17, on a 31-character alphabet of 0-9 plus A-Z less
+# I, O, S, V and Z. The 电子税务局, the 开票系统 and every piece of 财务软件
+# validate it on entry, so an invalid code cannot reach a 发票 at all —
+# which is why the check character is COMPUTED here rather than typed
+# (audit round 4, R4-3; the book used to carry `…J8`, which fails).
+USCC_ALPHABET = "0123456789ABCDEFGHJKLMNPQRTUWXY"
+USCC_WEIGHTS = (1, 3, 9, 27, 19, 26, 16, 17, 20, 29,
+                25, 13, 8, 24, 10, 30, 28)
+
+
+def uscc_check_char(body17: str) -> str:
+    """The GB 32100-2015 check character for a 17-character USCC body."""
+    total = sum(USCC_ALPHABET.index(c) * w
+                for c, w in zip(body17, USCC_WEIGHTS))
+    return USCC_ALPHABET[(31 - total % 31) % 31]
+
+
 BIZ_NAME = "深圳市林微电子商务工作室"
-BIZ_USCC = "92440300MA5FQ2X7J8"
+# 9 登记管理部门(市场监管) + 2 机构类别(个体工商户) + 440300 深圳 + a 9-char
+# 组织机构代码 + the computed check character. Well-formed AND checksum-
+# valid, and still FICTIONAL: the 组织机构代码 body was chosen arbitrarily
+# and names no registered entity — the check digit only makes the string
+# something a Chinese system would accept, not something that exists.
+_BIZ_USCC_BODY = "92440300MA5FQ2X7J"
+BIZ_USCC = _BIZ_USCC_BODY + uscc_check_char(_BIZ_USCC_BODY)
 
 
-def _fapiao(key: str) -> tuple[str, str]:
-    """A 发票代码 / 发票号码 pair, deterministic in ``key``.
+def _fapiao(key: str, when: date) -> str:
+    """A 全面数字化电子发票 (数电票) 发票号码, deterministic in ``key``.
 
-    Well-formed (12-digit 代码 opening on 深圳's 0440319 prefix, 8-digit
-    号码) and deliberately fictional — no synthetic book should carry a
-    number that could match a real 发票 on anyone's 电子税务局 record.
+    数电票 piloted in 广东 from 2021-12-01 and went nationwide on
+    2024-12-01. Every invoice in this book is dated 2025 or later, so
+    every reference has to be in that format (audit round 4, R4-2): one
+    **20-digit 发票号码** — 年份2 + 省局代码2 + 开票渠道1 + 15位流水 — and
+    **no 发票代码 at all**, the field the pre-数电 forms carried. ``44`` is
+    广东; ``0`` is the 电子发票服务平台 channel.
+
+    Deliberately fictional: the 15-digit serial comes from a seeded
+    stream, so no number here can match a real 发票 on anyone's
+    电子税务局 record.
     """
     rng = random.Random(f"{SEED}:fapiao:{key}")
-    return (f"0440319{rng.randint(10000, 99999)}",
-            f"{rng.randint(10000000, 99999999)}")
+    return (f"{when.year % 100:02d}440"
+            f"{rng.randrange(10 ** 14, 10 ** 15):015d}")
 
 
-def fapiao_note(key: str, kind: str = "增值税普通发票",
+def fapiao_note(key: str, when: date, kind: str = "数电普通发票",
                 extra: str = "") -> str:
     """The 税前扣除凭证 line every 经营支出 row carries: which 发票 backs
     the deduction, and that it is made out to the registered 工作室 —
     without it a Chinese auditor disallows the expense outright
     (cross-model tax audit §3.4)."""
-    code, number = _fapiao(key)
-    note = (f"{kind} 代码 {code} 号码 {number}；"
+    note = (f"{kind} 发票号码 {_fapiao(key, when)}；"
             f"抬头 {BIZ_NAME}（统一社会信用代码 {BIZ_USCC}）")
     return f"{note}；{extra}" if extra else note
 
@@ -1618,7 +1647,7 @@ def gen_recurring() -> list[dict]:
                 # A business bill paid on a personal card is still
                 # deductible — but only against a 发票 made out to the
                 # 工作室 (cross-model tax audit §3.4).
-                "notes": (fapiao_note(f"{name}:{yy}-{m:02d}")
+                "notes": (fapiao_note(f"{name}:{yy}-{m:02d}", d)
                           if dst.startswith(EXP_BIZ + ":") else None),
                 "splits": [(src, -amount), (dst, amount)],
             })
@@ -1842,7 +1871,7 @@ def gen_daily_weekly() -> list[dict]:
     if _on_or_before_through(date(YEAR, 8, 20)):
         txns.append({
             "description": "办公新显示器", "date": date(YEAR, 8, 20),
-            "notes": fapiao_note("办公设备:显示器",
+            "notes": fapiao_note("办公设备:显示器", date(YEAR, 8, 20),
                                  extra="27寸 4K 显示器，一次性计入当期成本"),
             "splits": [(CMB_CARD, D("-2800")), (EXP_OFFICE_EQUIP, D("2800"))],
         })
@@ -2151,7 +2180,8 @@ def gen_personal_life() -> list[dict]:
             amt = _spend(rng,lo, hi)
             txns.append({"description": desc, "date": tday,
                          "notes": fapiao_note(
-                             f"差旅:{tday.isoformat()}", "差旅电子发票",
+                             f"差旅:{tday.isoformat()}", tday,
+                             "数电普通发票",
                              extra="机票行程单 + 酒店发票，客户拜访"),
                          "splits": [(src, -amt), (EXP_BIZ_TRAVEL, amt)]})
         nm = cur.month - 1 + 5  # +5 months
@@ -2265,7 +2295,7 @@ def gen_personal_life() -> list[dict]:
 
 # The big mainland companies Lin Wei contracts to. Every progress payment
 # is an INVOICE to a named customer, posted to 收入:承包收入 and carrying a
-# 增值税专用发票 note — that is where the VAT and 经营所得 bases come from
+# 数电专用发票 note — that is where the VAT and 经营所得 bases come from
 # (audit L5: 199,000 of 2025 revenue used to land in the bank with no
 # 发票, and no reader could tell who the contracting party was).
 CONTRACT_CLIENTS = [
@@ -2334,16 +2364,54 @@ EXPORT_FILING = {
     "pacific": ("PTS", "Pacific Trade Solutions Inc.（美国）"),
     "munich": ("HKM", "Handelskontor München GmbH（德国）"),
 }
+# The first export invoice to each customer — the day its 免税备案 was
+# filed, and the date every later invoice under the same 跨境应税行为
+# points back to.
+EXPORT_FIRST = {
+    "pacific": date(YEAR, PACIFIC_PLAN[0][0], 5),
+    "munich": date(YEAR, MUNICH_PLAN[0][0], 8),
+}
+
+
+def export_contract(customer: str, when: date) -> str:
+    """The framework contract an export invoice is raised under: ONE per
+    customer per year, renewed each January, so every invoice in a year
+    cites the same 合同编号 — and therefore the same 备案 (audit round 4,
+    R4-4 saw two filings eight weeks apart under one contract number)."""
+    prefix, _party = EXPORT_FILING[customer]
+    rng = random.Random(f"{SEED}:contract:{customer}:{when.year}")
+    return f"{prefix}-{when.year}-{rng.randint(101, 199)}"
+
+
+def export_beian(customer: str) -> str:
+    """The ONE 跨境应税行为免税备案 acceptance number per customer.
+
+    国家税务总局公告2016年第29号 第七条 (amended by 2024年第15号) files the
+    备案 once, at the first exemption: 相同跨境应税行为再次发生，无需再次
+    办理免税备案手续 — the contract and 收汇 evidence are 留存备查. So the
+    number is a function of the CUSTOMER alone, never of the invoice
+    (audit round 4, R4-4). It is also a 备案表 receipt's 受理编号 — the old
+    `深税跨境备〔20xx〕第N号` form implied a numbered 批文, which 备案 is
+    not.
+    """
+    rng = random.Random(f"{SEED}:beian:{customer}")
+    return f"4403{rng.randrange(10 ** 11, 10 ** 12):012d}"
 
 
 def export_invoice_note(customer: str, when: date) -> str:
     """The 免税备案 reference and contract number an export invoice
-    carries, deterministic in (customer, open date)."""
-    prefix, party = EXPORT_FILING[customer]
-    rng = random.Random(f"{SEED}:export:{customer}:{when.isoformat()}")
-    contract = f"{prefix}-{when.year}-{when.month:02d}{rng.randint(1, 9)}"
-    filing = f"深税跨境备〔{when.year}〕第{rng.randint(1000, 9999)}号"
-    return (f"跨境应税行为免税备案 {filing}；合同编号 {contract}"
+    carries: the customer's single filing, marked as the first filing on
+    the invoice that triggered it and as 留存备查 on every one after."""
+    _prefix, party = EXPORT_FILING[customer]
+    first = EXPORT_FIRST[customer]
+    if when <= first:
+        filed = f"{first.isoformat()} 首次备案"
+    else:
+        filed = (f"{first.isoformat()} 首次备案；相同跨境应税行为再次发生，"
+                 f"无需再次办理备案，合同及收汇凭证留存备查"
+                 f"（国家税务总局公告2016年第29号 第七条）")
+    return (f"跨境应税行为免税备案表 受理编号 {export_beian(customer)}"
+            f"（{filed}）；合同编号 {export_contract(customer, when)}"
             f"（{party}）；服务完全在境外消费，适用增值税免税"
             f"（财税〔2016〕36号 附件4、国家税务总局公告2016年第29号）；"
             f"开票方 {BIZ_NAME}（统一社会信用代码 {BIZ_USCC}）")
@@ -2352,13 +2420,22 @@ def export_invoice_note(customer: str, when: date) -> str:
 def settlement_note(customer: str, when: date, amount: str,
                     currency: str) -> str:
     """The 涉外收入申报 line on a 结汇 row: what SAFE sees when the
-    foreign receipt is converted and credited to the 对公账户."""
-    prefix, party = EXPORT_FILING[customer]
+    foreign receipt is converted and credited to the 对公账户.
+
+    交易编码 227020 is 服务贸易 — 电信、计算机和信息服务 — 计算机服务, which
+    is what 林微 actually sells. The book used to declare 121010
+    (货物贸易，一般贸易): a goods-trade code requires the declarant to sit
+    in the 贸易外汇收支企业名录, which a service-selling 个体工商户 does
+    not, so the bank rejects the declaration at the counter — and if it
+    passed, the 货物贸易外汇监测系统 would show 收汇 against zero 出口报关,
+    the textbook 总量核查 flag (audit round 4, R4-1).
+    """
+    _prefix, party = EXPORT_FILING[customer]
     rng = random.Random(f"{SEED}:settle:{customer}:{when.isoformat()}")
     return (f"涉外收入申报 编号 {when.year}{rng.randint(100000, 999999)}；"
             f"付款方 {party}；收汇 {currency} {amount}，按当日汇率结汇入"
-            f"{BIZ_CHECKING.split(':')[-1]}；交易编码 121010"
-            f"（电信、计算机和信息服务）；合同项下服务出口")
+            f"{BIZ_CHECKING.split(':')[-1]}；交易编码 227020"
+            f"（电信、计算机和信息服务—计算机服务）；合同项下服务出口")
 
 
 # ── Phase 7b: Business module (customers, vendors, invoices, bills)
@@ -2398,6 +2475,25 @@ def _employee_by_name(book: GnuCashBook, name: str) -> dict:
 def shenzhen_retainer(yy: int) -> Decimal:
     raised = D("12000") * (D("1.05") ** (yy - YEAR))
     return (raised / D("100")).to_integral_value(rounding="ROUND_HALF_UP") * D("100")
+
+
+SHENZHEN_CLIENT = "深圳跨境电商有限公司"
+
+
+def retainer_note(key: str, when: date, extra: str = "") -> str:
+    """The 数电普通发票 a 深圳跨境电商 invoice is issued under.
+
+    The 普票 half of every VAT filing in this book rests on this one
+    stream, and it used to carry no documentary reference at all (audit
+    round 4, R4-5). The buyer is a 有限公司: it cannot expense the fee
+    without a 发票, and under 金税四期 the seller's 开票数据 is the primary
+    cross-match against the 免税/普票 销售额 the quarterly return declares.
+    Same 数电票 shape as the 专票 and the expense side.
+    """
+    note = (f"数电普通发票 发票号码 {_fapiao(key, when)}；"
+            f"购方 {SHENZHEN_CLIENT}；销方 {BIZ_NAME}"
+            f"（统一社会信用代码 {BIZ_USCC}）；小规模纳税人，征收率 1%")
+    return f"{note}；{extra}" if extra else note
 
 
 # Bills that are NOT card charges (audit A2: 优客工场 and 阿里云 were both
@@ -2457,7 +2553,7 @@ def run_business(book: GnuCashBook, since: date | None = None) -> dict:
         contract_customers = {
             name: book.create_customer(
                 name=name, currency="CNY",
-                notes=f"{CONTRACT_PROJECTS[name]} 外包, 开具增值税专用发票, Net 15")
+                notes=f"{CONTRACT_PROJECTS[name]} 外包, 开具数电专用发票, Net 15")
             for name in CONTRACT_CLIENTS
         }
         counts["customers"] = 3 + len(contract_customers)
@@ -2562,8 +2658,10 @@ def run_business(book: GnuCashBook, since: date | None = None) -> dict:
                 "CNY", AR_CNY,
                 job_id=(job_sz["id"] if (yy, m) in ((YEAR, 1), (YEAR, 2))
                         else None),
-                notes=(f"{yy} 年度合同续签，月费 ¥{fee}" if m == 1 and yy > YEAR
-                       else ""),
+                notes=retainer_note(
+                    f"普票:深圳跨境电商:{yy}-{m:02d}", open_d,
+                    extra=(f"{yy} 年度合同续签，月费 ¥{fee}"
+                           if m == 1 and yy > YEAR else "")),
             )
     # Shenzhen OUTSTANDING (CNY A/R demo surface): a milestone just past
     # due and a maintenance invoice not yet due, both unpaid.
@@ -2572,12 +2670,18 @@ def run_business(book: GnuCashBook, since: date | None = None) -> dict:
         run_invoice(
             shenzhen["id"], sz_ms, sz_ms, "15000",
             f"{sz_ms.strftime('%Y年%m月')} 平台改版里程碑",
-            "CNY", AR_CNY, pay=False, job_id=job_sz["id"])
+            "CNY", AR_CNY, pay=False, job_id=job_sz["id"],
+            notes=retainer_note(
+                f"普票:里程碑:{sz_ms.isoformat()}", sz_ms,
+                extra="平台改版里程碑验收"))
         sz_mt = open_document_date("sz_maint")
         run_invoice(
             shenzhen["id"], sz_mt, sz_mt, "9000",
             f"{sz_mt.strftime('%Y年%m月')} 运维支持",
-            "CNY", AR_CNY, pay=False)
+            "CNY", AR_CNY, pay=False,
+            notes=retainer_note(
+                f"普票:运维:{sz_mt.isoformat()}", sz_mt,
+                extra="季度运维支持"))
 
     # Pacific Trade (USD → AR USD) and München (EUR → AR EUR): the same
     # calendar every year, paid cross-currency into CNY.
@@ -2622,13 +2726,14 @@ def run_business(book: GnuCashBook, since: date | None = None) -> dict:
     # 专票 is issued BY the registered 工作室 — that is what makes the
     # income 经营所得 rather than 劳务报酬所得 (tax audit §3.2).
     for plan in contract_invoice_plans():
-        code, number = _fapiao(
-            f"专票:{plan['client']}:{plan['open'].isoformat()}")
+        number = _fapiao(
+            f"专票:{plan['client']}:{plan['open'].isoformat()}",
+            plan["open"])
         run_invoice(
             contract_customers[plan["client"]]["id"], plan["open"],
             plan["pay"], plan["amount"], plan["desc"], "CNY", AR_CNY,
             revenue_account=CONTRACTOR, term="Net 15",
-            notes=(f"增值税专用发票（征收率 1%）代码 {code} 号码 {number}；"
+            notes=(f"数电专用发票（征收率 1%）发票号码 {number}；"
                    f"销方 {BIZ_NAME}（统一社会信用代码 {BIZ_USCC}）；"
                    f"技术服务费，款项汇入对公账户"),
         )
@@ -2682,7 +2787,7 @@ def run_business(book: GnuCashBook, since: date | None = None) -> dict:
                      f"{yy}年 第{(m - 1) // 3 + 1}季度 代理记账服务费",
                      EXP_BIZ_SERVICES, "CNY",
                      notes=fapiao_note(
-                         f"代理记账:{yy}Q{(m - 1) // 3 + 1}",
+                         f"代理记账:{yy}Q{(m - 1) // 3 + 1}", open_d,
                          extra="深圳博源代理记账 开具，对公转账支付"))
         for m, day, desc, amount, acct in HARDWARE_BILLS:
             open_d = next_business_day(date(yy, m, day))
@@ -2692,7 +2797,7 @@ def run_business(book: GnuCashBook, since: date | None = None) -> dict:
                      next_business_day(open_d + timedelta(days=9)),
                      amount, desc, acct, "CNY",
                      notes=fapiao_note(
-                         f"赛格电子:{yy}-{m:02d}",
+                         f"赛格电子:{yy}-{m:02d}", open_d,
                          extra="华强北 赛格电子 开具，对公转账支付"))
 
     # JetBrains US$249 — the foreign-currency PAYABLE case (M2).
@@ -2757,10 +2862,10 @@ def run_business(book: GnuCashBook, since: date | None = None) -> dict:
                 invoice_id=voucher["id"], post_account=AP,
                 post_date=open_d.isoformat(), owner_type="employee",
             )
-            kind = ("差旅电子发票" if acct == EXP_BIZ_TRAVEL
-                    else "增值税普通发票")
+            kind = ("数电普通发票（旅客运输）" if acct == EXP_BIZ_TRAVEL
+                    else "数电普通发票")
             txn_notes.append((posted["transaction_guid"], fapiao_note(
-                f"报销:{ASSISTANT}:{yy}-{m:02d}", kind,
+                f"报销:{ASSISTANT}:{yy}-{m:02d}", open_d, kind,
                 extra=f"{ASSISTANT} 垫付，凭票报销")))
             pay_d = next_business_day(open_d + timedelta(days=7))
             if pay_d <= THROUGH:
@@ -3262,7 +3367,8 @@ def run_edge_cases(book: GnuCashBook, out_path: Path) -> dict:
     recat = book.create_transaction(
         description="办公用品",
         trans_date=date(YEAR, 4, 20),
-        notes=fapiao_note("办公用品:2025-04", extra="错记杂项，已更正科目"),
+        notes=fapiao_note("办公用品:2025-04", date(YEAR, 4, 20),
+                          extra="错记杂项，已更正科目"),
         splits=[
             {"account": CMB_CARD, "amount": "-450"},
             {"account": EXP_MISC, "amount": "450"},
@@ -3965,6 +4071,14 @@ def _verify_invariants(out_path: Path, tax_summary: dict) -> None:
                 "SELECT obj_guid, string_val FROM slots "
                 "WHERE name = 'notes'")
         }
+        # Posted CUSTOMER documents only: owner_type 2 is a customer and
+        # 3 a job attached to one (invoices); 4 is a vendor bill and 5 an
+        # employee voucher, whose 凭证 rides the posting transaction.
+        revenue_invoices = con.execute(
+            "SELECT id, date_posted, notes FROM invoices "
+            "WHERE date_posted IS NOT NULL AND date_posted <> '' "
+            "AND owner_type IN (2, 3)"
+        ).fetchall()
         lot_splits = {}
         for lot, post, qn, qd, state in con.execute(
                 "SELECT s.lot_guid, t.post_date, s.quantity_num, "
@@ -4053,6 +4167,22 @@ def _verify_invariants(out_path: Path, tax_summary: dict) -> None:
         raise SystemExit(
             f"INVARIANT: {len(undocumented)} 经营支出 rows carry no "
             f"deduction voucher: {undocumented[:3]}")
+
+    # 2d. And every posted revenue invoice carries its 发票 reference —
+    # the 专票 on the contract engagements, the 普票 on the 深圳跨境电商
+    # retainer, the 免税备案 on the exports. Under 金税四期 the seller's
+    # 开票数据 is what the declared 销售额 is cross-matched against, so a
+    # revenue row with no 发票 is as much a build error as an
+    # undocumented deduction (audit round 4, R4-5).
+    undoc_inv = [(iid, posted[:10]) for iid, posted, inotes
+                 in revenue_invoices if not (inotes or "").strip()]
+    print(f"  revenue invoices documented: "
+          f"{len(revenue_invoices) - len(undoc_inv)}/{len(revenue_invoices)}; "
+          f"{len(undoc_inv)} without a 发票 reference")
+    if undoc_inv:
+        raise SystemExit(
+            f"INVARIANT: {len(undoc_inv)} revenue invoices carry no "
+            f"发票 reference: {undoc_inv[:3]}")
 
     # 3. No invoice unpaid beyond terms + 45 days at any month-end.
     late: list[tuple] = []
