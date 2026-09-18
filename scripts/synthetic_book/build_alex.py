@@ -25,11 +25,16 @@ QBI, the bracket table) and the April settlement runs the same model
 on the BOOK'S OWN ROWS — Schedule C from the LLC's revenue and
 expense accounts, Schedule B from the interest and dividend accounts,
 Box 1 and withholding from the payroll rows (cold audit R2 W1) — and
-is signed, so an overpaid year posts a refund; WA B&O is apportioned
-to the Washington clients (RCW 82.04.462), net of the small-business
-credit (RCW 82.04.4451 — a $0 return is still filed), and Seattle's
-B&O taxes the whole apportioned base once worldwide gross clears the
-$100K exemption;
+is signed, so an overpaid year posts a refund, and the note states
+the accrual method (Schedule C line F — the book carries A/R and A/P
+across the year-end; cold audit R3 W1); WA B&O sources services to
+the customer (RCW 82.04.462) and then applies the throw-out rule
+(WAC 458-20-19402): the LLC has nexus only in Washington, so the
+receipts factor is 100% and the apportioned base is worldwide gross,
+less the small-business credit with its phase-out (RCW 82.04.4451;
+R3 W2), paid at the quarterly due date; Seattle's B&O taxes the
+Seattle-apportioned base once worldwide gross clears the $100K
+exemption;
 the Seattle license and the SOS annual report are paid from the
 LLC; Robin's stub carries WA PFML (year-keyed rate) / WA Cares / L&I
 and a 7% UWRP deferral with match, withholding computed on wages net
@@ -1108,17 +1113,24 @@ FED_MFJ_TABLES = {
 SS_WAGE_BASE = {2025: D("176100"), 2026: D("184500")}
 TAX_INDEX_FACTOR = D("1.025")
 
-# Washington B&O (audit A7; cold audit A1/B1; R2 W2): Service & Other
-# Activities at 1.5% of the WA-APPORTIONED gross — services are sourced
-# to the customer's location (RCW 82.04.462), so only the Seattle
-# clients' receipts are Washington's; filed quarterly, less the
+# Washington B&O (audit A7; cold audit A1/B1; R2 W2; R3 W2): Service &
+# Other Activities at 1.5% of the apportioned gross. Services are
+# sourced to the customer's location (RCW 82.04.462), so the Seattle
+# clients' receipts are the WA-sourced numerator — but the receipts
+# factor is numerator over a denominator that EXCLUDES receipts
+# attributable to any state or country where the LLC is not taxable
+# (the throw-out rule, WAC 458-20-19402(3)). Alex works in Seattle
+# for remote clients and has nexus nowhere else (no $100K receipts in
+# any other state, no presence beyond one client visit), so every
+# non-WA receipt is thrown out, the factor is 100% and the apportioned
+# base is worldwide gross service receipts. Filed quarterly, less the
 # small-business B&O credit (RCW 82.04.4451(3)–(4): for a ≥50% service
 # filer the maximum credit is $160 per month of the period since
 # 2023-01-01, the credit is the whole tax when the tax is at or under
-# that maximum, and 2 × maximum − tax, floor $0, above it). A quarter
-# whose tax the credit covers still files — a $0 row records the
-# return; nothing is paid. Seattle's own
-# B&O (SMC 5.45) tests its $100K exemption on worldwide gross and,
+# that maximum, and 2 × maximum − tax, floor $0, above it — the
+# phase-out). A quarter whose tax the credit covers still files — a $0
+# row records the return; anything left is paid at the due date.
+# Seattle's own B&O (SMC 5.45) tests its $100K exemption on worldwide gross and,
 # once over it, taxes the whole Seattle-apportioned base at 0.427%
 # (the threshold is an exemption, not a deduction); it settles annually
 # with the license renewal. The SOS annual report is a flat $60 in the
@@ -1146,7 +1158,9 @@ def _receipts_by_month(through: date,
     """Gross receipts (USD, at the invoice's open-date rate) per calendar
     month, from the same invoice plan the business phase executes.
     ``wa_only`` keeps the Washington-sourced clients' receipts only
-    (the B&O apportioned base)."""
+    (the WA-sourced share the DOR note reports, and Seattle's
+    apportioned base; the DOR base itself is worldwide gross after
+    the throw-out rule)."""
     out: dict[tuple[int, int], Decimal] = {}
     for inv in _all_invoice_plans(through):
         if wa_only and inv["client"] not in WA_CLIENTS:
@@ -1429,8 +1443,10 @@ def _federal_settlement(book_path: Path, tax_year: int) -> dict | None:
     basis = (
         f"tax ${t['total']:,.0f} (income ${t['income']:,.0f} + SE "
         f"${t['se']:,.0f}) on W-2 wages ${t['box1']:,.2f} (Box 1 from the "
-        f"payroll rows), Schedule C net ${t['schedule_c']:,.2f} (LLC "
-        f"revenue ${t['revenue']:,.2f} + FX {fx_word} ${abs(t['fx']):,.2f} "
+        f"payroll rows), Schedule C net ${t['schedule_c']:,.2f} (accrual "
+        f"method, line F, consistent with the A/R and A/P subledgers: LLC "
+        f"revenue ${t['revenue']:,.2f} is accrual revenue as invoiced, not "
+        f"customer receipts; + FX {fx_word} ${abs(t['fx']):,.2f} "
         f"− business expenses ${t['expense_total']:,.2f} [{lines}] with "
         f"meals ${t['meals']:,.2f} deductible at 50%), Schedule B interest "
         f"${t['interest']:,.2f} + dividends ${t['dividends']:,.2f}, "
@@ -1486,6 +1502,10 @@ def _bo_tax_plan(through: date) -> list[dict]:
     wa_receipts = _receipts_by_month(through, wa_only=True)
     apportion = ("RCW 82.04.462 sources services to the customer's "
                  "location — Emerald Analytics, Sound Transit")
+    throw_out = ("throw-out rule applied, WAC 458-20-19402: the LLC has "
+                 "nexus only in Washington, so receipts attributable to "
+                 "states and countries where it is not taxable leave the "
+                 "denominator; receipts factor 100%")
     plan: list[dict] = []
     for yr in range(YEAR, through.year + 1):
         for q in range(1, 5):
@@ -1496,26 +1516,31 @@ def _bo_tax_plan(through: date) -> list[dict]:
             due_month = 3 * q + 1
             due = _next_bday(date(yr + 1, 1, 31) if due_month == 13
                              else _clamp_day(yr, due_month, 31))
-            if due > through or wa_gross <= 0:
+            if due > through or gross <= 0:
                 continue
-            tax = (wa_gross * WA_BO_RATE).quantize(D("0.01"))
+            # The apportioned base: WA-sourced over (worldwide − thrown
+            # out) = 100% of worldwide gross while nothing is taxable
+            # elsewhere (R3 W2).
+            base = gross
+            tax = (base * WA_BO_RATE).quantize(D("0.01"))
             cap = WA_BO_CREDIT_MONTHLY_MAX * len(months)
             credit = tax if tax <= cap else max(D("0"), 2 * cap - tax)
             net = tax - credit
             basis = (f"Q{q} {yr} combined excise return — service & other "
-                     f"activities: 1.5% on ${wa_gross:,.2f} WA-apportioned "
-                     f"gross (${gross:,.2f} worldwide; {apportion}) = "
-                     f"${tax:,.2f}, less small-business B&O credit "
-                     f"${credit:,.2f} (RCW 82.04.4451 — service filers, "
-                     f"${WA_BO_CREDIT_MONTHLY_MAX:,.0f}/month of the "
-                     f"period; the whole tax when it is at or under the "
-                     f"${cap:,.0f} maximum)")
+                     f"activities: worldwide gross ${gross:,.2f}; WA-sourced "
+                     f"${wa_gross:,.2f} ({apportion}); {throw_out} → "
+                     f"apportioned base ${base:,.2f}; 1.5% = ${tax:,.2f}, "
+                     f"less small-business B&O credit ${credit:,.2f} "
+                     f"(RCW 82.04.4451 — service filers, "
+                     f"${WA_BO_CREDIT_MONTHLY_MAX:,.0f}/month of the period: "
+                     f"the whole tax at or under the ${cap:,.0f} maximum, "
+                     f"2 × maximum − tax above it)")
             plan.append({
                 "date": due,
                 "description": ("WA DOR — B&O excise tax" if net > 0
                                 else "WA DOR — B&O excise return"),
-                "notes": basis + (f" — ${net:,.2f} due" if net > 0 else
-                                  " — $0 due; return filed, no payment"),
+                "notes": basis + (f" — net ${net:,.2f} due" if net > 0 else
+                                  " — net $0 due; return filed, no payment"),
                 "amount": net,
             })
         sos = _next_bday(date(yr, LLC_ANNIVERSARY_MONTH, 20))
@@ -3382,6 +3407,12 @@ CHASE_PAYOFF_MONTH = (YEAR, 6)
 AMEX_LATE_MONTH = (YEAR, 8)
 AMEX_LATE_PARTIAL = D("200.00")
 AMEX_LATE_FEE = D("29.00")
+# Statement due date: 25 days after the close (the CARD Act floor is
+# 21). The missed August cycle's story hangs on it (cold audit R3
+# H1): the $29 fee posts on the first business day AFTER the due date
+# and the partial payment lands two days after it, rolled to a
+# business day — both after the due date, neither on a holiday.
+AMEX_DUE_DAYS = 25
 
 
 def _card_running(book, path: str) -> list[tuple[date, Decimal]]:
@@ -3435,6 +3466,13 @@ def run_credit_cards(out_path: Path, through: date) -> int:
             # the same roll the policy engine applies from the frozen
             # edge onward.
             pay_date = _next_bday(close + timedelta(days=pay_lag))
+            late_cycle = card.account == AMEX and (y, m) == AMEX_LATE_MONTH
+            if late_cycle:
+                # The missed cycle: the payment goes out two days AFTER
+                # the due date (R3 H1) — a business day, by the same
+                # roll as every other ACH pull.
+                due_date = close + timedelta(days=AMEX_DUE_DAYS)
+                pay_date = _next_bday(due_date + timedelta(days=2))
             if pay_date > through:
                 break
             month = close.strftime("%B %Y")
@@ -3473,19 +3511,24 @@ def run_credit_cards(out_path: Path, through: date) -> int:
                 payment = min(owed, CHASE_MIN_PAYMENT)
                 notes = (f"Minimum-plus payment; ${owed - payment:,.2f} "
                          f"carried at {apr}% APR")
-            elif card.account == AMEX and (y, m) == AMEX_LATE_MONTH:
+            elif late_cycle:
                 payment = min(owed, AMEX_LATE_PARTIAL)
-                notes = (f"Partial payment after the due date — "
-                         f"${owed - payment:,.2f} carried; late fee and "
-                         f"interest follow")
+                notes = (f"Partial payment after the {due_date.isoformat()} "
+                         f"due date — ${owed - payment:,.2f} carried; late "
+                         f"fee posted, interest at the next close")
+                # The fee posts on the first business day after the
+                # due date — never a weekend or a federal holiday.
+                fee_date = _next_bday(due_date + timedelta(days=1))
                 txns.append({
                     "description": f"{card.label} — late payment fee",
-                    "date": close + timedelta(days=10),
-                    "notes": f"Late fee on the {month} statement",
+                    "date": fee_date,
+                    "notes": f"Late fee on the {month} statement (due "
+                             f"{due_date.isoformat()}, unpaid at close of "
+                             f"business)",
                     "splits": [(card.account, -AMEX_LATE_FEE),
                                (fee_acct, AMEX_LATE_FEE)],
                 })
-                rows.append((close + timedelta(days=10), -AMEX_LATE_FEE))
+                rows.append((fee_date, -AMEX_LATE_FEE))
                 rows.sort()
             else:
                 payment = owed
@@ -4518,8 +4561,12 @@ POLICY = PersonaPolicy(
     # Loans have no statement to reconcile against (review §1).
     no_reconcile=(MORTGAGE, AUTO_LOAN),
     # ACH settles on Fed business days: weekends and the eleven federal
-    # holidays roll forward (cold audit R2), the same calendar as
-    # ``_next_bday``.
+    # holidays roll forward for payments (cold audit R2), the same
+    # calendar as ``_next_bday``. Naming the calendar also has the
+    # engine's month-end sweeps (Chase → Ally), owner's draws and
+    # top-ups post on the last business day on or before the month-end
+    # (R3 H2, ``continuation.ach_date``); Ally's interest keeps the
+    # calendar month-end.
     holidays=federal_holidays,
     # The LLC (audit B3): invoices settle here, payables and the
     # business card are paid from here, and the month-end draw moves

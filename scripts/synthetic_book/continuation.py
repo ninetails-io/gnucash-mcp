@@ -20,6 +20,14 @@ Everything the policy acts on is read from the book; the only
 constants left are the policy parameters themselves (buffers, shares,
 bounds — see DRIFT_ANALYSIS.md for the measured derivations).
 
+Dates: the engine DECIDES at calendar month-ends (balances are read
+as of the last day of the month) but its transfers are bank-to-bank
+ACH moves, so a persona that names a settlement calendar
+(``PersonaPolicy.holidays``) has sweeps, draws and top-ups POST on
+the last business day on or before that day (``ach_date``); interest
+credits keep the month-end value date. Personas without a calendar
+keep every row on its calendar day.
+
 Determinism: every randomized choice (payment lag days, settle lags)
 draws from ``random.Random(f"{persona}:{purpose}:{anchor}")`` — seeded
 per (persona, purpose, date), so a re-run over the same range emits
@@ -104,7 +112,12 @@ class PersonaPolicy:
     # check the book before writing.
     book_repairs: Callable[[Path, date, date], list[str]] | None = None
     # holidays(year) -> the dates no ACH settles on, beyond weekends
-    # (``federal_holidays`` for a US persona). None = weekends only.
+    # (``federal_holidays`` for a US persona). Naming a calendar also
+    # OPTS the persona IN to ``ach_date``: the engine's month-end
+    # sweeps, owner's draws and top-ups then settle on the last
+    # business day on or before the calendar day they were decided
+    # on. None = weekends-only rolls for payments, and the engine's
+    # transfers keep their calendar day.
     holidays: Callable[[int], frozenset[date]] | None = None
     # Accounts stamped with the server's no_reconcile opt-out slot:
     # loans, VAT clearing — no statement exists to reconcile against
@@ -213,13 +226,41 @@ def business_day(d: date, holidays=None) -> date:
     ``holidays(year)`` when a calendar is given — to the next business
     day. Card statement payments and document settlements are ACH
     movements and post on business days (Alex cold audit C3; federal
-    holidays R2); month-end interest credits and the closed-loop
-    transfers stay on the calendar day the engine reads them at,
-    deliberately. Personas pass their own calendar through
+    holidays R2); month-end interest credits stay on the calendar day
+    the engine reads them at, deliberately (a bank's Wertstellung).
+    The engine's own transfers roll BACK instead — see ``ach_date``.
+    Personas pass their own calendar through
     ``PersonaPolicy.holidays``; None keeps weekends-only."""
     while not is_business_day(d, holidays):
         d += timedelta(days=1)
     return d
+
+
+def business_day_back(d: date, holidays=None) -> date:
+    """``d`` rolled BACK off a weekend (and off ``holidays(year)`` when
+    a calendar is given) to the last business day on or before it."""
+    while not is_business_day(d, holidays):
+        d -= timedelta(days=1)
+    return d
+
+
+def ach_date(policy: PersonaPolicy, when: date, not_before: date) -> date:
+    """The posting date of one of the engine's own transfers — a
+    surplus sweep, an owner's draw, a checking top-up — that the
+    policy decides on calendar day ``when``. These are bank-to-bank
+    ACH moves (Alex cold audit R3 H2: Chase → Ally on a Saturday), so
+    a persona that names its settlement calendar (``policy.holidays``
+    set) has them settle on the last business day ON OR BEFORE
+    ``when`` — back, not forward, so the month-end balance the policy
+    read is what the month closes on. A persona without a calendar
+    keeps the calendar day (Sabine re-dates its own base rows). Never
+    at or before ``not_before`` (the frozen cutoff, or the first day
+    of a floor walk): a roll-back that would land inside the frozen
+    prefix keeps ``when`` instead."""
+    if policy.holidays is None:
+        return when
+    d = business_day_back(when, policy.holidays)
+    return d if d > not_before else when
 
 
 def month_ends(after: date, through: date) -> Iterator[date]:
@@ -492,7 +533,10 @@ def _floor_topups(book: GnuCashBook, policy: PersonaPolicy, book_path: Path,
     """Walk checking's day-ends over start..end; the first day it would
     close under ``policy.floor`` gets a same-day top-up from savings
     back to ``buffer`` (bounded by what savings holds). Runs before the
-    month's sweep, so the sweep sees the topped-up balance."""
+    month's sweep, so the sweep sees the topped-up balance. The
+    transfer posts on the last business day on or before that day
+    when the persona names a calendar (``ach_date``; never before
+    ``start``) — the money is there by the day-end that needed it."""
     if policy.floor is None or start > end:
         return
     bal = _balance(book, policy.checking, start - timedelta(days=1))
@@ -501,11 +545,12 @@ def _floor_topups(book: GnuCashBook, policy: PersonaPolicy, book_path: Path,
     while d <= end:
         bal += net.get(d, D("0"))
         if bal < policy.floor:
-            available = _balance(book, policy.savings, d)
+            post = ach_date(policy, d, start - timedelta(days=1))
+            available = _balance(book, policy.savings, post)
             topup = min(policy.buffer - bal, available).quantize(D("0.01"))
             if topup >= policy.min_sweep:
                 book.create_transaction(
-                    description=policy.desc_topup, trans_date=d,
+                    description=policy.desc_topup, trans_date=post,
                     splits=[
                         {"account": policy.savings, "amount": str(-topup)},
                         {"account": policy.checking, "amount": str(topup)},
@@ -513,15 +558,19 @@ def _floor_topups(book: GnuCashBook, policy: PersonaPolicy, book_path: Path,
                     check_duplicates=False,
                 )
                 bal += topup
-                log.append(f"topup←savings: {topup} on {d} "
-                           f"(day-end under floor {policy.floor})")
+                log.append(f"topup←savings: {topup} on {post} "
+                           f"(day-end {d} under floor {policy.floor})")
         d += timedelta(days=1)
 
 
 def _sweep(book: GnuCashBook, policy: PersonaPolicy, book_path: Path,
-           month_end: date, log: list[str]) -> None:
+           month_end: date, log: list[str], post: date | None = None) -> None:
     """Month-end surplus disposition: savings share monthly, invest
-    share in cadence months, both bounded by the staging cap."""
+    share in cadence months, both bounded by the staging cap. The
+    surplus is read AS OF ``month_end``; the bank transfer posts on
+    ``post`` (``ach_date`` — the last business day on or before it;
+    default: the month-end itself)."""
+    post = post or month_end
     checking = _balance(book, policy.checking, month_end)
     surplus = checking - policy.buffer
 
@@ -534,14 +583,14 @@ def _sweep(book: GnuCashBook, policy: PersonaPolicy, book_path: Path,
         topup = min(policy.buffer - checking, available).quantize(D("0.01"))
         if topup >= policy.min_sweep:
             book.create_transaction(
-                description=policy.desc_topup, trans_date=month_end,
+                description=policy.desc_topup, trans_date=post,
                 splits=[
                     {"account": policy.savings, "amount": str(-topup)},
                     {"account": policy.checking, "amount": str(topup)},
                 ],
                 check_duplicates=False,
             )
-            log.append(f"topup←savings: {topup} on {month_end}")
+            log.append(f"topup←savings: {topup} on {post}")
         return
 
     if surplus < policy.min_sweep:
@@ -567,14 +616,14 @@ def _sweep(book: GnuCashBook, policy: PersonaPolicy, book_path: Path,
     if to_savings >= policy.min_sweep:
         desc = policy.desc_repair_sweep if staged else policy.desc_sweep
         book.create_transaction(
-            description=desc, trans_date=month_end,
+            description=desc, trans_date=post,
             splits=[
                 {"account": policy.checking, "amount": str(-to_savings)},
                 {"account": policy.savings, "amount": str(to_savings)},
             ],
             check_duplicates=False,
         )
-        log.append(f"sweep→savings: {to_savings} on {month_end}"
+        log.append(f"sweep→savings: {to_savings} on {post}"
                    + (" (staged)" if staged else ""))
 
     if to_invest >= policy.min_sweep:
@@ -627,16 +676,19 @@ def _savings_interest(book: GnuCashBook, policy: PersonaPolicy,
 
 
 def _owner_draw(book: GnuCashBook, policy: PersonaPolicy, month_end: date,
-                log: list[str]) -> None:
+                log: list[str], post: date | None = None) -> None:
     """Month-end owner's draw: everything in the business account above
     its floor (working capital + the reserve accrued so far this year)
     moves to the household, rounded down to the hundred. Through the
     equity clearing account when one is configured: the LLC side
     debits Owner's Draw, the household side credits it back, so the
     LLC's register shows the draw against equity and the combined
-    book's net worth is unchanged."""
+    book's net worth is unchanged. The balance is read AS OF
+    ``month_end``; the transfer posts on ``post`` (``ach_date``;
+    default: the month-end itself)."""
     if policy.business_checking is None:
         return
+    post = post or month_end
     reserve = (policy.business_reserve_monthly * month_end.month
                if month_end.month != 12 else D("0"))
     floor = policy.business_buffer + reserve
@@ -649,7 +701,7 @@ def _owner_draw(book: GnuCashBook, policy: PersonaPolicy, month_end: date,
     if policy.draw_equity is None:
         book.create_transaction(
             description=policy.desc_draw.format(month=month),
-            trans_date=month_end,
+            trans_date=post,
             splits=[
                 {"account": policy.business_checking, "amount": str(-draw)},
                 {"account": policy.checking, "amount": str(draw)},
@@ -659,7 +711,7 @@ def _owner_draw(book: GnuCashBook, policy: PersonaPolicy, month_end: date,
     else:
         book.create_transaction(
             description=policy.desc_draw.format(month=month),
-            trans_date=month_end,
+            trans_date=post,
             splits=[
                 {"account": policy.business_checking, "amount": str(-draw)},
                 {"account": policy.draw_equity, "amount": str(draw)},
@@ -668,14 +720,14 @@ def _owner_draw(book: GnuCashBook, policy: PersonaPolicy, month_end: date,
         )
         book.create_transaction(
             description=policy.desc_draw_deposit.format(month=month),
-            trans_date=month_end,
+            trans_date=post,
             splits=[
                 {"account": policy.draw_equity, "amount": str(-draw)},
                 {"account": policy.checking, "amount": str(draw)},
             ],
             check_duplicates=False,
         )
-    log.append(f"owner's draw: {draw} on {month_end} (floor {floor})")
+    log.append(f"owner's draw: {draw} on {post} (floor {floor})")
 
 
 def _card_closes(book: GnuCashBook, card: CardPolicy, cutoff: date,
@@ -721,12 +773,16 @@ def run_policy(policy: PersonaPolicy, book_path: Path, cutoff: date,
         else:
             # The floor pass covers the month's days first; then
             # interest and the owner's draw land so the sweep sees the
-            # month's true household surplus.
+            # month's true household surplus. Interest keeps the
+            # calendar month-end (a bank's value date); the draw and
+            # the sweep are ACH moves and post on the last business
+            # day on or before it when the persona names a calendar.
+            post = ach_date(policy, when, cutoff)
             _floor_topups(book, policy, book_path,
                           walked + timedelta(days=1), when, log)
             _savings_interest(book, policy, when, log)
-            _owner_draw(book, policy, when, log)
-            _sweep(book, policy, book_path, when, log)
+            _owner_draw(book, policy, when, log, post=post)
+            _sweep(book, policy, book_path, when, log, post=post)
             _rebalance(book, policy, book_path, when, log)
             walked = when
     # A partial last month has no sweep, but its days still get the
