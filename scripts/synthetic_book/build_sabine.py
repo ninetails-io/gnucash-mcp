@@ -222,6 +222,23 @@ PKW_NOTES = ("VW Golf VIII 1.5 eTSI (Benzin), Erstzulassung 01/2024. "
              "Anschaffungskosten 26.890,76 € netto, AfA linear 6 Jahre "
              "(4.481,79 €/Jahr). Kein 0,03%-Zuschlag: Wohnung und Studio "
              "beide in Schwabing.")
+# W2 (cold audit R3): the same parameters in the account's own Notes
+# field — where a Prüfer looks for the Bruttolistenpreis and the
+# Erstzulassung — plus the reason there is no 0,03%-Zuschlag: the
+# Wohnung (Eigentumswohnung Schwabing) and the Studio (Miete Studio
+# Schwabing) are ~600 m apart and the way to work is walked, so there
+# are no Fahrten zwischen Wohnung und Betriebsstätte with the Pkw and
+# nothing to add back under §4 Abs. 5 Nr. 6 EStG.
+PKW_ACCOUNT_NOTES = (
+    "VW Golf VIII 1.5 eTSI (Benzin), Erstzulassung 01/2024, Anschaffung 01/2024. "
+    "Bruttolistenpreis (BLP) 32.000,00 €; Anschaffungskosten 26.890,76 € netto "
+    "(32.000,00 € brutto). AfA linear über 6 Jahre = 4.481,79 €/Jahr, erstmals 2024. "
+    "Private Nutzung nach der 1%-Regelung: 320,00 €/Monat (davon 80% mit 19% USt, "
+    "SKR03 8924/8920). Kein Zuschlag von 0,03% je Entfernungskilometer und keine "
+    "Hinzurechnung nach §4 Abs. 5 Nr. 6 EStG: Wohnung (Schwabing) und Betriebsstätte "
+    "(Studio Schwabing) liegen rund 600 m auseinander und werden zu Fuß zurückgelegt — "
+    "der Pkw wird für diese Strecke nicht genutzt. "
+    "Finanzierung: VW Bank, 0640, 4,49% p.a., 60 Monate.")
 
 # ── Phase 2: chart = authentic SKR03 (100) + additions ─────────────
 SKR03 = [
@@ -518,6 +535,10 @@ def set_account_slots(book: GnuCashBook) -> None:
     book.set_account_slot(HYPOTHEK, "loan_term_months", "300")
     book.set_account_slot(KFZ_FIN, "apr", "4.49")
     book.set_account_slot(KFZ_FIN, "loan_term_months", "60")
+    # W2/P6: BLP, Erstzulassung and the 1%-Regelung on the Pkw account
+    # itself — "notes" is GnuCash's own KVP key for an account's Notes
+    # field, so the desktop register shows what a Prüfer asks for.
+    book.set_account_slot(PKW, "notes", PKW_ACCOUNT_NOTES)
     # Loans and VAT clearing accounts opt out of the reconciliation
     # surface — no statement exists to reconcile against (bookkeeper
     # review §1; USt settles via the monthly USt-VA, not a statement).
@@ -556,6 +577,19 @@ OPENING_PRIVATE = [
     (WOHNUNG, D("540000")),
     (HYPOTHEK, D("-395000")),
 ]
+# H2: what the Saldenvortrag does NOT carry, and why. The December 2024
+# invoices are erfasst as documents with their original dates, so 1400
+# and 1776 open with the figures those Belege carry rather than with a
+# lump-sum Vortrag — the OPOS list and the Debitorensaldo agree by
+# construction, which a 9008-Vortrag could not guarantee.
+OPENING_NOTE = (
+    "Eröffnungsbilanzwerte zum 01.01.2025 (Umstellung der Buchführung). "
+    "Pkw 0320 mit dem Restbuchwert nach der ersten Jahres-AfA 2024 (EZ 01/2024), "
+    "0640 mit dem Restsaldo der Kfz-Finanzierung. Die offenen Forderungen aus "
+    "12/2024 (1400) und die Umsatzsteuer-Zahllast 12/2024 (1776) stehen nicht im "
+    "Saldenvortrag: sie sind als Einzelbelege mit Originaldatum erfasst (OPOS) und "
+    "werden im Januar 2025 ausgeglichen bzw. mit der USt-Voranmeldung 12/2024 "
+    "am 10.01.2025 abgeführt.")
 ETF_UNITS = D("95")
 
 
@@ -610,15 +644,15 @@ def opening_balances(out_path: Path) -> None:
         eur = book.default_currency
         acct = {a.fullname: a for a in book.accounts}
         jan1 = date(YEAR, 1, 1)
-        for rows, equity, desc in (
-                (OPENING_BALANCES, OPENING, "Anfangsbestand 01.01.2025"),
-                (OPENING_PRIVATE, PRIV_KAPITAL, "Anfangsbestand 01.01.2025 (privat)")):
+        for rows, equity, desc, note in (
+                (OPENING_BALANCES, OPENING, "Anfangsbestand 01.01.2025", OPENING_NOTE),
+                (OPENING_PRIVATE, PRIV_KAPITAL, "Anfangsbestand 01.01.2025 (privat)", "")):
             splits, total = [], D("0")
             for path, bal in rows:
                 splits.append(piecash.Split(account=acct[path], value=bal))
                 total += bal
             splits.append(piecash.Split(account=acct[equity], value=-total))
-            piecash.Transaction(currency=eur, description=desc,
+            piecash.Transaction(currency=eur, description=desc, notes=note,
                                 post_date=jan1, splits=splits)
         # ETF opening lot — private, so against Privatkapital.
         etf_cost = (etf_price(jan1) * ETF_UNITS).quantize(D("0.01"), ROUND_HALF_UP)
@@ -735,7 +769,8 @@ PAYEES: dict[tuple[str, str], tuple[str, str, bool]] = {
     ("buero", "Viking Direkt"): (BUEROBEDARF, "vst19", False),
     ("buero", "Office Discount"): (BUEROBEDARF, "vst19", False),
     ("buero", "McPaper"): (BUEROBEDARF, "vst19", True),
-    # Hardware — routed by net amount (≤ 250 Kleingerät, else GWG)
+    # Hardware — the shops; the ACCOUNT is decided by ``_device`` from
+    # the catalogue (Peripherie → 4985, selbständig nutzbar > 250 → 4855)
     ("hardware", "MediaMarkt"): (WERKZEUG, "vst19", True),
     ("hardware", "Cyberport"): (WERKZEUG, "vst19", False),
     ("hardware", "Apple Store München"): (WERKZEUG, "vst19", False),
@@ -752,8 +787,11 @@ PAYEES: dict[tuple[str, str], tuple[str, str, bool]] = {
     ("bewirtung", "dean&david"): (BEWIRTUNG, "bewirtung19", True),
     ("bewirtung", "Hofbräuhaus"): (BEWIRTUNG, "bewirtung19", False),
     ("bewirtung", "Vinzenzmurr"): (BEWIRTUNG, "bewirtung7", True),
-    # Aufmerksamkeiten (≤ 50 € netto, §4 Abs. 5 Nr. 1 EStG)
-    ("aufmerk", "Blumen Lindner"): (AUFMERK, "vst19", False),
+    # Aufmerksamkeiten (≤ 50 € netto, §4 Abs. 5 Nr. 1 EStG). W1 (cold
+    # audit R3): Schnittblumen und Blumensträuße sind Anlage 2 Nr. 7
+    # UStG — 7%, nicht 19%. Every florist books its VSt on 1571.
+    ("aufmerk", "Blumen Lindner"): (AUFMERK, "vst7", False),
+    ("aufmerk", "Blumenhaus Amalienstraße"): (AUFMERK, "vst7", False),
     ("aufmerk", "Confiserie Rottenhöfer"): (AUFMERK, "vst7", False),
     ("aufmerk", "Dallmayr"): (AUFMERK, "vst7", False),
     # Werbung: the platforms are Irish → §13b; Flyeralarm is a vendor bill
@@ -850,18 +888,45 @@ def _book_expense(day: date, category: str, payee: str, gross: D,
     return _tx(day, desc, splits, notes)
 
 
-def _hardware(day: date, payee: str, gross: D, item: str, rng) -> dict:
-    """Hardware routes by net price (W8): ≤ €250 net is a Kleingerät
-    (4985); above that and ≤ €800 it is a GWG on 4855 with a
-    GWG-Verzeichnis note (§6 Abs. 2 EStG)."""
+def _device(day: date, payee: str, item: str, gross: D, *,
+            selbstaendig: bool, nr: str | None, vorgaenger: int | None = None,
+            defekt: bool = False, description: str | None = None) -> dict:
+    """One device purchase, routed by §6 Abs. 2 EStG rather than by
+    price alone (H1, cold audit R3 + the tax report's addendum):
+
+    * a **Peripheriegerät** (Maus, Tastatur, Webcam, Monitorarm, Dock,
+      externe SSD, Ringlicht, Stift, Kalibrierungssonde) is *nicht
+      selbständig nutzbar* (BFH v. 19.02.2004, BStBl II 2004, 958;
+      R 6.13 EStR) — it can never be a GWG whatever it costs. The
+      catalogue keeps every peripheral under €250 net, so it is a
+      Sofortaufwand on 4985 and no Anlagekonto is involved.
+    * a **selbständig nutzbares** item (NAS, Drucker, Tablet, Kamera,
+      Projektor, Bürostuhl, Kopfhörer) above €250 and up to €800 net is
+      a GWG on 4855 and gets the next number of that year's laufend
+      geführtes GWG-Verzeichnis (§6 Abs. 2 S. 4 EStG); below €250 it is
+      the same Sofortaufwand as the peripherals.
+
+    ``gross`` is what the till prints; the booked net is derived from it
+    so the note states the figure the ledger carries."""
     net, _ = _vat_split(gross, D("19"))
-    if net <= D("250"):
-        return _book_expense(day, "hardware", payee, gross,
-                             f"Kleingerät: {item} ({net:.2f} € netto)")
-    nr = f"{day.year}-{rng.randint(1, 99):02d}"
-    return _book_expense(day, "hardware", payee, gross,
-                         f"GWG: {item}, AK {net:.2f} € netto — GWG-Verzeichnis Nr. {nr}",
-                         account=GWG)
+    tail = ""
+    if vorgaenger and defekt:
+        tail = f" — Ersatz nach Defekt (Gerät aus {vorgaenger} vorzeitig ausgefallen)"
+    elif vorgaenger:
+        tail = f" — Ersatz für das Gerät aus {vorgaenger} (Nutzungsdauer erreicht)"
+    if nr is not None:
+        note = (f"GWG: {item}, AK {net:.2f} € netto — selbständig nutzbar, "
+                f"GWG-Verzeichnis Nr. {nr} (§6 Abs. 2 EStG){tail}")
+        return _book_expense(day, "hardware", payee, gross, note, account=GWG,
+                             description=description)
+    if selbstaendig:
+        note = (f"Kleingerät: {item} ({net:.2f} € netto) — selbständig nutzbar, "
+                f"Sofortaufwand ≤ 250 € netto{tail}")
+    else:
+        note = (f"Kleingerät: {item} ({net:.2f} € netto) — Peripheriegerät, nicht "
+                "selbständig nutzbar (BFH BStBl II 2004, 958), daher kein GWG; "
+                f"Sofortaufwand ≤ 250 € netto (R 6.13 EStR){tail}")
+    return _book_expense(day, "hardware", payee, gross, note, description=description)
 
 
 def _pick(rng, category: str, names: list[str]) -> str:
@@ -1010,9 +1075,56 @@ CONTACTS = {
 ANLAESSE = ["Projektbesprechung", "Briefing neue Kampagne", "Abnahme Layout",
             "Kick-off Verpackungsdesign", "Jahresgespräch", "Präsentation Entwürfe",
             "Korrekturschleife Katalog"]
-HARDWARE = ["USB-C Dock", "Externe SSD 2 TB", "Monitorarm", "Studio-Kopfhörer",
-            "Farbkalibrierungsgerät", "Webcam", "Ringlicht", "Tastatur", "Maus",
-            "Grafiktablett-Stift", "NAS-Festplatte 8 TB", "Drucker Etiketten"]
+# H1 (cold audit R3): the device catalogue. One entry per item, a
+# realistic net price band, and the §6 Abs. 2 EStG question answered
+# once — ``selbstaendig`` is "selbständig nutzbar". Peripherals are
+# capped under €250 net by their band, so no peripheral can ever reach
+# 4855; the independently usable items carry the GWG range up to €800.
+# ``DEVICE_MERCHANTS`` are the shops she buys them at.
+DEVICES: dict[str, tuple[int, int, bool]] = {
+    # Peripheriegeräte — not independently usable, never a GWG
+    "Maus": (40, 90, False),
+    "Tastatur": (80, 180, False),
+    "Webcam": (70, 150, False),
+    "Monitorarm": (60, 150, False),
+    "USB-C Dock": (90, 180, False),
+    "Externe SSD 2 TB": (80, 200, False),
+    "Ringlicht": (40, 80, False),
+    "Grafiktablett-Stift": (60, 90, False),
+    "Farbkalibrierungsgerät": (150, 245, False),
+    "Dokumentenscanner": (150, 245, False),
+    "Kartenleser (SD/CF)": (40, 90, False),
+    "USB-Hub mit Netzteil": (40, 90, False),
+    # Selbständig nutzbar — GWG above €250 net, Sofortaufwand below
+    "Studio-Kopfhörer": (150, 320, True),
+    "Etikettendrucker": (120, 260, True),
+    "NAS-Festplatte 8 TB": (300, 650, True),
+    "Laserdrucker (s/w, Duplex)": (250, 480, True),
+    "Fotodrucker A3+ (Proofs)": (450, 780, True),
+    "Tablet (Kundenpräsentation)": (450, 700, True),
+    "Diensthandy (Vorjahresmodell)": (400, 780, True),
+    "Digitalkamera (Produktfotos)": (400, 780, True),
+    "Fotostativ mit Studioblitz-Set": (280, 560, True),
+    "Beamer (Kundenpräsentation)": (400, 700, True),
+    "Bürostuhl (ergonomisch)": (300, 650, True),
+    "Besprechungsstuhl": (250, 400, True),
+    "Rollcontainer (abschließbar)": (250, 400, True),
+    "Aktenvernichter (Stufe P-4)": (250, 420, True),
+    "Stapelschneider A3": (250, 450, True),
+    "Laminiergerät A3": (250, 400, True),
+    "Leuchttisch A3": (250, 420, True),
+}
+DEVICE_MERCHANTS = ["MediaMarkt", "Cyberport", "Apple Store München", "Gravis", "Amazon.de"]
+# A peripheral must stay a Sofortaufwand: its band may not reach the
+# €250 line, or the router would have to capitalize it.
+assert all(hi <= 250 for _, hi, selbst in DEVICES.values() if not selbst)
+DEVICE_YEAR_COUNT = (6, 10)               # distinct items per Wirtschaftsjahr
+DEVICE_YEAR_NET = (D("2000"), D("4000"))  # and their net total
+# An item in service is not bought again: the catalogue only offers what
+# she does not already own, until the unit has run its Nutzungsdauer.
+# The catalogue is wide enough that this never runs dry — at most two
+# years of draws are locked at once, well inside each pool.
+DEVICE_CYCLE = 3
 BUERO_ITEMS = ["Druckerpapier, Toner", "Skizzenbücher, Marker", "Ordner, Register",
                "Präsentationsmappen", "Briefumschläge", "Klebeband, Cutter"]
 BUECHER_ITEMS = ["Typografie-Fachbuch", "PAGE Magazin Abo", "Design-Jahrbuch",
@@ -1020,11 +1132,13 @@ BUECHER_ITEMS = ["Typografie-Fachbuch", "PAGE Magazin Abo", "Design-Jahrbuch",
 
 # Business spend: (category, lo, hi, avg-count/mo, payees)
 BUSINESS = [
+    # Hardware is NOT a monthly lumpy draw — devices come from the
+    # catalogue in ``gen_devices`` (H1), one unit per item per year.
     ("buero", 8, 90, 4, ["Amazon.de", "Viking Direkt", "Office Discount", "McPaper"]),
-    ("hardware", 25, 780, 2, ["MediaMarkt", "Cyberport", "Apple Store München", "Gravis", "Amazon.de"]),
     ("reise", 3, 120, 4, ["MVG München", "FREENOW", "Deutsche Bahn", "Sixt"]),
     ("bewirtung", 18, 95, 3, ["L'Osteria", "Café Frischhut", "Vinzenzmurr", "Hofbräuhaus", "dean&david"]),
-    ("aufmerk", 15, 55, 1, ["Blumen Lindner", "Confiserie Rottenhöfer", "Dallmayr"]),
+    ("aufmerk", 15, 55, 1, ["Blumen Lindner", "Blumenhaus Amalienstraße",
+                            "Confiserie Rottenhöfer", "Dallmayr"]),
     ("werbung", 30, 420, 1, ["Google Ads", "Meta Platforms", "LinkedIn Ads"]),
     ("porto", 3, 30, 3, ["Deutsche Post", "DHL Paket", "Hermes Versand", "DPD"]),
     ("buecher", 10, 65, 1, ["Hugendubel", "Amazon.de", "PAGE Magazin", "Rheinwerk Verlag"]),
@@ -1095,9 +1209,6 @@ def gen_variable() -> list[dict]:
                 desc = _pick(rng, category, names)
                 payee = _payee_of(desc)
                 gross = _cents(rng, lo, hi)
-                if category == "hardware":
-                    txns.append(_hardware(day, payee, gross, rng.choice(HARDWARE), rng))
-                    continue
                 if category == "bewirtung":
                     # W3: a Bewirtung needs Anlass + Teilnehmer; a fifth
                     # of the restaurant lines have no Beleg — private.
@@ -1141,7 +1252,13 @@ def gen_variable() -> list[dict]:
                     note = "Versand Druckmuster an Kunden" if payee != "Deutsche Post" \
                         else "Briefporto (USt-frei, §4 Nr. 11b UStG)"
                 else:  # tanken
-                    note = "Tankbeleg Pkw (Benzin)" if payee != "Parkhaus Stachus" else "Parken Kundentermin Innenstadt"
+                    if payee == "Parkhaus Stachus":
+                        # H1: a Parkschein is €3–12 net a visit, not a
+                        # tank of petrol — its own band, not the fuel one.
+                        gross = (_cents(rng, 3, 11) * D("1.19")).quantize(D("0.01"), ROUND_HALF_UP)
+                        note = "Parken Kundentermin Innenstadt"
+                    else:
+                        note = "Tankbeleg Pkw (Benzin)"
                 txns.append(_book_expense(day, category, payee, gross, note, description=desc))
         if first.month == 12:
             # Weihnachten: a small present to the clients who had none
@@ -1153,6 +1270,88 @@ def gen_variable() -> list[dict]:
                 payee = rng.choice(["Confiserie Rottenhöfer", "Dallmayr"])
                 gross = _cents(rng, 18, 45)
                 txns.append(_gift(day, payee, gross, client, "Weihnachten", gifted))
+    return txns
+
+
+# ── Phase 5c: devices (H1) — a catalogue, not a shopping spree ─────
+def _device_price(net_target: D) -> tuple[D, D]:
+    """(gross, booked net) for a catalogue price. The gross is what the
+    till prints; the booked net is re-derived from it, so the routing
+    threshold and the note both read the figure the ledger carries."""
+    gross = (net_target * D("1.19")).quantize(D("0.01"), ROUND_HALF_UP)
+    return gross, _vat_split(gross, D("19"))[0]
+
+
+def _device_year(rng, year: int, eligible: list[str],
+                 ersatz_item: str | None) -> list[tuple[str, D, D]]:
+    """This Wirtschaftsjahr's device list as (item, gross, net): distinct
+    items drawn WITHOUT replacement from what she does not already have
+    in service (no item name twice in a year, and no second unit of a
+    device that still works), 6–10 of them, €2–4k net in total.
+    ``ersatz_item`` — the one early replacement the two-year cycle
+    allows — is forced in and excluded from the fresh draw."""
+    selbst = [i for i in eligible if DEVICES[i][2] and i != ersatz_item]
+    perif = [i for i in eligible if not DEVICES[i][2] and i != ersatz_item]
+    lo_n, hi_n = DEVICE_YEAR_COUNT
+    lo_eur, hi_eur = DEVICE_YEAR_NET
+    forced = [ersatz_item] if ersatz_item else []
+    for _ in range(600):
+        pick = forced + rng.sample(selbst, min(rng.randint(4, 5), len(selbst))) \
+            + rng.sample(perif, min(rng.randint(2, 4), len(perif)))
+        priced = [(i, *_device_price(_cents(rng, DEVICES[i][0], DEVICES[i][1] - 1)))
+                  for i in pick]
+        total = sum(net for _, _, net in priced)
+        if lo_n <= len(priced) <= hi_n and lo_eur <= total <= hi_eur:
+            return priced
+    raise SystemExit(f"device catalogue: no {year} draw inside the count/total bands "
+                     f"({len(selbst)} + {len(perif)} items available)")
+
+
+def gen_devices() -> list[dict]:
+    """Device purchases from the catalogue (H1). One unit per item per
+    year, and never a second unit of a device that is still in service:
+    an item comes round again only after its Nutzungsdauer
+    (``DEVICE_CYCLE``), and the ONE exception — a device that fails
+    early — carries "Ersatz nach Defekt" and happens at most once every
+    two years. The GWG-Verzeichnis counter runs per year in date order,
+    so its numbers are chronological and unique (§6 Abs. 2 S. 4 EStG:
+    a *laufend zu führendes* Verzeichnis)."""
+    rng = random.Random(SEED + 11)
+    txns: list[dict] = []
+    owned: dict[str, int] = {}          # item → year of the unit in service
+    last_ersatz = YEAR - 2
+    for year in range(YEAR, THROUGH.year + 1):
+        ersatz_item = None
+        in_service = sorted(i for i, bought in owned.items()
+                            if 1 <= year - bought < DEVICE_CYCLE)
+        if in_service and year - last_ersatz >= 2:
+            ersatz_item = rng.choice(in_service)
+            last_ersatz = year
+        eligible = sorted(i for i in DEVICES
+                          if i not in owned or year - owned[i] >= DEVICE_CYCLE)
+        priced = _device_year(rng, year, eligible, ersatz_item)
+        # Spread the year's purchases evenly over its months (distinct
+        # months, in a random item order), so a part-year horizon cuts a
+        # representative slice instead of whatever the draw clustered.
+        rng.shuffle(priced)
+        months = [1 + (i * 12) // len(priced) for i in range(len(priced))]
+        dated = sorted((bankday(day_in(date(year, m, 1), rng.randint(2, 27))), item, gross, net)
+                       for m, (item, gross, net) in zip(months, priced))
+        # Number AFTER the horizon clamp: the Verzeichnis the book shows
+        # runs 01, 02, … with no gap where a future purchase would be.
+        counter = 0
+        for day, item, gross, net in [row for row in dated if row[0] <= THROUGH]:
+            selbstaendig = DEVICES[item][2]
+            nr = None
+            if selbstaendig and net > D("250"):
+                counter += 1
+                nr = f"{year}-{counter:02d}"
+            shop = _pick(rng, "hardware", DEVICE_MERCHANTS)
+            txns.append(_device(day, _payee_of(shop), item, gross,
+                                selbstaendig=selbstaendig, nr=nr,
+                                vorgaenger=owned.get(item),
+                                defekt=item == ersatz_item, description=shop))
+            owned[item] = year
     return txns
 
 
@@ -1444,6 +1643,30 @@ def _invoice_plan() -> list[dict]:
                     entries=entries,
                     pay=(pay or _pay(opened), sum(e["gross"] for e in entries)))
 
+    # H2 (cold audit R3): the prior-year tail. The business ran through
+    # 2024 — the Pkw's first AfA year, the VW loan, "ESt-VZ lt. Bescheid
+    # 2024" all say so — so the cut-over into this book carries December
+    # 2024's open items with their ORIGINAL dates (OPOS-Erfassung, as a
+    # Buchhaltungsumstellung does). They are the earliest documents in
+    # the sequence, they stand open on 1 January, they settle in
+    # January, and the 19% USt they carry IS the 12/2024 Zahllast that
+    # ``run_ust_va`` pays on the first Bankarbeitstag on/after 10
+    # January. Nothing else of 2024 is in the book, and no bank row
+    # predates the Anfangsbestand.
+    for opened, paid, key, title, net in (
+            (date(2024, 12, 4), date(2025, 1, 8), "verlag",
+             "Editorial-Design 12/2024 (Retainer)", D("2400")),
+            (date(2024, 12, 9), date(2025, 1, 14), "stadtmarketing",
+             "Jahresrückblick-Broschüre 2024", D("2900")),
+            (date(2024, 12, 13), date(2025, 1, 20), "biobackhaus",
+             "Verpackungsdesign Weihnachtssortiment", D("3400")),
+            (date(2024, 12, 19), date(2025, 1, 27), "lindberg",
+             "Katalog Winter 2024/25", D("3900"))):
+        plan.append(_spec(key, opened, [_entry(REV19, title, net, "19")],
+                          f"Leistungszeitraum: {opened:%m/%Y}. Offener Posten aus 2024, "
+                          "bei der Umstellung der Buchführung zum 01.01.2025 mit "
+                          "Originaldatum erfasst (OPOS-Vortrag)",
+                          pay=bankday(paid)))
     for first in iter_months():
         # The retainer — 2,400 net in 2025, +100 each year.
         opened = weekday_in(first, 5)
@@ -2252,6 +2475,104 @@ def verify(out_path: Path) -> None:
     print(f"✓ N1: {len(gifts)} Geschenke, one per Empfänger-Jahr ({len(per_year)} pairs), "
           f"4653 ≤ €50 net each; {n4665} over the cap on 4665 without VSt; Weihnachten only in December")
 
+    # N2: the device catalogue (H1). One unit per item per year, a
+    # Verzeichnis that runs 01, 02, … in date order, no Peripheriegerät
+    # on 4855 whatever it cost (§6 Abs. 2 EStG, BFH BStBl II 2004, 958),
+    # and a year's purchases inside the count and net-total bands.
+    con = sqlite3.connect(str(out_path))
+    try:
+        devices = con.execute(
+            "SELECT date(t.post_date), a.name, n.string_val, s.value_num, s.value_denom "
+            "FROM splits s JOIN accounts a ON a.guid = s.account_guid "
+            "JOIN transactions t ON t.guid = s.tx_guid "
+            "JOIN slots n ON n.obj_guid = t.guid AND n.name = 'notes' "
+            "WHERE a.name LIKE '4855 %' OR a.name LIKE '4985 %' "
+            "ORDER BY date(t.post_date), t.guid").fetchall()
+        # H2: the prior-year tail — the earliest document is a December
+        # 2024 invoice, it settles in January 2025, and the 19% USt it
+        # carries is the 12/2024 Zahllast the Finanzamt draws on the
+        # first Bankarbeitstag on or after 10 January.
+        first_id, first_opened = con.execute(
+            "SELECT id, date(date_opened) FROM invoices WHERE owner_type = 2 "
+            "ORDER BY id LIMIT 1").fetchone()
+        n_2024 = con.execute(
+            "SELECT COUNT(*) FROM invoices WHERE owner_type = 2 "
+            "AND substr(date_opened, 1, 4) = '2024'").fetchone()[0]
+        settle = con.execute(
+            "SELECT date(post_date) FROM transactions WHERE description LIKE ?",
+            (f"Zahlungseingang%Re. {first_id}",)).fetchone()
+        ust_dec = -sum(D(num) / D(den) for num, den in con.execute(
+            "SELECT s.value_num, s.value_denom FROM splits s "
+            "JOIN accounts a ON a.guid = s.account_guid "
+            "JOIN transactions t ON t.guid = s.tx_guid "
+            "WHERE a.name LIKE '1776 %' AND date(t.post_date) <= '2024-12-31'"))
+        va_dec = con.execute(
+            "SELECT date(t.post_date), s.value_num, s.value_denom FROM transactions t "
+            "JOIN splits s ON s.tx_guid = t.guid JOIN accounts a ON a.guid = s.account_guid "
+            "WHERE t.description = ? AND a.name = '1200 Bankkonto'",
+            (f"{UST_VA_DESC} 12/2024",)).fetchone()
+    finally:
+        con.close()
+    per_year: dict[int, list] = {}
+    bought: dict[str, list[tuple[int, bool]]] = {}
+    peripherals = {i for i, (_, _, s) in DEVICES.items() if not s}
+    for day, leaf, note, num, den in devices:
+        m = re.match(r"^(GWG|Kleingerät): (.+?)(?:, AK [\d.]+ € netto| \([\d.]+ € netto\))", note)
+        assert m, f"device note not in the catalogue form: {note!r}"
+        kind, item = m.group(1), m.group(2)
+        assert item in DEVICES, f"{item!r} is not in the device catalogue"
+        assert not (kind == "GWG" and item in peripherals), \
+            f"{item} on 4855 though it is a Peripheriegerät (not selbständig nutzbar): {day}"
+        nr = re.search(r"GWG-Verzeichnis Nr. (\d{4})-(\d+)", note)
+        assert (nr is not None) == leaf.startswith("4855"), f"GWG number vs account: {note!r}"
+        per_year.setdefault(int(day[:4]), []).append(
+            (day, item, D(num) / D(den), nr and nr.group(0), "Ersatz nach Defekt" in note))
+        bought.setdefault(item, []).append((int(day[:4]), "Ersatz nach Defekt" in note))
+    ersatz_years = sorted({y for y, rows in per_year.items() if any(r[4] for r in rows)})
+    for y, prev in zip(ersatz_years[1:], ersatz_years):
+        assert y - prev >= 2, f"two Ersatz purchases less than two years apart: {prev}, {y}"
+    # A second unit of a device she owns is either an early failure
+    # ("Ersatz nach Defekt") or the successor of a unit that has run its
+    # Nutzungsdauer — never an unexplained duplicate.
+    for item, units in bought.items():
+        for (year, defekt), (prev_year, _) in zip(units[1:], units):
+            assert defekt or year - prev_year >= DEVICE_CYCLE, \
+                f"{item}: bought {prev_year} and again {year} with no Ersatz reason"
+    for year, rows in sorted(per_year.items()):
+        items = [r[1] for r in rows]
+        assert len(set(items)) == len(items), \
+            f"{year}: an item bought twice — {sorted(i for i in items if items.count(i) > 1)}"
+        assert sum(1 for r in rows if r[4]) <= 1, f"{year}: more than one Ersatz"
+        numbers = [r[3] for r in rows if r[3]]
+        assert numbers == [f"GWG-Verzeichnis Nr. {year}-{i:02d}"
+                           for i in range(1, len(numbers) + 1)], \
+            f"{year}: GWG-Verzeichnis not chronological/unique: {numbers}"
+        total = sum(r[2] for r in rows)
+        if date(year, 12, 31) <= THROUGH:
+            lo_n, hi_n = DEVICE_YEAR_COUNT
+            lo_eur, hi_eur = DEVICE_YEAR_NET
+            assert lo_n <= len(rows) <= hi_n, f"{year}: {len(rows)} devices"
+            assert lo_eur <= total <= hi_eur, f"{year}: €{total} of devices"
+        print(f"  Geräte {year}: {len(rows)} Stück, €{total} netto, "
+              f"{len(numbers)} GWG ({'–'.join(n[-7:] for n in (numbers[:1] + numbers[-1:])) or 'keine'})"
+              + (", 1× Ersatz nach Defekt" if any(r[4] for r in rows) else ""))
+    print(f"✓ N2: {len(bought)} device types, one unit each per year and none re-bought "
+          f"inside its {DEVICE_CYCLE}-year Nutzungsdauer without an Ersatz reason; "
+          "GWG-Verzeichnis chronological and unique; no Peripheriegerät on 4855 "
+          "(nicht selbständig nutzbar); €2–4k net a full year")
+
+    assert first_opened.startswith("2024-12"), \
+        f"the earliest invoice is {first_id} of {first_opened}, not a December 2024 one"
+    assert n_2024 >= 1 and settle and settle[0].startswith("2025-01"), \
+        f"{n_2024} invoices from 2024; Re. {first_id} settled {settle}"
+    assert ust_dec > 0 and va_dec, "no 12/2024 output VAT or no VA clearing it"
+    assert va_dec[0] == bankday(date(YEAR, 1, 10)).isoformat(), \
+        f"USt-VA 12/2024 booked {va_dec[0]}, not on the first Bankarbeitstag ≥ 10.01."
+    assert -D(va_dec[1]) / D(va_dec[2]) == ust_dec, \
+        f"USt-VA 12/2024 pays {-D(va_dec[1]) / D(va_dec[2])}, Zahllast is {ust_dec}"
+    print(f"✓ H2: {n_2024} open items from 12/2024 carried into the book (earliest Re. {first_id}, "
+          f"{first_opened}, settled {settle[0]}); Zahllast 12/2024 €{ust_dec} paid {va_dec[0]}")
+
 
 # ── Continuation hooks (closed-loop policy layer) ───────────────
 # Persona wiring for scripts/synthetic_book/continue_book.py. Sabine
@@ -2570,6 +2891,8 @@ def build(out_path: Path) -> None:
     print(f"  {write_bulk(out_path, gen_yearend())} AfA bookings")
     print("\nPhase 5: variable business spend (through the payee table)")
     print(f"  {write_bulk(out_path, gen_variable())} variable txns")
+    print("\nPhase 5c: devices from the catalogue (GWG-Verzeichnis, Peripherie)")
+    print(f"  {write_bulk(out_path, gen_devices())} device purchases")
     print("\nPhase 5b: trips (transport, lodging, Pauschalen, conferences)")
     print(f"  {write_bulk(out_path, gen_trips())} trip rows")
     print("\nPhase 6: personal living + Krankenkasse (Privatentnahme)")
