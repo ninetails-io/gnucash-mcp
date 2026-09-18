@@ -387,6 +387,71 @@ def test_market_value_cost_basis_converts_foreign_purchase(tmp_path):
         assert value == Decimal("1200.00")
 
 
+def test_balance_sheet_excludes_closed_unpriced_position(tmp_path):
+    """A fully-closed holding (net quantity zero) in a commodity that
+    was never independently priced must value at zero, not the
+    realized gain/loss baked into its unpriced sell leg.
+
+    ``_split_in_default_currency``'s cost-basis fallback sums each
+    split's raw ``.value`` — correct while a position is open, since
+    that value approximates cost basis. But once every share is sold,
+    the true remaining value is zero regardless of what the unpriced
+    buy/sell legs recorded; summing them instead leaks the realized
+    gain (or loss) as a phantom balance. Reproduces a real book: a
+    small-cap altcoin bought for 1000 and fully sold for 1500 two
+    years later, with no market price ever recorded for it.
+    """
+    path = tmp_path / "closed.gnucash"
+    book = piecash.create_book(str(path), currency="USD", overwrite=True)
+    usd = book.default_currency
+    coin = piecash.Commodity(
+        namespace="CRYPTO", mnemonic="ALT",
+        fullname="Some Altcoin", fraction=100000000,
+    )
+    book.session.add(coin)
+    assets = piecash.Account(
+        name="Assets", type="ASSET", commodity=usd,
+        parent=book.root_account, placeholder=True,
+    )
+    cash = piecash.Account(
+        name="Checking", type="BANK", commodity=usd, parent=assets,
+    )
+    holding = piecash.Account(
+        name="Altcoin", type="STOCK", commodity=coin, parent=assets,
+    )
+    piecash.Transaction(
+        currency=usd, post_date=date(2021, 1, 1), description="Buy",
+        splits=[
+            piecash.Split(account=holding, value=Decimal("1000"),
+                          quantity=Decimal("10")),
+            piecash.Split(account=cash, value=Decimal("-1000"),
+                          quantity=Decimal("-1000")),
+        ],
+    )
+    piecash.Transaction(
+        currency=usd, post_date=date(2022, 6, 1), description="Sell",
+        splits=[
+            piecash.Split(account=holding, value=Decimal("-1500"),
+                          quantity=Decimal("-10")),
+            piecash.Split(account=cash, value=Decimal("1500"),
+                          quantity=Decimal("1500")),
+        ],
+    )
+    book.save()
+    book.close()
+
+    gb = GnuCashBook(str(path))
+    bs = gb.balance_sheet(as_of_date=date(2026, 1, 1))
+
+    rows = {a["account"]: a for a in bs["assets"]["accounts"]}
+    # The closed, unpriced position holds nothing and must not appear
+    # in the report at all — not a "$0.00" line, simply absent, same
+    # as any other zero-balance account.
+    assert "Assets:Altcoin" not in rows
+    # Total reflects only the cash account: -1000 (buy) + 1500 (sell) = 500.
+    assert Decimal(bs["assets"]["total"]) == Decimal("500.00")
+
+
 class TestSameDatePriceTieBreak:
     """Bookkeeper finding F3: two prices on the same
     commodity/currency/date used to resolve by an accident of query

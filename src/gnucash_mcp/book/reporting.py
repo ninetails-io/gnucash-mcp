@@ -724,11 +724,32 @@ class ReportingMixin:
                         "usd": Decimal("0"),
                         "quantity": Decimal("0"),
                         "commodity": account.commodity,
+                        "guid": account.guid,
                     }
                 balances[key]["usd"] += amt
                 balances[key]["quantity"] += split.quantity
 
             default_currency = self._require_default_currency(book)
+
+            # A commodity holding with no market rate on file falls
+            # back to summing each split's raw ``.value`` as a cost-
+            # basis stand-in (see ``_split_in_default_currency``) —
+            # a reasonable approximation while the position is open.
+            # But once the account's quantity nets to zero, the
+            # position is fully closed and genuinely holds nothing;
+            # any realized gain/loss baked into the unpriced sell
+            # leg's value must not linger as a phantom balance (e.g.
+            # a small-cap altcoin bought and fully sold years ago,
+            # never independently priced — the sale's implied gain
+            # otherwise shows up as a residual "holding").
+            for info in balances.values():
+                if (
+                    info["commodity"] != default_currency
+                    and info["quantity"] == 0
+                    and factors.get(info["guid"]) is None
+                ):
+                    info["usd"] = Decimal("0")
+
             # Display rates anchored to the report date, market
             # prices only (see _rates_as_of).
             latest_rates = self._rates_as_of(book, as_of_date)
