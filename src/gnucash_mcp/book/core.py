@@ -40,7 +40,6 @@ from gnucash_mcp.book._base import (
     _commodity_quantum,
     _gnc_bool,
     _guid_prefix_map,
-    _is_market_price,
     _is_unreconciled,
     _is_voided,
     _slot_bool,
@@ -978,17 +977,15 @@ class CoreMixin:
                 if a.type != "ROOT" and a.guid not in template_guids:
                     in_use.add(a.commodity.guid)
 
-            # One pass over book.prices builds both signals: in-use
-            # commodities and latest market-price date. ``in_use.add``
-            # runs AFTER the ``_is_market_price`` filter — marking
-            # first would tag commodities that only have piecash
-            # auto-placeholder prices as in-use and misfire the
-            # "no price on file" warning.
+            # One pass over the price list builds both signals: in-use
+            # commodities and latest market-price date. ``market_only``
+            # is applied before ``in_use.add`` — marking first would
+            # tag commodities that only have piecash auto-placeholder
+            # prices as in-use and misfire the "no price on file"
+            # warning.
             cutoff = today - timedelta(days=self._STALE_PRICE_DAYS)
             by_commodity_latest: dict[str, date] = {}
-            for p in book.prices:
-                if not _is_market_price(p):
-                    continue
+            for p in self._find_prices(book, market_only=True):
                 in_use.add(p.commodity.guid)
                 p_date = p.date
                 if hasattr(p_date, "date") and callable(p_date.date):
@@ -2782,6 +2779,10 @@ class CoreMixin:
                 # account), but this unfiltered path would render a
                 # stale "Mortgage Payment" recipe identically to a
                 # real event.
+                # The template filter walks every transaction's splits;
+                # load the graph once. The account branch above has
+                # its own targeted preload.
+                self._preload_split_graph(book)
                 template_guids = self._template_account_guids(book)
                 transactions = {
                     t for t in book.transactions
@@ -5280,6 +5281,10 @@ class CoreMixin:
             raise ValueError(f"Invalid search field: {field}")
 
         with self.open(readonly=True) as book:
+            # Whole-book scan: the template filter below walks every
+            # transaction's splits.
+            self._preload_split_graph(book)
+
             matched = []
 
             # Same template-recipe filter as list_transactions: all

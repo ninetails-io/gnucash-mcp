@@ -333,11 +333,9 @@ class CurrencyMixin:
         if default_currency is None:
             default_currency = self._require_default_currency(book)
         latest: dict[str, tuple[date, Decimal]] = {}
-        for p in book.prices:
-            if p.currency != default_currency:
-                continue
-            if not _is_market_price(p):
-                continue
+        for p in self._find_prices(
+            book, currency_guid=default_currency.guid, market_only=True,
+        ):
             p_date = _to_date(p.date)
             if p_date > anchor:
                 continue
