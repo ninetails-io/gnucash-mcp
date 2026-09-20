@@ -450,6 +450,235 @@ def test_balance_sheet_excludes_closed_unpriced_position(tmp_path):
     assert "Assets:Altcoin" not in rows
     # Total reflects only the cash account: -1000 (buy) + 1500 (sell) = 500.
     assert Decimal(bs["assets"]["total"]) == Decimal("500.00")
+    # A = L + E still holds, and the unbooked 500 gain is what the
+    # balancing residual carries — not a dropped account.
+    assert (
+        Decimal(bs["assets"]["total"]) - Decimal(bs["liabilities"]["total"])
+        == Decimal(bs["equity"]["total"])
+    )
+    # net_worth reads the same book the same way (#185: it used to
+    # keep the phantom while balance_sheet dropped it).
+    nw = gb.net_worth(end_date=date(2026, 1, 1))
+    assert Decimal(nw["net_worth"]) == Decimal("500")
+
+
+def _unpriced_holding_book(path, legs, *, commodity_ns="CRYPTO"):
+    """USD book with one never-priced holding and one checking account.
+
+    ``legs`` is a list of ``(post_date, description, quantity, value)``
+    for the holding; the cash leg mirrors ``value``. Returns the
+    GnuCashBook.
+    """
+    book = piecash.create_book(str(path), currency="USD", overwrite=True)
+    usd = book.default_currency
+    coin = piecash.Commodity(
+        namespace=commodity_ns, mnemonic="ALT",
+        fullname="Some Altcoin", fraction=100000000,
+    )
+    book.session.add(coin)
+    assets = piecash.Account(
+        name="Assets", type="ASSET", commodity=usd,
+        parent=book.root_account, placeholder=True,
+    )
+    cash = piecash.Account(
+        name="Checking", type="BANK", commodity=usd, parent=assets,
+    )
+    holding = piecash.Account(
+        name="Altcoin", type="STOCK", commodity=coin, parent=assets,
+    )
+    for post_date, desc, qty, value in legs:
+        piecash.Transaction(
+            currency=usd, post_date=post_date, description=desc,
+            splits=[
+                piecash.Split(account=holding, value=Decimal(value),
+                              quantity=Decimal(qty)),
+                piecash.Split(account=cash, value=-Decimal(value),
+                              quantity=-Decimal(value)),
+            ],
+        )
+    book.save()
+    book.close()
+    return GnuCashBook(str(path))
+
+
+def _three_surfaces(gb, as_of):
+    """(balance_sheet A - L, net_worth, dashboard net worth) as of a
+    date — the numbers that must agree on any book."""
+    bs = gb.balance_sheet(as_of_date=as_of)
+    sheet = (
+        Decimal(bs["assets"]["total"]) - Decimal(bs["liabilities"]["total"])
+    )
+    nw = Decimal(gb.net_worth(end_date=as_of)["net_worth"])
+    with gb.open(readonly=True) as book:
+        dash = gb._compute_net_worth_at(
+            book, as_of, book.default_currency, list(book.accounts),
+        )
+    # The sheet renders cents; the other two return the raw Decimal.
+    cent = Decimal("0.01")
+    return sheet, nw.quantize(cent), dash.quantize(cent)
+
+
+class TestUnpricedCostBasis:
+    """#185: an unpriced holding is worth its remaining cost basis.
+
+    The old fallback summed every leg's raw ``value``, which is cost
+    minus proceeds: a partly sold position carried its realized gain
+    (or loss) as part of the "basis", and a fully sold one showed the
+    gain as a phantom holding. The rule now lives in one place
+    (``_unpriced_cost_basis`` / ``_CostPool``) and every surface reads
+    it, so balance_sheet, net_worth and the dashboard agree by
+    construction.
+    """
+
+    AS_OF = date(2026, 1, 1)
+
+    def test_partial_sale_values_remaining_units_at_average_cost(
+        self, tmp_path,
+    ):
+        gb = _unpriced_holding_book(tmp_path / "partial.gnucash", [
+            (date(2021, 1, 1), "Buy", "10", "1000"),
+            (date(2022, 6, 1), "Sell", "-9", "-1350"),
+        ])
+        bs = gb.balance_sheet(as_of_date=self.AS_OF)
+        rows = {a["account"]: a for a in bs["assets"]["accounts"]}
+        # One unit left, bought at 100 — not 1000 - 1350 = -350.
+        assert Decimal(
+            rows["Assets:Altcoin"]["default_currency_value"]
+        ) == Decimal("100.00")
+        assert "no price data" in rows["Assets:Altcoin"]["balance"]
+        # Cash: -1000 + 1350 = 350; plus the unit at cost = 450.
+        assert Decimal(bs["assets"]["total"]) == Decimal("450.00")
+        sheet, nw, dash = _three_surfaces(gb, self.AS_OF)
+        assert sheet == nw == dash == Decimal("450")
+
+    def test_repurchase_after_full_sale_starts_a_new_basis(
+        self, tmp_path,
+    ):
+        """Chronological: the pool relieves to zero on the sale and
+        the later buy opens a fresh basis — not the average of every
+        buy ever made."""
+        gb = _unpriced_holding_book(tmp_path / "rebuy.gnucash", [
+            (date(2021, 1, 1), "Buy", "10", "1000"),
+            (date(2021, 6, 1), "Sell", "-10", "-1500"),
+            (date(2022, 1, 1), "Buy again", "10", "2000"),
+        ])
+        bs = gb.balance_sheet(as_of_date=self.AS_OF)
+        rows = {a["account"]: a for a in bs["assets"]["accounts"]}
+        assert Decimal(
+            rows["Assets:Altcoin"]["default_currency_value"]
+        ) == Decimal("2000.00")
+        sheet, nw, dash = _three_surfaces(gb, self.AS_OF)
+        # Cash: -1000 + 1500 - 2000 = -1500; holding 2000 → 500.
+        assert sheet == nw == dash == Decimal("500")
+
+    def test_dust_remainder_is_not_a_knife_edge(self, tmp_path):
+        """One satoshi left behind used to keep the whole realized
+        gain on the sheet as a negative asset; now it is one satoshi
+        at cost."""
+        gb = _unpriced_holding_book(tmp_path / "dust.gnucash", [
+            (date(2021, 1, 1), "Buy", "10", "1000"),
+            (date(2022, 6, 1), "Sell", "-9.99999999", "-1499.99"),
+        ])
+        bs = gb.balance_sheet(as_of_date=self.AS_OF)
+        rows = {a["account"]: a for a in bs["assets"]["accounts"]}
+        remaining = Decimal(rows["Assets:Altcoin"]["default_currency_value"])
+        assert Decimal("0") <= remaining < Decimal("0.01")
+        sheet, nw, dash = _three_surfaces(gb, self.AS_OF)
+        assert sheet == nw == dash
+
+    def test_voided_sale_does_not_relieve_the_basis(self, tmp_path):
+        gb = _unpriced_holding_book(tmp_path / "void.gnucash", [
+            (date(2021, 1, 1), "Buy", "10", "1000"),
+            (date(2022, 6, 1), "Sell", "-10", "-1500"),
+        ])
+        with gb.open(readonly=False) as book:
+            sale = [t for t in book.transactions
+                    if t.description == "Sell"][0]
+            for s in sale.splits:
+                s.reconcile_state = "v"
+                s.value = Decimal("0")
+                s.quantity = Decimal("0")
+            book.save()
+        bs = gb.balance_sheet(as_of_date=self.AS_OF)
+        rows = {a["account"]: a for a in bs["assets"]["accounts"]}
+        assert Decimal(
+            rows["Assets:Altcoin"]["default_currency_value"]
+        ) == Decimal("1000.00")
+
+    def test_series_boundaries_match_point_in_time(self, tmp_path):
+        """The trajectory's incremental pool reads the same basis at
+        each boundary as the one-shot valuation."""
+        gb = _unpriced_holding_book(tmp_path / "series.gnucash", [
+            (date(2021, 3, 1), "Buy", "10", "1000"),
+            (date(2022, 6, 1), "Sell", "-4", "-600"),
+            (date(2023, 9, 1), "Buy", "2", "300"),
+            (date(2024, 2, 1), "Sell", "-8", "-1200"),
+        ])
+        series = gb.net_worth(
+            end_date=self.AS_OF, start_date=date(2021, 1, 1),
+            interval="year",
+        )["series"]
+        assert len(series) == 6
+        for point in series:
+            boundary = date.fromisoformat(point["date"])
+            one_shot = gb.net_worth(end_date=boundary)["net_worth"]
+            assert Decimal(point["net_worth"]) == Decimal(one_shot), (
+                point["date"]
+            )
+        # After the last sale nothing remains: cash only.
+        assert Decimal(series[-1]["net_worth"]) == Decimal("500")
+
+    def test_foreign_liability_paid_off_leaves_the_sheet(self, tmp_path):
+        """Sign-agnostic: a EUR card with no EUR rate on file, charged
+        then paid in full, is a zero liability — and the FX difference
+        the user never booked is the residual, on every surface."""
+        path = tmp_path / "card.gnucash"
+        book = piecash.create_book(str(path), currency="USD", overwrite=True)
+        usd = book.default_currency
+        eur = factories.create_currency_from_ISO("EUR")
+        assets = piecash.Account(
+            name="Assets", type="ASSET", commodity=usd,
+            parent=book.root_account, placeholder=True,
+        )
+        liab = piecash.Account(
+            name="Liabilities", type="LIABILITY", commodity=usd,
+            parent=book.root_account, placeholder=True,
+        )
+        cash = piecash.Account(
+            name="Checking", type="BANK", commodity=usd, parent=assets,
+        )
+        card = piecash.Account(
+            name="EuroCard", type="CREDIT", commodity=eur, parent=liab,
+        )
+        exp = piecash.Account(
+            name="Expenses", type="EXPENSE", commodity=usd,
+            parent=book.root_account,
+        )
+        piecash.Transaction(
+            currency=usd, post_date=date(2021, 1, 1), description="Charge",
+            splits=[
+                piecash.Split(account=card, value=Decimal("-1100"),
+                              quantity=Decimal("-1000")),
+                piecash.Split(account=exp, value=Decimal("1100"),
+                              quantity=Decimal("1100")),
+            ],
+        )
+        piecash.Transaction(
+            currency=usd, post_date=date(2021, 2, 1), description="Payoff",
+            splits=[
+                piecash.Split(account=card, value=Decimal("1050"),
+                              quantity=Decimal("1000")),
+                piecash.Split(account=cash, value=Decimal("-1050"),
+                              quantity=Decimal("-1050")),
+            ],
+        )
+        book.save()
+        book.close()
+        gb = GnuCashBook(str(path))
+        bs = gb.balance_sheet(as_of_date=self.AS_OF)
+        assert bs["liabilities"]["accounts"] == []
+        sheet, nw, dash = _three_surfaces(gb, self.AS_OF)
+        assert sheet == nw == dash == Decimal("-1050")
 
 
 class TestSameDatePriceTieBreak:

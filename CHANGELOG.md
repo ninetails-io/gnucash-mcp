@@ -34,9 +34,11 @@ Schedule recipes, invoice links, and budget signs are now stored the way GnuCash
 - Deleting a transaction or schedule strips GUID-valued slots before the ORM delete, so piecash's cascade can never reach the entity the slot points at (#179).
 - A database book's flag columns and a book path with a percent escape both round-trip (#175).
 - Demo-book continuation counts ledger rows only when guarding its frozen prefix; schedule templates are not activity (#181).
+- **An unpriced holding is worth its remaining cost basis** (#185): remaining units at the running average cost of the legs that acquired them, so a fully sold position is exactly zero and a partly sold one carries none of its realized gain. The old fallback summed every leg's raw value, which left a sold-out altcoin on the balance sheet as a phantom holding — found and fixed for the closed case by @DrSkippy in #184. One rule now serves `balance_sheet`, `net_worth` (point-in-time and series), the dashboard, and runway, so they agree by construction; voided and undated legs are skipped the way every own-splits sum skips them.
 - **Intel Macs install without a Rust toolchain again**: `cryptography` (transitive, via `mcp`) dropped macOS x86_64 wheels at 49.0; a marker-scoped constraint keeps 48.0.1 on that platform only, every other platform stays current.
 
 ### Credits
+- @DrSkippy — the closed-position valuation bug and its regression test (#184).
 - @vchatela — the database backend (#175), the largest outside code contribution to date: nine commits, the `[postgres]` extra, and CI against PostgreSQL.
 
 ## v1.4.4 - The statement is the call
