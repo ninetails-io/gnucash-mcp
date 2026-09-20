@@ -442,9 +442,7 @@ class CurrencyMixin:
             return cached
 
         seen: dict[str, piecash.Commodity] = {}
-        for p in book.prices:
-            if not _is_market_price(p):
-                continue
+        for p in CurrencyMixin._find_prices(book, market_only=True):
             for c in (p.commodity, p.currency):
                 seen.setdefault(c.guid, c)
         result = sorted(
