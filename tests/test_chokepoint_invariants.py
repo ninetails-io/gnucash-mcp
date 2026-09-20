@@ -1336,6 +1336,84 @@ class TestAccountNotFoundGoesThroughSuggestions:
         assert not offenders, offenders
 
 
+class TestPriceWalkChokepoint:
+    """``_find_prices`` is the one reader of price history: indexed
+    per pair, memoized per open, newest-first with the same-date
+    tie-break every valuation path shares. A raw ``for p in
+    book.prices`` walk skips all three, and the last two such walks
+    (``list_commodities``, ``get_latest_price``) answered same-date
+    ties by storage order — a different row per backend, and a
+    different row than the reports priced by (#186)."""
+
+    def test_no_raw_book_prices_walk_anywhere(self):
+        import gnucash_mcp.book as pkg
+        raw = re.compile(r"^\s*for \w+ in book\.prices\b")
+        offenders = []
+        for path in sorted(Path(pkg.__file__).parent.glob("*.py")):
+            for lineno, line in enumerate(
+                path.read_text().splitlines(), start=1,
+            ):
+                if raw.search(line):
+                    offenders.append(f"{path.name}:{lineno}")
+        assert not offenders, offenders
+
+    def test_latest_price_surfaces_agree_on_same_date_tie(self, tmp_path):
+        """Two market quotes on one day: the manual quote outranks
+        the feed everywhere, and the tool that shows the operator
+        'the rate on file' shows the rate the reports use."""
+        path = tmp_path / "tie.gnucash"
+        book = piecash.create_book(str(path), currency="USD", overwrite=True)
+        usd = book.default_currency
+        aaa = piecash.Commodity(
+            namespace="NASDAQ", mnemonic="AAA", fullname="AAA", fraction=10000,
+        )
+        book.session.add(aaa)
+        assets = piecash.Account(
+            name="Assets", type="ASSET", commodity=usd,
+            parent=book.root_account, placeholder=True,
+        )
+        piecash.Account(name="AAA", type="STOCK", commodity=aaa, parent=assets)
+        # A second holding with no quote at all: the verbose listing
+        # must say so with an explicit null, not omit the key.
+        zzz = piecash.Commodity(
+            namespace="NASDAQ", mnemonic="ZZZ", fullname="ZZZ", fraction=10000,
+        )
+        book.session.add(zzz)
+        piecash.Account(name="ZZZ", type="STOCK", commodity=zzz, parent=assets)
+        # Feed row written first, manual quote second: storage order
+        # and rank order disagree, which is the case that matters.
+        book.session.add(piecash.Price(
+            commodity=aaa, currency=usd, date=date(2026, 1, 15),
+            value=Decimal("50"), source="user:market-data", type="last",
+        ))
+        book.session.add(piecash.Price(
+            commodity=aaa, currency=usd, date=date(2026, 1, 15),
+            value=Decimal("80"), source="user:price", type="last",
+        ))
+        book.save()
+        aaa_guid = aaa.guid
+        book.close()
+
+        gb = GnuCashBook(str(path))
+        with gb.open(readonly=True) as b:
+            report_rate = gb._rates_as_of(b, date(2026, 9, 1))[aaa_guid]
+        assert report_rate == Decimal("80")
+        assert Decimal(
+            gb.get_latest_price("AAA", "NASDAQ")["value"]
+        ) == report_rate
+        listing = gb.list_commodities(compact=False)
+        row = next(
+            c for c in listing["commodities"]["NASDAQ"]
+            if c["mnemonic"] == "AAA"
+        )
+        assert Decimal(row["latest_price"]["value"]) == report_rate
+        unpriced = next(
+            c for c in listing["commodities"]["NASDAQ"]
+            if c["mnemonic"] == "ZZZ"
+        )
+        assert "latest_price" in unpriced and unpriced["latest_price"] is None
+
+
 class TestBudgetSignChokepoint:
     """``_budget_targets`` is the one reader of budget amounts and
     ``_budget_stored_sign`` the one writer-side sign; a site that

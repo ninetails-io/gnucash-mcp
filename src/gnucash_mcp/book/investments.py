@@ -76,19 +76,17 @@ class InvestmentsMixin:
         with self.open(readonly=True) as book:
             by_namespace: dict[str, list[dict]] = {}
 
-            # One pass over book.prices builds the latest-quote map.
-            # _is_market_price is required — a newer
-            # type='transaction' placeholder would otherwise shadow
-            # the user's last nav quote.
+            # Latest market quote per commodity. ``_find_prices`` is
+            # newest-first with the same-date tie-break every
+            # valuation path uses, so the first row per commodity is
+            # the one the reports price by; ``market_only`` keeps a
+            # newer type='transaction' placeholder from shadowing the
+            # user's last nav quote.
             latest_market: dict[str, tuple[date, "Price"]] = {}
-            for p in book.prices:
-                if not _is_market_price(p):
-                    continue
-                key = p.commodity.guid
-                p_date = _to_date(p.date)
-                existing = latest_market.get(key)
-                if existing is None or p_date > existing[0]:
-                    latest_market[key] = (p_date, p)
+            for p in self._find_prices(book, market_only=True):
+                latest_market.setdefault(
+                    p.commodity.guid, (_to_date(p.date), p),
+                )
 
             today = date.today()
             default_commodity = self._require_default_currency(book)
@@ -141,6 +139,12 @@ class InvestmentsMixin:
                         "currency": price.currency.mnemonic,
                         "date": _to_date(price.date).isoformat(),
                     }
+                else:
+                    # Explicit null: "no price on file" is an answer
+                    # (the compact view says it in words); a missing
+                    # key reads as a field the caller forgot to ask
+                    # for.
+                    entry["latest_price"] = None
                 # Staleness markers only under the filter — the
                 # unfiltered listing's shape is unchanged.
                 if days_stale is not None:
@@ -865,28 +869,24 @@ class InvestmentsMixin:
             if currency is None:
                 currency = self._require_default_currency(book).mnemonic
 
-            # Indexed query — only iterate prices for this commodity.
-            candidates = book.session.query(Price).filter_by(
-                commodity_guid=comm.guid,
-            ).all()
-            latest = None
-            latest_date = None
-            for p in candidates:
-                if p.currency.mnemonic != currency:
-                    continue
-                # Skip type='transaction' placeholders — every other
-                # valuation path excludes them, and this tool must
-                # not return a transaction artifact where the user
-                # expects their nav quote.
-                if not _is_market_price(p):
-                    continue
-                p_date = _to_date(p.date)
-                if latest_date is None or p_date > latest_date:
-                    latest_date = p_date
-                    latest = p
-
+            # The chokepoint's list is newest-first with the same-date
+            # tie-break every valuation path uses, so the first row in
+            # the requested quote currency IS the rate the reports
+            # price by; ``market_only`` keeps a type='transaction'
+            # placeholder from answering where the user expects their
+            # nav quote.
+            latest = next(
+                (
+                    p for p in self._find_prices(
+                        book, commodity_guid=comm.guid, market_only=True,
+                    )
+                    if p.currency.mnemonic == currency
+                ),
+                None,
+            )
             if latest is None:
                 return None
+            latest_date = _to_date(latest.date)
 
             return {
                 "date": latest_date.isoformat(),

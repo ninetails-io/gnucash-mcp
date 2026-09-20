@@ -187,6 +187,21 @@ def _commodity_quantum(commodity) -> Decimal:
     return Decimal(1) / Decimal(fraction)
 
 
+def _all_slot_columns():
+    """Loader target that fetches every Slot subclass column in one
+    query. piecash's Slot is single-table polymorphic (``SlotString``,
+    ``SlotInt64``, ... share the ``slots`` table); a plain relationship
+    load fetches only the base columns and defers each row's typed
+    value (``string_val``, ``int64_val``) to a SELECT on first read,
+    one per slot. Used by both preload helpers so a slot-backed
+    property such as ``txn.notes`` resolves from memory after the
+    bulk load."""
+    from piecash.kvp import Slot
+    from sqlalchemy.orm import with_polymorphic
+
+    return with_polymorphic(Slot, "*")
+
+
 def _is_voided(split) -> bool:
     """True iff ``split`` carries GnuCash's voided marker.
 
@@ -2460,12 +2475,20 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         return ValueError(msg)
 
     @staticmethod
-    def _preload_split_graph(book) -> None:
-        """Bulk-load accounts, transactions and their split collections,
-        so that later traversals of ``txn.splits``, ``split.transaction``
-        and ``split.account`` resolve in memory instead of lazy-loading
-        per row. Intended for whole-book reports; a single-account lookup
+    def _preload_split_graph(book, *, account_splits: bool = True) -> None:
+        """Bulk-load accounts, transactions and their split and slot
+        collections, so that later traversals of ``txn.splits``,
+        ``txn.notes`` (slot-backed), ``split.transaction`` and
+        ``split.account`` resolve in memory instead of lazy-loading per
+        row. Intended for whole-book reports; a single-account lookup
         would load rows it never touches.
+
+        ``account_splits=False`` skips the ``Account.splits`` pass — a
+        second full read of the splits table that only a caller
+        walking ``account.splits`` needs (``get_book_summary`` does;
+        a transaction listing or search does not). A later call in
+        the same open that does need it upgrades the parked graph
+        rather than returning early.
 
         The loaded rows are parked on the book deliberately: SQLAlchemy's
         identity map holds them only weakly, so without a strong
@@ -2484,18 +2507,41 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         from piecash.core.transaction import Transaction
         from sqlalchemy.orm import selectinload
 
-        if getattr(book, "_gnucash_mcp_split_graph", None) is not None:
+        parked = getattr(book, "_gnucash_mcp_split_graph", None)
+        if parked is not None:
+            _accounts, transactions, has_account_splits = parked
+            if has_account_splits or not account_splits:
+                return
+            accounts = (
+                book.session.query(Account)
+                .options(selectinload(Account.splits))
+                .all()
+            )
+            book._gnucash_mcp_split_graph = (accounts, transactions, True)
             return
 
-        accounts = (
-            book.session.query(Account).options(selectinload(Account.splits)).all()
-        )
+        acct_q = book.session.query(Account)
+        if account_splits:
+            acct_q = acct_q.options(selectinload(Account.splits))
+        accounts = acct_q.all()
+        # Slots ride along: ``txn.notes`` is slot-backed, and the
+        # compact renderer and the notes search read it per row.
+        # ``of_type(with_polymorphic)`` matters: piecash's Slot is
+        # single-table polymorphic, and a plain ``selectinload``
+        # fetches only the base columns, leaving one SELECT per
+        # slot for its typed value (``string_val``). Loading every
+        # subclass column in the IN-query makes the walk free.
         transactions = (
             book.session.query(Transaction)
-            .options(selectinload(Transaction.splits))
+            .options(
+                selectinload(Transaction.splits),
+                selectinload(Transaction.slots.of_type(_all_slot_columns())),
+            )
             .all()
         )
-        book._gnucash_mcp_split_graph = (accounts, transactions)
+        book._gnucash_mcp_split_graph = (
+            accounts, transactions, account_splits,
+        )
 
     @staticmethod
     def _preload_account_transactions(book, account) -> list:
@@ -2528,7 +2574,7 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
             .filter(Split.account_guid == account.guid)
             .options(
                 selectinload(Transaction.splits),
-                selectinload(Transaction.slots),
+                selectinload(Transaction.slots.of_type(_all_slot_columns())),
             )
             .distinct()
             .all()
