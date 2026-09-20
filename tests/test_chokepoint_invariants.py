@@ -1373,6 +1373,13 @@ class TestPriceWalkChokepoint:
             parent=book.root_account, placeholder=True,
         )
         piecash.Account(name="AAA", type="STOCK", commodity=aaa, parent=assets)
+        # A second holding with no quote at all: the verbose listing
+        # must say so with an explicit null, not omit the key.
+        zzz = piecash.Commodity(
+            namespace="NASDAQ", mnemonic="ZZZ", fullname="ZZZ", fraction=10000,
+        )
+        book.session.add(zzz)
+        piecash.Account(name="ZZZ", type="STOCK", commodity=zzz, parent=assets)
         # Feed row written first, manual quote second: storage order
         # and rank order disagree, which is the case that matters.
         book.session.add(piecash.Price(
@@ -1400,6 +1407,11 @@ class TestPriceWalkChokepoint:
             if c["mnemonic"] == "AAA"
         )
         assert Decimal(row["latest_price"]["value"]) == report_rate
+        unpriced = next(
+            c for c in listing["commodities"]["NASDAQ"]
+            if c["mnemonic"] == "ZZZ"
+        )
+        assert "latest_price" in unpriced and unpriced["latest_price"] is None
 
 
 class TestBudgetSignChokepoint:

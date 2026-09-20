@@ -139,6 +139,12 @@ class InvestmentsMixin:
                         "currency": price.currency.mnemonic,
                         "date": _to_date(price.date).isoformat(),
                     }
+                else:
+                    # Explicit null: "no price on file" is an answer
+                    # (the compact view says it in words); a missing
+                    # key reads as a field the caller forgot to ask
+                    # for.
+                    entry["latest_price"] = None
                 # Staleness markers only under the filter — the
                 # unfiltered listing's shape is unchanged.
                 if days_stale is not None:
