@@ -19,6 +19,7 @@ from decimal import Decimal, InvalidOperation
 import piecash
 
 from gnucash_mcp.book._base import _is_voided, _to_decimal
+from gnucash_mcp.book._currency import _CostPool
 from gnucash_mcp._format import (
     _GROUP_BY_VALUES,
     _PARTIAL_FOOTNOTE,
@@ -693,6 +694,9 @@ class ReportingMixin:
             # commodity for the "230.76 VTSAX @ 156.23 (USD …)"
             # triplet on non-default-currency rows.
             balances: dict[str, dict] = {}
+            # Unpriced holdings (no factor): legs collected here and
+            # valued at remaining cost basis after the pass.
+            unpriced: dict[str, list] = {}
             net_income = Decimal("0")
             for split, _txn, account in rows:
                 # Voided by state, not value: a well-formed void
@@ -709,8 +713,9 @@ class ReportingMixin:
                 # balancing-residual equity line it silently deletes
                 # the dropped asset instead. Same own-splits rule as
                 # ``net_worth`` and ``_compute_net_worth_at``.
+                factor = factors.get(account.guid)
                 amt = self._split_in_default_currency(
-                    split, account, factors.get(account.guid)
+                    split, account, factor
                 )
                 if account.type in _NET_INCOME_TYPES:
                     # Income is stored negative, expenses positive; net
@@ -724,31 +729,29 @@ class ReportingMixin:
                         "usd": Decimal("0"),
                         "quantity": Decimal("0"),
                         "commodity": account.commodity,
-                        "guid": account.guid,
                     }
                 balances[key]["usd"] += amt
                 balances[key]["quantity"] += split.quantity
+                if factor is None:
+                    unpriced.setdefault(key, []).append(split)
 
             default_currency = self._require_default_currency(book)
 
-            # A commodity holding with no market rate on file falls
-            # back to summing each split's raw ``.value`` as a cost-
-            # basis stand-in (see ``_split_in_default_currency``) —
-            # a reasonable approximation while the position is open.
-            # But once the account's quantity nets to zero, the
-            # position is fully closed and genuinely holds nothing;
-            # any realized gain/loss baked into the unpriced sell
-            # leg's value must not linger as a phantom balance (e.g.
-            # a small-cap altcoin bought and fully sold years ago,
-            # never independently priced — the sale's implied gain
-            # otherwise shows up as a residual "holding").
-            for info in balances.values():
-                if (
-                    info["commodity"] != default_currency
-                    and info["quantity"] == 0
-                    and factors.get(info["guid"]) is None
-                ):
-                    info["usd"] = Decimal("0")
+            # An unpriced holding is worth its remaining cost basis
+            # (``_unpriced_cost_basis``): remaining units at the
+            # running average cost of the legs that acquired them, so
+            # a fully sold position is exactly zero and a partly sold
+            # one carries none of its realized gain. The per-split sum
+            # above is cost minus proceeds for such an account, which
+            # is what left a sold-out altcoin on the sheet as a
+            # phantom holding (#184, #185). Same rule as the
+            # ``_market_value`` fallback behind the dashboard and
+            # net_worth, so the surfaces agree by construction.
+            for key, legs in unpriced.items():
+                balances[key]["usd"] = self._unpriced_cost_basis(
+                    book, legs,
+                    default_currency=default_currency, as_of=as_of_date,
+                )
 
             # Display rates anchored to the report date, market
             # prices only (see _rates_as_of).
@@ -902,6 +905,7 @@ class ReportingMixin:
         nw_types = _ASSET_TYPES | _LIABILITY_TYPES
 
         with self.open(readonly=True) as book:
+            default_currency = self._require_default_currency(book)
             # --- Point-in-time: one filtered SQL query, sum in Python.
             if not start_date or not interval:
                 factors = self._account_conversion_factors(book, end_date)
@@ -911,17 +915,30 @@ class ReportingMixin:
                     account_types=nw_types,
                 )
                 total = Decimal("0")
+                # Unpriced holdings: legs collected, valued at
+                # remaining cost basis below — the same rule as
+                # balance_sheet and the dashboard (#185).
+                unpriced: dict[str, list] = {}
                 for split, _txn, account in rows:
                     if _is_voided(split):
+                        continue
+                    factor = factors.get(account.guid)
+                    if factor is None:
+                        unpriced.setdefault(account.guid, []).append(split)
                         continue
                     # Liabilities are stored negative, so a direct
                     # sum gives assets minus liabilities.
                     total += self._split_in_default_currency(
-                        split, account, factors.get(account.guid)
+                        split, account, factor
+                    )
+                for legs in unpriced.values():
+                    total += self._unpriced_cost_basis(
+                        book, legs,
+                        default_currency=default_currency, as_of=end_date,
                     )
                 return {
                     "as_of_date": end_date.isoformat(),
-                    "net_worth": str(total),
+                    "net_worth": _format_number(total, decimals=2),
                 }
 
             # --- Time series: single sweep, per-boundary valuation.
@@ -957,9 +974,9 @@ class ReportingMixin:
 
             # Single pass in post_date order. Under per-boundary
             # rates a single running total can't be carried forward;
-            # track per-account quantity AND value totals and convert
-            # at snapshot time with that boundary's factors. Cost:
-            # O(splits + boundaries × accounts_with_splits).
+            # track per-account quantity AND a running cost pool and
+            # convert at snapshot time with that boundary's factors.
+            # Cost: O(splits + boundaries × accounts_with_splits).
             rows = self._query_filtered_splits(
                 book,
                 end_date=end_date,
@@ -968,13 +985,15 @@ class ReportingMixin:
             )
 
             running_qty: dict[str, Decimal] = {}
-            running_value: dict[str, Decimal] = {}
+            running_pool: dict[str, _CostPool] = {}
 
             def _snapshot_at(boundary: date) -> Decimal:
                 """Net worth at ``boundary`` using that date's
-                factors: per-account factor × quantity, cost-basis
-                fallback — ``_split_in_default_currency``'s
-                disambiguation lifted to account level."""
+                factors: per-account factor × quantity, else the
+                account's remaining cost basis — the same
+                ``_CostPool`` arithmetic ``_unpriced_cost_basis``
+                applies, carried incrementally so each boundary reads
+                the basis as of its own date."""
                 factors_here = factors_by_boundary[boundary]
                 total = Decimal("0")
                 for acct_guid, qty in running_qty.items():
@@ -982,7 +1001,7 @@ class ReportingMixin:
                     if factor is not None:
                         total += qty * factor
                     else:
-                        total += running_value[acct_guid]
+                        total += running_pool[acct_guid].basis
                 return total
 
             series: list[dict] = []
@@ -1009,7 +1028,9 @@ class ReportingMixin:
                 ):
                     series.append({
                         "date": boundaries[b_idx].isoformat(),
-                        "net_worth": str(_snapshot_at(boundaries[b_idx])),
+                        "net_worth": _format_number(
+                            _snapshot_at(boundaries[b_idx]), decimals=2,
+                        ),
                     })
                     b_idx += 1
                 # Voided filter placed after the boundary advance so
@@ -1018,13 +1039,18 @@ class ReportingMixin:
                 if _is_voided(split):
                     continue
                 acct_guid = account.guid
+                qty = Decimal(str(split.quantity))
                 running_qty[acct_guid] = (
-                    running_qty.get(acct_guid, Decimal("0"))
-                    + Decimal(str(split.quantity))
+                    running_qty.get(acct_guid, Decimal("0")) + qty
                 )
-                running_value[acct_guid] = (
-                    running_value.get(acct_guid, Decimal("0"))
-                    + Decimal(str(split.value))
+                pool = running_pool.get(acct_guid)
+                if pool is None:
+                    pool = running_pool[acct_guid] = _CostPool()
+                pool.apply(
+                    qty,
+                    self._leg_value_in_default(
+                        book, split, default_currency,
+                    ),
                 )
 
             # Drain boundaries past the last split — each still uses
@@ -1032,7 +1058,9 @@ class ReportingMixin:
             while b_idx < len(boundaries):
                 series.append({
                     "date": boundaries[b_idx].isoformat(),
-                    "net_worth": str(_snapshot_at(boundaries[b_idx])),
+                    "net_worth": _format_number(
+                        _snapshot_at(boundaries[b_idx]), decimals=2,
+                    ),
                 })
                 b_idx += 1
 

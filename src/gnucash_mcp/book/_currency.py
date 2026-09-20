@@ -184,6 +184,59 @@ def _is_market_price(price) -> bool:
     return getattr(price, "type", None) != "transaction"
 
 
+class _CostPool:
+    """Running average-cost basis of one unpriced holding.
+
+    The one arithmetic behind every "what is this holding worth when
+    no market rate is on file" answer. Legs are applied in posting
+    order:
+
+    - a leg that opens or grows the position (same sign as the
+      running quantity, or the first leg) adds its cost to the pool;
+    - a leg that shrinks it relieves the pool at the running average,
+      so the realized gain or loss on the sold units never stays in
+      the basis — a fully sold position is worth exactly zero;
+    - a leg that crosses zero relieves everything and opens the new
+      position at the crossing leg's proportional cost;
+    - a zero-quantity leg (return of capital, a fee booked to the
+      holding) adjusts the pool directly.
+
+    Sign-agnostic, so a foreign-currency liability with no rate on
+    file (charges negative, payments positive) values the same way.
+    """
+
+    __slots__ = ("quantity", "basis")
+
+    def __init__(self) -> None:
+        self.quantity = Decimal("0")
+        self.basis = Decimal("0")
+
+    def apply(self, quantity: Decimal, value: Decimal) -> None:
+        q, v = quantity, value
+        if q == 0:
+            self.basis += v
+            return
+        if self.quantity == 0 or (q > 0) == (self.quantity > 0):
+            self.quantity += q
+            self.basis += v
+            return
+        held = abs(self.quantity)
+        moved = abs(q)
+        if moved < held:
+            self.basis -= self.basis * moved / held
+            self.quantity += q
+            return
+        if moved == held:
+            self.quantity = Decimal("0")
+            self.basis = Decimal("0")
+            return
+        # Crosses zero: the excess opens a position the other way at
+        # the leg's proportional cost.
+        excess = moved - held
+        self.quantity += q
+        self.basis = v * excess / moved
+
+
 class CurrencyMixin:
     """Cross-commodity valuation helpers.
 
@@ -660,9 +713,12 @@ class CurrencyMixin:
         """Value a single split in the book's default currency.
 
         Uses ``factor * quantity`` when a factor is available. Falls
-        back to ``split.value`` otherwise — correct for STOCK/MUTUAL
-        splits whose transaction currency is the book default, and a
-        reasonable cost-basis approximation for other cases.
+        back to ``split.value`` otherwise — the raw transaction-
+        currency amount, which is right for a flow report reading one
+        leg. It is NOT a valuation of the account: summed over a
+        holding it is cost minus proceeds, so any sold units leave
+        their realized gain behind. Account-level consumers value an
+        unpriced holding through :meth:`_unpriced_cost_basis` instead.
         """
         if factor is not None:
             return Decimal(str(split.quantity)) * factor
@@ -791,27 +847,81 @@ class CurrencyMixin:
             return quantity * rate, note
         if not with_cost_fallback:
             return Decimal("0"), f"{quantity} {sym} — no price data"
-        # No market price for the holding: fall back to cost basis in
-        # the book default. ``split.value`` is in each purchase's
-        # transaction currency; convert each at its posting-date rate
-        # (mirroring calculate_lot_gain / _lot_decimals) so a holding
-        # bought across foreign currencies isn't summed as raw mixed
-        # units. Missing per-leg rate degrades to the raw value.
-        cost_basis = Decimal("0")
-        for s in account.splits:
-            if today is not None and s.transaction.post_date > today:
-                continue
-            value = Decimal(str(s.value))
-            txn_ccy = s.transaction.currency
-            if txn_ccy != default_currency:
-                leg_rate = self._cross_rate(
-                    book, txn_ccy, default_currency,
-                    as_of=s.transaction.post_date,
-                )
-                if leg_rate is not None:
-                    value = value * leg_rate
-            cost_basis += value
+        # No market price for the holding: its remaining cost basis
+        # in the book default (see ``_unpriced_cost_basis``).
+        cost_basis = self._unpriced_cost_basis(
+            book, account.splits,
+            default_currency=default_currency, as_of=today,
+        )
         return cost_basis, f"{quantity} {sym} — no price data"
+
+    def _leg_value_in_default(
+        self,
+        book: piecash.Book,
+        split,
+        default_currency: piecash.Commodity,
+    ) -> Decimal:
+        """One split's ``value`` in the book default: converted at
+        its posting-date rate when the transaction currency differs
+        (mirroring calculate_lot_gain / _lot_decimals), so a holding
+        bought across foreign currencies is never summed as raw mixed
+        units. A missing per-leg rate degrades to the raw value."""
+        value = Decimal(str(split.value))
+        txn_ccy = split.transaction.currency
+        if txn_ccy != default_currency:
+            leg_rate = self._cross_rate(
+                book, txn_ccy, default_currency,
+                as_of=split.transaction.post_date,
+            )
+            if leg_rate is not None:
+                value = value * leg_rate
+        return value
+
+    def _unpriced_cost_basis(
+        self,
+        book: piecash.Book,
+        splits,
+        *,
+        default_currency: piecash.Commodity,
+        as_of: date | None = None,
+    ) -> Decimal:
+        """Remaining cost basis, in the book default, of a holding
+        with no market rate on file — the one valuation every surface
+        (dashboard, ``balance_sheet``, ``net_worth``, runway) uses for
+        such an account, so they agree by construction.
+
+        Folds the account's legs through a :class:`_CostPool` in
+        posting order (``_txn_sort_key``, so same-day legs resolve the
+        same way on every backend). Voided and undated splits are
+        skipped by the same rule as ``_own_splits_balance``; ``as_of``
+        (inclusive) caps to legs posted by then, ``None`` applies no
+        bound.
+
+        Not the old raw sum of ``split.value``: that kept the realized
+        gain of every sold unit in the "basis" and showed a fully sold
+        altcoin as a phantom holding (issue #185, PR #184).
+        """
+        from gnucash_mcp.book._base import _is_voided, _txn_sort_key
+
+        legs = []
+        for s in splits:
+            if _is_voided(s):
+                continue
+            txn = s.transaction
+            post_date = txn.post_date
+            if post_date is None:
+                continue
+            if as_of is not None and post_date > as_of:
+                continue
+            legs.append((_txn_sort_key(txn), s))
+        legs.sort(key=lambda item: item[0])
+        pool = _CostPool()
+        for _key, s in legs:
+            pool.apply(
+                Decimal(str(s.quantity)),
+                self._leg_value_in_default(book, s, default_currency),
+            )
+        return pool.basis
 
     @staticmethod
     def _find_exchange_rate(

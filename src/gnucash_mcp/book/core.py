@@ -1456,25 +1456,17 @@ class CoreMixin:
             if balance == 0:
                 continue
 
-            if account.commodity == default_currency:
-                liquid += balance
-            else:
-                rate = rates.get(account.commodity.guid)
-                if rate is not None:
-                    liquid += balance * rate
-                else:
-                    # Cost-basis fallback, same as net worth. The
-                    # post_date <= today filter keeps future-dated
-                    # entries from inflating liquid.
-                    cost_basis = Decimal("0")
-                    for split in account.splits:
-                        post_date = split.transaction.post_date
-                        if hasattr(post_date, "date") and callable(post_date.date):
-                            post_date = post_date.date()
-                        if post_date > today:
-                            continue
-                        cost_basis += Decimal(str(split.value))
-                    liquid += cost_basis
+            # Market rate or remaining cost basis — the same
+            # ``_market_value`` rule behind the dashboard's asset
+            # lines and net_worth, so runway never disagrees with
+            # them on an unpriced holding. ``today`` keeps future-
+            # dated entries from inflating liquid.
+            converted, _ = self._market_value(
+                account, balance,
+                book=book, rates=rates,
+                default_currency=default_currency, today=today,
+            )
+            liquid += converted
 
         daily_burn = self._daily_expense_burn(
             book, transactions, days=self._RUNWAY_BURN_DAYS,
