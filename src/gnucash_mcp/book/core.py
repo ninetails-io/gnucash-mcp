@@ -2771,10 +2771,13 @@ class CoreMixin:
                 # account), but this unfiltered path would render a
                 # stale "Mortgage Payment" recipe identically to a
                 # real event.
-                # The template filter walks every transaction's splits;
-                # load the graph once. The account branch above has
-                # its own targeted preload.
-                self._preload_split_graph(book)
+                # The template filter reads every transaction's
+                # splits and the renderer reads slot-backed notes
+                # per row: one bulk load instead of a SELECT per
+                # transaction. No ``account.splits`` walk here, so
+                # skip that pass. The account branch above has its
+                # own targeted preload.
+                self._preload_split_graph(book, account_splits=False)
                 template_guids = self._template_account_guids(book)
                 transactions = {
                     t for t in book.transactions
@@ -5273,9 +5276,12 @@ class CoreMixin:
             raise ValueError(f"Invalid search field: {field}")
 
         with self.open(readonly=True) as book:
-            # Whole-book scan: the template filter below walks every
-            # transaction's splits.
-            self._preload_split_graph(book)
+            # Whole-book scan: the template filter reads every
+            # transaction's splits, the memo and amount modes every
+            # split, the notes mode every transaction's slots — one
+            # bulk load instead of a SELECT per row. No
+            # ``account.splits`` walk here, so skip that pass.
+            self._preload_split_graph(book, account_splits=False)
 
             matched = []
 

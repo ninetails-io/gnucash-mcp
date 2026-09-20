@@ -11,6 +11,7 @@ Entries are terse by design: what changed, one line each, PR numbers where they 
 - Backup refusals and `get_server_config` name the dialect's own dump tool (`pg_dump`, `mysqldump` / `mariadb-dump`); `docs/RESTORE_FROM_BACKUP.md` covers both (#181).
 
 ### Changed
+- **Every price read goes through `_find_prices`** (#186): `list_commodities` and `get_latest_price` now show the same rate the reports use on a same-day tie (manual quote over feed), on every backend, and `_rates_as_of` no longer loads the price table twice. The whole-book preload behind `list_transactions`, `search_transactions`, and `get_book_summary` covers slot values and skips the unused account pass, so every read tool issues a fixed number of queries whatever the book's size; a notes search on a 120-transaction book went from 129 statements to 9. Builds on @bhbrunt's #182.
 - URI mode is single-book by construction (`switch_book`, demo books, and the write disarm follow the path list); setting both `GNUCASH_BOOK_PATH` and `GNUCASH_BOOK_URI` is a startup error. `GNUCASH_LOG_DIR` is required in URI mode. Connection URIs are password-masked everywhere a book is named (#175).
 - A database book announces a server (re)start like a file book, and its audit header names the masked URI (#181).
 - `open()` disposes piecash's engine after close, so a database book holds no server connection between tool calls (#175).

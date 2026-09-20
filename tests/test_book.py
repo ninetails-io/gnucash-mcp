@@ -13115,6 +13115,166 @@ class TestSplitGraphPreload:
                 f"strong reference has been lost"
             )
 
+    def test_preloaded_notes_issue_no_sql(self, test_book):
+        """``txn.notes`` is slot-backed and piecash's Slot is
+        single-table polymorphic: a plain relationship load leaves
+        one SELECT per slot for its typed value. The preload loads
+        every subclass column, so a notes walk is free (#186)."""
+        from sqlalchemy import event
+
+        gc = GnuCashBook(str(test_book))
+        with gc.open(readonly=True) as book:
+            gc._preload_split_graph(book, account_splits=False)
+            transactions = list(book.transactions)
+
+            statements: list[str] = []
+            engine = book.session.get_bind()
+
+            def _record(conn, cursor, statement, parameters,
+                        context, executemany):
+                statements.append(statement)
+
+            event.listen(engine, "before_cursor_execute", _record)
+            try:
+                for txn in transactions:
+                    _ = txn.notes
+                    for s in txn.splits:
+                        _ = s.account
+            finally:
+                event.remove(engine, "before_cursor_execute", _record)
+
+            assert statements == [], (
+                f"notes/splits walk after preload issued "
+                f"{len(statements)} SQL statements: {statements[:2]}"
+            )
+
+    def test_upgrade_to_account_splits_in_same_open(self, test_book):
+        """A light preload followed by a full one in the same open
+        must add the account-side pass, not return early."""
+        from sqlalchemy import event
+
+        gc = GnuCashBook(str(test_book))
+        with gc.open(readonly=True) as book:
+            gc._preload_split_graph(book, account_splits=False)
+            gc._preload_split_graph(book)
+            accounts = list(book.accounts)
+
+            statements: list[str] = []
+            engine = book.session.get_bind()
+
+            def _record(conn, cursor, statement, parameters,
+                        context, executemany):
+                statements.append(statement)
+
+            event.listen(engine, "before_cursor_execute", _record)
+            try:
+                for acct in accounts:
+                    for s in acct.splits:
+                        _ = s.transaction
+            finally:
+                event.remove(engine, "before_cursor_execute", _record)
+            assert statements == []
+
+
+class TestReadToolQueryCounts:
+    """The whole-book read tools issue a fixed number of statements
+    regardless of how many transactions the book holds. Measured on
+    this branch: 9–10 per call at 30 and at 120 transactions, every
+    field mode of search_transactions included. Before the preload
+    covered slots, the notes search paid one SELECT per transaction
+    (129 at 120) and the unfiltered listing two per rendered row. The
+    budget sits well under the lazy version's cost on the 60-row
+    fixture below and well over the measured flat count."""
+
+    BUDGET = 20
+
+    @pytest.fixture
+    def noted_book(self, tmp_path):
+        path = tmp_path / "noted.gnucash"
+        book = piecash.create_book(str(path), currency="USD", overwrite=True)
+        usd = book.default_currency
+        assets = piecash.Account(
+            name="Assets", type="ASSET", commodity=usd,
+            parent=book.root_account, placeholder=True,
+        )
+        cash = piecash.Account(
+            name="Checking", type="BANK", commodity=usd, parent=assets,
+        )
+        exp = piecash.Account(
+            name="Expenses", type="EXPENSE", commodity=usd,
+            parent=book.root_account,
+        )
+        for i in range(60):
+            piecash.Transaction(
+                currency=usd, post_date=date(2025, 1 + i % 12, 1 + i % 27),
+                description=f"store {i}", notes=f"note {i}",
+                splits=[
+                    piecash.Split(account=exp, value=Decimal("10")),
+                    piecash.Split(account=cash, value=Decimal("-10")),
+                ],
+            )
+        book.save()
+        book.close()
+        return path
+
+    @staticmethod
+    def _count(gc, call):
+        from sqlalchemy import event
+
+        statements: list[str] = []
+        real_open = gc.open
+
+        class _Ctx:
+            def __init__(self, ctx):
+                self._ctx = ctx
+
+            def __enter__(self):
+                book = self._ctx.__enter__()
+                self._engine = book.session.get_bind()
+
+                def _record(conn, cursor, statement, parameters,
+                            context, executemany):
+                    statements.append(statement)
+
+                self._record = _record
+                event.listen(self._engine, "before_cursor_execute", _record)
+                return book
+
+            def __exit__(self, *exc):
+                event.remove(
+                    self._engine, "before_cursor_execute", self._record,
+                )
+                return self._ctx.__exit__(*exc)
+
+        gc.open = lambda **kw: _Ctx(real_open(**kw))
+        try:
+            call(gc)
+        finally:
+            gc.open = real_open
+        return len(statements)
+
+    @pytest.mark.parametrize("label, call", [
+        ("list unfiltered", lambda gc: gc.list_transactions(limit=10)),
+        ("list count-only", lambda gc: gc.list_transactions(limit=0)),
+        ("list by account", lambda gc: gc.list_transactions(
+            account="Assets:Checking", limit=10)),
+        ("search description", lambda gc: gc.search_transactions(
+            "store", field="description", limit=5)),
+        ("search memo", lambda gc: gc.search_transactions(
+            "x", field="memo", limit=5)),
+        ("search notes", lambda gc: gc.search_transactions(
+            "note", field="notes", limit=5)),
+        ("search amount", lambda gc: gc.search_transactions(
+            "10", field="amount", limit=5)),
+    ])
+    def test_flat_in_transaction_count(self, noted_book, label, call):
+        gc = GnuCashBook(str(noted_book))
+        n = self._count(gc, call)
+        assert n < self.BUDGET, (
+            f"{label}: {n} SQL statements on a 60-transaction book — "
+            f"a per-row lazy load is back"
+        )
+
 
 class TestDefaultedDateEcho:
     """Defaults resolve loudly, explicit inputs echo nothing: a
