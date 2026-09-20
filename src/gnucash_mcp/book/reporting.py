@@ -938,7 +938,7 @@ class ReportingMixin:
                     )
                 return {
                     "as_of_date": end_date.isoformat(),
-                    "net_worth": str(total),
+                    "net_worth": _format_number(total, decimals=2),
                 }
 
             # --- Time series: single sweep, per-boundary valuation.
@@ -1028,7 +1028,9 @@ class ReportingMixin:
                 ):
                     series.append({
                         "date": boundaries[b_idx].isoformat(),
-                        "net_worth": str(_snapshot_at(boundaries[b_idx])),
+                        "net_worth": _format_number(
+                            _snapshot_at(boundaries[b_idx]), decimals=2,
+                        ),
                     })
                     b_idx += 1
                 # Voided filter placed after the boundary advance so
@@ -1056,7 +1058,9 @@ class ReportingMixin:
             while b_idx < len(boundaries):
                 series.append({
                     "date": boundaries[b_idx].isoformat(),
-                    "net_worth": str(_snapshot_at(boundaries[b_idx])),
+                    "net_worth": _format_number(
+                        _snapshot_at(boundaries[b_idx]), decimals=2,
+                    ),
                 })
                 b_idx += 1
 
