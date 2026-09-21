@@ -12307,3 +12307,203 @@ class TestDocumentTypeStrings:
             actions = {s.action for s in row.post_txn.splits}
         assert title == f"Bill {bill['id']}"
         assert actions == {"Bill"}
+
+
+class TestFindInvoiceDialectGuard:
+    """``_find_invoice``'s ``date_posted=''`` self-heal is SQLite-only.
+
+    The heal exists because SQLite's dynamic typing lets an empty
+    string land in a datetime column. PostgreSQL types ``date_posted``
+    as ``timestamp`` and rejects ``''`` outright, so the heal's
+    ``WHERE date_posted = ''`` raised InvalidDatetimeFormat, which
+    aborts the whole PostgreSQL transaction — and the ORM query two
+    lines later then failed with the *generic*
+    ``InFailedSqlTransaction`` message, naming only the SELECT. Every
+    ``get_invoice`` and every explicit-id ``create_invoice`` failed on
+    every PostgreSQL book, for every ID, with an error that pointed at
+    the wrong statement. Found and fixed by @JamesRao98 on the
+    10xtechnology fork; the live-dialect half of this contract is
+    ``_RealDatabaseTests.test_document_lifecycle``.
+    """
+
+    @staticmethod
+    def _record_statements():
+        """Capture every SQL statement executed until ``stop`` is
+        called."""
+        from sqlalchemy import event
+        from sqlalchemy.engine import Engine
+
+        seen: list[str] = []
+
+        def _on_execute(conn, cursor, statement, params, context, executemany):
+            seen.append(statement)
+
+        event.listen(Engine, "before_cursor_execute", _on_execute)
+        return seen, lambda: event.remove(
+            Engine, "before_cursor_execute", _on_execute
+        )
+
+    def test_heal_runs_on_sqlite(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Heal Co")
+        inv = gb.create_invoice(customer_id="000001")
+
+        seen, stop = self._record_statements()
+        try:
+            gb.get_invoice(inv["id"], owner_type="customer")
+        finally:
+            stop()
+        assert any(
+            "UPDATE invoices SET date_posted = NULL" in s for s in seen
+        )
+
+    def test_heal_skipped_on_non_sqlite(self, business_book, monkeypatch):
+        """Under a PostgreSQL dialect the heal must not be emitted at
+        all — the guard is what keeps the lookup alive, since the
+        statement poisons the transaction rather than failing in
+        isolation."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Heal Co")
+        inv = gb.create_invoice(customer_id="000001")
+
+        monkeypatch.setattr(
+            "gnucash_mcp.book.business._dialect_name",
+            lambda book: "postgresql",
+        )
+        seen, stop = self._record_statements()
+        try:
+            found = gb.get_invoice(inv["id"], owner_type="customer")
+        finally:
+            stop()
+        assert found["id"] == inv["id"]
+        assert not any(
+            "UPDATE invoices SET date_posted = NULL" in s for s in seen
+        )
+
+    def test_lookup_survives_a_failing_heal(self, business_book, monkeypatch):
+        """Even on SQLite, a heal that raises must not take the
+        lookup down with it — the caller asked for an invoice, not
+        for a repair."""
+        from sqlalchemy.orm import Session
+
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Heal Co")
+        inv = gb.create_invoice(customer_id="000001")
+
+        real_execute = Session.execute
+
+        def boom(self, statement, *args, **kwargs):
+            if "date_posted = NULL" in str(statement):
+                raise RuntimeError("heal exploded")
+            return real_execute(self, statement, *args, **kwargs)
+
+        monkeypatch.setattr(Session, "execute", boom)
+        assert gb.get_invoice(inv["id"], owner_type="customer")["id"] == inv["id"]
+
+
+class TestRollbackIfAborted:
+    """``_rollback_if_aborted`` — the guard that keeps a swallowed
+    database error from being reported as somebody else's failure.
+
+    PostgreSQL marks a transaction aborted after any failed statement
+    and answers everything afterwards with ``InFailedSqlTransaction``.
+    A best-effort block that swallows its own error without clearing
+    that state hands the next statement a misleading exception, which
+    is exactly how ``_find_invoice``'s heal hid behind the SELECT
+    below it. The fakes here model SQLAlchemy 1.4's pool proxy; the
+    real-driver half is ``_RealDatabaseTests.test_rollback_if_aborted``.
+    """
+
+    INERROR = 3   # libpq PQTRANS_INERROR
+    INTRANS = 2   # libpq PQTRANS_INTRANS
+
+    class _Info:
+        def __init__(self, status):
+            self.transaction_status = status
+
+    class _Driver:
+        def __init__(self, status):
+            self.info = TestRollbackIfAborted._Info(status)
+
+    class _Proxy:
+        """SQLAlchemy's ``_ConnectionFairy``: its own ``.info`` is a
+        plain dict, the driver hangs off ``dbapi_connection``."""
+
+        def __init__(self, status, *, legacy=False):
+            self.info = {}
+            driver = TestRollbackIfAborted._Driver(status)
+            if legacy:
+                self.connection = driver
+            else:
+                self.dbapi_connection = driver
+
+    class _Conn:
+        def __init__(self, proxy):
+            self.connection = proxy
+
+    class _Session:
+        def __init__(self, proxy):
+            self._proxy = proxy
+            self.rolled_back = False
+
+        def connection(self):
+            return TestRollbackIfAborted._Conn(self._proxy)
+
+        def rollback(self):
+            self.rolled_back = True
+
+    def test_rolls_back_an_aborted_transaction(self):
+        from gnucash_mcp.book._base import _rollback_if_aborted
+
+        session = self._Session(self._Proxy(self.INERROR))
+        assert _rollback_if_aborted(session) is True
+        assert session.rolled_back is True
+
+    def test_reads_the_driver_not_the_pool_proxy(self):
+        """The proxy's ``.info`` is SQLAlchemy's dict, which has no
+        transaction status; reading it there would never see the
+        aborted state and the helper would be a silent no-op."""
+        from gnucash_mcp.book._base import _rollback_if_aborted
+
+        proxy = self._Proxy(self.INERROR)
+        proxy.info = {"decoy": True}
+        session = self._Session(proxy)
+        assert _rollback_if_aborted(session) is True
+
+    def test_legacy_connection_attribute(self):
+        """Older pool proxies expose the driver as ``.connection``."""
+        from gnucash_mcp.book._base import _rollback_if_aborted
+
+        session = self._Session(self._Proxy(self.INERROR, legacy=True))
+        assert _rollback_if_aborted(session) is True
+
+    def test_leaves_a_healthy_transaction_alone(self):
+        """A best-effort block that failed for a harmless reason (a
+        readonly session refusing to flush, say) must keep whatever
+        the caller already has pending — rolling back unconditionally
+        would discard real work to clean up a non-problem."""
+        from gnucash_mcp.book._base import _rollback_if_aborted
+
+        session = self._Session(self._Proxy(self.INTRANS))
+        assert _rollback_if_aborted(session) is False
+        assert session.rolled_back is False
+
+    def test_never_raises_on_a_broken_session(self):
+        """It runs inside ``except`` blocks; raising there would
+        replace the original failure with its own."""
+        from gnucash_mcp.book._base import _rollback_if_aborted
+
+        class _Broken:
+            def connection(self):
+                raise RuntimeError("connection gone")
+
+        assert _rollback_if_aborted(_Broken()) is False
+
+    def test_sqlite_session_is_left_alone(self, business_book):
+        """A real sqlite3 connection has no ``info``; the helper
+        answers False without touching the session."""
+        from gnucash_mcp.book._base import _rollback_if_aborted
+
+        gb = GnuCashBook(str(business_book))
+        with gb.open(readonly=True) as book:
+            assert _rollback_if_aborted(book.session) is False

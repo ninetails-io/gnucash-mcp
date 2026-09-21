@@ -278,6 +278,64 @@ def _gnc_bool(value) -> int:
     return 1 if value else 0
 
 
+# libpq's PQTRANS_INERROR. psycopg2 exposes it as
+# ``extensions.TRANSACTION_STATUS_INERROR`` and psycopg 3 as
+# ``pq.TransactionStatus.INERROR``; both are this value.
+_PG_TRANSACTION_INERROR = 3
+
+
+def _dialect_name(book) -> str:
+    """The SQLAlchemy dialect serving an open book: ``sqlite``,
+    ``postgresql``, or ``mysql``.
+
+    The one question a raw-SQL site may ask before emitting a
+    statement only one backend accepts. ``BookSource.backend`` answers
+    it from the connection string before a book is open; this reads
+    it off the live session, for the static helpers that receive a
+    piecash Book and nothing else.
+    """
+    return book.session.get_bind().dialect.name
+
+
+def _rollback_if_aborted(session) -> bool:
+    """Clear an aborted PostgreSQL transaction after a swallowed error.
+
+    PostgreSQL marks the transaction aborted after any failed
+    statement and answers everything that follows with
+    ``InFailedSqlTransaction`` — so a best-effort block that catches
+    its own error and moves on hands the NEXT statement a failure
+    naming the wrong culprit (that is how ``_find_invoice``'s
+    self-heal hid behind the SELECT below it). SQLite and MySQL have
+    no such state; a failed statement there leaves the connection
+    usable, and this returns False without touching the session.
+
+    Rolls back only when the driver reports the aborted state, so a
+    block that failed harmlessly (a readonly session refusing to
+    flush) keeps whatever the caller has pending. Never raises: it
+    runs inside ``except`` blocks, where its own failure would
+    replace the original. Returns True when it rolled back.
+
+    The driver connection is read through the pool proxy's
+    ``dbapi_connection`` — the proxy's own ``.info`` is SQLAlchemy's
+    per-connection dict, not psycopg2's status object.
+    """
+    try:
+        proxy = session.connection().connection
+        raw = getattr(proxy, "dbapi_connection", None)
+        if raw is None:
+            raw = proxy.connection
+        status = raw.info.transaction_status
+    except Exception:
+        return False
+    if status != _PG_TRANSACTION_INERROR:
+        return False
+    try:
+        session.rollback()
+    except Exception:
+        return False
+    return True
+
+
 def _to_decimal(value) -> Decimal:
     """Safe Decimal construction for user-supplied monetary values.
 

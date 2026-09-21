@@ -25,7 +25,9 @@ from gnucash_mcp.book._base import (
     _LOT_CLOSED,
     _LOT_OPEN,
     _commodity_quantum,
+    _dialect_name,
     _gnc_bool,
+    _rollback_if_aborted,
     _slot_value_str,
     _to_decimal,
     _unique_prefix,
@@ -1419,15 +1421,20 @@ class BusinessMixin:
     def _find_invoice(book, invoice_id: str, owner_type: int | None = None):
         """Find an invoice/bill by human-readable ID.
 
-        Self-heals malformed ``date_posted=''`` values to NULL
-        before the ORM query runs: piecash's ``_DateTime``
-        TypeDecorator hard-crashes loading a row whose
+        On SQLite books, self-heals malformed ``date_posted=''``
+        values to NULL before the ORM query runs: piecash's
+        ``_DateTime`` TypeDecorator hard-crashes loading a row whose
         ``date_posted`` is an empty string (a state some persistence
         paths leave on auto-id'd bills), blocking every subsequent
         invoice operation. piecash exposes no readonly flag, so the
-        heal is always attempted and the try/except absorbs the
-        failure on readonly sessions — one write operation heals the
-        book permanently.
+        heal is attempted on every SQLite lookup and the try/except
+        absorbs the failure on readonly sessions — one write
+        operation heals the book permanently.
+
+        PostgreSQL and MySQL books skip the heal: an empty string can
+        only reach a datetime column under SQLite's dynamic typing,
+        and on PostgreSQL the comparison itself is fatal (see the
+        guard below).
 
         Args:
             book: piecash Book instance.
@@ -1448,19 +1455,30 @@ class BusinessMixin:
         from piecash.business.invoice import Invoice
         from sqlalchemy import text
 
-        try:
-            book.session.execute(
-                text(
-                    "UPDATE invoices SET date_posted = NULL "
-                    "WHERE date_posted = ''"
+        # SQLite-only. PostgreSQL types ``date_posted`` as
+        # ``timestamp`` and rejects the ``''`` literal outright:
+        # psycopg2 raises InvalidDatetimeFormat, which aborts the
+        # whole transaction, so the ORM query below then failed with
+        # InFailedSqlTransaction — every get/post/pay/entry on every
+        # invoice, on every PostgreSQL book, with an error naming the
+        # wrong statement. Found and fixed by @JamesRao98 on the
+        # 10xtechnology fork.
+        if _dialect_name(book) == "sqlite":
+            try:
+                book.session.execute(
+                    text(
+                        "UPDATE invoices SET date_posted = NULL "
+                        "WHERE date_posted = ''"
+                    )
                 )
-            )
-            book.session.flush()
-        except Exception:
-            # Best-effort heal — readonly sessions, locked
-            # connections, and other rare failures fall through;
-            # never break a lookup over a self-heal attempt.
-            pass
+                book.session.flush()
+            except Exception:
+                # Best-effort heal — readonly sessions, locked
+                # connections, and other rare failures fall through;
+                # never break a lookup over a self-heal attempt. The
+                # rollback keeps "fall through" honest on a backend
+                # that aborts the transaction on error.
+                _rollback_if_aborted(book.session)
 
         query = book.session.query(Invoice).filter(Invoice.id == invoice_id)
         if owner_type is not None:
@@ -2298,7 +2316,11 @@ class BusinessMixin:
                         False,
                     )
         except Exception:
-            pass
+            # The billterm lookup is optional — Step 3's 30-day
+            # default covers the miss. Clear an aborted transaction
+            # first so the fallback, and everything after it in this
+            # call, isn't querying a poisoned connection.
+            _rollback_if_aborted(book.session)
 
         # Step 3: 30-day default. Annotate.
         posted = inv.date_posted

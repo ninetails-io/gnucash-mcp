@@ -322,6 +322,17 @@ Established chokepoints and the rule each one owns:
   one audit renderer names what converted. Reads never write. A new
   converter for a shape we shipped wrong goes here, not on its own
   module's writes.
+- `_dialect_name` / `_rollback_if_aborted` — the only backend
+  branch a raw-SQL site may take, and the only way a swallowed
+  database error is cleared. A statement one backend rejects
+  (`WHERE date_posted = ''` on a PostgreSQL timestamp) aborts the
+  whole transaction there, and the bare `except: pass` that follows
+  hands the NEXT statement an `InFailedSqlTransaction` naming the
+  wrong culprit — every invoice lookup on PostgreSQL failed that way
+  until @JamesRao98's fork caught it. Gate such statements on the
+  dialect; call the rollback helper in every `except` that swallows
+  a database error. The real-driver proof is
+  `_RealDatabaseTests.test_rollback_if_aborted`.
 - `_parse_owner_type`, `_commodity_quantum`, `_is_market_price`,
   `_effective_owner_type` — same story, smaller surface.
 
