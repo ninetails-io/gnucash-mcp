@@ -721,6 +721,9 @@ class _RealDatabaseTests:
     DUMP_TOOL: str = ""
     # Count of this database's live server connections.
     LIVE_CONNECTIONS_SQL: str = ""
+    # Whether one failed statement poisons the rest of the transaction
+    # (PostgreSQL's InFailedSqlTransaction). MySQL and SQLite carry on.
+    ABORTS_ON_ERROR: bool = False
 
     @pytest.fixture(scope="class")
     def db_book(self, request):
@@ -834,6 +837,76 @@ class _RealDatabaseTests:
                 assert opened.default_currency is not None
         assert live() == before
 
+    def test_document_lifecycle(self, db_book):
+        """Regression: every invoice lookup on a PostgreSQL book failed
+        with InFailedSqlTransaction — ``_find_invoice``'s SQLite-only
+        ``date_posted=''`` heal aborted the transaction ahead of the
+        SELECT, so get/post/pay/entry and explicit-id creation were
+        all dead while auto-id creation (no lookup) kept working.
+        Found and fixed by @JamesRao98 on the 10xtechnology fork. The
+        whole document lifecycle runs here so the business module's
+        raw SQL is proven on each dialect, not just on SQLite.
+        """
+        db_book.create_account(
+            name="Accounts Receivable", account_type="RECEIVABLE",
+            parent="Assets",
+        )
+        db_book.create_account(
+            name="Income", account_type="INCOME", placeholder=True,
+        )
+        db_book.create_account(
+            name="Sales", account_type="INCOME", parent="Income",
+        )
+        customer = db_book.create_customer(name="Dialect Co")
+        inv = db_book.create_invoice(customer_id=customer["id"])
+
+        found = db_book.get_invoice(inv["id"], owner_type="customer")
+        assert found["id"] == inv["id"]
+
+        db_book.add_invoice_entry(
+            invoice_id=inv["id"], account="Income:Sales",
+            description="Consulting", quantity="2", price="50.00",
+        )
+        posted = db_book.post_invoice(
+            invoice_id=inv["id"],
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        assert posted
+        paid = db_book.pay_invoice(
+            invoice_id=inv["id"], payment_account="Assets:Checking",
+            amount="100.00", owner_type="customer",
+        )
+        assert paid
+        assert db_book.get_invoice(
+            inv["id"], owner_type="customer"
+        )["status"] == "paid"
+
+        explicit = db_book.create_invoice(
+            customer_id=customer["id"], invoice_id="INV-EXPLICIT",
+        )
+        assert explicit["id"] == "INV-EXPLICIT"
+        assert db_book.get_invoice(
+            "INV-EXPLICIT", owner_type="customer"
+        )["id"] == "INV-EXPLICIT"
+
+    def test_rollback_if_aborted(self, db_book):
+        """The real-driver half of ``TestRollbackIfAborted``: after a
+        swallowed bad statement, the helper clears PostgreSQL's
+        aborted state (and reports it), leaves a MySQL session alone,
+        and either way the next statement runs."""
+        from sqlalchemy import text
+
+        from gnucash_mcp.book._base import _rollback_if_aborted
+
+        with db_book.open(readonly=True) as book:
+            try:
+                book.session.execute(text("SELECT no_such_column_anywhere"))
+            except Exception:
+                pass
+            assert _rollback_if_aborted(book.session) is self.ABORTS_ON_ERROR
+            assert book.session.execute(text("SELECT 1")).scalar() == 1
+
 
 @pytest.mark.skipif(
     not _PG_URI, reason="set GNUCASH_TEST_PG_URI to run PostgreSQL tests"
@@ -841,6 +914,7 @@ class _RealDatabaseTests:
 class TestPostgresBackend(_RealDatabaseTests):
     URI = _PG_URI
     DUMP_TOOL = "pg_dump"
+    ABORTS_ON_ERROR = True
     LIVE_CONNECTIONS_SQL = (
         "SELECT count(*) FROM pg_stat_activity "
         "WHERE datname = current_database()"
