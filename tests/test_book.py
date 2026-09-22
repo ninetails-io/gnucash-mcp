@@ -13483,3 +13483,124 @@ class TestScheduledLineOverdueCopy:
         assert "overdue" not in sched_line
         assert "further" not in sched_line
         assert "1 due in next 7 days" in sched_line
+
+
+class TestDashboardHonestFailure:
+    """A dashboard check that fails says so — spec:
+    specs/v1.5/DASHBOARD_HONEST_FAILURE_SPEC.md.
+
+    Absence of a warning is the dashboard's "all clear", so a
+    collector that swallowed its own failure reported a clean book
+    (the Python 3.10 GDATE incident). Every handler now routes
+    through ``_check_failed``: one visible line, reason inline,
+    because the debug log is opt-in and most users have none.
+    """
+
+    def test_describe_check_failure_shape(self):
+        from gnucash_mcp.book.core import _describe_check_failure
+
+        class FakeStatementError(Exception):
+            pass
+
+        exc = FakeStatementError(
+            "(psycopg2.errors.InFailedSqlTransaction) current transaction "
+            "is aborted, commands ignored until end of transaction block\n"
+            "[SQL: SELECT count(*) FROM jobs]\n"
+            "[parameters: {}]\n"
+            "(Background on this error at: https://sqlalche.me/e/14/2j85)"
+        )
+        line = _describe_check_failure("Active-jobs", exc)
+        assert line.startswith(
+            "Active-jobs check failed: FakeStatementError: "
+            "(psycopg2.errors.InFailedSqlTransaction) current transaction"
+        )
+        # First line only — no statement, parameters, or docs link.
+        assert "[SQL:" not in line and "sqlalche.me" not in line
+
+    def test_describe_check_failure_masks_uris_and_truncates(self):
+        from gnucash_mcp.book.core import (
+            _CHECK_FAILURE_REASON_CHARS, _describe_check_failure,
+        )
+
+        exc = RuntimeError(
+            "could not connect to postgresql://gnucash:s3cret@db.local/gnucash"
+        )
+        line = _describe_check_failure("Low-cash", exc)
+        assert "s3cret" not in line
+        assert "gnucash:***@db.local" in line
+
+        long = RuntimeError("x" * 500)
+        line = _describe_check_failure("Low-cash", long)
+        reason = line.split("RuntimeError: ", 1)[1]
+        assert len(reason) == _CHECK_FAILURE_REASON_CHARS
+        assert reason.endswith("…")
+
+        assert _describe_check_failure("Low-cash", RuntimeError()) == (
+            "Low-cash check failed: RuntimeError"
+        )
+
+    def test_failed_section_is_one_visible_line(
+        self, test_book: Path, monkeypatch,
+    ):
+        """Force the backup-health collector to raise: the dashboard
+        names the check and the exception, and every other section
+        still renders."""
+        def boom(self, *args, **kwargs):
+            raise RuntimeError("backup state unreadable")
+
+        monkeypatch.setattr(GnuCashBook, "get_backup_health", boom)
+        result = GnuCashBook(str(test_book)).get_book_summary()
+        assert "Warnings:" in result
+        warnings_block = result.split("Warnings:")[1].split("Accounts:")[0]
+        assert (
+            "⚠ Backup-health check failed: RuntimeError: "
+            "backup state unreadable"
+        ) in warnings_block
+        assert warnings_block.count("check failed") == 1
+        assert "Accounts:" in result
+
+    def test_per_item_failures_are_one_line_with_a_count(
+        self, business_book: Path, monkeypatch,
+    ):
+        """Two posted, overdue invoices whose due-date resolution
+        raises: one line per check with the skipped count, and no
+        'Past due' line pretending the check ran."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Flaky Terms Co")
+        for _ in range(2):
+            inv = gb.create_invoice(customer_id="000001")
+            gb.add_invoice_entry(
+                invoice_id=inv["id"], account="Income:Sales",
+                description="Work", quantity="1", price="100",
+            )
+            gb.post_invoice(
+                invoice_id=inv["id"],
+                post_account="Assets:Accounts Receivable",
+                post_date=(date.today() - timedelta(days=90)).isoformat(),
+                due_date=(date.today() - timedelta(days=60)).isoformat(),
+                owner_type="customer",
+            )
+
+        def boom(self, book, inv):
+            raise RuntimeError("terms unreadable")
+
+        monkeypatch.setattr(GnuCashBook, "_resolve_invoice_due_date", boom)
+        result = gb.get_book_summary()
+        warnings_block = result.split("Warnings:")[1].split("Accounts:")[0]
+        assert (
+            "⚠ Overdue-document check failed: RuntimeError: "
+            "terms unreadable — 2 documents skipped"
+        ) in warnings_block
+        assert (
+            "⚠ Business-count check failed: RuntimeError: "
+            "terms unreadable — 2 documents skipped"
+        ) in warnings_block
+        assert warnings_block.count("check failed") == 2
+        assert "Past due" not in warnings_block
+        # The documents still count as open — only overdue-ness was
+        # unknowable.
+        assert "2 invoices" in result or "open" in result.lower()
+
+    def test_healthy_book_has_no_failure_lines(self, test_book: Path):
+        result = GnuCashBook(str(test_book)).get_book_summary()
+        assert "check failed" not in result

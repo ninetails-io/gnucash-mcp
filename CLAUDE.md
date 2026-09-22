@@ -348,6 +348,17 @@ Established chokepoints and the rule each one owns:
   dialect; call the rollback helper in every `except` that swallows
   a database error. The real-driver proof is
   `_RealDatabaseTests.test_rollback_if_aborted`.
+- `_check_failed` — the one way a dashboard collector records a
+  failed check: clear an aborted PostgreSQL transaction, debug-log
+  the traceback, return the visible line with the reason inline
+  (`Low-cash check failed: ValueError: …`). A collector that
+  swallows on its own reports a failed check as a clean book — the
+  Python 3.10 GDATE incident — and on PostgreSQL leaves every later
+  collector querying an aborted transaction. Locked by
+  `TestDashboardHonestFailure`; spec
+  `specs/v1.5/DASHBOARD_HONEST_FAILURE_SPEC.md`. Its first catch was
+  `get_backup_health` raising on every database book's dashboard
+  call, unseen for three weeks.
 - `_parse_owner_type`, `_commodity_quantum`, `_is_market_price`,
   `_effective_owner_type` — same story, smaller surface.
 
