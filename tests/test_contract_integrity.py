@@ -36,6 +36,7 @@ contract, the bug class is open again.
 from __future__ import annotations
 
 import ast
+import re
 from pathlib import Path
 
 import pytest
@@ -679,6 +680,79 @@ class TestBackendPortabilityChokepoints:
         assert base.count("st_mtime_ns") >= 1
         assert "_gnc_bool" in (self._BOOK_DIR / "core.py").read_text()
         assert "_gnc_bool" in (self._BOOK_DIR / "business.py").read_text()
+
+    # SQLite accepts each of these; PostgreSQL and/or MySQL reject it.
+    # Pattern → the portable form to write instead.
+    _SQLITE_ONLY_SQL = (
+        (r"\bMAX\s*\(\s*[^()]*,", "scalar MAX(a, b): write CASE / GREATEST"),
+        (r"\bMIN\s*\(\s*[^()]*,", "scalar MIN(a, b): write CASE / LEAST"),
+        (r"\bstrftime\s*\(", "strftime(): compute the date in Python"),
+        (r"\bjulianday\s*\(", "julianday(): compute the date in Python"),
+        (r"\bdatetime\s*\(", "datetime(): compute the date in Python"),
+        (r"\bifnull\s*\(", "IFNULL(): write COALESCE"),
+        (r"\bINSERT\s+OR\b", "INSERT OR ...: not portable"),
+        (r"\bGLOB\b", "GLOB: write LIKE"),
+        (r"\bPRAGMA\b", "PRAGMA: SQLite-only"),
+        (r"\btypeof\s*\(", "typeof(): SQLite-only"),
+        (r"\|\|", "|| concatenation: MySQL reads it as OR"),
+        (r"(=|<>|!=|\bIS\b|\bIS\s+NOT\b)\s*''", "typed column vs '': only SQLite's dynamic typing allows the comparison"),
+    )
+
+    def test_raw_sql_avoids_sqlite_only_constructs(self):
+        """Every ``text(...)`` statement runs unchanged on all three
+        backends.
+
+        SQLite is the permissive dialect, and it is the one every
+        hermetic test runs on — so a statement only SQLite accepts
+        passes the whole suite and fails the first database book it
+        meets. Two shipped that way: the taxtable refcount clamp
+        ``MAX(0, refcount - :n)`` (PostgreSQL and MySQL know MAX only
+        as an aggregate; no tax-bearing draft could be deleted on a
+        database book) and ``_find_invoice``'s ``date_posted = ''``
+        heal, which aborted every PostgreSQL invoice lookup (#189).
+
+        A statement that genuinely must be one backend's is allowed
+        when it sits inside a ``_dialect_name(book) == "sqlite"``
+        guard, which is how the heal is written now.
+        """
+        import ast
+
+        offenders = []
+        for path in self._book_sources():
+            source = path.read_text()
+            lines = source.splitlines()
+            tree = ast.parse(source, filename=str(path))
+            for node in ast.walk(tree):
+                if not (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "text"
+                    and node.args
+                ):
+                    continue
+                pieces = [
+                    sub.value
+                    for sub in ast.walk(node.args[0])
+                    if isinstance(sub, ast.Constant) and isinstance(sub.value, str)
+                ]
+                sql = " ".join(pieces)
+                guarded = any(
+                    '_dialect_name(book) == "sqlite"' in ln
+                    for ln in lines[max(0, node.lineno - 30): node.lineno]
+                )
+                for pattern, advice in self._SQLITE_ONLY_SQL:
+                    if re.search(pattern, sql, flags=re.IGNORECASE) and not guarded:
+                        offenders.append(
+                            f"{path.name}:{node.lineno}: {advice}\n"
+                            f"      {sql.strip()[:110]}"
+                        )
+        assert not offenders, (
+            "SQLite-only SQL in a raw text() statement. The hermetic "
+            "suite runs on SQLite and cannot see this; PostgreSQL / "
+            "MySQL reject it at runtime. Write the portable form, or "
+            "gate the statement on _dialect_name(book) == \"sqlite\".\n"
+            + "\n".join(f"  {o}" for o in offenders)
+        )
 
 
 def _enclosing_def(path: Path, lineno: int) -> str:

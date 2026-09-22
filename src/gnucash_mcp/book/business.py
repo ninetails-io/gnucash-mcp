@@ -7231,17 +7231,26 @@ class BusinessMixin:
                     # Deliberately NOT paired with a _verify_*: the
                     # stored refcount has no in-process consumer
                     # (checks use _compute_taxtable_refcount's live
-                    # COUNT), and MAX(0, …) makes a miss a harmless
-                    # no-op. The write-verification contract test
-                    # scans Table.__table__ DML, not raw text() —
+                    # COUNT), and the clamp at zero makes a miss a
+                    # harmless no-op. The write-verification contract
+                    # test scans Table.__table__ DML, not raw text() —
                     # this site is deliberately outside its scope.
+                    #
+                    # The clamp is a CASE, not MAX(0, …): the scalar
+                    # two-argument MAX is SQLite-only. PostgreSQL and
+                    # MySQL know MAX solely as an aggregate (their
+                    # scalar form is GREATEST), so the old statement
+                    # was rejected outright on every database book
+                    # and no tax-bearing draft could be deleted.
                     book.session.execute(
                         text(
                             "UPDATE taxtables "
-                            "SET refcount = MAX(0, refcount - :n) "
+                            "SET refcount = CASE "
+                            "WHEN refcount - :n < 0 THEN 0 "
+                            "ELSE refcount - :n END "
                             "WHERE guid = :guid"
                         ),
-                        {"n": ref.n, "guid": ref.taxtable_guid},
+                        {"n": int(ref.n), "guid": ref.taxtable_guid},
                     )
 
                 book.session.execute(

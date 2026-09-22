@@ -213,6 +213,21 @@ module contributes zero tools to the MCP surface.
   Connection URIs are password-masked wherever a book is named,
   unconditionally (not behind `GNUCASH_REDACT_PATHS` — a path is a
   privacy preference, a credential is a leak).
+- **Raw SQL is written in the three-dialect intersection.** Every
+  `text(...)` statement runs unchanged on SQLite, PostgreSQL, and
+  MySQL/MariaDB. SQLite is the permissive one — scalar two-argument
+  `MAX`/`MIN`, `strftime`, `julianday`, `IFNULL`, `INSERT OR`,
+  `GLOB`, and comparing a typed column to `''` all work there and
+  nowhere else, and SQLite-only tests can't tell. The refcount
+  clamp shipped as `MAX(0, refcount - :n)` and no tax-bearing draft
+  could be deleted on a database book; the `date_posted = ''` heal
+  aborted every PostgreSQL invoice lookup (#189). Write the portable
+  form (`CASE`, `COALESCE`); where a statement genuinely must be
+  one backend's, gate it on `_dialect_name`. Locked by
+  `TestBackendPortabilityChokepoints::test_raw_sql_avoids_sqlite_only_constructs`.
+  When a fix is dialect-shaped, the sibling search is "read every
+  raw statement", not "grep for the construct that broke" — the
+  second instance here was found only on the full read.
 - **GnuCash's flag columns are INTEGER, not BOOLEAN.**
   `placeholder`, `hidden`, `enabled`, `is_closed`, `active`,
   `invisible`, the entry `*_taxable` / `*_taxincluded` pair. SQLite has no
