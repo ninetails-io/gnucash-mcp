@@ -890,6 +890,45 @@ class _RealDatabaseTests:
             "INV-EXPLICIT", owner_type="customer"
         )["id"] == "INV-EXPLICIT"
 
+    def test_tax_bearing_draft_can_be_deleted(self, db_book):
+        """Regression: deleting an unposted document with a taxed
+        entry ran ``SET refcount = MAX(0, refcount - :n)`` — SQLite's
+        scalar two-argument MAX, which PostgreSQL and MySQL reject
+        outright (MAX is an aggregate there; GREATEST is the scalar).
+        Every tax-bearing draft was undeletable on a database book.
+        The clamp is now a CASE expression every backend accepts.
+        """
+        # Self-contained: xdist gives each worker its own class
+        # fixture, so nothing here may lean on accounts another test
+        # created.
+        db_book.create_account(
+            name="Tax Liabilities", account_type="LIABILITY",
+            placeholder=True,
+        )
+        db_book.create_account(
+            name="Sales Tax", account_type="LIABILITY",
+            parent="Tax Liabilities",
+        )
+        db_book.create_account(
+            name="Taxed Income", account_type="INCOME",
+        )
+        db_book.create_taxtable(
+            name="VAT", entries=[{
+                "type": "percentage", "amount": "10",
+                "account": "Tax Liabilities:Sales Tax",
+            }],
+        )
+        customer = db_book.create_customer(name="Taxed Co")
+        inv = db_book.create_invoice(customer_id=customer["id"])
+        db_book.add_invoice_entry(
+            invoice_id=inv["id"], account="Taxed Income",
+            description="Taxed work", quantity="1", price="100.00",
+            taxtable="VAT",
+        )
+        result = db_book.delete_invoice(inv["id"])
+        assert result["status"] == "deleted"
+        assert db_book.get_taxtable("VAT")["refcount"] == 0
+
     def test_rollback_if_aborted(self, db_book):
         """The real-driver half of ``TestRollbackIfAborted``: after a
         swallowed bad statement, the helper clears PostgreSQL's
