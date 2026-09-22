@@ -755,6 +755,61 @@ class TestBackendPortabilityChokepoints:
         )
 
 
+class TestDashboardHonestFailure:
+    """Every ``except`` in the three dashboard collectors routes
+    through ``_check_failed`` — spec:
+    specs/v1.5/DASHBOARD_HONEST_FAILURE_SPEC.md.
+
+    A handler that swallows on its own reports a failed check as a
+    clean book, and on PostgreSQL leaves the transaction aborted for
+    every collector after it. The ``ImportError`` guards (business or
+    scheduling module not loaded) are the one exemption: that is
+    configuration, not failure.
+    """
+
+    _CORE = _REPO_ROOT / "src" / "gnucash_mcp" / "book" / "core.py"
+    _COLLECTORS = (
+        "_business_summary_counts",
+        "_overdue_scheduled_warnings",
+        "_collect_warnings",
+    )
+
+    def test_every_collector_handler_calls_check_failed(self):
+        tree = ast.parse(self._CORE.read_text(), filename=str(self._CORE))
+        seen = set()
+        offenders = []
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.FunctionDef)
+                and node.name in self._COLLECTORS
+            ):
+                continue
+            seen.add(node.name)
+            for handler in ast.walk(node):
+                if not isinstance(handler, ast.ExceptHandler):
+                    continue
+                if (
+                    isinstance(handler.type, ast.Name)
+                    and handler.type.id == "ImportError"
+                ):
+                    continue
+                routed = any(
+                    isinstance(sub, ast.Call)
+                    and isinstance(sub.func, ast.Attribute)
+                    and sub.func.attr == "_check_failed"
+                    for sub in ast.walk(handler)
+                )
+                if not routed:
+                    offenders.append(f"{node.name}:{handler.lineno}")
+        assert seen == set(self._COLLECTORS), f"collectors not found: {seen}"
+        assert not offenders, (
+            "dashboard collector handler that does not call "
+            "_check_failed — a failed check must clear an aborted "
+            "transaction and render its reason, never fall silent:\n"
+            + "\n".join(f"  {o}" for o in offenders)
+        )
+
+
 def _enclosing_def(path: Path, lineno: int) -> str:
     """Name of the function containing ``lineno``, or ""."""
     tree = ast.parse(path.read_text())

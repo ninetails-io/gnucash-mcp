@@ -927,6 +927,19 @@ class BackupMixin:
                 "newest_backup_age_days": int | None,
             }``
         """
+        if not self.source.is_file:
+            # No chain to report on: this server does not back up a
+            # database book (create_backup refuses, _maybe_auto_backup
+            # is a no-op), so the dashboard's backup-health section has
+            # nothing to say. It must answer the empty shape rather
+            # than raise — this raised TypeError on ``book_path.stem``
+            # on every dashboard call, swallowed until the collectors
+            # started reporting failed checks.
+            return {
+                "last_attempt": None,
+                "newest_backup_at": None,
+                "newest_backup_age_days": None,
+            }
         backups_dir = self._backups_dir()
         attempt = _read_attempt_status(backups_dir, self.book_path.stem)
         try:

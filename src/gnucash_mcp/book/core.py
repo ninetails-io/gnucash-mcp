@@ -14,6 +14,7 @@ extracted-to-core dependency in the whole tree.
 """
 
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -22,6 +23,7 @@ import piecash
 
 from gnucash_mcp.logging_config import DEBUG_LOGGER_NAME
 from gnucash_mcp._format import (
+    _redact_uri,
     _candidate_comparison_tsv,
     _dry_run_summary,
     _format_number,
@@ -32,7 +34,34 @@ from gnucash_mcp._format import (
 
 _debug_logger = logging.getLogger(DEBUG_LOGGER_NAME)
 
+# Longest reason a failed-check warning carries. Enough to paste into
+# an issue; short enough that the dashboard stays a dashboard.
+_CHECK_FAILURE_REASON_CHARS = 120
+_URI_IN_TEXT_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://\S+")
+
+
+def _describe_check_failure(check: str, exc: BaseException) -> str:
+    """The one-line, redacted text of a failed dashboard check.
+
+    ``"<Check> check failed: <ExceptionType>: <first line of message>"``.
+    First line only — SQLAlchemy appends the statement, its
+    parameters, and a docs link on later lines, none of which belong
+    on a dashboard. Any URI in the text is password-masked through
+    ``_redact_uri`` (a connection error can quote the DSN). Truncated
+    with an ellipsis past ``_CHECK_FAILURE_REASON_CHARS``.
+
+    The reason travels inline because the debug log is opt-in and
+    the users this reaches are the ones who never turned it on.
+    """
+    first = (str(exc).strip().splitlines() or [""])[0].strip()
+    first = _URI_IN_TEXT_RE.sub(lambda m: _redact_uri(m.group(0)), first)
+    if len(first) > _CHECK_FAILURE_REASON_CHARS:
+        first = first[: _CHECK_FAILURE_REASON_CHARS - 1] + "…"
+    reason = f"{type(exc).__name__}: {first}" if first else type(exc).__name__
+    return f"{check} check failed: {reason}"
+
 from gnucash_mcp.book._base import (
+    _rollback_if_aborted,
     _txn_sort_key,
     _budget_targets,
     _account_to_compact_line,
@@ -179,7 +208,46 @@ class CoreMixin:
     # pending before reconciliation makes sense.
     _LAST_ENTRY_WARN_DAYS = 14
 
-    def _business_summary_counts(self, book) -> dict:
+    # ── Honest failure for the dashboard collectors ────────────────
+    # Every ``except`` in _business_summary_counts,
+    # _overdue_scheduled_warnings, and _collect_warnings routes through
+    # _check_failed (locked by TestDashboardHonestFailure in
+    # test_contract_integrity.py). Spec:
+    # specs/v1.5/DASHBOARD_HONEST_FAILURE_SPEC.md.
+
+    def _check_failed(self, book, check: str, exc: BaseException) -> str:
+        """Record a failed dashboard check; return its warning line.
+
+        Three things, in order, and the only place any of them
+        happens for the collectors:
+
+        1. ``_rollback_if_aborted`` — on PostgreSQL a failed statement
+           aborts the transaction and every later collector's query
+           would fail with InFailedSqlTransaction, each swallowed in
+           turn: one bad check blanked the whole dashboard downstream
+           of it, silently. Clearing the state here keeps "skip the
+           failed check, emit the rest" true on every backend.
+        2. Debug log with the traceback, for those who have one.
+        3. The visible line, reason inline (``_describe_check_failure``),
+           because most users have no log to check. A missing warning
+           is indistinguishable from a clean book; a failed check
+           must never read as "all clear".
+        """
+        _rollback_if_aborted(book.session)
+        _debug_logger.debug("summary: %s check failed", check, exc_info=True)
+        return _describe_check_failure(check, exc)
+
+    @staticmethod
+    def _summarize_item_failures(lines: list[str], noun: str) -> str:
+        """One line for a per-item loop that skipped some items:
+        the first failure's text plus how many were skipped. Never
+        one line per item — fifty bad rows are one problem."""
+        n = len(lines)
+        return f"{lines[0]} — {n} {noun}{'' if n == 1 else 's'} skipped"
+
+    def _business_summary_counts(
+        self, book, failures: list[str] | None = None,
+    ) -> dict:
         """Action-signal counts for the get_book_summary business
         lines: open/overdue invoices and bills, active jobs. Returns
         zeros when BusinessMixin isn't loaded.
@@ -220,6 +288,7 @@ class CoreMixin:
             for lot in acct.lots:
                 lots_by_guid[lot.guid] = lot
 
+        item_failures: list[str] = []
         for inv in book.session.query(Invoice).filter(
             Invoice.date_posted.isnot(None),
         ).all():
@@ -233,12 +302,10 @@ class CoreMixin:
                 balance = calc_lot_balance(lot_obj)
                 if balance == 0:
                     continue
-            except Exception:
-                # Swallow ORM hiccups so summary signals survive
-                # partial corruption; --debug captures the cause.
-                _debug_logger.debug(
-                    "summary signals: invoice eval failed; skipping",
-                    exc_info=True,
+            except Exception as exc:
+                # Recorded, not swallowed — see _check_failed.
+                item_failures.append(
+                    self._check_failed(book, "Business-count", exc)
                 )
                 continue
 
@@ -250,10 +317,9 @@ class CoreMixin:
             if get_is_cn is not None:
                 try:
                     is_credit_note = bool(get_is_cn(inv))
-                except Exception:
-                    _debug_logger.debug(
-                        "summary signals: credit-note check failed",
-                        exc_info=True,
+                except Exception as exc:
+                    item_failures.append(
+                        self._check_failed(book, "Business-count", exc)
                     )
 
             is_overdue = False
@@ -262,12 +328,11 @@ class CoreMixin:
                     due_date, _ = resolve_due(book, inv)
                     if due_date is not None and due_date < today:
                         is_overdue = True
-                except Exception:
-                    # Due-date resolution can fail on
-                    # corrupt term records; surface in debug log.
-                    _debug_logger.debug(
-                        "summary signals: due date resolve failed",
-                        exc_info=True,
+                except Exception as exc:
+                    # Due-date resolution can fail on corrupt term
+                    # records; the document still counts as open.
+                    item_failures.append(
+                        self._check_failed(book, "Business-count", exc)
                     )
 
             if inv.owner_type == 4:  # vendor bill
@@ -287,17 +352,22 @@ class CoreMixin:
                     if is_overdue:
                         out["overdue_invoices"] += 1
 
+        if item_failures and failures is not None:
+            failures.append(
+                self._summarize_item_failures(item_failures, "document")
+            )
         try:
             out["active_jobs"] = book.session.query(Job).filter(
                 Job.active == 1,
             ).count()
-        except Exception:
-            # The jobs table may not exist on very old books;
-            # log and continue.
-            _debug_logger.debug(
-                "summary signals: active jobs query failed",
-                exc_info=True,
-            )
+        except Exception as exc:
+            # The jobs table may not exist on very old books. On
+            # PostgreSQL the failed query also aborts the
+            # transaction; _check_failed clears it before the next
+            # collector runs.
+            line = self._check_failed(book, "Active-jobs", exc)
+            if failures is not None:
+                failures.append(line)
 
         return out
 
@@ -654,6 +724,7 @@ class CoreMixin:
 
     def _overdue_scheduled_warnings(
         self, book: piecash.Book, today: date,
+        failures: list[str] | None = None,
     ) -> list[dict]:
         """Overdue-scheduled entries, most overdue first — each
         ``{days, name, msg}``; ``len()`` still feeds the Scheduled
@@ -672,6 +743,7 @@ class CoreMixin:
         try:
             from piecash.core.transaction import ScheduledTransaction
             overdue_entries: list[tuple[int, str]] = []
+            item_failures: list[str] = []
             for sx in book.session.query(ScheduledTransaction).all():
                 if not sx.enabled:
                     continue
@@ -687,8 +759,15 @@ class CoreMixin:
                             f"Overdue scheduled: {sx.name} "
                             f"due {next_occ.isoformat()}",
                         ))
-                except Exception:
+                except Exception as exc:
+                    item_failures.append(
+                        self._check_failed(book, "Overdue-schedule", exc)
+                    )
                     continue
+            if item_failures and failures is not None:
+                failures.append(
+                    self._summarize_item_failures(item_failures, "schedule")
+                )
             # Most overdue first; equal days by name, so the "+N
             # more" preview names the same three on every backend.
             overdue_entries.sort(key=lambda e: (-e[0], e[1]))
@@ -696,7 +775,10 @@ class CoreMixin:
                 {"days": d, "name": n, "msg": m}
                 for d, n, m in overdue_entries
             ]
-        except Exception:
+        except Exception as exc:
+            line = self._check_failed(book, "Overdue-schedule", exc)
+            if failures is not None:
+                failures.append(line)
             return []
 
     def _collect_warnings(
@@ -706,6 +788,7 @@ class CoreMixin:
         accounts: list,
         overdue_scheduled: list[dict] | None = None,
         last_entry_days_behind: int | None = None,
+        check_failures: list[str] | None = None,
     ) -> list[str]:
         """Collect warnings for the consolidated Warnings section.
 
@@ -730,6 +813,8 @@ class CoreMixin:
         computes it here for direct callers.
         """
         today = date.today()
+        if check_failures is None:
+            check_failures = []
         default_currency = self._require_default_currency(book)
 
         # ── 1. Data integrity: Imbalance / Orphan accounts ──
@@ -849,8 +934,10 @@ class CoreMixin:
                 # Lowest balance first — most urgent.
                 low_cash_entries.sort(key=lambda e: e[0])
                 low_cash = [msg for _, msg in low_cash_entries]
-        except Exception:
-            pass
+        except Exception as exc:
+            check_failures.append(
+                self._check_failed(book, "Low-cash", exc)
+            )
 
         # ── 3. Overdue invoices and bills ──
         # Posted, non-zero lot balance, due date past. Requires
@@ -878,6 +965,7 @@ class CoreMixin:
                     self, "_OWNER_TYPE_TO_RESPONSE_TYPE", {},
                 )
                 overdue_inv_entries: list[tuple[int, str]] = []
+                item_failures: list[str] = []
                 get_is_cn = getattr(
                     self, "_get_is_credit_note", None,
                 )
@@ -956,14 +1044,27 @@ class CoreMixin:
                         overdue_inv_entries.append(
                             (days_overdue, msg),
                         )
-                    except Exception:
+                    except Exception as exc:
+                        item_failures.append(
+                            self._check_failed(
+                                book, "Overdue-document", exc,
+                            )
+                        )
                         continue
+                if item_failures:
+                    check_failures.append(
+                        self._summarize_item_failures(
+                            item_failures, "document",
+                        )
+                    )
                 overdue_inv_entries.sort(reverse=True)
                 overdue_invoices = [
                     msg for _, msg in overdue_inv_entries
                 ]
-            except Exception:
-                pass
+            except Exception as exc:
+                check_failures.append(
+                    self._check_failed(book, "Overdue-document", exc)
+                )
 
         # ── 4. Stale prices ──
         stale_prices: list[str] = []
@@ -1036,14 +1137,17 @@ class CoreMixin:
                 ),
                 escape_hatch="get_prices / create_prices to refresh",
             )
-        except Exception:
-            # Per spec: skip failed checks, emit the rest.
-            pass
+        except Exception as exc:
+            # Per spec: skip the failed check, emit the rest — and
+            # say which one failed.
+            check_failures.append(
+                self._check_failed(book, "Stale-price", exc)
+            )
 
         # ── 5. Overdue scheduled transactions ──
         if overdue_scheduled is None:
             overdue_scheduled = self._overdue_scheduled_warnings(
-                book, today,
+                book, today, failures=check_failures,
             )
 
         # ── 6. Backup health ──
@@ -1075,8 +1179,10 @@ class CoreMixin:
                         f"No backup in {newest_age} days (most recent "
                         f"snapshot is older than 1 month)"
                     )
-            except Exception:
-                pass
+            except Exception as exc:
+                check_failures.append(
+                    self._check_failed(book, "Backup-health", exc)
+                )
 
         # Overdue-scheduled rollup: small lists stay itemized;
         # beyond the threshold, one aggregate line carries count,
@@ -1122,8 +1228,10 @@ class CoreMixin:
                         f"update_scheduled_transaction on any schedule "
                         f"converts all, nothing posted"
                     )
-            except Exception:
-                pass
+            except Exception as exc:
+                check_failures.append(
+                    self._check_failed(book, "Legacy-recipe", exc)
+                )
 
         # Staleness linkage: when the book itself is far behind,
         # time-based warnings describe the gap, not events — say so
@@ -1143,6 +1251,7 @@ class CoreMixin:
         return (
             staleness_note
             + integrity
+            + check_failures
             + legacy_recipe
             + backup_health
             + low_cash
@@ -2461,7 +2570,13 @@ class CoreMixin:
                 c.mnemonic for c in book.commodities
                 if c.namespace.lower() != "template"
             ))
-            biz_counts = self._business_summary_counts(book)
+            # Failed checks are collected across all three collectors
+            # and rendered as warnings — a check that could not run is
+            # never reported as "all clear".
+            check_failures: list[str] = []
+            biz_counts = self._business_summary_counts(
+                book, failures=check_failures,
+            )
 
             # Section renderers chain in output order — reorder by
             # moving lines, not editing a template.
@@ -2478,7 +2593,7 @@ class CoreMixin:
             # Warnings section and the Scheduled line's overdue
             # count, so the two can't disagree.
             overdue_sched = self._overdue_scheduled_warnings(
-                book, date.today(),
+                book, date.today(), failures=check_failures,
             )
             days_behind_for_warnings = (
                 (date.today() - last_date).days
@@ -2488,6 +2603,7 @@ class CoreMixin:
                 book, transactions, accounts,
                 overdue_scheduled=overdue_sched,
                 last_entry_days_behind=days_behind_for_warnings,
+                check_failures=check_failures,
             )
             if warnings:
                 lines.append("Warnings:")

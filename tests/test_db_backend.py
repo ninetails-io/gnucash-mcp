@@ -272,6 +272,22 @@ class TestBackupDegradation:
         uri_book._maybe_auto_backup()
         assert uri_book._backup_checked_in_process is False
 
+    def test_backup_health_is_empty_not_an_error(self, uri_book):
+        """No chain, no report — and no exception. This raised
+        TypeError on ``book_path.stem`` for every database book's
+        dashboard call; the collectors swallowed it until they started
+        reporting failed checks (the honest-failure branch's first
+        catch)."""
+        assert uri_book.get_backup_health() == {
+            "last_attempt": None,
+            "newest_backup_at": None,
+            "newest_backup_age_days": None,
+        }
+
+    def test_dashboard_has_no_failed_check_on_a_uri_book(self, uri_book):
+        result = uri_book.get_book_summary()
+        assert "check failed" not in result
+
     def test_file_books_still_back_up(self, test_book: Path):
         book = GnuCashBook(str(test_book))
         result = book.create_backup(label="regression")
@@ -928,6 +944,40 @@ class _RealDatabaseTests:
         result = db_book.delete_invoice(inv["id"])
         assert result["status"] == "deleted"
         assert db_book.get_taxtable("VAT")["refcount"] == 0
+
+    def test_dashboard_recovers_from_an_aborted_transaction(
+        self, db_book, monkeypatch,
+    ):
+        """Poison the transaction just ahead of one collector. On
+        PostgreSQL that collector's first query fails with
+        InFailedSqlTransaction; ``_check_failed`` reports it once and
+        clears the abort, so every collector after it runs and the
+        dashboard returns. MySQL has no aborted state: nothing fails,
+        nothing is reported. Spec:
+        specs/v1.5/DASHBOARD_HONEST_FAILURE_SPEC.md.
+        """
+        from sqlalchemy import text
+
+        original = GnuCashBook._overdue_scheduled_warnings
+
+        def poisoned(self, book, today, failures=None):
+            try:
+                book.session.execute(text("SELECT no_such_column_anywhere"))
+            except Exception:
+                pass  # deliberately NOT cleared — that is the point
+            return original(self, book, today, failures=failures)
+
+        monkeypatch.setattr(
+            GnuCashBook, "_overdue_scheduled_warnings", poisoned,
+        )
+        result = db_book.get_book_summary()
+        assert "Accounts:" in result
+        if self.ABORTS_ON_ERROR:
+            assert "Overdue-schedule check failed" in result
+            assert "InFailedSqlTransaction" in result
+            assert result.count("check failed") == 1, result
+        else:
+            assert "check failed" not in result
 
     def test_rollback_if_aborted(self, db_book):
         """The real-driver half of ``TestRollbackIfAborted``: after a
