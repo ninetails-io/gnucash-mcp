@@ -2233,6 +2233,26 @@ class TestGetBookSummaryWarnings:
     ``specs/GET_BOOK_SUMMARY_SPEC.md`` §5.
     """
 
+
+    @staticmethod
+    def _hold_shares(gc, account, shares="2", cost="250"):
+        """Put a nonzero position in ``account`` — the stale-price
+        check only nags about securities someone actually holds."""
+        with gc.open(readonly=False) as book:
+            sec = gc._find_account(book, account)
+            checking = gc._find_account(book, "Assets:Checking")
+            book.session.add(piecash.Transaction(
+                currency=book.default_currency,
+                description=f"Buy {account}",
+                post_date=date.today() - timedelta(days=5),
+                splits=[
+                    piecash.Split(account=sec, value=Decimal(cost),
+                                  quantity=Decimal(shares)),
+                    piecash.Split(account=checking,
+                                  value=-Decimal(cost)),
+                ],
+            ))
+            book.save()
     def test_section_omitted_when_no_warnings(self, test_book: Path):
         """No warnings → no header, no body — absence is the signal.
         The fixture is a clean book with no integrity issues, no
@@ -2347,6 +2367,7 @@ class TestGetBookSummaryWarnings:
         single price on 2026-01-15, which is now well past the
         30-day cutoff."""
         gc = GnuCashBook(str(investment_book))
+        self._hold_shares(gc, "Assets:Investments:VTSAX")
         result = gc.get_book_summary()
         assert "Warnings:" in result
         warnings_block = result.split("Warnings:")[1].split(
@@ -2355,6 +2376,18 @@ class TestGetBookSummaryWarnings:
         assert "VTSAX" in warnings_block
         assert "Stale price" in warnings_block
         assert "days ago" in warnings_block
+
+    def test_stale_price_skips_security_nobody_holds(
+        self, investment_book: Path,
+    ):
+        """A fund swapped out to zero keeps its account and
+        commodity, but a quote for it values nothing — no warning
+        (live book, 2026-09-24: an emptied 401k fund nagged for a
+        price). Holding any shares brings the warning back."""
+        gc = GnuCashBook(str(investment_book))
+        assert "Stale price" not in gc.get_book_summary()
+        self._hold_shares(gc, "Assets:Investments:VTSAX")
+        assert "Stale price: VTSAX" in gc.get_book_summary()
 
     def test_unpriced_commodity_in_use_warns_no_price_on_file(
         self, test_book: Path,
@@ -2379,6 +2412,7 @@ class TestGetBookSummaryWarnings:
                 commodity=wild,
             )
             book.save()
+        self._hold_shares(gc, "Assets:WILD")
         result = gc.get_book_summary()
         assert "Warnings:" in result
         warnings_block = result.split("Warnings:")[1].split(
@@ -3048,6 +3082,7 @@ class TestGetBookSummaryWarnings:
         """When emitted, Warnings appears above Accounts — that's
         the scan-first ordering the spec calls for."""
         gc = GnuCashBook(str(investment_book))
+        self._hold_shares(gc, "Assets:Investments:VTSAX")
         result = gc.get_book_summary()
         assert "Warnings:" in result
         warnings_idx = result.index("Warnings:")

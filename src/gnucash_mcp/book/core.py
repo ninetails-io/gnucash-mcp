@@ -1082,9 +1082,23 @@ class CoreMixin:
             # "no price on file" warning on desktop-created books.
             template_guids = self._template_account_guids(book)
             in_use: set = set()
+            # Securities held in a nonzero quantity somewhere. A
+            # fund swapped out to zero keeps its account (history)
+            # and its commodity, but a quote for it values nothing —
+            # the warning nagged a live book to price an empty 401k
+            # fund (2026-09-24). Currencies are exempt: flow reports
+            # convert foreign transactions at their rate whether or
+            # not any account holds a balance.
+            held: set = set()
             for a in accounts:
                 if a.type != "ROOT" and a.guid not in template_guids:
                     in_use.add(a.commodity.guid)
+                    if (
+                        a.commodity.namespace != "CURRENCY"
+                        and a.commodity.guid not in held
+                        and self._own_splits_balance(a, as_of=today) != 0
+                    ):
+                        held.add(a.commodity.guid)
 
             # One pass over the price list builds both signals: in-use
             # commodities and latest market-price date. ``market_only``
@@ -1113,6 +1127,11 @@ class CoreMixin:
                 if commodity == default_currency:
                     continue
                 if commodity.guid not in in_use:
+                    continue
+                if (
+                    commodity.namespace != "CURRENCY"
+                    and commodity.guid not in held
+                ):
                     continue
                 latest = by_commodity_latest.get(commodity.guid)
                 if latest is None:
