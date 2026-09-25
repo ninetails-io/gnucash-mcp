@@ -2385,10 +2385,20 @@ class CoreMixin:
                     plural = (
                         "s" if upcoming["count"] != 1 else ""
                     )
-                    total_int = int(upcoming["total"])
-                    amount_part = f"{currency} {total_int:,}"
+                    # Cash out and in stay separate: one signless
+                    # total read a paycheck as a bill.
+                    flows = [
+                        f"{currency} {int(upcoming[key]):,} {label}"
+                        for key, label in (
+                            ("cash_out", "out"), ("cash_in", "in"),
+                        )
+                        if int(upcoming[key])
+                    ]
+                    amount_part = (
+                        ", ".join(flows) if flows else "no cash moves"
+                    )
                     # Foreign-currency schedules with no market
-                    # rate can't join the sum — say so rather than
+                    # rate can't join the sums — say so rather than
                     # silently understate the week's bills.
                     if upcoming.get("unrated"):
                         amount_part += (
