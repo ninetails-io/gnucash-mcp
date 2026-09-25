@@ -1486,6 +1486,10 @@ class CoreMixin:
         retirement money (penalty-locked — see
         ``_is_in_retirement_subtree``).
 
+        Taxable brokerage positions are liquid; retirement-wrapped
+        holdings are not — decided, not inherited (bookkeeper
+        ruling, 2026-09-24).
+
         The one definition of the pool: runway's numerator sums
         these balances and ``_daily_cash_burn`` measures cash
         leaving them, so the two can't drift apart.

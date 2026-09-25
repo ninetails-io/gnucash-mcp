@@ -1556,7 +1556,11 @@ class TestRunwayCashBurn:
 
     def test_numerator_and_burn_share_one_pool(self):
         """Runway's liquid sum and the burn read the same predicate
-        — the pool can't be edited in one place and not the other."""
+        — the pool can't be edited in one place and not the other.
+
+        Taxable brokerage positions are liquid; retirement-wrapped
+        holdings are not — decided, not inherited (bookkeeper
+        ruling, 2026-09-24)."""
         import inspect
         from gnucash_mcp.book.core import CoreMixin
         for fn in (CoreMixin._runway_metrics, CoreMixin._daily_cash_burn):
