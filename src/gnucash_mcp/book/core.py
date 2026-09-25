@@ -866,13 +866,18 @@ class CoreMixin:
         integrity = [msg for _, msg in integrity]
 
         # ── 2. Critically low cash ──
-        # Threshold = 1 day of daily burn — scales with actual cash
-        # outflow instead of a fixed dollar floor. Skipped when
-        # nothing left the liquid pool in the window.
+        # Threshold = 1 day of the ACCOUNT'S OWN outflow, not the
+        # household's burn. Measured against total burn, a thin
+        # payments account (Cash App, a wallet) read "critical"
+        # while checking beside it held thousands — the honest burn
+        # of the runway fix pushed a live book's $299 spillway under
+        # the line (2026-09-24). Its own pace ($26/day) says 11
+        # days. An account with no outflow in the window has no
+        # pace to run out at and never fires.
         low_cash: list[str] = []
         try:
-            daily_burn = self._daily_cash_burn(book, transactions)
-            if daily_burn > 0:
+            own_out = self._account_daily_outflows(book, transactions)
+            if own_out:
                 template_guids = self._template_account_guids(book)
                 rates = self._rates_as_of(
                     book, today, default_currency,
@@ -920,7 +925,10 @@ class CoreMixin:
                             continue
                         balance_default = balance_qty * rate
 
-                    if balance_default >= daily_burn:
+                    # Own-commodity comparison: balance and pace are
+                    # in the same units, no rate needed.
+                    pace = own_out.get(account.guid, Decimal("0"))
+                    if pace <= 0 or balance_qty >= pace:
                         continue
 
                     leaf = account.fullname.split(":")[-1]
@@ -929,7 +937,7 @@ class CoreMixin:
                         balance_default,
                         f"Critically low cash: {leaf} at "
                         f"{default_currency.mnemonic} {amount_str} "
-                        f"(under 1 day of burn)",
+                        f"(under 1 day of its own outflow)",
                     ))
                 # Lowest balance first — most urgent.
                 low_cash_entries.sort(key=lambda e: e[0])
@@ -1524,8 +1532,8 @@ class CoreMixin:
         (bookkeeper ruling, 2026-09-24; the expense-sum burn it
         replaced counted ~$73/day of withholding on a live book).
 
-        Shared between runway (divisor) and the critically-low-cash
-        warning (threshold) so the two agree by construction.
+        Runway's divisor only: the low-cash warning measures each
+        account against its own pace (``_account_daily_outflows``).
         ``transactions`` is the list get_book_summary materializes
         once and threads through. Returns ``Decimal("0")`` when
         nothing left the pool in the window.
@@ -1586,6 +1594,37 @@ class CoreMixin:
             if net < 0:
                 cash_out -= net
         return cash_out / Decimal(days)
+
+    def _account_daily_outflows(
+        self, book: piecash.Book, transactions: list,
+        days: int | None = None,
+    ) -> dict[str, Decimal]:
+        """``{account_guid: average daily outflow}`` in each
+        account's own commodity, over the burn window. Per
+        transaction an account's legs net; a negative net is
+        outflow. Accounts with none are absent. The low-cash
+        check's yardstick: each account against its own pace.
+        """
+        days = self._burn_window_days(transactions, days)
+        today = date.today()
+        window_start = today - timedelta(days=days)
+        out: dict[str, Decimal] = {}
+        for txn in transactions:
+            if txn.post_date is None:  # old-book artifact
+                continue
+            if txn.post_date < window_start or txn.post_date > today:
+                continue
+            net: dict[str, Decimal] = {}
+            for s in txn.splits:
+                if s.account.type in ("BANK", "CASH"):
+                    net[s.account.guid] = (
+                        net.get(s.account.guid, Decimal("0"))
+                        + Decimal(str(s.quantity))
+                    )
+            for guid, amt in net.items():
+                if amt < 0:
+                    out[guid] = out.get(guid, Decimal("0")) - amt
+        return {g: v / Decimal(days) for g, v in out.items()}
 
     def _runway_metrics(
         self,

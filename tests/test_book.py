@@ -2547,39 +2547,77 @@ class TestGetBookSummaryWarnings:
             )[0]
             assert "Disabled Schedule" not in warnings_block
 
-    def test_low_cash_below_one_day_burn_warns(
-        self, test_book: Path,
-    ):
-        """A BANK / CASH account whose balance falls below one day
-        of daily expense burn earns a 'Critically low cash:'
-        warning. Threshold scales with the user's actual spending,
-        not a fixed dollar floor.
-
-        Regression for the cousin's report on Alex's $6 Savings
-        account at $683/day burn — relative threshold catches it
-        cleanly."""
-        gc = GnuCashBook(str(test_book))
-        # Seed enough expense activity that daily_burn is high
-        # enough to flag fixture's tiny accounts. With $36,000
-        # over 180 days → $200/day burn. Fixture's Savings doesn't
-        # exist, so add one with a $5 balance.
-        gc.create_account(
-            name="Savings", account_type="BANK", parent="Assets",
-        )
+    def _fund(self, gc, account, amount, days_ago):
         with gc.open(readonly=False) as book:
-            savings = gc._find_account(book, "Assets:Savings")
+            acct = gc._find_account(book, account)
             opening = gc._find_account(book, "Equity:Opening Balance")
             book.session.add(piecash.Transaction(
                 currency=book.default_currency,
-                description="Token deposit",
-                post_date=date.today() - timedelta(days=20),
+                description=f"Fund {account}",
+                post_date=date.today() - timedelta(days=days_ago),
                 splits=[
-                    piecash.Split(account=savings, value=Decimal("5")),
-                    piecash.Split(account=opening, value=Decimal("-5")),
+                    piecash.Split(account=acct, value=Decimal(amount)),
+                    piecash.Split(account=opening,
+                                  value=-Decimal(amount)),
                 ],
             ))
             book.save()
-        # Seed $36,000 of expenses → $200/day burn.
+
+    def test_low_cash_below_one_day_of_own_outflow_warns(
+        self, test_book: Path,
+    ):
+        """A BANK / CASH account whose balance is under one day of
+        its OWN outflow earns a 'Critically low cash:' warning —
+        it's about to run dry at the pace it's actually drawn on."""
+        gc = GnuCashBook(str(test_book))
+        gc.create_account(
+            name="Savings", account_type="BANK", parent="Assets",
+        )
+        self._fund(gc, "Assets:Savings", "1000", 170)
+        # $995 out over the window → ~$5.53/day; $5 left.
+        gc.create_transaction(
+            description="Drawdown",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "995"},
+                {"account": "Assets:Savings", "amount": "-995"},
+            ],
+            trans_date=date.today() - timedelta(days=30),
+            check_duplicates=False,
+        )
+        result = gc.get_book_summary()
+        warnings_block = result.split("Warnings:")[1].split(
+            "Accounts:"
+        )[0]
+        assert "Critically low cash: Savings" in warnings_block
+        assert "under 1 day of its own outflow" in warnings_block
+
+    def test_thin_spillway_does_not_warn_against_household_burn(
+        self, test_book: Path,
+    ):
+        """A small payments account measured against the whole
+        household's burn read "critical" while checking held
+        thousands (live book, 2026-09-24: Cash App at $299 vs
+        $309/day). Against its own $26/day it has 11 days; an
+        account with no outflow at all (a wallet) never fires."""
+        gc = GnuCashBook(str(test_book))
+        gc.create_account(
+            name="Cash App", account_type="BANK", parent="Assets",
+        )
+        gc.create_account(
+            name="Wallet", account_type="CASH", parent="Assets",
+        )
+        self._fund(gc, "Assets:Cash App", "180", 100)  # $150 left
+        self._fund(gc, "Assets:Wallet", "40", 100)
+        gc.create_transaction(
+            description="Small spend",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "30"},
+                {"account": "Assets:Cash App", "amount": "-30"},
+            ],
+            trans_date=date.today() - timedelta(days=20),
+            check_duplicates=False,
+        )
+        # Household burn of $200/day dwarfs both balances.
         gc.create_transaction(
             description="Burn",
             splits=[
@@ -2589,15 +2627,9 @@ class TestGetBookSummaryWarnings:
             trans_date=date.today() - timedelta(days=30),
             check_duplicates=False,
         )
-
         result = gc.get_book_summary()
-        assert "Warnings:" in result
-        warnings_block = result.split("Warnings:")[1].split(
-            "Accounts:"
-        )[0]
-        assert "Critically low cash" in warnings_block
-        assert "Savings" in warnings_block
-        assert "under 1 day of burn" in warnings_block
+        assert "Critically low cash: Cash App" not in result
+        assert "Critically low cash: Wallet" not in result
 
     def test_low_cash_above_one_day_burn_does_not_warn(
         self, test_book: Path,
@@ -2743,9 +2775,8 @@ class TestGetBookSummaryWarnings:
             assert "uncleared suspense balance" in warnings_block
 
     def test_low_cash_skipped_when_no_burn(self, test_book: Path):
-        """When the book has no expense activity in the burn
-        window, there's no daily-burn benchmark. Skip the
-        low-cash check entirely rather than guess a threshold."""
+        """An account with no outflow in the window has no pace to
+        run out at — a deposit-only account never fires."""
         gc = GnuCashBook(str(test_book))
         gc.create_account(
             name="Empty Savings", account_type="BANK", parent="Assets",
