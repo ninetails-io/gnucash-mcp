@@ -1505,6 +1505,64 @@ class TestGetBookSummaryMonthlyNet:
         assert "+811" in prior_row
 
 
+class TestRunwayCashBurn:
+    """Runway's burn is cash leaving its own liquid pool — a fact
+    the ledger transcribes, not a spending model (bookkeeper
+    ruling, 2026-09-24). The expense-sum burn it replaced counted
+    payroll withholding that never touches the pool (~$73/day on
+    a live book) and missed card/loan payments that drain it."""
+
+    def test_burn_counts_what_leaves_the_pool(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        gc.create_account(name="Savings", account_type="BANK",
+                          parent="Assets")
+        gc.create_account(name="Retirement Cash", account_type="BANK",
+                          parent="Assets")
+        gc.create_account(name="Card", account_type="CREDIT",
+                          parent="Liabilities")
+        gc.create_account(name="Taxes", account_type="EXPENSE",
+                          parent="Expenses")
+        when = date.today() - timedelta(days=10)
+        for desc, splits in [
+            # Withholding never reaches checking: no cash out.
+            ("Paycheck", [("Assets:Checking", "2000"),
+                          ("Expenses:Taxes", "500"),
+                          ("Income:Salary", "-2500")]),
+            # A card charge moves no cash until it's paid.
+            ("Card charge", [("Expenses:Groceries", "100"),
+                             ("Liabilities:Card", "-100")]),
+            ("Card payment", [("Liabilities:Card", "300"),
+                              ("Assets:Checking", "-300")]),
+            # Pool-internal move nets to zero.
+            ("Sweep", [("Assets:Checking", "-400"),
+                       ("Assets:Savings", "400")]),
+            # Into retirement leaves the pool...
+            ("IRA contribution", [("Assets:Checking", "-250"),
+                                  ("Assets:Retirement Cash", "250")]),
+            # ...and spending from retirement never was in it.
+            ("From IRA", [("Expenses:Groceries", "50"),
+                          ("Assets:Retirement Cash", "-50")]),
+        ]:
+            gc.create_transaction(
+                description=desc,
+                splits=[{"account": a, "amount": v} for a, v in splits],
+                trans_date=when, check_duplicates=False,
+            )
+        with gc.open(readonly=True) as book:
+            burn = gc._daily_cash_burn(book, list(book.transactions))
+        # Card payment 300 + IRA contribution 250. The expense-sum
+        # burn would have read 650 (taxes 500 + groceries 150).
+        assert (burn * 180).quantize(Decimal("0.01")) == Decimal("550")
+
+    def test_numerator_and_burn_share_one_pool(self):
+        """Runway's liquid sum and the burn read the same predicate
+        — the pool can't be edited in one place and not the other."""
+        import inspect
+        from gnucash_mcp.book.core import CoreMixin
+        for fn in (CoreMixin._runway_metrics, CoreMixin._daily_cash_burn):
+            assert "_is_runway_liquid(" in inspect.getsource(fn)
+
+
 class TestGetBookSummaryRunway:
     """Runway section in get_book_summary.
 
@@ -1568,14 +1626,15 @@ class TestGetBookSummaryRunway:
         assert "days" in runway_line
         assert "USD" in runway_line
         assert "liquid" in runway_line
-        assert "/day burn" in runway_line
+        assert "/day cash out incl. debt paydown" in runway_line
         # Burn-averaging window is disclosed (book-age clamped,
         # so the exact day count varies with the fixture's age).
         assert "-day avg)" in runway_line
         # Comma-separated for the liquid (2,670).
         assert "2,670" in runway_line
-        # No decimals.
-        assert "." not in runway_line
+        # No decimals (the label's "incl." is prose, not a number).
+        import re
+        assert not re.search(r"\d\.\d", runway_line)
 
     def test_warning_below_60_days(self, test_book: Path):
         """Runway < 60 days → ⚠ marker."""
@@ -10721,7 +10780,7 @@ class TestMultiCurrencyBalances:
 class TestMultiCurrencyDashboardHelpers:
     """v1.3.0 follow-up to the spending/income FX-conversion fix:
     three dashboard helpers (``_monthly_net_income``,
-    ``_daily_expense_burn``, ``_budget_headline``) and one report
+    ``_daily_cash_burn``, ``_budget_headline``) and one report
     (``vendor_spending_report``) were summing ``split.value`` /
     ``split.quantity`` raw across currencies. Same class of bug —
     silently wrong on any book with foreign-currency activity.
@@ -10821,7 +10880,7 @@ class TestMultiCurrencyDashboardHelpers:
             f"expected +1,200 in MTD line, got: {mtd_line!r}"
         )
 
-    def test_daily_expense_burn_converts_foreign_currency_expense(
+    def test_daily_cash_burn_converts_foreign_currency_expense(
         self, multi_currency_book: Path,
     ):
         """Runway's daily-burn divisor must reflect foreign-currency
@@ -10862,11 +10921,11 @@ class TestMultiCurrencyDashboardHelpers:
                 ],
             ))
             bk.save()
-            # _daily_expense_burn is an instance method requiring a
+            # _daily_cash_burn is an instance method requiring a
             # book session — call it within an open block.
             transactions = list(bk.transactions)
             from datetime import timedelta
-            burn = gc_book._daily_expense_burn(
+            burn = gc_book._daily_cash_burn(
                 bk, transactions, days=30,
             )
             # €200 × 1.50 = $300 of expense in default currency.

@@ -866,12 +866,12 @@ class CoreMixin:
         integrity = [msg for _, msg in integrity]
 
         # ── 2. Critically low cash ──
-        # Threshold = 1 day of daily burn — scales with actual
-        # spending instead of a fixed dollar floor. Skipped when the
-        # book has no expense activity.
+        # Threshold = 1 day of daily burn — scales with actual cash
+        # outflow instead of a fixed dollar floor. Skipped when
+        # nothing left the liquid pool in the window.
         low_cash: list[str] = []
         try:
-            daily_burn = self._daily_expense_burn(book, transactions)
+            daily_burn = self._daily_cash_burn(book, transactions)
             if daily_burn > 0:
                 template_guids = self._template_account_guids(book)
                 rates = self._rates_as_of(
@@ -1460,7 +1460,7 @@ class CoreMixin:
         Book-age clamp: ``_RUNWAY_BURN_DAYS`` is a MAX, not a fixed
         denominator — dividing by 180 on a 19-day-old book
         overstates runway ~10×. The 1-day floor avoids
-        divide-by-zero. Shared between ``_daily_expense_burn`` (the
+        divide-by-zero. Shared between ``_daily_cash_burn`` (the
         divisor) and the Runway render (the label) so the displayed
         window always matches the math.
         """
@@ -1476,40 +1476,112 @@ class CoreMixin:
             days = min(days, book_age_days)
         return days
 
-    def _daily_expense_burn(
+    def _is_runway_liquid(
+        self, account, book: piecash.Book, template_guids: set,
+    ) -> bool:
+        """True when ``account`` is in runway's liquid pool: a
+        ``_RUNWAY_LIQUID_TYPES`` account that isn't the root, a
+        template, a placeholder, a suspense/Imbalance account
+        (unresolved bookkeeping, not money to live on), or
+        retirement money (penalty-locked — see
+        ``_is_in_retirement_subtree``).
+
+        The one definition of the pool: runway's numerator sums
+        these balances and ``_daily_cash_burn`` measures cash
+        leaving them, so the two can't drift apart.
+        """
+        return (
+            account.type in self._RUNWAY_LIQUID_TYPES
+            and account.guid not in template_guids
+            and not account.placeholder
+            and not self._is_auto_balancing_account(
+                account, book.root_account,
+            )
+            and not self._is_in_retirement_subtree(account)
+        )
+
+    def _daily_cash_burn(
         self,
         book: piecash.Book,
         transactions: list,
         days: int | None = None,
     ) -> Decimal:
-        """Average daily EXPENSE outflow over the last ``days`` days.
+        """Average daily cash leaving the liquid pool over the last
+        ``days`` days.
+
+        Per transaction, the liquid legs (``_is_runway_liquid``) net
+        together; a negative net is cash out, a positive one (pay,
+        refunds) is ignored — runway asks how long the pool lasts
+        with nothing coming in. Netting keeps checking→savings and
+        checking→brokerage moves at zero. This is a transcribed
+        fact, not a spending model: payroll withholding never
+        touches the pool and doesn't count, while card and loan
+        payments do — at the pace actually paid, paydown included
+        (bookkeeper ruling, 2026-09-24; the expense-sum burn it
+        replaced counted ~$73/day of withholding on a live book).
 
         Shared between runway (divisor) and the critically-low-cash
         warning (threshold) so the two agree by construction.
-
         ``transactions`` is the list get_book_summary materializes
-        once and threads through. Returns ``Decimal("0")`` when the
-        window has no expense activity. Each split converts to the
-        book default currency — raw ``split.value`` would mix
-        currencies on books with foreign-currency expenses.
+        once and threads through. Returns ``Decimal("0")`` when
+        nothing left the pool in the window.
+
+        Liquid legs share the transaction currency, so they net in
+        ``split.value`` (a stock buy nets to exactly zero) and the
+        net converts at that currency's rate as of today. A foreign
+        transaction currency with no rate on file falls back to
+        each leg's own-commodity amount via the account factors.
         """
         days = self._burn_window_days(transactions, days)
         today = date.today()
         window_start = today - timedelta(days=days)
-        # "Now" burn signal — anchor factors to today.
-        factors = self._account_conversion_factors(book, today)
-        expenses = Decimal("0")
+        default_currency = self._require_default_currency(book)
+        template_guids = self._template_account_guids(book)
+        # "Now" burn signal — anchor rates to today.
+        rates = self._rates_as_of(book, today, default_currency)
+        factors = None
+        pool: dict[str, bool] = {}
+
+        def liquid(acct) -> bool:
+            if acct.guid not in pool:
+                pool[acct.guid] = self._is_runway_liquid(
+                    acct, book, template_guids,
+                )
+            return pool[acct.guid]
+
+        cash_out = Decimal("0")
         for txn in transactions:
             if txn.post_date is None:  # old-book artifact
                 continue
             if txn.post_date < window_start or txn.post_date > today:
                 continue
-            for s in txn.splits:
-                if s.account.type == "EXPENSE":
-                    expenses += self._split_in_default_currency(
-                        s, s.account, factors.get(s.account.guid),
+            legs = [s for s in txn.splits if liquid(s.account)]
+            if not legs:
+                continue
+            net = sum(
+                (Decimal(str(s.value)) for s in legs), Decimal("0"),
+            )
+            if txn.currency != default_currency:
+                rate = rates.get(txn.currency.guid)
+                if rate is not None:
+                    net *= rate
+                else:
+                    if factors is None:
+                        factors = self._account_conversion_factors(
+                            book, today,
+                        )
+                    net = sum(
+                        (
+                            self._split_in_default_currency(
+                                s, s.account, factors.get(s.account.guid),
+                            )
+                            for s in legs
+                        ),
+                        Decimal("0"),
                     )
-        return expenses / Decimal(days)
+            if net < 0:
+                cash_out -= net
+        return cash_out / Decimal(days)
 
     def _runway_metrics(
         self,
@@ -1521,17 +1593,15 @@ class CoreMixin:
         """Compute runway: days the household survives on liquid
         assets at current burn rate if income stopped today.
 
-        **Liquid** = balances in ``_RUNWAY_LIQUID_TYPES`` (see that
-        constant for the ASSET exclusion), minus anything in a
-        Retirement subtree (``_is_in_retirement_subtree`` —
-        penalty-locked money isn't runway). Positions value at
-        shares × latest price with cost-basis fallback, same as
-        net worth.
+        **Liquid** = balances of the ``_is_runway_liquid`` pool
+        (see ``_RUNWAY_LIQUID_TYPES`` for the ASSET exclusion;
+        retirement money is out). Positions value at shares ×
+        latest price with cost-basis fallback, same as net worth.
 
-        **Daily burn** = ``_daily_expense_burn`` over
-        ``_RUNWAY_BURN_DAYS`` (book-age clamped).
+        **Daily burn** = ``_daily_cash_burn`` — cash leaving that
+        same pool — over ``_RUNWAY_BURN_DAYS`` (book-age clamped).
 
-        Special cases: no expense activity → None (section
+        Special cases: nothing left the pool → None (section
         omitted); negative liquid (overdrafts exceed cash) → flag
         dict the caller renders as "0 days ⚠"; otherwise
         ``{runway_days, liquid, daily_burn}``.
@@ -1543,20 +1613,7 @@ class CoreMixin:
         # --- Liquid assets pass over book.accounts ---
         liquid = Decimal("0")
         for account in accounts:
-            if account.type == "ROOT":
-                continue
-            if account.guid in template_guids:
-                continue
-            if account.placeholder:
-                continue
-            if account.type not in self._RUNWAY_LIQUID_TYPES:
-                continue
-            if self._is_auto_balancing_account(account, book.root_account):
-                # Suspense/Imbalance balances aren't runway liquidity —
-                # they're unresolved bookkeeping, not money to live on.
-                continue
-            if self._is_in_retirement_subtree(account):
-                # Penalty-locked money isn't runway — see the helper.
+            if not self._is_runway_liquid(account, book, template_guids):
                 continue
 
             # Cap at today — a rent payment dated +10 days must not
@@ -1577,7 +1634,7 @@ class CoreMixin:
             )
             liquid += converted
 
-        daily_burn = self._daily_expense_burn(
+        daily_burn = self._daily_cash_burn(
             book, transactions, days=self._RUNWAY_BURN_DAYS,
         )
         burn_window = self._burn_window_days(
@@ -1934,11 +1991,16 @@ class CoreMixin:
     ) -> list[str]:
         """Render the Runway line.
 
-        Liquid assets / daily burn → days. The single most
+        Liquid assets / daily cash out → days. The single most
         actionable personal-finance number that doesn't appear on
-        standard financial statements. ``None`` = no expense data in
-        the burn window → omit section. ``negative_liquid`` flag
-        renders the special 0-days-with-warning line.
+        standard financial statements. ``None`` = no cash left the
+        pool in the burn window → omit section. ``negative_liquid``
+        flag renders the special 0-days-with-warning line.
+
+        The label says what the burn is: cash out at the pace
+        actually paid, card and loan paydown included — the lever
+        a reader would pull first in a real income stop, so the
+        number must not hide it.
         """
         if runway is None:
             return []
@@ -1952,7 +2014,7 @@ class CoreMixin:
         return [
             f"Runway: {days} days{warn} "
             f"({currency} {liquid:,} liquid / "
-            f"{currency} {burn:,}/day burn, "
+            f"{currency} {burn:,}/day cash out incl. debt paydown, "
             f"{window}-day avg)"
         ]
 
