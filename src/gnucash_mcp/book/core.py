@@ -3220,7 +3220,7 @@ class CoreMixin:
             .all()
         )
         swept = [
-            (txn, txn.description.lower())
+            (txn, (txn.description or "").lower())
             for txn in loaded
             if txn.post_date is not None
             and not self._is_template_transaction(txn, template_guids)
@@ -5546,7 +5546,7 @@ class CoreMixin:
                 ):
                     continue
                 if field == "description":
-                    if query.lower() in transaction.description.lower():
+                    if query.lower() in (transaction.description or "").lower():
                         matched.append(transaction)
 
                 elif field == "notes":
