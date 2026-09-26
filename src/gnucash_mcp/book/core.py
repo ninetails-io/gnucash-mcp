@@ -6814,12 +6814,6 @@ class CoreMixin:
         if len(splits) < 2:
             raise ValueError("At least 2 splits required")
 
-        # Validate balance upfront. _to_decimal guards against float input
-        # slipping past the pydantic boundary (see tools/_helpers.SplitInput).
-        total = sum((_to_decimal(s["amount"]) for s in splits), Decimal("0"))
-        if total != Decimal("0"):
-            raise ValueError(f"Splits do not balance: total is {total}")
-
         with self.open(readonly=False) as book:
             warnings = []
 
@@ -6839,18 +6833,16 @@ class CoreMixin:
             # aren't changing but the REPLACE_SPLITS formatter wants them).
             self._stage_audit_before(_transaction_to_dict(transaction))
 
-            # 3. Resolve and validate all accounts upfront
-            resolved_accounts = []
-            for split_data in splits:
-                account_name = split_data["account"]
-                account = self._resolve_account(book, account_name)
-                if not account:
-                    raise self._account_not_found_error(
-                        book, account_name,
-                    )
-                if account.placeholder:
-                    raise self._placeholder_error(account)
-                resolved_accounts.append((account, split_data))
+            # 3. Validate every input rule before anything mutates:
+            # the shared validator (balance, resolution, cross-
+            # commodity quantity and sign), then placeholders, which
+            # only a new split can land on.
+            validated = self._validate_transaction_splits(
+                book, splits, transaction.currency,
+            )
+            for v in validated:
+                if v["account"].placeholder:
+                    raise self._placeholder_error(v["account"])
 
             # 4a. Voided transactions are immutable — same
             # rationale as update_transaction; no force override.
@@ -6881,17 +6873,6 @@ class CoreMixin:
                 for s in transaction.splits
             ]
 
-            def _new_split_quantity(account, split_data):
-                """Quantity a new split would carry, or None when a
-                required cross-commodity quantity is absent (step 7
-                rejects that row; the pre-pass just skips it)."""
-                amount = _to_decimal(split_data["amount"])
-                if account.commodity == transaction.currency:
-                    return amount
-                if "quantity" in split_data:
-                    return _to_decimal(split_data["quantity"])
-                return None
-
             def _claim(pool, account_guid, value, quantity):
                 for c in pool:
                     if (
@@ -6909,13 +6890,8 @@ class CoreMixin:
             # an unchanged reconciled leg is preserved verbatim and
             # needs no override.
             scratch = [dict(c) for c in carryover]
-            for account, split_data in resolved_accounts:
-                quantity = _new_split_quantity(account, split_data)
-                if quantity is not None:
-                    _claim(
-                        scratch, account.guid,
-                        _to_decimal(split_data["amount"]), quantity,
-                    )
+            for v in validated:
+                _claim(scratch, v["account"].guid, v["value"], v["quantity"])
             reconciled_changed = [
                 s for s, c in zip(transaction.splits, scratch)
                 if s.reconcile_state == "y" and not c["claimed"]
@@ -6959,49 +6935,19 @@ class CoreMixin:
                 book.delete(split)
 
             # 7. Create new splits
-            trans_currency = transaction.currency
-            fx_check_splits: list[dict] = []
-            for account, split_data in resolved_accounts:
-                amount = _to_decimal(split_data["amount"])
-
-                # Determine quantity
-                if account.commodity == trans_currency:
-                    quantity = amount
-                elif "quantity" in split_data:
-                    quantity = _to_decimal(split_data["quantity"])
-                    if quantity * amount < 0:
-                        raise ValueError(
-                            f"Split for '{account.fullname}': quantity and "
-                            f"value must have same sign "
-                            f"(got value={amount}, quantity={quantity})"
-                        )
-                else:
-                    raise ValueError(
-                        f"Split for '{account.fullname}' requires 'quantity' "
-                        f"because account commodity "
-                        f"({account.commodity.mnemonic}) differs from "
-                        f"transaction currency ({trans_currency.mnemonic})"
-                    )
-
-                fx_check_splits.append({
-                    "account": account, "value": amount, "quantity": quantity,
-                })
+            for v in validated:
                 # Unchanged leg: keep its memo and action (caller-
                 # supplied values win) and its reconciliation,
                 # verbatim.
-                match = _claim(carryover, account.guid, amount, quantity)
+                match = _claim(
+                    carryover, v["account"].guid, v["value"], v["quantity"],
+                )
                 new_split = piecash.Split(
-                    account=account,
-                    value=amount,
-                    quantity=quantity,
-                    memo=(
-                        split_data.get("memo")
-                        or (match["memo"] if match else "")
-                    ),
-                    action=(
-                        split_data.get("action")
-                        or (match["action"] if match else "")
-                    ),
+                    account=v["account"],
+                    value=v["value"],
+                    quantity=v["quantity"],
+                    memo=v["memo"] or (match["memo"] if match else ""),
+                    action=v["action"] or (match["action"] if match else ""),
                     transaction=transaction,
                 )
                 if match and match["state"] in ("y", "c"):
@@ -7013,7 +6959,7 @@ class CoreMixin:
             # path's warnings are plain strings, so emit messages.
             warnings.extend(
                 w["message"] for w in self._fx_sanity_warnings(
-                    book, fx_check_splits, trans_currency,
+                    book, validated, transaction.currency,
                     transaction.post_date,
                 )
             )
