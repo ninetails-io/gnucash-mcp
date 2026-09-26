@@ -71,6 +71,7 @@ from gnucash_mcp.book._base import (
     _guid_prefix_map,
     _is_unreconciled,
     _is_voided,
+    _lot_forget_flag,
     _slot_bool,
     _slot_value_str,
     _split_to_compact_dict,
@@ -6040,9 +6041,9 @@ class CoreMixin:
 
     def _validate_transaction_deletable(
         self, book, transaction, force: bool,
-    ) -> int:
+    ) -> tuple[int, list]:
         """Shared delete safeguards; returns the reconciled-split
-        count (0 when clean).
+        count and the splits held in lots (0 and [] when clean).
 
         - Refuses an invoice's posting transaction: deleting it
           orphans the invoice's posted-state metadata, after which
@@ -6050,6 +6051,9 @@ class CoreMixin:
           ("already posted") — SQL surgery is the only escape.
           unpost_document clears the metadata properly.
         - Refuses reconciled splits unless ``force``.
+        - Refuses splits in lots unless ``force``, the same gate
+          ``replace_splits`` applies: a lot split is cost basis or
+          an invoice payment, and deleting it reopens the lot.
         """
         from sqlalchemy import text
         posting_for = book.session.execute(
@@ -6071,28 +6075,42 @@ class CoreMixin:
                 f"Transaction has reconciled splits in: {acct_names}. "
                 f"Deleting will break reconciliation. Use force=true to override."
             )
-        return len(reconciled)
+
+        in_lots = [s for s in transaction.splits if s.lot is not None]
+        if in_lots and not force:
+            names = ", ".join(
+                f"{s.lot.title or 'untitled lot'} ({s.account.fullname})"
+                for s in in_lots
+            )
+            raise ValueError(
+                f"Transaction has splits in lots: {names}. Deleting "
+                f"reopens them (cost basis, or an invoice's payment). "
+                f"Use force=true to override."
+            )
+        return len(reconciled), in_lots
 
     def delete_transaction(self, guid: str, force: bool = False) -> dict:
         """Delete a transaction by GUID.
 
         Args:
             guid: Transaction GUID (32-character hex string).
-            force: If True, allow deleting transactions with reconciled splits.
+            force: If True, allow deleting transactions with reconciled
+                splits or splits in lots.
 
         Returns:
-            Dict with guid, description, and status.
+            Dict with guid, description, and status, plus
+            reconciled_splits_affected / lot_splits_affected when forced.
 
         Raises:
-            ValueError: If transaction not found, or has reconciled splits
-                       and force is False.
+            ValueError: If transaction not found, or has reconciled or
+                       lot-held splits and force is False.
         """
         with self.open(readonly=False) as book:
             transaction = self._find_transaction(book, guid)
             if not transaction:
                 raise ValueError(f"Transaction not found: {guid}")
 
-            reconciled_count = self._validate_transaction_deletable(
+            reconciled_count, in_lots = self._validate_transaction_deletable(
                 book, transaction, force,
             )
 
@@ -6110,6 +6128,8 @@ class CoreMixin:
             }
             if reconciled_count:
                 result["reconciled_splits_affected"] = reconciled_count
+            if in_lots:
+                result["lot_splits_affected"] = len(in_lots)
 
             # Strip GUID-valued slots (from-sched-xaction,
             # invoice-guid, gains-split…) and frames by raw SQL
@@ -6121,7 +6141,8 @@ class CoreMixin:
                 f"delete of {transaction.guid[:8]}",
                 objects=[transaction, *transaction.splits],
             )
-            # Delete the transaction
+            for split in in_lots:
+                _lot_forget_flag(split.lot)
             book.session.delete(transaction)
             book.save()
 
@@ -6134,15 +6155,15 @@ class CoreMixin:
 
         All-or-nothing: every guid must resolve and pass the same
         safeguards as ``delete_transaction`` (invoice-posting guard,
-        reconciled splits vs ``force``) BEFORE anything is deleted —
-        validate-then-mutate, so a bad guid mid-list can't leave a
-        half-deleted batch.
+        reconciled and lot-held splits vs ``force``) BEFORE anything
+        is deleted — validate-then-mutate, so a bad guid mid-list
+        can't leave a half-deleted batch.
 
         Returns:
             ``{status, count, transactions: [{guid, description,
-            reconciled_splits_affected?}]}`` — a dict envelope (not a
-            bare list) so the response machinery and audit decorator
-            see the same shape every write returns.
+            reconciled_splits_affected?, lot_splits_affected?}]}`` — a
+            dict envelope (not a bare list) so the response machinery
+            and audit decorator see the same shape every write returns.
 
         Raises:
             ValueError: empty list, duplicate guid, any guid not
@@ -6166,18 +6187,20 @@ class CoreMixin:
                     )
                 seen.add(transaction.guid)
                 try:
-                    reconciled_count = self._validate_transaction_deletable(
-                        book, transaction, force,
+                    reconciled_count, in_lots = (
+                        self._validate_transaction_deletable(
+                            book, transaction, force,
+                        )
                     )
                 except ValueError as e:
                     raise ValueError(f"{e} (nothing deleted)")
-                resolved.append((transaction, reconciled_count))
+                resolved.append((transaction, reconciled_count, in_lots))
 
             # Composite before-state — the audit formatter renders
             # one block per deleted transaction from this list.
             self._stage_audit_before({
                 "transactions": [
-                    _transaction_to_dict(t) for t, _ in resolved
+                    _transaction_to_dict(t) for t, _, _ in resolved
                 ],
             })
 
@@ -6186,22 +6209,26 @@ class CoreMixin:
             # closes.
             all_guids = [t.guid for t in book.transactions]
             items = []
-            for transaction, reconciled_count in resolved:
+            for transaction, reconciled_count, in_lots in resolved:
                 item = {
                     "guid": _unique_prefix(transaction.guid, all_guids),
                     "description": transaction.description,
                 }
                 if reconciled_count:
                     item["reconciled_splits_affected"] = reconciled_count
+                if in_lots:
+                    item["lot_splits_affected"] = len(in_lots)
                 items.append(item)
 
-            for transaction, _ in resolved:
+            for transaction, _, in_lots in resolved:
                 self._strip_guid_slots(
                     book,
                     [transaction.guid] + [s.guid for s in transaction.splits],
                     f"delete of {transaction.guid[:8]}",
                     objects=[transaction, *transaction.splits],
                 )
+                for split in in_lots:
+                    _lot_forget_flag(split.lot)
                 book.session.delete(transaction)
             book.save()
 
@@ -6892,6 +6919,8 @@ class CoreMixin:
                     f"Removed splits from lots: {lot_info}. "
                     f"Cost basis tracking affected."
                 )
+                for split in in_lots:
+                    _lot_forget_flag(split.lot)
 
             # 6. Delete existing splits
             for split in list(transaction.splits):

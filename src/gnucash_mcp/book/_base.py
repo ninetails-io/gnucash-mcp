@@ -740,6 +740,17 @@ def _lot_cache_flag(lot) -> None:
         lot.is_closed = _LOT_OPEN
 
 
+def _lot_forget_flag(lot) -> None:
+    """Mark a lot's flag UNKNOWN after a split leaves it.
+
+    What ``gnc_lot_remove_split`` does: the cached answer described
+    the old membership, so the next read recomputes. Without it a
+    sold-out lot that loses its sell keeps reading closed with shares
+    in it, and an invoice whose payment is deleted keeps reading paid.
+    """
+    lot.is_closed = _LOT_CLOSED_UNKNOWN
+
+
 def _ordered_splits(transaction) -> list:
     """A transaction's splits in GnuCash's own order, on every backend.
 
