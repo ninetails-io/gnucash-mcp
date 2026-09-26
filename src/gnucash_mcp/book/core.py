@@ -71,6 +71,7 @@ from gnucash_mcp.book._base import (
     _guid_prefix_map,
     _is_unreconciled,
     _is_voided,
+    _lot_forget_flag,
     _slot_bool,
     _slot_value_str,
     _split_to_compact_dict,
@@ -181,6 +182,16 @@ def _post_date_as_date(transaction) -> date | None:
     if hasattr(pd, "date") and callable(pd.date):
         return pd.date()
     return pd
+
+
+def _lot_split_names(splits) -> str:
+    """How a refusal or warning names lot-held splits: the lot's
+    title, then the account, so an invoice payment reads as its
+    document and a sell as its lot."""
+    return ", ".join(
+        f"{s.lot.title or 'untitled lot'} ({s.account.fullname})"
+        for s in splits
+    )
 
 
 class CoreMixin:
@@ -3219,7 +3230,7 @@ class CoreMixin:
             .all()
         )
         swept = [
-            (txn, txn.description.lower())
+            (txn, (txn.description or "").lower())
             for txn in loaded
             if txn.post_date is not None
             and not self._is_template_transaction(txn, template_guids)
@@ -5545,7 +5556,7 @@ class CoreMixin:
                 ):
                     continue
                 if field == "description":
-                    if query.lower() in transaction.description.lower():
+                    if query.lower() in (transaction.description or "").lower():
                         matched.append(transaction)
 
                 elif field == "notes":
@@ -6040,9 +6051,9 @@ class CoreMixin:
 
     def _validate_transaction_deletable(
         self, book, transaction, force: bool,
-    ) -> int:
+    ) -> tuple[int, list]:
         """Shared delete safeguards; returns the reconciled-split
-        count (0 when clean).
+        count and the splits held in lots (0 and [] when clean).
 
         - Refuses an invoice's posting transaction: deleting it
           orphans the invoice's posted-state metadata, after which
@@ -6050,6 +6061,9 @@ class CoreMixin:
           ("already posted") — SQL surgery is the only escape.
           unpost_document clears the metadata properly.
         - Refuses reconciled splits unless ``force``.
+        - Refuses splits in lots unless ``force``, the same gate
+          ``replace_splits`` applies: a lot split is cost basis or
+          an invoice payment, and deleting it reopens the lot.
         """
         from sqlalchemy import text
         posting_for = book.session.execute(
@@ -6071,28 +6085,39 @@ class CoreMixin:
                 f"Transaction has reconciled splits in: {acct_names}. "
                 f"Deleting will break reconciliation. Use force=true to override."
             )
-        return len(reconciled)
+
+        in_lots = [s for s in transaction.splits if s.lot is not None]
+        if in_lots and not force:
+            raise ValueError(
+                f"Transaction has splits in lots: "
+                f"{_lot_split_names(in_lots)}. Deleting "
+                f"reopens them (cost basis, or an invoice's payment). "
+                f"Use force=true to override."
+            )
+        return len(reconciled), in_lots
 
     def delete_transaction(self, guid: str, force: bool = False) -> dict:
         """Delete a transaction by GUID.
 
         Args:
             guid: Transaction GUID (32-character hex string).
-            force: If True, allow deleting transactions with reconciled splits.
+            force: If True, allow deleting transactions with reconciled
+                splits or splits in lots.
 
         Returns:
-            Dict with guid, description, and status.
+            Dict with guid, description, and status, plus
+            reconciled_splits_affected / lot_splits_affected when forced.
 
         Raises:
-            ValueError: If transaction not found, or has reconciled splits
-                       and force is False.
+            ValueError: If transaction not found, or has reconciled or
+                       lot-held splits and force is False.
         """
         with self.open(readonly=False) as book:
             transaction = self._find_transaction(book, guid)
             if not transaction:
                 raise ValueError(f"Transaction not found: {guid}")
 
-            reconciled_count = self._validate_transaction_deletable(
+            reconciled_count, in_lots = self._validate_transaction_deletable(
                 book, transaction, force,
             )
 
@@ -6110,6 +6135,8 @@ class CoreMixin:
             }
             if reconciled_count:
                 result["reconciled_splits_affected"] = reconciled_count
+            if in_lots:
+                result["lot_splits_affected"] = len(in_lots)
 
             # Strip GUID-valued slots (from-sched-xaction,
             # invoice-guid, gains-split…) and frames by raw SQL
@@ -6121,7 +6148,8 @@ class CoreMixin:
                 f"delete of {transaction.guid[:8]}",
                 objects=[transaction, *transaction.splits],
             )
-            # Delete the transaction
+            for split in in_lots:
+                _lot_forget_flag(split.lot)
             book.session.delete(transaction)
             book.save()
 
@@ -6134,15 +6162,15 @@ class CoreMixin:
 
         All-or-nothing: every guid must resolve and pass the same
         safeguards as ``delete_transaction`` (invoice-posting guard,
-        reconciled splits vs ``force``) BEFORE anything is deleted —
-        validate-then-mutate, so a bad guid mid-list can't leave a
-        half-deleted batch.
+        reconciled and lot-held splits vs ``force``) BEFORE anything
+        is deleted — validate-then-mutate, so a bad guid mid-list
+        can't leave a half-deleted batch.
 
         Returns:
             ``{status, count, transactions: [{guid, description,
-            reconciled_splits_affected?}]}`` — a dict envelope (not a
-            bare list) so the response machinery and audit decorator
-            see the same shape every write returns.
+            reconciled_splits_affected?, lot_splits_affected?}]}`` — a
+            dict envelope (not a bare list) so the response machinery
+            and audit decorator see the same shape every write returns.
 
         Raises:
             ValueError: empty list, duplicate guid, any guid not
@@ -6166,18 +6194,20 @@ class CoreMixin:
                     )
                 seen.add(transaction.guid)
                 try:
-                    reconciled_count = self._validate_transaction_deletable(
-                        book, transaction, force,
+                    reconciled_count, in_lots = (
+                        self._validate_transaction_deletable(
+                            book, transaction, force,
+                        )
                     )
                 except ValueError as e:
                     raise ValueError(f"{e} (nothing deleted)")
-                resolved.append((transaction, reconciled_count))
+                resolved.append((transaction, reconciled_count, in_lots))
 
             # Composite before-state — the audit formatter renders
             # one block per deleted transaction from this list.
             self._stage_audit_before({
                 "transactions": [
-                    _transaction_to_dict(t) for t, _ in resolved
+                    _transaction_to_dict(t) for t, _, _ in resolved
                 ],
             })
 
@@ -6186,22 +6216,26 @@ class CoreMixin:
             # closes.
             all_guids = [t.guid for t in book.transactions]
             items = []
-            for transaction, reconciled_count in resolved:
+            for transaction, reconciled_count, in_lots in resolved:
                 item = {
                     "guid": _unique_prefix(transaction.guid, all_guids),
                     "description": transaction.description,
                 }
                 if reconciled_count:
                     item["reconciled_splits_affected"] = reconciled_count
+                if in_lots:
+                    item["lot_splits_affected"] = len(in_lots)
                 items.append(item)
 
-            for transaction, _ in resolved:
+            for transaction, _, in_lots in resolved:
                 self._strip_guid_slots(
                     book,
                     [transaction.guid] + [s.guid for s in transaction.splits],
                     f"delete of {transaction.guid[:8]}",
                     objects=[transaction, *transaction.splits],
                 )
+                for split in in_lots:
+                    _lot_forget_flag(split.lot)
                 book.session.delete(transaction)
             book.save()
 
@@ -6577,18 +6611,20 @@ class CoreMixin:
                 clears.
             splits: Optional split updates matched to existing splits
                 by account; cross-currency splits need 'quantity'.
-            force: Allow modifying reconciled splits (only checked
-                when splits change).
+            force: Allow modifying reconciled splits, or changing
+                the amount of a split in a lot (only checked when
+                splits change).
 
         Returns:
-            Thin dict: {guid, date, description, status}; for a
+            Thin dict: {guid, date, description, status}, plus
+            lot_splits_affected when forced past the lot gate; for a
             list, ``{status, count, transactions: [{guid,
             description}]}``.
 
         Raises:
             ValueError: not found, voided, imbalance, account not in
-                transaction, missing quantity, or reconciled without
-                force.
+                transaction, missing quantity, or reconciled or
+                lot-held amount changes without force.
         """
         if isinstance(guid, list):
             return self._update_transactions_broadcast(
@@ -6631,6 +6667,7 @@ class CoreMixin:
             self._stage_audit_before(_transaction_to_dict(transaction))
 
             fx_warnings: list[dict] = []
+            lot_changes: list = []
 
             # Update description if provided
             if description is not None:
@@ -6671,6 +6708,28 @@ class CoreMixin:
                     for v, raw in zip(validated, splits)
                 }
 
+                # A lot-held split whose amount changes is cost basis
+                # or an invoice payment: the gate replace_splits and
+                # delete apply. Restating the same amount (a memo
+                # edit) passes.
+                lot_changes = [
+                    s for s in transaction.splits
+                    if s.lot is not None
+                    and s.account.fullname in split_updates
+                    and (s.value, s.quantity) != (
+                        split_updates[s.account.fullname]["value"],
+                        split_updates[s.account.fullname]["quantity"],
+                    )
+                ]
+                if lot_changes and not force:
+                    raise ValueError(
+                        f"Transaction has splits in lots: "
+                        f"{_lot_split_names(lot_changes)}. "
+                        f"Changing their amounts changes the lot (cost "
+                        f"basis, or an invoice's payment). Use "
+                        f"force=true to override."
+                    )
+
                 # Update existing splits — pure mutation, validated above.
                 for split in transaction.splits:
                     account_name = split.account.fullname
@@ -6678,6 +6737,7 @@ class CoreMixin:
                         v = split_updates[account_name]
                         split.value = v["value"]
                         split.quantity = v["quantity"]
+                        _lot_forget_flag(split.lot)
                         raw = raw_by_fullname[account_name]
                         if "memo" in raw:
                             split.memo = raw["memo"]
@@ -6713,6 +6773,8 @@ class CoreMixin:
                 "description": transaction.description,
                 "status": "updated",
             }
+            if lot_changes:
+                result["lot_splits_affected"] = len(lot_changes)
             if fx_warnings:
                 result["warnings"] = fx_warnings
             return result
@@ -6755,12 +6817,6 @@ class CoreMixin:
         if len(splits) < 2:
             raise ValueError("At least 2 splits required")
 
-        # Validate balance upfront. _to_decimal guards against float input
-        # slipping past the pydantic boundary (see tools/_helpers.SplitInput).
-        total = sum((_to_decimal(s["amount"]) for s in splits), Decimal("0"))
-        if total != Decimal("0"):
-            raise ValueError(f"Splits do not balance: total is {total}")
-
         with self.open(readonly=False) as book:
             warnings = []
 
@@ -6780,18 +6836,16 @@ class CoreMixin:
             # aren't changing but the REPLACE_SPLITS formatter wants them).
             self._stage_audit_before(_transaction_to_dict(transaction))
 
-            # 3. Resolve and validate all accounts upfront
-            resolved_accounts = []
-            for split_data in splits:
-                account_name = split_data["account"]
-                account = self._resolve_account(book, account_name)
-                if not account:
-                    raise self._account_not_found_error(
-                        book, account_name,
-                    )
-                if account.placeholder:
-                    raise self._placeholder_error(account)
-                resolved_accounts.append((account, split_data))
+            # 3. Validate every input rule before anything mutates:
+            # the shared validator (balance, resolution, cross-
+            # commodity quantity and sign), then placeholders, which
+            # only a new split can land on.
+            validated = self._validate_transaction_splits(
+                book, splits, transaction.currency,
+            )
+            for v in validated:
+                if v["account"].placeholder:
+                    raise self._placeholder_error(v["account"])
 
             # 4a. Voided transactions are immutable — same
             # rationale as update_transaction; no force override.
@@ -6822,17 +6876,6 @@ class CoreMixin:
                 for s in transaction.splits
             ]
 
-            def _new_split_quantity(account, split_data):
-                """Quantity a new split would carry, or None when a
-                required cross-commodity quantity is absent (step 7
-                rejects that row; the pre-pass just skips it)."""
-                amount = _to_decimal(split_data["amount"])
-                if account.commodity == transaction.currency:
-                    return amount
-                if "quantity" in split_data:
-                    return _to_decimal(split_data["quantity"])
-                return None
-
             def _claim(pool, account_guid, value, quantity):
                 for c in pool:
                     if (
@@ -6850,13 +6893,8 @@ class CoreMixin:
             # an unchanged reconciled leg is preserved verbatim and
             # needs no override.
             scratch = [dict(c) for c in carryover]
-            for account, split_data in resolved_accounts:
-                quantity = _new_split_quantity(account, split_data)
-                if quantity is not None:
-                    _claim(
-                        scratch, account.guid,
-                        _to_decimal(split_data["amount"]), quantity,
-                    )
+            for v in validated:
+                _claim(scratch, v["account"].guid, v["value"], v["quantity"])
             reconciled_changed = [
                 s for s, c in zip(transaction.splits, scratch)
                 if s.reconcile_state == "y" and not c["claimed"]
@@ -6879,68 +6917,38 @@ class CoreMixin:
             # 5. Check lot assignments
             in_lots = [s for s in transaction.splits if s.lot is not None]
             if in_lots and not force:
-                names = ", ".join(s.account.fullname for s in in_lots)
                 raise ValueError(
-                    f"Transaction has splits in lots: {names}. "
+                    f"Transaction has splits in lots: "
+                    f"{_lot_split_names(in_lots)}. "
                     f"Use force=true to override."
                 )
             if in_lots:
-                lot_info = ", ".join(
-                    f"{s.lot.title} ({s.account.fullname})" for s in in_lots
-                )
                 warnings.append(
-                    f"Removed splits from lots: {lot_info}. "
+                    f"Removed splits from lots: "
+                    f"{_lot_split_names(in_lots)}. "
                     f"Cost basis tracking affected."
                 )
+                for split in in_lots:
+                    _lot_forget_flag(split.lot)
 
             # 6. Delete existing splits
             for split in list(transaction.splits):
                 book.delete(split)
 
             # 7. Create new splits
-            trans_currency = transaction.currency
-            fx_check_splits: list[dict] = []
-            for account, split_data in resolved_accounts:
-                amount = _to_decimal(split_data["amount"])
-
-                # Determine quantity
-                if account.commodity == trans_currency:
-                    quantity = amount
-                elif "quantity" in split_data:
-                    quantity = _to_decimal(split_data["quantity"])
-                    if quantity * amount < 0:
-                        raise ValueError(
-                            f"Split for '{account.fullname}': quantity and "
-                            f"value must have same sign "
-                            f"(got value={amount}, quantity={quantity})"
-                        )
-                else:
-                    raise ValueError(
-                        f"Split for '{account.fullname}' requires 'quantity' "
-                        f"because account commodity "
-                        f"({account.commodity.mnemonic}) differs from "
-                        f"transaction currency ({trans_currency.mnemonic})"
-                    )
-
-                fx_check_splits.append({
-                    "account": account, "value": amount, "quantity": quantity,
-                })
+            for v in validated:
                 # Unchanged leg: keep its memo and action (caller-
                 # supplied values win) and its reconciliation,
                 # verbatim.
-                match = _claim(carryover, account.guid, amount, quantity)
+                match = _claim(
+                    carryover, v["account"].guid, v["value"], v["quantity"],
+                )
                 new_split = piecash.Split(
-                    account=account,
-                    value=amount,
-                    quantity=quantity,
-                    memo=(
-                        split_data.get("memo")
-                        or (match["memo"] if match else "")
-                    ),
-                    action=(
-                        split_data.get("action")
-                        or (match["action"] if match else "")
-                    ),
+                    account=v["account"],
+                    value=v["value"],
+                    quantity=v["quantity"],
+                    memo=v["memo"] or (match["memo"] if match else ""),
+                    action=v["action"] or (match["action"] if match else ""),
                     transaction=transaction,
                 )
                 if match and match["state"] in ("y", "c"):
@@ -6952,7 +6960,7 @@ class CoreMixin:
             # path's warnings are plain strings, so emit messages.
             warnings.extend(
                 w["message"] for w in self._fx_sanity_warnings(
-                    book, fx_check_splits, trans_currency,
+                    book, validated, transaction.currency,
                     transaction.post_date,
                 )
             )

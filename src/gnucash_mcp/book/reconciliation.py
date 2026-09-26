@@ -17,6 +17,7 @@ from gnucash_mcp.book._base import (
     _commodity_quantum,
     _is_unreconciled,
     _is_voided,
+    _lot_forget_flag,
     _split_to_compact_dict,
     _to_decimal,
     _transaction_to_dict,
@@ -570,6 +571,7 @@ class ReconciliationMixin:
 
                 split.value = Decimal("0")
                 split.quantity = Decimal("0")
+                _lot_forget_flag(split.lot)
 
                 split.reconcile_state = "v"
 
@@ -652,6 +654,7 @@ class ReconciliationMixin:
                 if former_quantity is not None:
                     split.quantity = Decimal(former_quantity)
                     del split["void-former-quantity"]
+                _lot_forget_flag(split.lot)
 
                 split.reconcile_state = "n"
 
