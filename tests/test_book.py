@@ -6882,22 +6882,57 @@ class TestLotFlagFollowsAmountChanges:
 
         assert gc_book.get_lot(lot_guid)["is_closed"] is True
 
+    HALF_SELL = [
+        {
+            "account": "Assets:Investments:VTSAX",
+            "amount": "-700.00", "quantity": "-5",
+        },
+        {"account": "Assets:Checking", "amount": "700.00"},
+    ]
+
+    def test_update_amount_needs_force(self, investment_book: Path):
+        """The gate replace_splits and delete apply: changing a
+        lot-held split's amount changes cost basis."""
+        gc_book = GnuCashBook(str(investment_book))
+        lot_guid, sell_guid = _sold_out_lot(gc_book)
+
+        with pytest.raises(ValueError, match="splits in lots"):
+            gc_book.update_transaction(sell_guid, splits=self.HALF_SELL)
+        assert gc_book.get_lot(lot_guid)["is_closed"] is True
+
     def test_update_amount_reopens_lot(self, investment_book: Path):
         gc_book = GnuCashBook(str(investment_book))
         lot_guid, sell_guid = _sold_out_lot(gc_book)
 
-        gc_book.update_transaction(
+        result = gc_book.update_transaction(
+            sell_guid, splits=self.HALF_SELL, force=True,
+        )
+
+        assert result["lot_splits_affected"] == 1
+        assert gc_book.get_lot(lot_guid)["is_closed"] is False
+
+    def test_update_unchanged_lot_split_needs_no_force(
+        self, investment_book: Path,
+    ):
+        """Only an amount change is gated: a memo on the lot leg, with
+        its amount restated as-is, goes through."""
+        gc_book = GnuCashBook(str(investment_book))
+        lot_guid, sell_guid = _sold_out_lot(gc_book)
+
+        result = gc_book.update_transaction(
             sell_guid,
             splits=[
                 {
                     "account": "Assets:Investments:VTSAX",
-                    "amount": "-700.00", "quantity": "-5",
+                    "amount": "-1400.00", "quantity": "-10",
+                    "memo": "sold all",
                 },
-                {"account": "Assets:Checking", "amount": "700.00"},
+                {"account": "Assets:Checking", "amount": "1400.00"},
             ],
         )
 
-        assert gc_book.get_lot(lot_guid)["is_closed"] is False
+        assert "lot_splits_affected" not in result
+        assert gc_book.get_lot(lot_guid)["is_closed"] is True
 
 
 class TestDeleteTransaction:

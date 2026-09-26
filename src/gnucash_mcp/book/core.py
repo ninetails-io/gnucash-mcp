@@ -6604,18 +6604,20 @@ class CoreMixin:
                 clears.
             splits: Optional split updates matched to existing splits
                 by account; cross-currency splits need 'quantity'.
-            force: Allow modifying reconciled splits (only checked
-                when splits change).
+            force: Allow modifying reconciled splits, or changing
+                the amount of a split in a lot (only checked when
+                splits change).
 
         Returns:
-            Thin dict: {guid, date, description, status}; for a
+            Thin dict: {guid, date, description, status}, plus
+            lot_splits_affected when forced past the lot gate; for a
             list, ``{status, count, transactions: [{guid,
             description}]}``.
 
         Raises:
             ValueError: not found, voided, imbalance, account not in
-                transaction, missing quantity, or reconciled without
-                force.
+                transaction, missing quantity, or reconciled or
+                lot-held amount changes without force.
         """
         if isinstance(guid, list):
             return self._update_transactions_broadcast(
@@ -6658,6 +6660,7 @@ class CoreMixin:
             self._stage_audit_before(_transaction_to_dict(transaction))
 
             fx_warnings: list[dict] = []
+            lot_changes: list = []
 
             # Update description if provided
             if description is not None:
@@ -6697,6 +6700,32 @@ class CoreMixin:
                     v["account"].fullname: raw
                     for v, raw in zip(validated, splits)
                 }
+
+                # A lot-held split whose amount changes is cost basis
+                # or an invoice payment: the gate replace_splits and
+                # delete apply. Restating the same amount (a memo
+                # edit) passes.
+                lot_changes = [
+                    s for s in transaction.splits
+                    if s.lot is not None
+                    and s.account.fullname in split_updates
+                    and (s.value, s.quantity) != (
+                        split_updates[s.account.fullname]["value"],
+                        split_updates[s.account.fullname]["quantity"],
+                    )
+                ]
+                if lot_changes and not force:
+                    names = ", ".join(
+                        f"{s.lot.title or 'untitled lot'} "
+                        f"({s.account.fullname})"
+                        for s in lot_changes
+                    )
+                    raise ValueError(
+                        f"Transaction has splits in lots: {names}. "
+                        f"Changing their amounts changes the lot (cost "
+                        f"basis, or an invoice's payment). Use "
+                        f"force=true to override."
+                    )
 
                 # Update existing splits — pure mutation, validated above.
                 for split in transaction.splits:
@@ -6741,6 +6770,8 @@ class CoreMixin:
                 "description": transaction.description,
                 "status": "updated",
             }
+            if lot_changes:
+                result["lot_splits_affected"] = len(lot_changes)
             if fx_warnings:
                 result["warnings"] = fx_warnings
             return result

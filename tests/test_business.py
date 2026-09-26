@@ -12184,6 +12184,28 @@ class TestDocumentPaymentState:
         rows = gb.get_outstanding_invoices(compact=False)["invoices"]
         assert [r["amount_due"] for r in rows] == ["500.00"]
 
+    def test_editing_a_payment_amount_needs_force(self, business_book):
+        """Shrinking a payment through update_transaction changes what
+        the invoice has been paid, so it takes force like delete."""
+        gb = GnuCashBook(str(business_book))
+        self._post_invoice(gb, "500.00")
+        txn = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="500",
+        )["transaction_guid"]
+        smaller = [
+            {"account": "Assets:Checking", "amount": "300.00"},
+            {"account": "Assets:Accounts Receivable", "amount": "-300.00"},
+        ]
+
+        with pytest.raises(ValueError, match="splits in lots"):
+            gb.update_transaction(txn, splits=smaller)
+        assert gb.get_invoice("000001")["status"] == "paid"
+
+        gb.update_transaction(txn, splits=smaller, force=True)
+        assert Decimal(gb.get_invoice("000001")["amount_due"]) == Decimal("200")
+
     def test_pay_invoice_reports_payment_and_cumulative_total(
         self, business_book,
     ):
