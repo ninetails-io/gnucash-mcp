@@ -1158,19 +1158,30 @@ class SchedulingMixin:
         self, book, days: int = 7,
     ) -> dict:
         """Summary stats for scheduled transactions due within
-        ``days`` days: ``{"count": int, "total": Decimal,
-        "unrated": int}``.
+        ``days`` days: ``{"count": int, "cash_out": Decimal,
+        "cash_in": Decimal, "unrated": int, "legacy": int}``.
 
-        Total = sum of positive split amounts per occurrence (same
-        convention as ``get_upcoming_transactions``), in the BOOK
-        DEFAULT currency: foreign-currency templates convert at the
-        latest market rate; templates whose currency has no rate on
-        file are counted but excluded from the total (``unrated``
-        reports how many, so the summary line can say so instead of
-        silently understating). Feeds the get_book_summary Scheduled
-        line; lives here so a book class built without scheduling
-        lacks the method and the summary skips the line via
-        ``hasattr``.
+        Money is measured on each occurrence's CASH legs — splits
+        into BANK/CASH accounts outside a retirement subtree, the
+        same accounts the low-cash check reads — netted per
+        occurrence: negative lands in ``cash_out``, positive in
+        ``cash_in``. A signless sum of positive splits (the old
+        ``total``) added a paycheck's gross to the week's bills —
+        USD 6,777 "due" on a live book whose real outflow was
+        USD 1,931. Netting per occurrence also keeps a
+        checking→savings sweep out of both columns, and a paycheck
+        counts only what reaches checking, not the 401k/FSA/tax
+        legs. A schedule with no cash leg (a charge to a card)
+        still counts toward ``count`` but moves no cash this week.
+
+        Amounts are in the BOOK DEFAULT currency: foreign-currency
+        templates convert at the latest market rate; templates
+        whose currency has no rate on file are counted but excluded
+        from the sums (``unrated`` reports how many, so the summary
+        line can say so instead of silently understating). Feeds
+        the get_book_summary Scheduled line; lives here so a book
+        class built without scheduling lacks the method and the
+        summary skips the line via ``hasattr``.
         """
 
         today = date.today()
@@ -1180,7 +1191,8 @@ class SchedulingMixin:
         rates = self._rates_as_of(book, today, default_currency)
 
         count = 0
-        total = Decimal("0")
+        cash_out = Decimal("0")
+        cash_in = Decimal("0")
         unrated = 0
         legacy = 0
         for sx in book.session.query(ScheduledTransaction).all():
@@ -1215,14 +1227,35 @@ class SchedulingMixin:
                 if rate is None:
                     unrated += 1
                     continue
+            net = Decimal("0")
             for s in recipe["splits"]:
-                amt = _to_decimal(s["amount"])
-                if amt > 0:
-                    total += amt * rate
+                if self._sx_split_is_cash(book, s.get("account", "")):
+                    net += _to_decimal(s["amount"]) * rate
+            if net < 0:
+                cash_out += -net
+            else:
+                cash_in += net
         return {
-            "count": count, "total": total, "unrated": unrated,
-            "legacy": legacy,
+            "count": count, "cash_out": cash_out, "cash_in": cash_in,
+            "unrated": unrated, "legacy": legacy,
         }
+
+    def _sx_split_is_cash(self, book, ref: str) -> bool:
+        """True when a recipe split's account is spendable cash:
+        BANK/CASH, outside a retirement subtree — the low-cash
+        check's notion of cash. ``ref`` is a stored recipe account:
+        a full GUID, or a path on pre-GUID templates. A vanished
+        account is not cash.
+        """
+        if len(ref) == 32 and _HEX_GUID_RE.fullmatch(ref):
+            acct = book.session.query(
+                piecash.Account
+            ).filter_by(guid=ref).first()
+        else:
+            acct = self._find_account(book, ref)
+        if acct is None or acct.type not in ("BANK", "CASH"):
+            return False
+        return not self._is_in_retirement_subtree(acct)
 
     def get_upcoming_transactions(
         self,

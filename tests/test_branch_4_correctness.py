@@ -11,7 +11,7 @@ Group A — Budget correctness:
 
 Group B — Reporting + dashboard correctness:
 - ``TestBalanceSheetSkipsPlaceholders`` — SB-8
-- ``TestDailyExpenseBurnBookAgeClamp`` — SB-7
+- ``TestDailyCashBurnBookAgeClamp`` — SB-7
 - ``TestCollectWarningsPlaceholderFilter`` — HP-6
 
 Group C — Business + FX:
@@ -368,8 +368,8 @@ class TestBudgetHeadlineRollup:
 # ── SB-7: daily_burn book-age clamp ────────────────────────────────
 
 
-class TestDailyExpenseBurnBookAgeClamp:
-    """SB-7: ``_daily_expense_burn`` must clamp the divisor to
+class TestDailyCashBurnBookAgeClamp:
+    """SB-7: ``_daily_cash_burn`` must clamp the divisor to
     ``min(180, book_age_days)``.
 
     Pre-fix the function always divided by 180. On a 19-day-old
@@ -442,7 +442,7 @@ class TestDailyExpenseBurnBookAgeClamp:
         gb = GnuCashBook(str(book_path))
         with gb.open(readonly=True) as pb:
             transactions = list(pb.transactions)
-            burn = gb._daily_expense_burn(pb, transactions)
+            burn = gb._daily_cash_burn(pb, transactions)
 
         # $50 spend, 19 days of data → burn ≈ $2.63/day.
         # Pre-fix would have been $50 / 180 ≈ $0.28/day.
@@ -514,7 +514,7 @@ class TestDailyExpenseBurnBookAgeClamp:
         gb = GnuCashBook(str(book_path))
         with gb.open(readonly=True) as pb:
             transactions = list(pb.transactions)
-            burn = gb._daily_expense_burn(pb, transactions)
+            burn = gb._daily_cash_burn(pb, transactions)
 
         # $180 / 180 days = $1.00/day (clamp doesn't apply).
         # The exact value depends on the today vs window math —

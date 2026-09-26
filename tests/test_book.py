@@ -1505,6 +1505,68 @@ class TestGetBookSummaryMonthlyNet:
         assert "+811" in prior_row
 
 
+class TestRunwayCashBurn:
+    """Runway's burn is cash leaving its own liquid pool — a fact
+    the ledger transcribes, not a spending model (bookkeeper
+    ruling, 2026-09-24). The expense-sum burn it replaced counted
+    payroll withholding that never touches the pool (~$73/day on
+    a live book) and missed card/loan payments that drain it."""
+
+    def test_burn_counts_what_leaves_the_pool(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        gc.create_account(name="Savings", account_type="BANK",
+                          parent="Assets")
+        gc.create_account(name="Retirement Cash", account_type="BANK",
+                          parent="Assets")
+        gc.create_account(name="Card", account_type="CREDIT",
+                          parent="Liabilities")
+        gc.create_account(name="Taxes", account_type="EXPENSE",
+                          parent="Expenses")
+        when = date.today() - timedelta(days=10)
+        for desc, splits in [
+            # Withholding never reaches checking: no cash out.
+            ("Paycheck", [("Assets:Checking", "2000"),
+                          ("Expenses:Taxes", "500"),
+                          ("Income:Salary", "-2500")]),
+            # A card charge moves no cash until it's paid.
+            ("Card charge", [("Expenses:Groceries", "100"),
+                             ("Liabilities:Card", "-100")]),
+            ("Card payment", [("Liabilities:Card", "300"),
+                              ("Assets:Checking", "-300")]),
+            # Pool-internal move nets to zero.
+            ("Sweep", [("Assets:Checking", "-400"),
+                       ("Assets:Savings", "400")]),
+            # Into retirement leaves the pool...
+            ("IRA contribution", [("Assets:Checking", "-250"),
+                                  ("Assets:Retirement Cash", "250")]),
+            # ...and spending from retirement never was in it.
+            ("From IRA", [("Expenses:Groceries", "50"),
+                          ("Assets:Retirement Cash", "-50")]),
+        ]:
+            gc.create_transaction(
+                description=desc,
+                splits=[{"account": a, "amount": v} for a, v in splits],
+                trans_date=when, check_duplicates=False,
+            )
+        with gc.open(readonly=True) as book:
+            burn = gc._daily_cash_burn(book, list(book.transactions))
+        # Card payment 300 + IRA contribution 250. The expense-sum
+        # burn would have read 650 (taxes 500 + groceries 150).
+        assert (burn * 180).quantize(Decimal("0.01")) == Decimal("550")
+
+    def test_numerator_and_burn_share_one_pool(self):
+        """Runway's liquid sum and the burn read the same predicate
+        — the pool can't be edited in one place and not the other.
+
+        Taxable brokerage positions are liquid; retirement-wrapped
+        holdings are not — decided, not inherited (bookkeeper
+        ruling, 2026-09-24)."""
+        import inspect
+        from gnucash_mcp.book.core import CoreMixin
+        for fn in (CoreMixin._runway_metrics, CoreMixin._daily_cash_burn):
+            assert "_is_runway_liquid(" in inspect.getsource(fn)
+
+
 class TestGetBookSummaryRunway:
     """Runway section in get_book_summary.
 
@@ -1568,14 +1630,15 @@ class TestGetBookSummaryRunway:
         assert "days" in runway_line
         assert "USD" in runway_line
         assert "liquid" in runway_line
-        assert "/day burn" in runway_line
+        assert "/day cash out incl. debt paydown" in runway_line
         # Burn-averaging window is disclosed (book-age clamped,
         # so the exact day count varies with the fixture's age).
         assert "-day avg)" in runway_line
         # Comma-separated for the liquid (2,670).
         assert "2,670" in runway_line
-        # No decimals.
-        assert "." not in runway_line
+        # No decimals (the label's "incl." is prose, not a number).
+        import re
+        assert not re.search(r"\d\.\d", runway_line)
 
     def test_warning_below_60_days(self, test_book: Path):
         """Runway < 60 days → ⚠ marker."""
@@ -2170,6 +2233,26 @@ class TestGetBookSummaryWarnings:
     ``specs/GET_BOOK_SUMMARY_SPEC.md`` §5.
     """
 
+
+    @staticmethod
+    def _hold_shares(gc, account, shares="2", cost="250"):
+        """Put a nonzero position in ``account`` — the stale-price
+        check only nags about securities someone actually holds."""
+        with gc.open(readonly=False) as book:
+            sec = gc._find_account(book, account)
+            checking = gc._find_account(book, "Assets:Checking")
+            book.session.add(piecash.Transaction(
+                currency=book.default_currency,
+                description=f"Buy {account}",
+                post_date=date.today() - timedelta(days=5),
+                splits=[
+                    piecash.Split(account=sec, value=Decimal(cost),
+                                  quantity=Decimal(shares)),
+                    piecash.Split(account=checking,
+                                  value=-Decimal(cost)),
+                ],
+            ))
+            book.save()
     def test_section_omitted_when_no_warnings(self, test_book: Path):
         """No warnings → no header, no body — absence is the signal.
         The fixture is a clean book with no integrity issues, no
@@ -2284,6 +2367,7 @@ class TestGetBookSummaryWarnings:
         single price on 2026-01-15, which is now well past the
         30-day cutoff."""
         gc = GnuCashBook(str(investment_book))
+        self._hold_shares(gc, "Assets:Investments:VTSAX")
         result = gc.get_book_summary()
         assert "Warnings:" in result
         warnings_block = result.split("Warnings:")[1].split(
@@ -2292,6 +2376,18 @@ class TestGetBookSummaryWarnings:
         assert "VTSAX" in warnings_block
         assert "Stale price" in warnings_block
         assert "days ago" in warnings_block
+
+    def test_stale_price_skips_security_nobody_holds(
+        self, investment_book: Path,
+    ):
+        """A fund swapped out to zero keeps its account and
+        commodity, but a quote for it values nothing — no warning
+        (live book, 2026-09-24: an emptied 401k fund nagged for a
+        price). Holding any shares brings the warning back."""
+        gc = GnuCashBook(str(investment_book))
+        assert "Stale price" not in gc.get_book_summary()
+        self._hold_shares(gc, "Assets:Investments:VTSAX")
+        assert "Stale price: VTSAX" in gc.get_book_summary()
 
     def test_unpriced_commodity_in_use_warns_no_price_on_file(
         self, test_book: Path,
@@ -2316,6 +2412,7 @@ class TestGetBookSummaryWarnings:
                 commodity=wild,
             )
             book.save()
+        self._hold_shares(gc, "Assets:WILD")
         result = gc.get_book_summary()
         assert "Warnings:" in result
         warnings_block = result.split("Warnings:")[1].split(
@@ -2484,39 +2581,77 @@ class TestGetBookSummaryWarnings:
             )[0]
             assert "Disabled Schedule" not in warnings_block
 
-    def test_low_cash_below_one_day_burn_warns(
-        self, test_book: Path,
-    ):
-        """A BANK / CASH account whose balance falls below one day
-        of daily expense burn earns a 'Critically low cash:'
-        warning. Threshold scales with the user's actual spending,
-        not a fixed dollar floor.
-
-        Regression for the cousin's report on Alex's $6 Savings
-        account at $683/day burn — relative threshold catches it
-        cleanly."""
-        gc = GnuCashBook(str(test_book))
-        # Seed enough expense activity that daily_burn is high
-        # enough to flag fixture's tiny accounts. With $36,000
-        # over 180 days → $200/day burn. Fixture's Savings doesn't
-        # exist, so add one with a $5 balance.
-        gc.create_account(
-            name="Savings", account_type="BANK", parent="Assets",
-        )
+    def _fund(self, gc, account, amount, days_ago):
         with gc.open(readonly=False) as book:
-            savings = gc._find_account(book, "Assets:Savings")
+            acct = gc._find_account(book, account)
             opening = gc._find_account(book, "Equity:Opening Balance")
             book.session.add(piecash.Transaction(
                 currency=book.default_currency,
-                description="Token deposit",
-                post_date=date.today() - timedelta(days=20),
+                description=f"Fund {account}",
+                post_date=date.today() - timedelta(days=days_ago),
                 splits=[
-                    piecash.Split(account=savings, value=Decimal("5")),
-                    piecash.Split(account=opening, value=Decimal("-5")),
+                    piecash.Split(account=acct, value=Decimal(amount)),
+                    piecash.Split(account=opening,
+                                  value=-Decimal(amount)),
                 ],
             ))
             book.save()
-        # Seed $36,000 of expenses → $200/day burn.
+
+    def test_low_cash_below_one_day_of_own_outflow_warns(
+        self, test_book: Path,
+    ):
+        """A BANK / CASH account whose balance is under one day of
+        its OWN outflow earns a 'Critically low cash:' warning —
+        it's about to run dry at the pace it's actually drawn on."""
+        gc = GnuCashBook(str(test_book))
+        gc.create_account(
+            name="Savings", account_type="BANK", parent="Assets",
+        )
+        self._fund(gc, "Assets:Savings", "1000", 170)
+        # $995 out over the window → ~$5.53/day; $5 left.
+        gc.create_transaction(
+            description="Drawdown",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "995"},
+                {"account": "Assets:Savings", "amount": "-995"},
+            ],
+            trans_date=date.today() - timedelta(days=30),
+            check_duplicates=False,
+        )
+        result = gc.get_book_summary()
+        warnings_block = result.split("Warnings:")[1].split(
+            "Accounts:"
+        )[0]
+        assert "Critically low cash: Savings" in warnings_block
+        assert "under 1 day of its own outflow" in warnings_block
+
+    def test_thin_spillway_does_not_warn_against_household_burn(
+        self, test_book: Path,
+    ):
+        """A small payments account measured against the whole
+        household's burn read "critical" while checking held
+        thousands (live book, 2026-09-24: Cash App at $299 vs
+        $309/day). Against its own $26/day it has 11 days; an
+        account with no outflow at all (a wallet) never fires."""
+        gc = GnuCashBook(str(test_book))
+        gc.create_account(
+            name="Cash App", account_type="BANK", parent="Assets",
+        )
+        gc.create_account(
+            name="Wallet", account_type="CASH", parent="Assets",
+        )
+        self._fund(gc, "Assets:Cash App", "180", 100)  # $150 left
+        self._fund(gc, "Assets:Wallet", "40", 100)
+        gc.create_transaction(
+            description="Small spend",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "30"},
+                {"account": "Assets:Cash App", "amount": "-30"},
+            ],
+            trans_date=date.today() - timedelta(days=20),
+            check_duplicates=False,
+        )
+        # Household burn of $200/day dwarfs both balances.
         gc.create_transaction(
             description="Burn",
             splits=[
@@ -2526,15 +2661,9 @@ class TestGetBookSummaryWarnings:
             trans_date=date.today() - timedelta(days=30),
             check_duplicates=False,
         )
-
         result = gc.get_book_summary()
-        assert "Warnings:" in result
-        warnings_block = result.split("Warnings:")[1].split(
-            "Accounts:"
-        )[0]
-        assert "Critically low cash" in warnings_block
-        assert "Savings" in warnings_block
-        assert "under 1 day of burn" in warnings_block
+        assert "Critically low cash: Cash App" not in result
+        assert "Critically low cash: Wallet" not in result
 
     def test_low_cash_above_one_day_burn_does_not_warn(
         self, test_book: Path,
@@ -2680,9 +2809,8 @@ class TestGetBookSummaryWarnings:
             assert "uncleared suspense balance" in warnings_block
 
     def test_low_cash_skipped_when_no_burn(self, test_book: Path):
-        """When the book has no expense activity in the burn
-        window, there's no daily-burn benchmark. Skip the
-        low-cash check entirely rather than guess a threshold."""
+        """An account with no outflow in the window has no pace to
+        run out at — a deposit-only account never fires."""
         gc = GnuCashBook(str(test_book))
         gc.create_account(
             name="Empty Savings", account_type="BANK", parent="Assets",
@@ -2954,6 +3082,7 @@ class TestGetBookSummaryWarnings:
         """When emitted, Warnings appears above Accounts — that's
         the scan-first ordering the spec calls for."""
         gc = GnuCashBook(str(investment_book))
+        self._hold_shares(gc, "Assets:Investments:VTSAX")
         result = gc.get_book_summary()
         assert "Warnings:" in result
         warnings_idx = result.index("Warnings:")
@@ -10721,7 +10850,7 @@ class TestMultiCurrencyBalances:
 class TestMultiCurrencyDashboardHelpers:
     """v1.3.0 follow-up to the spending/income FX-conversion fix:
     three dashboard helpers (``_monthly_net_income``,
-    ``_daily_expense_burn``, ``_budget_headline``) and one report
+    ``_daily_cash_burn``, ``_budget_headline``) and one report
     (``vendor_spending_report``) were summing ``split.value`` /
     ``split.quantity`` raw across currencies. Same class of bug —
     silently wrong on any book with foreign-currency activity.
@@ -10821,7 +10950,7 @@ class TestMultiCurrencyDashboardHelpers:
             f"expected +1,200 in MTD line, got: {mtd_line!r}"
         )
 
-    def test_daily_expense_burn_converts_foreign_currency_expense(
+    def test_daily_cash_burn_converts_foreign_currency_expense(
         self, multi_currency_book: Path,
     ):
         """Runway's daily-burn divisor must reflect foreign-currency
@@ -10862,11 +10991,11 @@ class TestMultiCurrencyDashboardHelpers:
                 ],
             ))
             bk.save()
-            # _daily_expense_burn is an instance method requiring a
+            # _daily_cash_burn is an instance method requiring a
             # book session — call it within an open block.
             transactions = list(bk.transactions)
             from datetime import timedelta
-            burn = gc_book._daily_expense_burn(
+            burn = gc_book._daily_cash_burn(
                 bk, transactions, days=30,
             )
             # €200 × 1.50 = $300 of expense in default currency.

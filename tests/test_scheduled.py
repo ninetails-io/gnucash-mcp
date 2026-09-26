@@ -1066,11 +1066,15 @@ class TestScheduledCurrency:
 
         gc = GnuCashBook(str(multi_currency_book))
         self._eur_accounts(gc)
+        gc.create_account(
+            name="Euro Fees", account_type="EXPENSE",
+            parent="Expenses", commodity="EUR",
+        )
         gc.create_scheduled_transaction(
-            name="EUR Sweep", description="x",
+            name="EUR Bill", description="x",
             splits=[
                 {"account": "Assets:EUR Checking", "amount": "-25.00"},
-                {"account": "Assets:Euro Savings", "amount": "25.00"},
+                {"account": "Expenses:Euro Fees", "amount": "25.00"},
             ],
             start_date=(_date.today() + _td(days=2)).isoformat(),
             frequency="monthly", currency="EUR",
@@ -1082,7 +1086,7 @@ class TestScheduledCurrency:
             stats = gc._upcoming_within_days(book, days=7)
         assert stats["count"] == 1
         assert stats["unrated"] == 1
-        assert stats["total"] == 0
+        assert stats["cash_out"] == 0
 
         # A real market rate converts the total.
         gc.create_price(
@@ -1092,7 +1096,8 @@ class TestScheduledCurrency:
         with gc.open(readonly=True) as book:
             stats = gc._upcoming_within_days(book, days=7)
         assert stats["unrated"] == 0
-        assert stats["total"] == Decimal("25.00") * Decimal("1.08")
+        assert stats["cash_out"] == Decimal("25.00") * Decimal("1.08")
+        assert stats["cash_in"] == 0
 
 
 class TestScheduledSplitAction:
@@ -1196,6 +1201,101 @@ def _rent(gb, start, name="Rent", **kw):
         frequency="monthly",
         **kw,
     )
+
+
+def _sched_line(gb):
+    return next(
+        line for line in gb.get_book_summary().splitlines()
+        if line.startswith("Scheduled:")
+    )
+
+
+class TestSummaryCashDirection:
+    """The dashboard's 7-day money reads cash legs by direction. A
+    signless positive-split sum put a paycheck's gross into the
+    week's bills (live book, 2026-09-24: USD 6,777 "due", USD 1,931
+    actually leaving checking)."""
+
+    def _paycheck(self, gb, splits=None):
+        gb.create_scheduled_transaction(
+            name="Paycheck", description="Paycheck",
+            splits=splits or [
+                {"account": "Assets:Checking", "amount": "3000.00"},
+                {"account": "Income:Salary", "amount": "-3000.00"},
+            ],
+            start_date=(date.today() + timedelta(days=1)).isoformat(),
+            frequency="monthly",
+        )
+
+    def test_income_and_bills_split_by_direction(self, scheduled_book):
+        gb = GnuCashBook(str(scheduled_book))
+        _rent(gb, date.today() + timedelta(days=3))
+        self._paycheck(gb)
+        with gb.open(readonly=True) as book:
+            week = gb._upcoming_within_days(book, days=7)
+        assert week["count"] == 2
+        assert week["cash_out"] == Decimal("1850.00")
+        assert week["cash_in"] == Decimal("3000.00")
+        assert (
+            "2 due in next 7 days (USD 1,850 out, USD 3,000 in)"
+            in _sched_line(gb)
+        )
+
+    def test_only_the_cash_leg_of_a_paycheck_counts(self, scheduled_book):
+        """Retirement and non-cash legs of a paycheck aren't cash
+        arriving — only what reaches checking is."""
+        gb = GnuCashBook(str(scheduled_book))
+        gb.create_account(
+            name="Retirement Cash", account_type="BANK", parent="Assets",
+        )
+        gb.create_account(
+            name="Federal", account_type="EXPENSE", parent="Expenses",
+        )
+        self._paycheck(gb, splits=[
+            {"account": "Assets:Checking", "amount": "2200.00"},
+            {"account": "Assets:Retirement Cash", "amount": "500.00"},
+            {"account": "Expenses:Federal", "amount": "300.00"},
+            {"account": "Income:Salary", "amount": "-3000.00"},
+        ])
+        with gb.open(readonly=True) as book:
+            week = gb._upcoming_within_days(book, days=7)
+        assert week["cash_in"] == Decimal("2200.00")
+        assert week["cash_out"] == 0
+        assert "(USD 2,200 in)" in _sched_line(gb)
+
+    def test_transfers_and_card_charges_move_no_cash(self, scheduled_book):
+        gb = GnuCashBook(str(scheduled_book))
+        gb.create_account(
+            name="Savings", account_type="BANK", parent="Assets",
+        )
+        gb.create_account(
+            name="Liabilities", account_type="LIABILITY", placeholder=True,
+        )
+        gb.create_account(
+            name="Card", account_type="CREDIT", parent="Liabilities",
+        )
+        soon = (date.today() + timedelta(days=2)).isoformat()
+        gb.create_scheduled_transaction(
+            name="Sweep", description="Sweep",
+            splits=[
+                {"account": "Assets:Checking", "amount": "-200.00"},
+                {"account": "Assets:Savings", "amount": "200.00"},
+            ],
+            start_date=soon, frequency="monthly",
+        )
+        gb.create_scheduled_transaction(
+            name="Streaming", description="Streaming",
+            splits=[
+                {"account": "Expenses:Utilities", "amount": "22.10"},
+                {"account": "Liabilities:Card", "amount": "-22.10"},
+            ],
+            start_date=soon, frequency="monthly",
+        )
+        with gb.open(readonly=True) as book:
+            week = gb._upcoming_within_days(book, days=7)
+        assert week["count"] == 2
+        assert week["cash_out"] == 0 and week["cash_in"] == 0
+        assert "2 due in next 7 days (no cash moves)" in _sched_line(gb)
 
 
 class TestOccurrenceAgreement:
