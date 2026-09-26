@@ -7891,7 +7891,10 @@ class TestReplaceSplits:
         gc_book.assign_split_to_lot(inv_split["guid"], lot_guid)
 
         # Try to replace splits without force
-        with pytest.raises(ValueError, match="splits in lots"):
+        with pytest.raises(
+            ValueError,
+            match=r"splits in lots: Test Lot \(Assets:Investments:VTSAX\)",
+        ):
             gc_book.replace_splits(
                 guid=txn_guid,
                 splits=[

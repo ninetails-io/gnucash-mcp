@@ -184,6 +184,16 @@ def _post_date_as_date(transaction) -> date | None:
     return pd
 
 
+def _lot_split_names(splits) -> str:
+    """How a refusal or warning names lot-held splits: the lot's
+    title, then the account, so an invoice payment reads as its
+    document and a sell as its lot."""
+    return ", ".join(
+        f"{s.lot.title or 'untitled lot'} ({s.account.fullname})"
+        for s in splits
+    )
+
+
 class CoreMixin:
     """Accounts, transactions, and the book-summary view. Always loaded."""
 
@@ -6078,12 +6088,9 @@ class CoreMixin:
 
         in_lots = [s for s in transaction.splits if s.lot is not None]
         if in_lots and not force:
-            names = ", ".join(
-                f"{s.lot.title or 'untitled lot'} ({s.account.fullname})"
-                for s in in_lots
-            )
             raise ValueError(
-                f"Transaction has splits in lots: {names}. Deleting "
+                f"Transaction has splits in lots: "
+                f"{_lot_split_names(in_lots)}. Deleting "
                 f"reopens them (cost basis, or an invoice's payment). "
                 f"Use force=true to override."
             )
@@ -6715,13 +6722,9 @@ class CoreMixin:
                     )
                 ]
                 if lot_changes and not force:
-                    names = ", ".join(
-                        f"{s.lot.title or 'untitled lot'} "
-                        f"({s.account.fullname})"
-                        for s in lot_changes
-                    )
                     raise ValueError(
-                        f"Transaction has splits in lots: {names}. "
+                        f"Transaction has splits in lots: "
+                        f"{_lot_split_names(lot_changes)}. "
                         f"Changing their amounts changes the lot (cost "
                         f"basis, or an invoice's payment). Use "
                         f"force=true to override."
@@ -6914,17 +6917,15 @@ class CoreMixin:
             # 5. Check lot assignments
             in_lots = [s for s in transaction.splits if s.lot is not None]
             if in_lots and not force:
-                names = ", ".join(s.account.fullname for s in in_lots)
                 raise ValueError(
-                    f"Transaction has splits in lots: {names}. "
+                    f"Transaction has splits in lots: "
+                    f"{_lot_split_names(in_lots)}. "
                     f"Use force=true to override."
                 )
             if in_lots:
-                lot_info = ", ".join(
-                    f"{s.lot.title} ({s.account.fullname})" for s in in_lots
-                )
                 warnings.append(
-                    f"Removed splits from lots: {lot_info}. "
+                    f"Removed splits from lots: "
+                    f"{_lot_split_names(in_lots)}. "
                     f"Cost basis tracking affected."
                 )
                 for split in in_lots:
