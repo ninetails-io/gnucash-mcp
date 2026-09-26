@@ -6845,6 +6845,61 @@ def _sold_out_lot(gc_book):
     return lot_guid, guids[1]
 
 
+class TestLotFlagFollowsAmountChanges:
+    """GnuCash's ``mark_split`` resets a lot to LOT_CLOSED_UNKNOWN on
+    every amount or value change to one of its splits
+    (``xaccSplitSetAmount`` / ``xaccSplitSetValue``, which void and
+    unvoid both go through). A cached flag left behind describes the
+    old amounts: a sold-out lot whose sell is voided or shrunk holds
+    shares again and must stop reading closed."""
+
+    def test_void_reopens_lot(self, investment_book: Path):
+        gc_book = GnuCashBook(str(investment_book))
+        lot_guid, sell_guid = _sold_out_lot(gc_book)
+
+        gc_book.void_transaction(sell_guid, reason="entered twice")
+
+        assert gc_book.get_lot(lot_guid)["is_closed"] is False
+
+    def test_unvoid_closes_lot_again(self, investment_book: Path):
+        """Between void and unvoid the lot is open, and GnuCash caches
+        that answer (``gnc_lot_get_balance`` stores it). Unvoid has to
+        clear the cached 0, or the sold-out lot reads open."""
+        import sqlite3
+
+        gc_book = GnuCashBook(str(investment_book))
+        lot_guid, sell_guid = _sold_out_lot(gc_book)
+        gc_book.void_transaction(sell_guid, reason="entered twice")
+        assert gc_book.get_lot(lot_guid)["is_closed"] is False
+        with sqlite3.connect(investment_book) as conn:
+            cached = conn.execute(
+                "UPDATE lots SET is_closed = 0 WHERE guid LIKE ?",
+                (lot_guid + "%",),
+            )
+            assert cached.rowcount == 1
+
+        gc_book.unvoid_transaction(sell_guid)
+
+        assert gc_book.get_lot(lot_guid)["is_closed"] is True
+
+    def test_update_amount_reopens_lot(self, investment_book: Path):
+        gc_book = GnuCashBook(str(investment_book))
+        lot_guid, sell_guid = _sold_out_lot(gc_book)
+
+        gc_book.update_transaction(
+            sell_guid,
+            splits=[
+                {
+                    "account": "Assets:Investments:VTSAX",
+                    "amount": "-700.00", "quantity": "-5",
+                },
+                {"account": "Assets:Checking", "amount": "700.00"},
+            ],
+        )
+
+        assert gc_book.get_lot(lot_guid)["is_closed"] is False
+
+
 class TestDeleteTransaction:
     """Tests for delete_transaction method."""
 

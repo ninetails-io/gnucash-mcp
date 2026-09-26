@@ -230,6 +230,29 @@ class TestChokepointLock:
         text = (self.BOOK_DIR / "investments.py").read_text()
         assert re.search(r"^\s*split\.lot = lot\s*$", text, re.M)
 
+    AMOUNT_WRITE = re.compile(r"^\s*(split|s)\.(quantity|value)\s*=[^=]")
+
+    def test_every_amount_write_forgets_the_flag(self):
+        """GnuCash's ``mark_split`` resets the lot on every
+        ``xaccSplitSetAmount`` / ``SetValue``; each write of a split's
+        amount here is followed within a few lines by
+        ``_lot_forget_flag(<split>.lot)``."""
+        offenders = []
+        for path in sorted(self.BOOK_DIR.glob("*.py")):
+            lines = path.read_text().splitlines()
+            for i, line in enumerate(lines):
+                m = self.AMOUNT_WRITE.search(line)
+                if not m:
+                    continue
+                window = "\n".join(lines[i + 1:i + 9])
+                if f"_lot_forget_flag({m.group(1)}.lot)" not in window:
+                    offenders.append(f"{path.name}:{i + 1}: {line.strip()}")
+        assert not offenders, "\n".join(offenders)
+
+    def test_the_amount_scanner_is_not_vacuous(self):
+        lines = (self.BOOK_DIR / "reconciliation.py").read_text().splitlines()
+        assert sum(1 for l in lines if self.AMOUNT_WRITE.search(l)) >= 4
+
     def test_no_literal_writes(self):
         offenders = []
         for path in sorted(self.BOOK_DIR.glob("*.py")):

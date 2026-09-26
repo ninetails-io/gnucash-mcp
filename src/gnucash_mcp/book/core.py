@@ -6705,6 +6705,7 @@ class CoreMixin:
                         v = split_updates[account_name]
                         split.value = v["value"]
                         split.quantity = v["quantity"]
+                        _lot_forget_flag(split.lot)
                         raw = raw_by_fullname[account_name]
                         if "memo" in raw:
                             split.memo = raw["memo"]
