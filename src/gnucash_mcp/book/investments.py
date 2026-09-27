@@ -197,7 +197,7 @@ class InvestmentsMixin:
         mnemonic: str,
         fullname: str,
         namespace: str = "FUND",
-        fraction: int = 10000,
+        fraction: int | None = None,
         cusip: str | None = None,
     ) -> dict:
         """Create a new commodity (stock, mutual fund, etc.) in the book.
@@ -209,7 +209,9 @@ class InvestmentsMixin:
                        "NYSE", "AMEX", or any custom string. Default "FUND".
             fraction: Smallest fractional unit. Use 10000 for 4 decimal places
                       (standard for shares), 100 for 2, 1000000 for 6 (crypto).
-                      Default 10000.
+                      Default 10000. A CURRENCY is GnuCash's, from the ISO
+                      4217 table: its fraction, name, and quote flag come
+                      from there, and a fraction that disagrees is refused.
             cusip: Optional CUSIP/ISIN identifier for the security.
 
         Returns:
@@ -243,6 +245,29 @@ class InvestmentsMixin:
                 f"Commodity cusip contains control characters. "
                 f"Got: {cusip!r}."
             )
+        # A currency is never invented: GnuCash's come from the ISO
+        # table. The share default (10000) once landed on a USD a
+        # caller created here, and every amount in it read at 4 places.
+        if namespace == "CURRENCY":
+            from piecash.core.currency_ISO import ISO_currencies
+
+            iso = ISO_currencies.get(mnemonic)
+            if iso is None:
+                raise ValueError(
+                    f"{mnemonic} is not an ISO 4217 currency code — "
+                    f"GnuCash's currencies come from the ISO table. Use "
+                    f"another namespace for a non-currency commodity."
+                )
+            iso_fraction = 10 ** int(iso.fraction)
+            if fraction is not None and fraction != iso_fraction:
+                raise ValueError(
+                    f"The ISO 4217 fraction for {mnemonic} is "
+                    f"{iso_fraction}, and GnuCash stores the currency "
+                    f"that way. Omit fraction, or pass {iso_fraction}."
+                )
+            fraction = iso_fraction
+        elif fraction is None:
+            fraction = 10000
         # fraction must be a positive integer — zero or negative
         # breaks every quantity computation that divides by it.
         if not isinstance(fraction, int) or fraction <= 0:
@@ -258,14 +283,17 @@ class InvestmentsMixin:
                     f"Commodity {namespace}:{mnemonic} already exists"
                 )
 
-            commodity = piecash.Commodity(
-                namespace=namespace,
-                mnemonic=mnemonic,
-                fullname=fullname,
-                fraction=fraction,
-                cusip=cusip or "",
-                book=book,
-            )
+            if namespace == "CURRENCY":
+                commodity = self._get_or_create_currency(book, mnemonic)
+            else:
+                commodity = piecash.Commodity(
+                    namespace=namespace,
+                    mnemonic=mnemonic,
+                    fullname=fullname,
+                    fraction=fraction,
+                    cusip=cusip or "",
+                    book=book,
+                )
 
             book.save()
 

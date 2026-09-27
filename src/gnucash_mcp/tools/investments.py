@@ -142,7 +142,7 @@ def register(mcp, get_book) -> None:
         mnemonic: str,
         fullname: str,
         namespace: str = "FUND",
-        fraction: int = 10000,
+        fraction: int | None = None,
         cusip: str | None = None,
     ) -> str:
         """Create a new commodity (stock, mutual fund, etc.).
@@ -154,7 +154,11 @@ def register(mcp, get_book) -> None:
                 "AMEX" for stocks, or any custom string.
             fraction: Smallest fractional unit. 1 = whole units, 100 =
                 2 decimals, 10000 = 4 decimals (default, shares),
-                1000000 = 6 decimals (crypto).
+                1000000 = 6 decimals (crypto). Omit it for
+                namespace "CURRENCY": a currency is GnuCash's, from
+                the ISO 4217 table (USD 100, JPY 1), and a fraction
+                that disagrees is refused. Other tools that take a
+                currency code add an unseen ISO currency themselves.
             cusip: Optional CUSIP/ISIN identifier.
         """
         book = get_book()

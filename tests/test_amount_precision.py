@@ -163,3 +163,91 @@ def test_the_refusal_is_worded_once():
     book_dir = Path(__file__).resolve().parent.parent / "src" / "gnucash_mcp" / "book"
     text = "\n".join(p.read_text() for p in book_dir.glob("*.py"))
     assert text.count("carries finer precision") == 1
+
+
+class TestDocumentTotal:
+    def test_untaxed_total_reads_at_the_currency_unit(
+        self, business_book: Path,
+    ):
+        """An untaxed invoice read "2000.0000" beside amount_paid
+        "2000.00" (seen on a German-chart test book); the total speaks
+        the same unit as the amounts beside it."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001", account="Income:Sales",
+            description="Work", quantity="1", price="2000",
+        )
+        assert gb.get_invoice("000001")["total"] == "2000.00"
+        gb.post_invoice(
+            invoice_id="000001", post_account="Assets:Accounts Receivable",
+        )
+        doc = gb.get_invoice("000001")
+        assert doc["total"] == "2000.00" == doc["amount_due"]
+
+
+def _currency_row(book_path: Path, mnemonic: str):
+    with sqlite3.connect(book_path) as conn:
+        return conn.execute(
+            "SELECT fraction, quote_flag FROM commodities "
+            "WHERE namespace = 'CURRENCY' AND mnemonic = ?", (mnemonic,),
+        ).fetchone()
+
+
+class TestCurrencyDefinitions:
+    """A currency is GnuCash's, from the ISO table — never invented.
+    A German-chart test book held USD at fraction 10000: create_customer
+    refused an unseen USD, and the caller's fallback, create_commodity,
+    applied its share default (10000) to a currency."""
+
+    def test_create_commodity_currency_takes_the_iso_fraction(
+        self, test_book: Path,
+    ):
+        gc = GnuCashBook(str(test_book))
+        result = gc.create_commodity(
+            mnemonic="CHF", fullname="Swiss Franc", namespace="CURRENCY",
+        )
+        assert result["fraction"] == 100
+        assert _currency_row(test_book, "CHF") == (100, 1)
+
+    def test_create_commodity_refuses_a_non_iso_fraction(
+        self, test_book: Path,
+    ):
+        gc = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match="ISO 4217 fraction for CHF is 100"):
+            gc.create_commodity(
+                mnemonic="CHF", fullname="Swiss Franc",
+                namespace="CURRENCY", fraction=10000,
+            )
+        assert _currency_row(test_book, "CHF") is None
+
+    def test_create_commodity_refuses_a_non_iso_currency(
+        self, test_book: Path,
+    ):
+        gc = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match="not an ISO 4217 currency"):
+            gc.create_commodity(
+                mnemonic="XYZ", fullname="Nope", namespace="CURRENCY",
+            )
+
+    def test_securities_keep_the_share_default(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        assert gc.create_commodity(
+            mnemonic="ACME", fullname="Acme Corp",
+        )["fraction"] == 10000
+
+    def test_create_customer_adds_an_unseen_iso_currency(
+        self, test_book: Path,
+    ):
+        gc = GnuCashBook(str(test_book))
+        gc.create_customer(name="Zurich AG", currency="CHF")
+        assert _currency_row(test_book, "CHF") == (100, 1)
+
+    def test_create_invoice_adds_an_unseen_iso_currency(
+        self, business_book: Path,
+    ):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001", currency="JPY")
+        assert _currency_row(business_book, "JPY") == (1, 1)

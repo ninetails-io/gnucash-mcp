@@ -2461,6 +2461,20 @@ class BusinessMixin:
             .all()
         )
 
+    def _document_currency(self, book, code: str):
+        """The currency a party or document names: from the book, or
+        added from the ISO table if unseen — the rule
+        ``create_transaction`` and ``create_price`` already follow.
+        Refusing an unseen code sent a caller to ``create_commodity``
+        to invent one (a USD at fraction 10000). A code that isn't ISO
+        4217 is refused."""
+        try:
+            return self._get_or_create_currency(book, code)
+        except ValueError:
+            raise ValueError(
+                f"Currency not found: {code} is not an ISO 4217 code"
+            )
+
     def _document_status(
         self, book, inv, **known,
     ) -> tuple[str, dict | None]:
@@ -2670,13 +2684,7 @@ class BusinessMixin:
         )
 
         if currency:
-            currency_obj = None
-            for c in book.currencies:
-                if c.mnemonic == currency:
-                    currency_obj = c
-                    break
-            if not currency_obj:
-                raise ValueError(f"Currency not found: {currency}")
+            currency_obj = self._document_currency(book, currency)
         else:
             currency_obj = self._require_default_currency(book)
 
@@ -2834,12 +2842,7 @@ class BusinessMixin:
             changed["name"] = name
 
         if currency is not None:
-            # ``_get_or_create_currency`` auto-loads unseen ISO codes
-            # (same convention as ``create_price``).
-            try:
-                new_currency = self._get_or_create_currency(book, currency)
-            except ValueError:
-                raise ValueError(f"Currency not found: {currency}")
+            new_currency = self._document_currency(book, currency)
             if new_currency != entity.currency:
                 entity.currency = new_currency
                 changed["currency"] = currency
@@ -4331,13 +4334,7 @@ class BusinessMixin:
                     )
 
             if currency:
-                currency_obj = None
-                for c in book.currencies:
-                    if c.mnemonic == currency:
-                        currency_obj = c
-                        break
-                if not currency_obj:
-                    raise ValueError(f"Currency not found: {currency}")
+                currency_obj = self._document_currency(book, currency)
                 currency_guid = currency_obj.guid
             else:
                 # Owner currency first, book default as defensive
