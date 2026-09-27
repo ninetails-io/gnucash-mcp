@@ -1456,3 +1456,31 @@ class TestBudgetSignChokepoint:
                 if raw.search(line):
                     offenders.append(f"{path.name}:{lineno}")
         assert not offenders, offenders
+
+
+class TestDocumentOwnerTypeChokepoint:
+    """The document tools' party_type / document_type → owner side
+    rule lives in ``_document_owner_type``; it was copied into five
+    tool wrappers."""
+
+    def test_the_rule(self):
+        from gnucash_mcp.tools.business import _document_owner_type
+
+        assert _document_owner_type("invoice", None) == "customer"
+        assert _document_owner_type("bill", None) == "vendor"
+        assert _document_owner_type("voucher", None) == "employee"
+        # A credit note exists on both sides; no type says nothing.
+        assert _document_owner_type("credit_note", None) is None
+        assert _document_owner_type(None, None) is None
+        # An explicit party_type always wins.
+        assert _document_owner_type("invoice", "vendor") == "vendor"
+        assert _document_owner_type(None, "customer") == "customer"
+
+    def test_the_mapping_is_written_once(self):
+        import gnucash_mcp.tools as tools_pkg
+
+        text = "\n".join(
+            p.read_text()
+            for p in sorted(Path(tools_pkg.__file__).parent.glob("*.py"))
+        )
+        assert text.count('"invoice": "customer"') == 1

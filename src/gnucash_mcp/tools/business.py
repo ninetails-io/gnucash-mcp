@@ -16,6 +16,19 @@ from gnucash_mcp.tools._helpers import (
 )
 
 
+def _document_owner_type(document_type, party_type):
+    """The owner side a document tool passes to the book: the caller's
+    ``party_type`` when given, else the side ``document_type`` implies
+    (invoice → customer, bill → vendor, voucher → employee). None for
+    a credit note, which exists on both sides, or no type at all —
+    the book resolves the id or asks for ``party_type``."""
+    if party_type:
+        return party_type
+    return {
+        "invoice": "customer", "bill": "vendor", "voucher": "employee",
+    }.get(document_type)
+
+
 def register(mcp, get_book) -> None:
     """Attach business tools to the FastMCP server."""
 
@@ -764,10 +777,7 @@ def register(mcp, get_book) -> None:
                 engagement?" listing pattern.
             offset: 0-indexed first row to return (default 0).
         """
-        owner_type = party_type if party_type else {
-            "invoice": "customer", "bill": "vendor",
-            "voucher": "employee",
-        }.get(document_type)
+        owner_type = _document_owner_type(document_type, party_type)
         book = get_book()
         result = book.list_invoices(
             doc_type=document_type,
@@ -822,10 +832,7 @@ def register(mcp, get_book) -> None:
             party_type: Owner side ("customer"/"vendor") — needed
                 only for credit notes, which exist on both sides.
         """
-        owner_type = party_type if party_type else {
-            "invoice": "customer", "bill": "vendor",
-            "voucher": "employee",
-        }.get(document_type)
+        owner_type = _document_owner_type(document_type, party_type)
         book = get_book()
         result = book.get_invoice(invoice_id=id, owner_type=owner_type)
         return _json(result)
@@ -871,10 +878,7 @@ def register(mcp, get_book) -> None:
             force: Override the stale-FX-rate guard and post with a
                 7–90 day stale rate. Default False.
         """
-        owner_type = party_type if party_type else {
-            "invoice": "customer", "bill": "vendor",
-            "voucher": "employee",
-        }.get(document_type)
+        owner_type = _document_owner_type(document_type, party_type)
         book = get_book()
         result = book.post_invoice(
             invoice_id=id,
@@ -911,10 +915,7 @@ def register(mcp, get_book) -> None:
                 "credit_note" — disambiguates when IDs collide.
             party_type: Owner side, credit notes only.
         """
-        owner_type = party_type if party_type else {
-            "invoice": "customer", "bill": "vendor",
-            "voucher": "employee",
-        }.get(document_type)
+        owner_type = _document_owner_type(document_type, party_type)
         book = get_book()
         result = book.unpost_invoice(
             invoice_id=id,
@@ -1025,10 +1026,7 @@ def register(mcp, get_book) -> None:
             ``"would_pay"`` on dry runs — plus the amount paid,
             remaining balance, and transaction reference.
         """
-        owner_type = party_type if party_type else {
-            "invoice": "customer", "bill": "vendor",
-            "voucher": "employee",
-        }.get(document_type)
+        owner_type = _document_owner_type(document_type, party_type)
         book = get_book()
         result = book.pay_invoice(
             invoice_id=id,
