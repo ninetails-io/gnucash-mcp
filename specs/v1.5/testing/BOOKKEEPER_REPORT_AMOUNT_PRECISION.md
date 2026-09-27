@@ -81,3 +81,42 @@ Signed: Abe VI, the remote bookkeeper — every sub-cent refused at every
 door, every stored fraction GnuCash-shaped, and the message knows what
 currency it's speaking. One gate awaits a human (or a brave screen
 session).
+
+## Round 2 — addendum (steps 9–13), 2026-09-27
+
+Branch at `2f4645b`, fresh copy of committed Alex
+(`abe-bench/alex-precision-r2.gnucash`), repo's own `mcpcall.py` via
+`REPO` env (fix `b1756e0` verified in use — no patching needed).
+
+9. **PASS.** "Zurich Probe AG" created with CHF; commodity listed;
+   storage fraction **100**.
+10. **PASS.** SEK, no fraction → created, fraction 100. NOK @ 10000 →
+    refused verbatim: `The ISO 4217 fraction for NOK is 100, and
+    GnuCash stores the currency that way. Omit fraction, or pass 100.`
+    XYZ → refused: `XYZ is not an ISO 4217 currency code — GnuCash's
+    currencies come from the ISO table. Use another namespace for a
+    non-currency commodity.` ACME (NASDAQ, no fraction) → 10000.
+    (Note: `fullname` is required by the schema; the plan's shorthand
+    omits it. Not a defect — a plan nit.)
+11. **PASS.** Old names (`credit_note_id`/`applies_to_invoice_id`) now
+    schema-rejected naming both as not permitted — the exact inversion
+    of round 1's finding; `id`/`applies_to_id` applied C9002 (50.00) to
+    000019 → due 3,450.00, payments crediting `from: Credit Note C9002`.
+    Round-1 route-around 2: **RESOLVED** (`7b4a3bf`).
+12. **PASS.** Invoice A9002 created with unseen JPY; storage fraction
+    **1** (ISO minor unit, not the currency default).
+13. **PASS.** `list_documents` bills-only and vendor-side return the
+    same 8 rows; A9003 post → unpost → `get_document` reads `open`.
+    Owner-side refactor (`507cb9f`) exercised across all five tools
+    with rounds 1+2 combined — no behavior change observed.
+
+Storage cross-check: `commodities` table reads JPY|1, CHF|100, SEK|100,
+ACME|10000, USD|100. Round-1 route-around 3 (mcpcall REPO): **RESOLVED**
+(`b1756e0`). The migration side-effect (route-around 4) fired again on
+this fresh copy, as expected for pre-format samples.
+
+**Part C desktop GUI gate remains the only open box** — both rounds'
+litter sits in `abe-bench/` awaiting it, per the plan.
+
+Countersigned for round 2: Abe VI. The currencies come from the ISO
+table now, and the tools speak one argot.
