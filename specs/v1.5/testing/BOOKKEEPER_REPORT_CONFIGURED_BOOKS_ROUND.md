@@ -71,7 +71,33 @@ prices, the same difference the class-6 loop saw on Alex.
 2. `update_transaction`'s reconciled gate still raises before its lot
    gate. No MCP tool reaches that path.
 3. The live server in the maintainer's session was started before
-   this work and still runs the old code; it needs a restart before
-   the remote bookkeeper uses it.
+   this work; the maintainer restarted it for the live round below.
 
 Signed: Claude (Opus 5.5), Claude Code, for the bookkeeper.
+
+## Live round — the restarted server, 2026-09-27
+
+The maintainer restarted the live server (11:32, after this branch's
+last commit), and the same surfaces were exercised through it on the
+real files. Reads only on the maintainer's book and on the committed
+Lin Wei sample; the one write was a void/unvoid round trip on the
+German-chart test book.
+
+- **Maintainer's book:** lots, `get_lot`, search, and the dashboard
+  read correctly.
+- **Lin Wei:** the list shows 23 `paid` and 6 `posted`, and the 6 are
+  exactly the outstanding list. Job-attached EUR and USD invoices
+  list their payment in the document's currency; an unpaid one lists
+  `payments: []`.
+- **Test book:** the unforced delete of the invoice payment was
+  refused, naming the invoice. Void → `posted`, full amount due,
+  `payments: []`, on the outstanding list; unvoid → `paid`, payment
+  listed. The payment has an FX gain/loss leg, and `from` still names
+  the bank account. The audit log records the refusal, the void, and
+  the unvoid. Split amounts, actions, and slots after the round trip
+  match the pre-round copy.
+
+Two things seen that predate this work: unvoid restores a quantity
+with denominator 1 (`1900/1` where it was `190000/100`, same value),
+and the UNVOID audit block omits split actions that the VOID block
+shows.
