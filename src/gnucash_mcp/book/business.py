@@ -2348,7 +2348,8 @@ class BusinessMixin:
         Returns a dict of ``post_account``, ``lot``, ``balance``
         (signed lot balance), ``grand_total``, ``amount_paid``,
         ``amount_due`` (direction-normalized: positive = still owed,
-        NEGATIVE = overpaid, never abs()'d), and ``overpaid``.
+        NEGATIVE = overpaid, never abs()'d), ``overpaid``, and
+        ``sign`` (``amount_due == sign * balance``).
         """
         if not _is_invoice_posted(inv):
             return None
@@ -2374,9 +2375,8 @@ class BusinessMixin:
         # paid/due/total read alike (250.00, not 250 beside 200.00)
         # on every surface and in the audit line that echoes them.
         quantum = _commodity_quantum(post_acct.commodity)
-        amount_due = (
-            -balance if (is_bill ^ is_credit_note) else balance
-        ).quantize(quantum)
+        sign = -1 if (is_bill ^ is_credit_note) else 1
+        amount_due = (sign * balance).quantize(quantum)
         if grand_total is not None:
             grand_total = grand_total.quantize(quantum)
         else:
@@ -2396,7 +2396,46 @@ class BusinessMixin:
             "amount_paid": grand_total - amount_due,
             "amount_due": amount_due,
             "overpaid": amount_due < 0 and not is_credit_note,
+            "sign": sign,
         }
+
+    def _document_payments(self, book, inv, settlement) -> list[dict]:
+        """What has settled a posted document: every non-voided split
+        in its lot except the posting, oldest first.
+
+        ``guid`` is the settling transaction, short, so the caller can
+        void or delete it directly. ``amount`` is what it settled, in
+        the lot's currency, in the direction ``amount_due`` reads.
+        ``from`` names the other side: a lot's title when the other leg
+        sits in one (a credit note applied, or the invoice it was
+        applied to), otherwise the account the money moved through.
+        """
+        post_guid = inv.post_txn.guid if inv.post_txn is not None else None
+        quantum = _commodity_quantum(settlement["post_account"].commodity)
+        prefixes = self._transaction_prefix_map(book)
+        rows = []
+        for split in settlement["lot"].splits:
+            txn = split.transaction
+            if txn.guid == post_guid or split.reconcile_state == "v":
+                continue
+            others = [o for o in txn.splits if o is not split]
+            in_lot = next((o for o in others if o.lot is not None), None)
+            if in_lot is not None:
+                source = in_lot.lot.title or in_lot.account.fullname
+            elif others:
+                source = max(others, key=lambda o: abs(o.value)).account.fullname
+            else:
+                source = ""
+            rows.append({
+                "guid": prefixes.get(txn.guid, txn.guid[:8]),
+                "date": txn.post_date.isoformat() if txn.post_date else None,
+                "amount": str(
+                    (-settlement["sign"] * split.value).quantize(quantum)
+                ),
+                "from": source,
+            })
+        rows.sort(key=lambda r: (r["date"] or "", r["guid"]))
+        return rows
 
     def _preload_document_lots(self, book, invoices) -> list:
         """Load the posting accounts of a page of documents with every
@@ -5498,6 +5537,9 @@ class BusinessMixin:
                 result["amount_due"] = str(settlement["amount_due"])
                 if settlement["overpaid"]:
                     result["overpaid"] = True
+                result["payments"] = self._document_payments(
+                    book, inv, settlement,
+                )
 
             # Forward signal: surface available (or just-expired)
             # early-payment discount so get_invoice is actionable

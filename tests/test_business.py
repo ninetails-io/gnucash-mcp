@@ -12168,6 +12168,70 @@ class TestDocumentPaymentState:
         assert verbose["status"] == "paid"
         assert "000001" in gb.list_invoices(status="posted")
 
+    def test_get_invoice_names_its_payments(self, business_book):
+        """Each settlement in the document's lot is listed with a
+        transaction guid the caller can void or delete directly —
+        the "bounced payment" workflow no longer means searching by
+        customer and guessing by date and amount. Voided payments
+        drop out, as they do from the balance."""
+        gb = GnuCashBook(str(business_book))
+        self._post_invoice(gb, "500.00")
+        first = gb.pay_invoice(
+            invoice_id="000001", payment_account="Assets:Checking",
+            amount="200",
+        )["transaction_guid"]
+        gb.pay_invoice(
+            invoice_id="000001", payment_account="Assets:Checking",
+            amount="300",
+        )
+        payments = gb.get_invoice("000001")["payments"]
+        assert sorted(p["amount"] for p in payments) == ["200.00", "300.00"]
+        assert {p["from"] for p in payments} == {"Assets:Checking"}
+        for p in payments:
+            assert gb.get_transaction(p["guid"]) is not None
+        assert first in {p["guid"] for p in payments}
+
+        gb.void_transaction(first, reason="bounced")
+        doc = gb.get_invoice("000001")
+        assert [p["amount"] for p in doc["payments"]] == ["300.00"]
+        assert doc["amount_due"] == "200.00"
+
+    def test_unpaid_invoice_lists_no_payments(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        self._post_invoice(gb, "500.00")
+        assert gb.get_invoice("000001")["payments"] == []
+
+    def test_credit_application_names_the_other_document(
+        self, business_book,
+    ):
+        """A credit note settles an invoice with no cash leg; its
+        entry names the document on the other side, both ways."""
+        gb = GnuCashBook(str(business_book))
+        self._post_invoice(gb, "500.00")
+        cn = gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+            applies_to_invoice_id="000001",
+        )["id"]
+        gb.add_credit_note_entry(
+            credit_note_id=cn, account="Income:Sales",
+            description="Disputed line", quantity="1", price="100",
+        )
+        gb.post_invoice(
+            invoice_id=cn, post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        gb.apply_credit_note(
+            credit_note_id=cn, applies_to_invoice_id="000001",
+        )
+
+        [inv_side] = gb.get_invoice("000001")["payments"]
+        assert inv_side["amount"] == "100.00"
+        assert inv_side["from"] == f"Credit Note {cn}"
+        [cn_side] = gb.get_invoice(cn)["payments"]
+        assert cn_side["amount"] == "100.00"
+        assert cn_side["from"] == "Invoice 000001"
+        assert cn_side["guid"] == inv_side["guid"]
+
     def test_list_status_reads_settlements_in_fixed_queries(
         self, business_book,
     ):
