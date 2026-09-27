@@ -833,8 +833,9 @@ def _split_to_compact_dict(split: piecash.Split) -> dict:
     (~40-60 chars vs ~140 for the full dict).
 
     Emits ``account`` and ``value`` always; ``quantity`` only when
-    cross-currency, ``memo`` / ``reconcile_state`` only when
-    non-default. Omits ``guid`` (the described splits are gone —
+    cross-currency, ``memo`` / ``action`` / ``reconcile_state`` only
+    when non-default — for replace_splits' ``previous_splits`` this is
+    the audit log's only record of the deleted legs. Omits ``guid`` (the described splits are gone —
     unaddressable), ``reconcile_date``, and ``lot_guid``. Compatible
     with the audit formatter's ``_format_splits_text``.
     """
@@ -846,6 +847,8 @@ def _split_to_compact_dict(split: piecash.Split) -> dict:
         result["quantity"] = str(split.quantity)
     if split.memo:
         result["memo"] = split.memo
+    if split.action:
+        result["action"] = split.action
     if split.reconcile_state and split.reconcile_state != "n":
         result["reconcile_state"] = split.reconcile_state
     return result

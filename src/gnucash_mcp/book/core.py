@@ -6079,21 +6079,30 @@ class CoreMixin:
         reconciled = [
             s for s in transaction.splits if s.reconcile_state == "y"
         ]
-        if reconciled and not force:
-            acct_names = ", ".join(s.account.fullname for s in reconciled)
-            raise ValueError(
-                f"Transaction has reconciled splits in: {acct_names}. "
-                f"Deleting will break reconciliation. Use force=true to override."
-            )
-
         in_lots = [s for s in transaction.splits if s.lot is not None]
-        if in_lots and not force:
-            raise ValueError(
-                f"Transaction has splits in lots: "
-                f"{_lot_split_names(in_lots)}. Deleting "
-                f"reopens them (cost basis, or an invoice's payment). "
-                f"Use force=true to override."
-            )
+        if not force:
+            # One refusal names every blocker: force given for the
+            # reconciliation must not be spent, unseen, on a lot.
+            blockers = []
+            if reconciled:
+                acct_names = ", ".join(
+                    s.account.fullname for s in reconciled
+                )
+                blockers.append(
+                    f"reconciled splits in: {acct_names} (deleting "
+                    f"breaks reconciliation)"
+                )
+            if in_lots:
+                blockers.append(
+                    f"splits in lots: {_lot_split_names(in_lots)} "
+                    f"(deleting reopens them — cost basis, or an "
+                    f"invoice's payment)"
+                )
+            if blockers:
+                raise ValueError(
+                    f"Transaction has {'; and '.join(blockers)}. "
+                    f"Use force=true to override."
+                )
         return len(reconciled), in_lots
 
     def delete_transaction(self, guid: str, force: bool = False) -> dict:
@@ -6899,13 +6908,25 @@ class CoreMixin:
                 s for s, c in zip(transaction.splits, scratch)
                 if s.reconcile_state == "y" and not c["claimed"]
             ]
-            if reconciled_changed and not force:
-                names = ", ".join(
-                    s.account.fullname for s in reconciled_changed
-                )
+            # 5. Lot assignments. Refused together with the reconciled
+            # legs, so one refusal names every blocker.
+            in_lots = [s for s in transaction.splits if s.lot is not None]
+            if not force and (reconciled_changed or in_lots):
+                blockers = []
+                if reconciled_changed:
+                    names = ", ".join(
+                        s.account.fullname for s in reconciled_changed
+                    )
+                    blockers.append(
+                        f"reconciled splits in: {names} that this "
+                        f"replacement would change"
+                    )
+                if in_lots:
+                    blockers.append(
+                        f"splits in lots: {_lot_split_names(in_lots)}"
+                    )
                 raise ValueError(
-                    f"Transaction has reconciled splits in: {names} "
-                    f"that this replacement would change. "
+                    f"Transaction has {'; and '.join(blockers)}. "
                     f"Use force=true to override."
                 )
             if reconciled_changed:
@@ -6913,15 +6934,6 @@ class CoreMixin:
                     s.account.fullname for s in reconciled_changed
                 )
                 warnings.append(f"Replaced reconciled splits in: {names}")
-
-            # 5. Check lot assignments
-            in_lots = [s for s in transaction.splits if s.lot is not None]
-            if in_lots and not force:
-                raise ValueError(
-                    f"Transaction has splits in lots: "
-                    f"{_lot_split_names(in_lots)}. "
-                    f"Use force=true to override."
-                )
             if in_lots:
                 warnings.append(
                     f"Removed splits from lots: "

@@ -7035,6 +7035,49 @@ class TestDeleteTransaction:
         assert result["transactions"][0]["lot_splits_affected"] == 1
         assert gc_book.get_lot(lot_guid)["is_closed"] is False
 
+    @staticmethod
+    def _reconcile_checking_leg(gc_book, txn_guid):
+        split = next(
+            s for s in gc_book.get_transaction(txn_guid)["splits"]
+            if s["account"] == "Assets:Checking"
+        )
+        gc_book.set_reconcile_state(split["guid"], "y")
+
+    def test_refusal_names_every_blocker(self, investment_book: Path):
+        """A paycheck with a 401(k) buy is reconciled on checking AND
+        lot-held (found on the maintainer's book). The refusal names
+        both, so force is never given for one and spent on the other."""
+        gc_book = GnuCashBook(str(investment_book))
+        _, sell_guid = _sold_out_lot(gc_book)
+        self._reconcile_checking_leg(gc_book, sell_guid)
+
+        for call in (
+            lambda: gc_book.delete_transaction(sell_guid),
+            lambda: gc_book.delete_transactions([sell_guid]),
+        ):
+            with pytest.raises(ValueError) as exc:
+                call()
+            message = str(exc.value)
+            assert "reconciled splits in: Assets:Checking" in message
+            assert "splits in lots: Sold out" in message
+
+    def test_replace_refusal_names_every_blocker(
+        self, investment_book: Path,
+    ):
+        gc_book = GnuCashBook(str(investment_book))
+        _, sell_guid = _sold_out_lot(gc_book)
+        self._reconcile_checking_leg(gc_book, sell_guid)
+
+        with pytest.raises(ValueError) as exc:
+            gc_book.replace_splits(guid=sell_guid, splits=[
+                {"account": "Assets:Checking", "amount": "1500.00"},
+                {"account": "Assets:Investments:VTSAX",
+                 "amount": "-1500.00", "quantity": "-10"},
+            ])
+        message = str(exc.value)
+        assert "reconciled splits in: Assets:Checking" in message
+        assert "splits in lots: Sold out" in message
+
 
 class TestDeleteTransactions:
     """Multi-guid delete: one open/save, all-or-nothing."""
@@ -12877,6 +12920,50 @@ class TestListCommoditiesStaleFilter:
 class TestSplitAction:
     """Split ``action`` — native splits.action column, exposed on
     the create paths and preserved through replace_splits."""
+
+    def _wire(self, gc):
+        return gc.create_transaction(
+            description="Wire out",
+            splits=[
+                {"account": "Assets:Checking", "amount": "-90.00",
+                 "action": "Wire"},
+                {"account": "Expenses:Groceries", "amount": "90.00"},
+            ],
+        )["guid"]
+
+    def test_replaced_splits_keep_their_action_in_the_audit(
+        self, test_book: Path,
+    ):
+        """``previous_splits`` is the only record of legs replace_splits
+        deletes; an action dropped there is gone from the audit log."""
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+
+        gc = GnuCashBook(str(test_book))
+        guid = self._wire(gc)
+        result = gc.replace_splits(guid=guid, splits=[
+            {"account": "Assets:Checking", "amount": "-95.00"},
+            {"account": "Expenses:Groceries", "amount": "95.00"},
+        ])
+        old = next(
+            s for s in result["previous_splits"]
+            if s["account"] == "Assets:Checking"
+        )
+        assert old["action"] == "Wire"
+        rendered = _format_audit_entry_text({
+            "classification": "write", "entity_type": "transaction",
+            "operation": "replace_splits",
+            "timestamp": "2026-09-27T12:00:00",
+            "params": {"guid": guid}, "after_state": result,
+        })
+        assert "[Wire]" in rendered
+
+    def test_unvoid_reply_carries_the_action(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        guid = self._wire(gc)
+        gc.void_transaction(guid, reason="test")
+        restored = gc.unvoid_transaction(guid)["splits"]
+        chk = next(s for s in restored if s["account"] == "Assets:Checking")
+        assert chk["action"] == "Wire"
 
     def test_create_and_read_back(self, test_book: Path):
         gc = GnuCashBook(str(test_book))

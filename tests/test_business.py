@@ -12141,6 +12141,151 @@ class TestDocumentPaymentState:
         assert doc["amount_due"] == "300.00"
         assert doc["amount_paid"] == "200.00"
 
+    def test_list_status_agrees_with_get_invoice(self, business_book):
+        """The list's status column speaks the shared vocabulary its
+        docstring defines — a settled invoice reads ``paid`` there
+        too, not ``posted``. The ``status`` filter stays document
+        state: ``posted`` still returns it."""
+        gb = GnuCashBook(str(business_book))
+        self._post_invoice(gb, "500.00")
+
+        def row_status():
+            lines = gb.list_invoices().splitlines()
+            row = next(r for r in lines if r.startswith("000001"))
+            return row.split("\t")[-1]
+
+        gb.pay_invoice(
+            invoice_id="000001", payment_account="Assets:Checking",
+            amount="200",
+        )
+        assert row_status() == "posted" == gb.get_invoice("000001")["status"]
+        gb.pay_invoice(
+            invoice_id="000001", payment_account="Assets:Checking",
+            amount="300",
+        )
+        assert row_status() == "paid" == gb.get_invoice("000001")["status"]
+        verbose = gb.list_invoices(compact=False)["invoices"][0]
+        assert verbose["status"] == "paid"
+        assert "000001" in gb.list_invoices(status="posted")
+
+    def test_get_invoice_names_its_payments(self, business_book):
+        """Each settlement in the document's lot is listed with a
+        transaction guid the caller can void or delete directly —
+        the "bounced payment" workflow no longer means searching by
+        customer and guessing by date and amount. Voided payments
+        drop out, as they do from the balance."""
+        gb = GnuCashBook(str(business_book))
+        self._post_invoice(gb, "500.00")
+        first = gb.pay_invoice(
+            invoice_id="000001", payment_account="Assets:Checking",
+            amount="200",
+        )["transaction_guid"]
+        gb.pay_invoice(
+            invoice_id="000001", payment_account="Assets:Checking",
+            amount="300",
+        )
+        payments = gb.get_invoice("000001")["payments"]
+        assert sorted(p["amount"] for p in payments) == ["200.00", "300.00"]
+        assert {p["from"] for p in payments} == {"Assets:Checking"}
+        for p in payments:
+            assert gb.get_transaction(p["guid"]) is not None
+        assert first in {p["guid"] for p in payments}
+
+        gb.void_transaction(first, reason="bounced")
+        doc = gb.get_invoice("000001")
+        assert [p["amount"] for p in doc["payments"]] == ["300.00"]
+        assert doc["amount_due"] == "200.00"
+
+    def test_unpaid_invoice_lists_no_payments(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        self._post_invoice(gb, "500.00")
+        assert gb.get_invoice("000001")["payments"] == []
+
+    def test_credit_application_names_the_other_document(
+        self, business_book,
+    ):
+        """A credit note settles an invoice with no cash leg; its
+        entry names the document on the other side, both ways."""
+        gb = GnuCashBook(str(business_book))
+        self._post_invoice(gb, "500.00")
+        cn = gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+            applies_to_invoice_id="000001",
+        )["id"]
+        gb.add_credit_note_entry(
+            credit_note_id=cn, account="Income:Sales",
+            description="Disputed line", quantity="1", price="100",
+        )
+        gb.post_invoice(
+            invoice_id=cn, post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        gb.apply_credit_note(
+            credit_note_id=cn, applies_to_invoice_id="000001",
+        )
+
+        [inv_side] = gb.get_invoice("000001")["payments"]
+        assert inv_side["amount"] == "100.00"
+        assert inv_side["from"] == f"Credit Note {cn}"
+        [cn_side] = gb.get_invoice(cn)["payments"]
+        assert cn_side["amount"] == "100.00"
+        assert cn_side["from"] == "Invoice 000001"
+        assert cn_side["guid"] == inv_side["guid"]
+
+    def test_list_status_reads_settlements_in_fixed_queries(
+        self, business_book,
+    ):
+        """Status per row reads each document's lot. The listing
+        preloads posting accounts, lots, and lot splits once, so those
+        reads don't grow with the page: 2 documents or 5, the same
+        count."""
+        import re
+
+        from sqlalchemy import event
+        from sqlalchemy.engine import Engine
+
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+
+        def post_and_pay(n):
+            for _ in range(n):
+                inv = gb.create_invoice(customer_id="000001")["id"]
+                gb.add_invoice_entry(
+                    invoice_id=inv, account="Income:Sales",
+                    description="Work", quantity="1", price="100",
+                )
+                gb.post_invoice(
+                    invoice_id=inv,
+                    post_account="Assets:Accounts Receivable",
+                )
+                gb.pay_invoice(
+                    invoice_id=inv, payment_account="Assets:Checking",
+                    amount="100",
+                )
+
+        def settlement_reads():
+            statements: list[str] = []
+
+            def _record(conn, cursor, statement, *args):
+                statements.append(statement)
+
+            event.listen(Engine, "before_cursor_execute", _record)
+            try:
+                out = gb.list_invoices()
+            finally:
+                event.remove(Engine, "before_cursor_execute", _record)
+            assert out.count("\tpaid") == out.count("\n")
+            return sum(
+                1 for s in statements
+                if re.search(r"\bFROM (accounts|lots|splits)\b", s)
+            )
+
+        post_and_pay(2)
+        few = settlement_reads()
+        post_and_pay(3)
+        many = settlement_reads()
+        assert many == few <= 3, (few, many)
+
     def test_paid_document_keeps_amounts_after_leaving_unpaid_list(
         self, business_book,
     ):

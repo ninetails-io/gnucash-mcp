@@ -805,6 +805,14 @@ def register(mcp, get_book) -> None:
         document keeps its amounts here after it leaves the unpaid
         list.
 
+        Once posted it also lists ``payments``, oldest first:
+        ``{guid, date, amount, from}`` per settlement. ``guid`` is
+        the settling transaction — pass it to ``void_transaction`` for
+        a bounced payment. ``from`` is the account the money moved
+        through, or the other document's title when a credit note was
+        applied. Voided payments are left out, as they are from the
+        balance.
+
         Args:
             id: Document ID (e.g., "000001"). This is the
                 human-readable ID, not the internal GUID.
