@@ -669,11 +669,11 @@ def register(mcp, get_book) -> None:
     @safe_tool
     @audit_log(classification="write", operation="apply", entity_type="credit_note")
     def apply_credit_note(
-        credit_note_id: str,
-        applies_to_invoice_id: str,
+        id: str,
+        applies_to_id: str,
         amount: str | None = None,
         apply_date: str | None = None,
-        party_type: str | None = None,
+        party_type: PartyType | None = None,
     ) -> str:
         """Net a posted credit note against a posted invoice or
         bill from the same owner. No cash moves — the credit
@@ -688,9 +688,9 @@ def register(mcp, get_book) -> None:
         settled by sending or receiving cash.
 
         Args:
-            credit_note_id: The credit note to apply (must be
-                posted).
-            applies_to_invoice_id: The target invoice/bill (must
+            id: The credit note to apply (must be posted) — the
+                same ``id`` every document tool takes.
+            applies_to_id: The target invoice/bill (must
                 be posted, same owner, same currency, same A/R
                 or A/P post account). Need not be the document
                 the credit note was created against — that link
@@ -707,8 +707,8 @@ def register(mcp, get_book) -> None:
         """
         book = get_book()
         result = book.apply_credit_note(
-            credit_note_id=credit_note_id,
-            applies_to_invoice_id=applies_to_invoice_id,
+            credit_note_id=id,
+            applies_to_invoice_id=applies_to_id,
             amount=amount,
             apply_date=apply_date,
             owner_type=party_type,
