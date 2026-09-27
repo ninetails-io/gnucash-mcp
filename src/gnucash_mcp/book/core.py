@@ -72,6 +72,10 @@ from gnucash_mcp.book._base import (
     _is_unreconciled,
     _is_voided,
     _lot_forget_flag,
+    _money_precision_error,
+    _new_split,
+    _set_split_amounts,
+    _split_amounts,
     _slot_bool,
     _slot_value_str,
     _split_to_compact_dict,
@@ -3693,10 +3697,24 @@ class CoreMixin:
                 raise self._account_not_found_error(book, ref)
 
             value = _to_decimal(split["amount"])
+            error = _money_precision_error(
+                value, trans_currency, f"Split for '{ref}'",
+            )
+            if error:
+                raise error
             if account.commodity == trans_currency:
                 quantity = value
             elif "quantity" in split:
                 quantity = _to_decimal(split["quantity"])
+                # A foreign-currency account holds money too; shares
+                # round at storage instead (_split_amounts).
+                if account.commodity.namespace == "CURRENCY":
+                    error = _money_precision_error(
+                        quantity, account.commodity,
+                        f"Split for '{ref}' quantity",
+                    )
+                    if error:
+                        raise error
                 if quantity * value < 0:
                     raise ValueError(
                         f"Split for '{ref}': quantity and value "
@@ -3711,6 +3729,16 @@ class CoreMixin:
                     f"transaction currency ({trans_currency.mnemonic})"
                 )
 
+            # A quantity finer than the account's unit is replaced by
+            # what GnuCash will store, so later comparisons (claims,
+            # verification) see the stored amount. Otherwise the
+            # caller's own number stays, as typed ("1700", not
+            # "1700.00"); _new_split sets the stored denominator.
+            _, stored_quantity = _split_amounts(
+                value, quantity, trans_currency, account,
+            )
+            if stored_quantity != quantity:
+                quantity = stored_quantity
             resolved.append({
                 "account": account,
                 "value": value,
@@ -3905,10 +3933,9 @@ class CoreMixin:
                 # never call book.save().
                 if not readonly:
                     piecash_splits.append(
-                        piecash.Split(
-                            account=account,
-                            value=v["value"],
-                            quantity=v["quantity"],
+                        _new_split(
+                            account, v["value"], v["quantity"],
+                            trans_currency,
                             memo=v["memo"] or "",
                             action=v["action"] or "",
                         )
@@ -4330,9 +4357,9 @@ class CoreMixin:
             built = []
             for p, dup_count, _max_conf in accepted:
                 piecash_splits = [
-                    piecash.Split(
-                        account=v["account"], value=v["value"],
-                        quantity=v["quantity"], memo=v["memo"] or "",
+                    _new_split(
+                        v["account"], v["value"], v["quantity"],
+                        p["currency"], memo=v["memo"] or "",
                         action=v["action"] or "",
                     )
                     for v in p["validated"]
@@ -4575,24 +4602,21 @@ class CoreMixin:
                 # not a rounding job — and rounding here would let
                 # the self-check gate and the tie compute different
                 # sums for the same statement.
-                if amt != amt.quantize(quantum):
-                    raise ValueError(
-                        f"line {ln['ref']}: amount {ln['amount']} "
-                        f"carries finer precision than "
-                        f"{account.commodity.mnemonic} — re-check "
-                        f"the transcription"
-                    )
+                error = _money_precision_error(
+                    amt, account.commodity, f"line {ln['ref']}: amount",
+                )
+                if error:
+                    raise error
                 amounts[ln["ref"]] = amt
             for label, bal in (
                 ("opening_balance", opening),
                 ("closing_balance", closing),
             ):
-                if bal != bal.quantize(quantum):
-                    raise ValueError(
-                        f"{label} {bal} carries finer precision "
-                        f"than {account.commodity.mnemonic} — "
-                        f"re-check the transcription"
-                    )
+                error = _money_precision_error(
+                    bal, account.commodity, label,
+                )
+                if error:
+                    raise error
 
             # Self-consistency gate — statement-native signs, before
             # any transform: the statement must not contradict itself.
@@ -5420,9 +5444,9 @@ class CoreMixin:
         built = []
         for ln, validated, src in prepared:
             piecash_splits = [
-                piecash.Split(
-                    account=v["account"], value=v["value"],
-                    quantity=v["quantity"], memo=v["memo"] or "",
+                _new_split(
+                    v["account"], v["value"], v["quantity"],
+                    default_currency, memo=v["memo"] or "",
                     action=v["action"] or "",
                 )
                 for v in validated
@@ -6744,9 +6768,9 @@ class CoreMixin:
                     account_name = split.account.fullname
                     if account_name in split_updates:
                         v = split_updates[account_name]
-                        split.value = v["value"]
-                        split.quantity = v["quantity"]
-                        _lot_forget_flag(split.lot)
+                        _set_split_amounts(
+                            split, v["value"], v["quantity"],
+                        )
                         raw = raw_by_fullname[account_name]
                         if "memo" in raw:
                             split.memo = raw["memo"]
@@ -6955,10 +6979,9 @@ class CoreMixin:
                 match = _claim(
                     carryover, v["account"].guid, v["value"], v["quantity"],
                 )
-                new_split = piecash.Split(
-                    account=v["account"],
-                    value=v["value"],
-                    quantity=v["quantity"],
+                new_split = _new_split(
+                    v["account"], v["value"], v["quantity"],
+                    transaction.currency,
                     memo=v["memo"] or (match["memo"] if match else ""),
                     action=v["action"] or (match["action"] if match else ""),
                     transaction=transaction,

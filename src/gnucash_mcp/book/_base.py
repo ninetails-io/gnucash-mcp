@@ -19,7 +19,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Generator, Iterable
 from urllib.parse import quote
@@ -185,6 +185,76 @@ def _commodity_quantum(commodity) -> Decimal:
     if fraction <= 1:
         return Decimal(1)
     return Decimal(1) / Decimal(fraction)
+
+
+def _account_unit(account) -> Decimal:
+    """An account's smallest quantity, as a Decimal quantum.
+
+    ``xaccAccountGetCommoditySCU``, ported: the account's own
+    ``commodity_scu`` only when it is marked non-standard (or has no
+    commodity), otherwise its commodity's fraction.
+    """
+    if account.non_std_scu or account.commodity is None:
+        scu = account.commodity_scu or 1
+        return Decimal(1) if scu <= 1 else Decimal(1) / Decimal(scu)
+    return _commodity_quantum(account.commodity)
+
+
+def _split_amounts(value, quantity, currency, account) -> tuple:
+    """A split's value and quantity the way GnuCash stores them.
+
+    ``xaccSplitSetValue`` converts the value to the transaction
+    currency's fraction and ``xaccSplitSetAmount`` the quantity to the
+    account's unit, both rounding half up. Every split this server
+    writes goes through here: piecash stores a Decimal over its own
+    exponent, so "12" became 12/1 and "12.345" dollars 12345/1000 — a
+    sub-cent amount desktop can never hold. Rounding here covers
+    amounts the server computes (FX, tax) and share quantities; money
+    typed in finer than its unit is refused earlier, by
+    ``_money_precision_error`` in the validator.
+    """
+    return (
+        Decimal(value).quantize(_commodity_quantum(currency), ROUND_HALF_UP),
+        Decimal(quantity).quantize(_account_unit(account), ROUND_HALF_UP),
+    )
+
+
+def _new_split(account, value, quantity, currency, **fields):
+    """The one constructor of a ``piecash.Split``: amounts through
+    ``_split_amounts`` first. ``currency`` is the transaction's, which
+    may not exist yet when the split is built. Locked by
+    ``test_amount_precision.py``: no ``piecash.Split(`` elsewhere."""
+    value, quantity = _split_amounts(value, quantity, currency, account)
+    return piecash.Split(
+        account=account, value=value, quantity=quantity, **fields,
+    )
+
+
+def _set_split_amounts(split, value, quantity) -> None:
+    """The one writer of an existing split's amounts — GnuCash's
+    ``xaccSplitSetValue`` / ``xaccSplitSetAmount`` together: round
+    through ``_split_amounts``, then ``mark_split``'s lot reset
+    (``_lot_forget_flag``), since the lot's cached answer described
+    the old amounts."""
+    split.value, split.quantity = _split_amounts(
+        value, quantity, split.transaction.currency, split.account,
+    )
+    _lot_forget_flag(split.lot)
+
+
+def _money_precision_error(amount, commodity, what: str) -> ValueError | None:
+    """The refusal for money typed finer than its currency's unit
+    (maintainer ruling, 2026-09-27): "12.345" dollars is a typo to
+    catch, not a value to round. None when the amount fits."""
+    quantum = _commodity_quantum(commodity)
+    if amount == amount.quantize(quantum, ROUND_HALF_UP):
+        return None
+    places = max(-quantum.as_tuple().exponent, 0)
+    return ValueError(
+        f"{what}: {amount} carries finer precision than "
+        f"{commodity.mnemonic} allows ({places} decimals) — re-check "
+        f"the transcription"
+    )
 
 
 def _all_slot_columns():
