@@ -88,3 +88,46 @@ Expected: `100` for every value; `100` for dollar quantities and
 ## Routed around
 
 Name every workaround taken, with the tool that forced it.
+
+## Addendum — round 2 (after the round-1 report)
+
+Branch at `b1756e0` plus this addendum; three commits since round 1:
+`4cfb7c8` (a currency comes from the ISO table), `7b4a3bf`
+(`apply_credit_note` takes `id` / `applies_to_id`), `b1756e0`
+(harness: `mcpcall.py` honors `REPO`). Same setup: a fresh copy of
+committed Alex, in a user-private directory (the log sidecar refuses
+`/tmp`). Restart the server on the branch; `mcpcall.py` no longer
+needs patching.
+
+The currency commit comes from the round-1 note that the German test
+book's invoice read `2000.0000`. Its USD was created at fraction
+10000: `create_customer` refused an unseen USD, and the caller fell
+back to `create_commodity`, whose share default (10000) landed on a
+currency. Existing books keep what they hold; this prevents new ones.
+
+9. **A party adds an unseen ISO currency.** `create_party`
+   customer "Zurich Probe AG", currency `CHF`. Expected: created,
+   `currency: CHF`. `list_commodities` shows CHF; if you check
+   storage, fraction 100.
+10. **`create_commodity` for a currency.** `SEK`, namespace
+    `CURRENCY`, no fraction: created, `fraction: 100`. `NOK` with
+    `fraction: 10000`: refused, `The ISO 4217 fraction for NOK is
+    100, and GnuCash stores the currency that way. Omit fraction, or
+    pass 100.` `XYZ`: refused, `XYZ is not an ISO 4217 currency
+    code…`. A security (`ACME`, namespace `NASDAQ`, no fraction)
+    still gets 10000.
+11. **`apply_credit_note` speaks its siblings' names.** Create a
+    credit note against an open invoice (`create_document`
+    `credit_note`, `applies_to_id`), add an entry, post it. Apply
+    with the old names first (`credit_note_id` /
+    `applies_to_invoice_id`): rejected by the schema, naming both as
+    not permitted. Then `id` / `applies_to_id` (plus `party_type`
+    `customer`): `applied`. The audit log's `APPLY CREDIT NOTE` line
+    names the credit note and `against:` the invoice.
+12. **Invoice creation adds an unseen ISO currency.**
+    `create_document` invoice for an existing customer with currency
+    `JPY` (not in Alex): created; JPY appears with fraction 1.
+
+Part C still stands: the desktop GUI gate (open, check, edit, save,
+reopen) on a looped copy. It can take both rounds' litter at once.
+`gnucash-cli` stays an optional oracle, not a requirement.
