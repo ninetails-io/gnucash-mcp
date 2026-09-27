@@ -954,6 +954,25 @@ def _fmt_transaction_unvoid(entry: dict) -> list[str]:
     return lines
 
 
+def _forced_overrides_line(result: dict, indent: str) -> str | None:
+    """The ``force`` overrides a delete took, from its response
+    counts — so a forced delete of an invoice payment or a lot-held
+    sell never reads like an ordinary one. None when none were taken."""
+    parts = []
+    reconciled = result.get("reconciled_splits_affected")
+    if reconciled:
+        parts.append(
+            f"{reconciled} reconciled split{'s' if reconciled > 1 else ''}"
+        )
+    in_lots = result.get("lot_splits_affected")
+    if in_lots:
+        parts.append(
+            "1 split in a lot (the lot reopens)" if in_lots == 1
+            else f"{in_lots} splits in lots (the lots reopen)"
+        )
+    return f"{indent}Forced: {', '.join(parts)}" if parts else None
+
+
 def _fmt_transaction_delete(entry: dict) -> list[str]:
     time_part = _extract_time(entry)
     before = entry.get("before_state")
@@ -975,6 +994,9 @@ def _fmt_transaction_delete(entry: dict) -> list[str]:
                 f'{_INDENT}DELETE  guid:{at.get("guid", "")}  '
                 f'"{at.get("description", "")}" ({bt.get("date", "")})'
             )
+            forced = _forced_overrides_line(at, _INDENT_SPLITS)
+            if forced:
+                lines.append(forced)
             if bt.get("splits"):
                 lines.append(
                     _format_splits_text(bt["splits"], _INDENT_SPLITS)
@@ -987,8 +1009,11 @@ def _fmt_transaction_delete(entry: dict) -> list[str]:
         desc = before.get("description", "")
         date_str = before.get("date", "")
         lines.append(f'{_INDENT}Was: "{desc}" ({date_str})')
-        if before.get("splits"):
-            lines.append(_format_splits_text(before["splits"], _INDENT_SPLITS))
+    forced = _forced_overrides_line(after, _INDENT)
+    if forced:
+        lines.append(forced)
+    if before and before.get("splits"):
+        lines.append(_format_splits_text(before["splits"], _INDENT_SPLITS))
     return lines
 
 

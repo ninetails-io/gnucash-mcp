@@ -6815,6 +6815,126 @@ class TestDeleteAccount:
             gc_book.delete_account("Expenses:Groceries")
 
 
+def _sold_out_lot(gc_book):
+    """A lot bought and sold to zero; returns (lot_guid, sell_guid)."""
+    lot_guid = gc_book.create_lot(
+        account="Assets:Investments:VTSAX", title="Sold out",
+    )["guid"]
+    guids = []
+    for amount, qty in (("1250.00", "10"), ("-1400.00", "-10")):
+        guid = gc_book.create_transaction(
+            description="Trade VTSAX",
+            splits=[
+                {
+                    "account": "Assets:Investments:VTSAX",
+                    "amount": amount, "quantity": qty,
+                },
+                {
+                    "account": "Assets:Checking",
+                    "amount": str(-Decimal(amount)),
+                },
+            ],
+        )["guid"]
+        split = next(
+            s for s in gc_book.get_transaction(guid)["splits"]
+            if s["account"] == "Assets:Investments:VTSAX"
+        )
+        gc_book.assign_split_to_lot(split["guid"], lot_guid)
+        guids.append(guid)
+    assert gc_book.get_lot(lot_guid)["is_closed"] is True
+    return lot_guid, guids[1]
+
+
+class TestLotFlagFollowsAmountChanges:
+    """GnuCash's ``mark_split`` resets a lot to LOT_CLOSED_UNKNOWN on
+    every amount or value change to one of its splits
+    (``xaccSplitSetAmount`` / ``xaccSplitSetValue``, which void and
+    unvoid both go through). A cached flag left behind describes the
+    old amounts: a sold-out lot whose sell is voided or shrunk holds
+    shares again and must stop reading closed."""
+
+    def test_void_reopens_lot(self, investment_book: Path):
+        gc_book = GnuCashBook(str(investment_book))
+        lot_guid, sell_guid = _sold_out_lot(gc_book)
+
+        gc_book.void_transaction(sell_guid, reason="entered twice")
+
+        assert gc_book.get_lot(lot_guid)["is_closed"] is False
+
+    def test_unvoid_closes_lot_again(self, investment_book: Path):
+        """Between void and unvoid the lot is open, and GnuCash caches
+        that answer (``gnc_lot_get_balance`` stores it). Unvoid has to
+        clear the cached 0, or the sold-out lot reads open."""
+        import sqlite3
+
+        gc_book = GnuCashBook(str(investment_book))
+        lot_guid, sell_guid = _sold_out_lot(gc_book)
+        gc_book.void_transaction(sell_guid, reason="entered twice")
+        assert gc_book.get_lot(lot_guid)["is_closed"] is False
+        with sqlite3.connect(investment_book) as conn:
+            cached = conn.execute(
+                "UPDATE lots SET is_closed = 0 WHERE guid LIKE ?",
+                (lot_guid + "%",),
+            )
+            assert cached.rowcount == 1
+
+        gc_book.unvoid_transaction(sell_guid)
+
+        assert gc_book.get_lot(lot_guid)["is_closed"] is True
+
+    HALF_SELL = [
+        {
+            "account": "Assets:Investments:VTSAX",
+            "amount": "-700.00", "quantity": "-5",
+        },
+        {"account": "Assets:Checking", "amount": "700.00"},
+    ]
+
+    def test_update_amount_needs_force(self, investment_book: Path):
+        """The gate replace_splits and delete apply: changing a
+        lot-held split's amount changes cost basis."""
+        gc_book = GnuCashBook(str(investment_book))
+        lot_guid, sell_guid = _sold_out_lot(gc_book)
+
+        with pytest.raises(ValueError, match="splits in lots"):
+            gc_book.update_transaction(sell_guid, splits=self.HALF_SELL)
+        assert gc_book.get_lot(lot_guid)["is_closed"] is True
+
+    def test_update_amount_reopens_lot(self, investment_book: Path):
+        gc_book = GnuCashBook(str(investment_book))
+        lot_guid, sell_guid = _sold_out_lot(gc_book)
+
+        result = gc_book.update_transaction(
+            sell_guid, splits=self.HALF_SELL, force=True,
+        )
+
+        assert result["lot_splits_affected"] == 1
+        assert gc_book.get_lot(lot_guid)["is_closed"] is False
+
+    def test_update_unchanged_lot_split_needs_no_force(
+        self, investment_book: Path,
+    ):
+        """Only an amount change is gated: a memo on the lot leg, with
+        its amount restated as-is, goes through."""
+        gc_book = GnuCashBook(str(investment_book))
+        lot_guid, sell_guid = _sold_out_lot(gc_book)
+
+        result = gc_book.update_transaction(
+            sell_guid,
+            splits=[
+                {
+                    "account": "Assets:Investments:VTSAX",
+                    "amount": "-1400.00", "quantity": "-10",
+                    "memo": "sold all",
+                },
+                {"account": "Assets:Checking", "amount": "1400.00"},
+            ],
+        )
+
+        assert "lot_splits_affected" not in result
+        assert gc_book.get_lot(lot_guid)["is_closed"] is True
+
+
 class TestDeleteTransaction:
     """Tests for delete_transaction method."""
 
@@ -6870,6 +6990,50 @@ class TestDeleteTransaction:
         assert result["status"] == "deleted"
         assert result["reconciled_splits_affected"] == 1
         assert gc_book.get_transaction(guid) is None
+
+    def test_delete_lot_split_rejected(self, investment_book: Path):
+        """A split in a lot is cost basis; deleting it needs force,
+        the same gate replace_splits applies."""
+        gc_book = GnuCashBook(str(investment_book))
+        lot_guid, sell_guid = _sold_out_lot(gc_book)
+
+        with pytest.raises(ValueError, match="splits in lots"):
+            gc_book.delete_transaction(sell_guid)
+        assert gc_book.get_transaction(sell_guid) is not None
+        assert gc_book.get_lot(lot_guid)["is_closed"] is True
+
+    def test_delete_lot_split_force_reopens_lot(self, investment_book: Path):
+        """Forced, the lot loses the split and its cached closed flag
+        goes back to UNKNOWN, as GnuCash does on removing a split —
+        a stale 1 would keep a lot with shares in it reading closed."""
+        gc_book = GnuCashBook(str(investment_book))
+        lot_guid, sell_guid = _sold_out_lot(gc_book)
+
+        result = gc_book.delete_transaction(sell_guid, force=True)
+
+        assert result["status"] == "deleted"
+        assert result["lot_splits_affected"] == 1
+        assert gc_book.get_transaction(sell_guid) is None
+        assert gc_book.get_lot(lot_guid)["is_closed"] is False
+
+    def test_batch_delete_lot_split_rejected(self, investment_book: Path):
+        gc_book = GnuCashBook(str(investment_book))
+        _, sell_guid = _sold_out_lot(gc_book)
+
+        with pytest.raises(ValueError, match="nothing deleted"):
+            gc_book.delete_transactions([sell_guid])
+        assert gc_book.get_transaction(sell_guid) is not None
+
+    def test_batch_delete_lot_split_force_reopens_lot(
+        self, investment_book: Path,
+    ):
+        gc_book = GnuCashBook(str(investment_book))
+        lot_guid, sell_guid = _sold_out_lot(gc_book)
+
+        result = gc_book.delete_transactions([sell_guid], force=True)
+
+        assert result["transactions"][0]["lot_splits_affected"] == 1
+        assert gc_book.get_lot(lot_guid)["is_closed"] is False
 
 
 class TestDeleteTransactions:
@@ -7727,7 +7891,10 @@ class TestReplaceSplits:
         gc_book.assign_split_to_lot(inv_split["guid"], lot_guid)
 
         # Try to replace splits without force
-        with pytest.raises(ValueError, match="splits in lots"):
+        with pytest.raises(
+            ValueError,
+            match=r"splits in lots: Test Lot \(Assets:Investments:VTSAX\)",
+        ):
             gc_book.replace_splits(
                 guid=txn_guid,
                 splits=[
@@ -7790,6 +7957,23 @@ class TestReplaceSplits:
         assert result["status"] == "splits_replaced"
         assert "warnings" in result
         assert any("lot" in w.lower() for w in result["warnings"])
+
+    def test_lot_with_force_reopens_lot(self, investment_book: Path):
+        """The replaced sell leaves the lot, so its cached closed flag
+        goes back to UNKNOWN — the lot holds shares again."""
+        gc_book = GnuCashBook(str(investment_book))
+        lot_guid, sell_guid = _sold_out_lot(gc_book)
+
+        gc_book.replace_splits(
+            guid=sell_guid,
+            splits=[
+                {"account": "Assets:Checking", "amount": "1400.00"},
+                {"account": "Income:Capital Gains", "amount": "-1400.00"},
+            ],
+            force=True,
+        )
+
+        assert gc_book.get_lot(lot_guid)["is_closed"] is False
 
     def test_three_way_split(self, test_book: Path):
         """Should allow recategorizing to more splits than original."""

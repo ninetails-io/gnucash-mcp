@@ -1336,6 +1336,29 @@ class TestAccountNotFoundGoesThroughSuggestions:
         assert not offenders, offenders
 
 
+class TestSplitValidatorChokepoint:
+    """``_validate_transaction_splits`` is the one place the split
+    input rules are enforced — sum to zero, cross-commodity quantity
+    required, quantity and value same-signed. ``replace_splits`` once
+    carried its own copy (three of the quantity rule, counting its
+    pairing pre-pass), checked after deleting the old splits."""
+
+    RULES = (
+        "Splits do not balance",
+        "requires 'quantity'",
+        "must have same sign",
+    )
+
+    def test_each_rule_is_worded_once(self):
+        import gnucash_mcp.book as pkg
+        text = "\n".join(
+            p.read_text()
+            for p in sorted(Path(pkg.__file__).parent.glob("*.py"))
+        )
+        counts = {rule: text.count(rule) for rule in self.RULES}
+        assert counts == {rule: 1 for rule in self.RULES}, counts
+
+
 class TestPriceWalkChokepoint:
     """``_find_prices`` is the one reader of price history: indexed
     per pair, memoized per open, newest-first with the same-date

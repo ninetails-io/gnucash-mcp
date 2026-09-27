@@ -8432,8 +8432,12 @@ class BusinessMixin:
         """Get spending breakdown by vendor for a period.
 
         Analyzes posted vendor bills: total billed, paid, and
-        outstanding per vendor, converted to the book's default
-        currency at period-end rates.
+        outstanding per vendor in the book's default currency, read
+        off the ledger as booked — each amount at the rate applied
+        when it was posted or paid, never a report-time rate. A split
+        with no default-currency side converts at its own
+        transaction's date (``_posting_split_in_default``); a bill
+        with no rate on file is left out of the totals and warned.
 
         Args:
             start_date / end_date: Period bounds (YYYY-MM-DD).

@@ -826,6 +826,59 @@ class TestBudgetAndScheduledAuditHandlers:
         assert 'DELETE  guid:83862278  "Test Legacy Coffee" (2026-07-10)' in rendered
         assert 'DELETE  guid:d868498f  "Test Legacy Gas" (2026-07-11)' in rendered
         assert "Checking" in rendered
+        assert "Forced" not in rendered
+
+    def test_forced_delete_says_what_it_overrode(self):
+        """A forced delete of an invoice payment reads differently from
+        an ordinary one: the reviewer sees the overrides it took."""
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        entry = {
+            "classification": "write",
+            "entity_type": "transaction",
+            "operation": "delete",
+            "timestamp": "2026-09-26T11:44:22",
+            "params": {"guid": "125cb915", "force": True},
+            "before_state": {
+                "description": "BookkeepingCo", "date": "2026-03-20",
+                "splits": [],
+            },
+            "after_state": {
+                "guid": "125cb915", "description": "BookkeepingCo",
+                "status": "deleted",
+                "reconciled_splits_affected": 1,
+                "lot_splits_affected": 1,
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert (
+            "Forced: 1 reconciled split, 1 split in a lot (the lot "
+            "reopens)" in rendered
+        )
+
+    def test_forced_batch_delete_marks_each_row(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        entry = {
+            "classification": "write",
+            "entity_type": "transaction",
+            "operation": "delete",
+            "timestamp": "2026-09-26T11:44:22",
+            "params": {"guid": ["0860dd6f", "83862278"], "force": True},
+            "before_state": {"transactions": [
+                {"description": "Sell", "date": "2026-07-20", "splits": []},
+                {"description": "Coffee", "date": "2026-07-10", "splits": []},
+            ]},
+            "after_state": {
+                "status": "deleted", "count": 2,
+                "transactions": [
+                    {"guid": "0860dd6f", "description": "Sell",
+                     "lot_splits_affected": 2},
+                    {"guid": "83862278", "description": "Coffee"},
+                ],
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert rendered.count("Forced:") == 1
+        assert "Forced: 2 splits in lots (the lots reopen)" in rendered
 
     def test_entry_create_renders_notes_and_action(self):
         from gnucash_mcp.logging_config import _format_audit_entry_text

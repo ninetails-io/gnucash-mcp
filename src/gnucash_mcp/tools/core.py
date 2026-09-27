@@ -801,8 +801,10 @@ def register(mcp, get_book) -> None:
         """Delete one transaction by GUID — or several in one call.
 
         Safeguards prevent deletion if a transaction has reconciled
-        splits (force=true overrides) or is an invoice's posting
-        record (unpost_document first).
+        splits or splits in lots — a lot split is cost basis or an
+        invoice payment, and deleting it reopens the lot (force=true
+        overrides either) — or is an invoice's posting record
+        (unpost_document first).
 
         Pass a LIST of GUIDs to delete several in one book open /
         one save. The batch is all-or-nothing: every guid is
@@ -814,7 +816,8 @@ def register(mcp, get_book) -> None:
         Args:
             guid: Transaction GUID (32-char hex or 8+ char prefix),
                 or a list of them.
-            force: Allow deleting transactions with reconciled splits.
+            force: Allow deleting transactions with reconciled splits
+                or splits in lots.
         """
         book = get_book()
         if isinstance(guid, list):

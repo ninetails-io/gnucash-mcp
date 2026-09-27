@@ -626,10 +626,11 @@ class TestBadAmountCellRejectsPerRow:
         import json
         from gnucash_mcp.tools._helpers import safe_tool
         gb = GnuCashBook(str(test_book))
+        guid = gb.list_transactions(compact=False)["transactions"][0]["guid"]
 
         @safe_tool
         def replace():
-            return gb.replace_splits("deadbeef", [
+            return gb.replace_splits(guid, [
                 {"account": "Assets:Checking", "amount": "ten"},
                 {"account": "Expenses:Groceries", "amount": "-10"},
             ])

@@ -12157,6 +12157,55 @@ class TestDocumentPaymentState:
         assert Decimal(doc["amount_paid"]) == Decimal("500")
         assert Decimal(doc["amount_due"]) == Decimal("0")
 
+    def test_deleting_a_payment_needs_force_and_reopens_the_invoice(
+        self, business_book,
+    ):
+        """A payment's A/R split sits in the invoice's lot. Deleting
+        it unpays the invoice, so it takes force; once forced, every
+        surface says the money is owed again."""
+        gb = GnuCashBook(str(business_book))
+        self._post_invoice(gb, "500.00")
+        payment = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="500",
+        )
+        txn = payment["transaction_guid"]
+
+        with pytest.raises(ValueError, match="splits in lots"):
+            gb.delete_transaction(txn)
+        assert gb.get_invoice("000001")["status"] == "paid"
+
+        result = gb.delete_transaction(txn, force=True)
+        assert result["lot_splits_affected"] == 1
+        doc = gb.get_invoice("000001")
+        assert doc["status"] == "posted"
+        assert Decimal(doc["amount_due"]) == Decimal("500")
+        rows = gb.get_outstanding_invoices(compact=False)["invoices"]
+        assert [r["amount_due"] for r in rows] == ["500.00"]
+
+    def test_editing_a_payment_amount_needs_force(self, business_book):
+        """Shrinking a payment through update_transaction changes what
+        the invoice has been paid, so it takes force like delete."""
+        gb = GnuCashBook(str(business_book))
+        self._post_invoice(gb, "500.00")
+        txn = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="500",
+        )["transaction_guid"]
+        smaller = [
+            {"account": "Assets:Checking", "amount": "300.00"},
+            {"account": "Assets:Accounts Receivable", "amount": "-300.00"},
+        ]
+
+        with pytest.raises(ValueError, match="splits in lots"):
+            gb.update_transaction(txn, splits=smaller)
+        assert gb.get_invoice("000001")["status"] == "paid"
+
+        gb.update_transaction(txn, splits=smaller, force=True)
+        assert Decimal(gb.get_invoice("000001")["amount_due"]) == Decimal("200")
+
     def test_pay_invoice_reports_payment_and_cumulative_total(
         self, business_book,
     ):
