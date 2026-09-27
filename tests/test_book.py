@@ -7035,6 +7035,49 @@ class TestDeleteTransaction:
         assert result["transactions"][0]["lot_splits_affected"] == 1
         assert gc_book.get_lot(lot_guid)["is_closed"] is False
 
+    @staticmethod
+    def _reconcile_checking_leg(gc_book, txn_guid):
+        split = next(
+            s for s in gc_book.get_transaction(txn_guid)["splits"]
+            if s["account"] == "Assets:Checking"
+        )
+        gc_book.set_reconcile_state(split["guid"], "y")
+
+    def test_refusal_names_every_blocker(self, investment_book: Path):
+        """A paycheck with a 401(k) buy is reconciled on checking AND
+        lot-held (found on the maintainer's book). The refusal names
+        both, so force is never given for one and spent on the other."""
+        gc_book = GnuCashBook(str(investment_book))
+        _, sell_guid = _sold_out_lot(gc_book)
+        self._reconcile_checking_leg(gc_book, sell_guid)
+
+        for call in (
+            lambda: gc_book.delete_transaction(sell_guid),
+            lambda: gc_book.delete_transactions([sell_guid]),
+        ):
+            with pytest.raises(ValueError) as exc:
+                call()
+            message = str(exc.value)
+            assert "reconciled splits in: Assets:Checking" in message
+            assert "splits in lots: Sold out" in message
+
+    def test_replace_refusal_names_every_blocker(
+        self, investment_book: Path,
+    ):
+        gc_book = GnuCashBook(str(investment_book))
+        _, sell_guid = _sold_out_lot(gc_book)
+        self._reconcile_checking_leg(gc_book, sell_guid)
+
+        with pytest.raises(ValueError) as exc:
+            gc_book.replace_splits(guid=sell_guid, splits=[
+                {"account": "Assets:Checking", "amount": "1500.00"},
+                {"account": "Assets:Investments:VTSAX",
+                 "amount": "-1500.00", "quantity": "-10"},
+            ])
+        message = str(exc.value)
+        assert "reconciled splits in: Assets:Checking" in message
+        assert "splits in lots: Sold out" in message
+
 
 class TestDeleteTransactions:
     """Multi-guid delete: one open/save, all-or-nothing."""
