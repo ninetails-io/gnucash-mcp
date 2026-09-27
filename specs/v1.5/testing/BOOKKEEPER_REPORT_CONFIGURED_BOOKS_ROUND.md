@@ -99,5 +99,8 @@ German-chart test book.
 
 Two things seen that predate this work: unvoid restores a quantity
 with denominator 1 (`1900/1` where it was `190000/100`, same value),
-and the UNVOID audit block omits split actions that the VOID block
-shows.
+and the UNVOID audit block omitted split actions that the VOID block
+shows. The second traced to `_split_to_compact_dict`, which also fed
+`replace_splits`' `previous_splits` — the audit log's only record of
+the legs it deletes — so their actions were lost from the log. Fixed
+on this branch: actions ride along when set, like memos.
