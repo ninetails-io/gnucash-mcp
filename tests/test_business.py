@@ -12141,6 +12141,87 @@ class TestDocumentPaymentState:
         assert doc["amount_due"] == "300.00"
         assert doc["amount_paid"] == "200.00"
 
+    def test_list_status_agrees_with_get_invoice(self, business_book):
+        """The list's status column speaks the shared vocabulary its
+        docstring defines — a settled invoice reads ``paid`` there
+        too, not ``posted``. The ``status`` filter stays document
+        state: ``posted`` still returns it."""
+        gb = GnuCashBook(str(business_book))
+        self._post_invoice(gb, "500.00")
+
+        def row_status():
+            lines = gb.list_invoices().splitlines()
+            row = next(r for r in lines if r.startswith("000001"))
+            return row.split("\t")[-1]
+
+        gb.pay_invoice(
+            invoice_id="000001", payment_account="Assets:Checking",
+            amount="200",
+        )
+        assert row_status() == "posted" == gb.get_invoice("000001")["status"]
+        gb.pay_invoice(
+            invoice_id="000001", payment_account="Assets:Checking",
+            amount="300",
+        )
+        assert row_status() == "paid" == gb.get_invoice("000001")["status"]
+        verbose = gb.list_invoices(compact=False)["invoices"][0]
+        assert verbose["status"] == "paid"
+        assert "000001" in gb.list_invoices(status="posted")
+
+    def test_list_status_reads_settlements_in_fixed_queries(
+        self, business_book,
+    ):
+        """Status per row reads each document's lot. The listing
+        preloads posting accounts, lots, and lot splits once, so those
+        reads don't grow with the page: 2 documents or 5, the same
+        count."""
+        import re
+
+        from sqlalchemy import event
+        from sqlalchemy.engine import Engine
+
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+
+        def post_and_pay(n):
+            for _ in range(n):
+                inv = gb.create_invoice(customer_id="000001")["id"]
+                gb.add_invoice_entry(
+                    invoice_id=inv, account="Income:Sales",
+                    description="Work", quantity="1", price="100",
+                )
+                gb.post_invoice(
+                    invoice_id=inv,
+                    post_account="Assets:Accounts Receivable",
+                )
+                gb.pay_invoice(
+                    invoice_id=inv, payment_account="Assets:Checking",
+                    amount="100",
+                )
+
+        def settlement_reads():
+            statements: list[str] = []
+
+            def _record(conn, cursor, statement, *args):
+                statements.append(statement)
+
+            event.listen(Engine, "before_cursor_execute", _record)
+            try:
+                out = gb.list_invoices()
+            finally:
+                event.remove(Engine, "before_cursor_execute", _record)
+            assert out.count("\tpaid") == out.count("\n")
+            return sum(
+                1 for s in statements
+                if re.search(r"\bFROM (accounts|lots|splits)\b", s)
+            )
+
+        post_and_pay(2)
+        few = settlement_reads()
+        post_and_pay(3)
+        many = settlement_reads()
+        assert many == few <= 3, (few, many)
+
     def test_paid_document_keeps_amounts_after_leaving_unpaid_list(
         self, business_book,
     ):

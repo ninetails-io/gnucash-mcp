@@ -1848,8 +1848,6 @@ class BusinessMixin:
         date_str = (
             str(opened.date()) if opened else "n/a"
         )
-        status = "posted" if _is_invoice_posted(invoice) else "open"
-
         # ``_find_invoice_owner_by_guid`` dispatches on owner_type,
         # chasing owner_type=3 through the Job to the counterparty.
         owner = self._find_invoice_owner_by_guid(
@@ -1865,10 +1863,12 @@ class BusinessMixin:
         # Total: sum of (quantity * price) across entries. Falls back
         # to "?" when entries can't be loaded — keeps the row legible
         # even on data-corruption edge cases.
+        known = {"is_bill": self._is_bill_side(effective_ot)}
         try:
             grand_total = self._get_invoice_entries_and_total(
                 book, invoice,
             )["grand_total"]
+            known["grand_total"] = grand_total
             ccy = (
                 invoice.currency.mnemonic
                 if invoice.currency else ""
@@ -1882,6 +1882,7 @@ class BusinessMixin:
             # a bare ``except Exception`` would swallow programming
             # errors (KeyError/NameError) silently too.
             amount_str = "?"
+        status, _ = self._document_status(book, invoice, **known)
 
         return (
             f"{invoice.id}\t{inv_type}\t{owner_name}\t{amount_str}\t"
@@ -2330,6 +2331,7 @@ class BusinessMixin:
 
     def _document_settlement(
         self, book, inv, *, is_bill=None, is_credit_note=None,
+        grand_total=None,
     ) -> dict | None:
         """Payment state of a POSTED document, read from its A/R or
         A/P lot. ``None`` when the document is unposted or its lot
@@ -2340,7 +2342,8 @@ class BusinessMixin:
         two surfaces agree by construction; ``pay_invoice`` derives
         ``total_paid`` from the same seam. Callers that already
         resolved the side may pass ``is_bill`` / ``is_credit_note``
-        to save a Job query.
+        to save a Job query, and one that already summed the entries
+        may pass ``grand_total``.
 
         Returns a dict of ``post_account``, ``lot``, ``balance``
         (signed lot balance), ``grand_total``, ``amount_paid``,
@@ -2355,9 +2358,9 @@ class BusinessMixin:
             is_bill = self._is_bill_side(
                 self._effective_owner_type(book, inv)
             )
-        post_acct = book.session.query(
-            piecash.Account
-        ).filter_by(guid=inv.post_acc_guid).first()
+        # By primary key, so an account already in the session costs
+        # no SQL — a listing asks once per document.
+        post_acct = book.session.get(piecash.Account, inv.post_acc_guid)
         if not post_acct:
             return None
         lot_obj = next(
@@ -2374,12 +2377,15 @@ class BusinessMixin:
         amount_due = (
             -balance if (is_bill ^ is_credit_note) else balance
         ).quantize(quantum)
-        try:
-            grand_total = self._get_invoice_entries_and_total(
-                book, inv,
-            )["grand_total"].quantize(quantum)
-        except ValueError:
-            grand_total = max(amount_due, Decimal("0"))
+        if grand_total is not None:
+            grand_total = grand_total.quantize(quantum)
+        else:
+            try:
+                grand_total = self._get_invoice_entries_and_total(
+                    book, inv,
+                )["grand_total"].quantize(quantum)
+            except ValueError:
+                grand_total = max(amount_due, Decimal("0"))
         # Signed arithmetic keeps amount_paid honest when overpaid:
         # grand 3500, due -1000 -> paid 4500.
         return {
@@ -2391,6 +2397,52 @@ class BusinessMixin:
             "amount_due": amount_due,
             "overpaid": amount_due < 0 and not is_credit_note,
         }
+
+    def _preload_document_lots(self, book, invoices) -> list:
+        """Load the posting accounts of a page of documents with every
+        lot and lot split, in one query per level; the caller holds the
+        returned list for as long as it reads settlements. The session's
+        identity map is weak, so without the reference each row reloaded
+        its account, lots, and splits."""
+        from sqlalchemy.orm import selectinload
+
+        guids = {
+            i.post_acc_guid for i in invoices
+            if _is_invoice_posted(i) and i.post_acc_guid
+        }
+        if not guids:
+            return []
+        return (
+            book.session.query(piecash.Account)
+            .options(
+                selectinload(piecash.Account.lots)
+                .selectinload(piecash.Lot.splits)
+            )
+            .filter(piecash.Account.guid.in_(guids))
+            .all()
+        )
+
+    def _document_status(
+        self, book, inv, **known,
+    ) -> tuple[str, dict | None]:
+        """The shared status word and the settlement it came from.
+
+        open = not yet booked; posted = booked, balance owed; paid =
+        balance zero or below (``overpaid`` flags below); a credit note
+        at zero reads applied, since it settles by application, not
+        cash. The one rule every document surface speaks, read off
+        ``_document_settlement``; a posted document whose lot can't be
+        found reads posted with no settlement. ``known`` passes a
+        caller's already-resolved ``is_bill`` / ``grand_total``
+        through to the settlement.
+        """
+        if not _is_invoice_posted(inv):
+            return "open", None
+        settlement = self._document_settlement(book, inv, **known)
+        if settlement is None or settlement["amount_due"] > 0:
+            return "posted", settlement
+        settled = "applied" if self._get_is_credit_note(inv) else "paid"
+        return settled, settlement
 
     def _get_invoice_entries_and_total(self, book, inv):
         """Query entries for an invoice/bill and compute totals,
@@ -5248,6 +5300,8 @@ class BusinessMixin:
                 date_key=lambda i: i.date_opened,
             )
             invoices = page
+            # Held for the rows below: each reads its settlement.
+            _held_accounts = self._preload_document_lots(book, invoices)
 
             if compact:
                 lines = [indicator]
@@ -5279,13 +5333,13 @@ class BusinessMixin:
                         j_obj = jobs_by_guid.get(i.owner_guid)
                         if j_obj is not None:
                             j_dict = self._job_to_dict(j_obj)
-                    results.append(
-                        self._invoice_to_dict(
-                            i,
-                            owner_name=o.name if o else None,
-                            job=j_dict,
-                        )
+                    row = self._invoice_to_dict(
+                        i,
+                        owner_name=o.name if o else None,
+                        job=j_dict,
                     )
+                    row["status"], _ = self._document_status(book, i)
+                    results.append(row)
                 # Envelope matches the other list tools: ``count`` =
                 # page length, ``total`` = full filter-set size,
                 # ``showing`` = the indicator compact leads with.
@@ -5437,28 +5491,13 @@ class BusinessMixin:
             result["total"] = str(total)
 
             # Payment state from the same lot arithmetic the unpaid
-            # list uses, so the two surfaces agree by construction.
-            # open = not yet booked; posted = booked, balance owed;
-            # paid = balance zero (or below: ``overpaid`` flags it).
-            if not _is_invoice_posted(inv):
-                result["status"] = "open"
-            else:
-                settlement = self._document_settlement(book, inv)
-                if settlement is None:
-                    result["status"] = "posted"
-                else:
-                    due = settlement["amount_due"]
-                    # A credit note settles by being applied, never
-                    # by cash: "applied" is the truer word for it.
-                    settled = (
-                        "applied" if self._get_is_credit_note(inv)
-                        else "paid"
-                    )
-                    result["status"] = settled if due <= 0 else "posted"
-                    result["amount_paid"] = str(settlement["amount_paid"])
-                    result["amount_due"] = str(due)
-                    if settlement["overpaid"]:
-                        result["overpaid"] = True
+            # list uses, so the surfaces agree by construction.
+            result["status"], settlement = self._document_status(book, inv)
+            if settlement is not None:
+                result["amount_paid"] = str(settlement["amount_paid"])
+                result["amount_due"] = str(settlement["amount_due"])
+                if settlement["overpaid"]:
+                    result["overpaid"] = True
 
             # Forward signal: surface available (or just-expired)
             # early-payment discount so get_invoice is actionable
