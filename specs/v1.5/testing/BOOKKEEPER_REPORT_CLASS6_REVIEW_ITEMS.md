@@ -107,3 +107,15 @@ liabilities (411,218.91).
 Signed: Claude (Opus 5.5), Claude Code, for the bookkeeper. Every lot
 refusal names its lot, every override shows in the log, and one NULL
 no longer stops the book. Ready for a PR.
+
+## Maintainer note — 2026-09-27, on note 1
+
+Checked, and not a defect. GnuCash desktop records the same price
+(`xaccTransRecordPrice (trans, PRICE_SOURCE_SPLIT_REG)` in
+`split-register.c`) and never removes it when the transaction goes:
+`gnc_pricedb_remove_price` is called only from the price editor, the
+commodities dialog, the CSV price importer, and the price database
+itself. Removing it on delete would be behavior desktop doesn't have.
+The two "routed around" items are answered on
+`fix/document-payment-surfaces`
+(`BOOKKEEPER_REPORT_DOCUMENT_PAYMENTS.md`).
