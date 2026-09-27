@@ -91,10 +91,12 @@ Name every workaround taken, with the tool that forced it.
 
 ## Addendum — round 2 (after the round-1 report)
 
-Branch at `b1756e0` plus this addendum; three commits since round 1:
-`4cfb7c8` (a currency comes from the ISO table), `7b4a3bf`
-(`apply_credit_note` takes `id` / `applies_to_id`), `b1756e0`
-(harness: `mcpcall.py` honors `REPO`). Same setup: a fresh copy of
+Branch at `507cb9f`; four commits since round 1: `4cfb7c8` (a
+currency comes from the ISO table), `7b4a3bf` (`apply_credit_note`
+takes `id` / `applies_to_id`), `b1756e0` (harness: `mcpcall.py` honors
+`REPO`), `507cb9f` (one rule for a document tool's owner side — a
+refactor of `list_`, `get_`, `post_`, `unpost_` and `pay_document`
+with no intended change; steps 5, 8 and 11 exercise all five). Same setup: a fresh copy of
 committed Alex, in a user-private directory (the log sidecar refuses
 `/tmp`). Restart the server on the branch; `mcpcall.py` no longer
 needs patching.
