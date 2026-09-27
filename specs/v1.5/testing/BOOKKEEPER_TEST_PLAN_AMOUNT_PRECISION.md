@@ -96,7 +96,7 @@ currency comes from the ISO table), `7b4a3bf` (`apply_credit_note`
 takes `id` / `applies_to_id`), `b1756e0` (harness: `mcpcall.py` honors
 `REPO`), `507cb9f` (one rule for a document tool's owner side — a
 refactor of `list_`, `get_`, `post_`, `unpost_` and `pay_document`
-with no intended change; steps 5, 8 and 11 exercise all five). Same setup: a fresh copy of
+with no intended change; steps 5, 8 and 13 exercise all five). Same setup: a fresh copy of
 committed Alex, in a user-private directory (the log sidecar refuses
 `/tmp`). Restart the server on the branch; `mcpcall.py` no longer
 needs patching.
@@ -129,6 +129,13 @@ currency. Existing books keep what they hold; this prevents new ones.
 12. **Invoice creation adds an unseen ISO currency.**
     `create_document` invoice for an existing customer with currency
     `JPY` (not in Alex): created; JPY appears with fraction 1.
+
+13. **The five document tools after the owner-side refactor.**
+    `list_documents` with `document_type: "bill"` shows only bills,
+    and with `party_type: "vendor"` the same rows. Create an invoice,
+    add an entry, `post_document` it, then `unpost_document` it:
+    `get_document` reads `open` again. (`get_document` and
+    `pay_document` are covered by steps 5 and 8.)
 
 Part C still stands: the desktop GUI gate (open, check, edit, save,
 reopen) on a looped copy. It can take both rounds' litter at once.
