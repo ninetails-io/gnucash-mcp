@@ -14,7 +14,6 @@ Depends on shared helpers from BaseGnuCashBook:
   - _verify_write, _verify_composite_write, _verify_delete
 """
 
-from calendar import monthrange
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 import uuid
@@ -27,8 +26,15 @@ from piecash.kvp import KVP_Type, Slot
 from sqlalchemy import text
 from sqlalchemy.orm import object_session
 
-from gnucash_mcp.book._base import (
+from gnucash_mcp.book._base import (  # noqa: F401 — re-exported ports
     _HEX_GUID_RE,
+    _PT_MONTHISH,
+    _PT_WEEKEND_ADJUSTED,
+    _add_months,
+    _adjust_for_weekend,
+    _is_last_of_month,
+    _nth_weekday_compare,
+    _recurrence_next,
     _commodity_quantum,
     _gnc_bool,
     _guid_prefix_map,
@@ -42,124 +48,6 @@ from gnucash_mcp.book._base import (
     _verify_write,
 )
 from gnucash_mcp._format import _paginate
-
-
-# ── GnuCash's recurrence engine, ported from Recurrence.cpp ──────
-# The occurrence anchor is the RECURRENCE row (period type, mult,
-# period start, weekend adjust), never the schedule's start_date and
-# never a frequency label: desktop lets "start 9 Sep, monthly on the
-# 15th" exist, and a schedule may carry several rows (monthly on the
-# 5th AND the 20th). recurrenceNextInstance is ported line for line,
-# including the weekend-adjust Friday special case; string tables
-# verbatim from period_type_strings / weekend_adj_strings.
-_PT_MONTHISH = frozenset(
-    {"year", "month", "end of month", "nth weekday", "last weekday"}
-)
-_PT_WEEKEND_ADJUSTED = frozenset({"year", "month", "end of month"})
-
-
-def _add_months(d: date, n: int) -> date:
-    """g_date_add_months: day clamped to the target month's length."""
-    total = d.month - 1 + n
-    y, m = d.year + total // 12, total % 12 + 1
-    return date(y, m, min(d.day, monthrange(y, m)[1]))
-
-
-def _is_last_of_month(d: date) -> bool:
-    return d.day == monthrange(d.year, d.month)[1]
-
-
-def _nth_weekday_compare(start: date, nxt: date, pt: str) -> int:
-    nd, sd = nxt.day, start.day
-    week = 3 if sd // 7 > 3 else sd // 7
-    if week > 0 and sd % 7 == 0 and sd != 28:
-        week -= 1
-    matchday = 7 * week + (
-        nd - nxt.isoweekday() + start.isoweekday() + 7
-    ) % 7
-    dim = monthrange(nxt.year, nxt.month)[1]
-    if (dim - matchday) >= 7 and pt == "last weekday":
-        matchday += 7
-    if pt == "nth weekday" and matchday % 7 == 0:
-        matchday += 7
-    return matchday - nd
-
-
-def _adjust_for_weekend(pt: str, wadj: str, d: date) -> date:
-    if pt in _PT_WEEKEND_ADJUSTED and d.isoweekday() in (6, 7):
-        sat = d.isoweekday() == 6
-        if wadj == "back":
-            return d - timedelta(days=1 if sat else 2)
-        if wadj == "forward":
-            return d + timedelta(days=2 if sat else 1)
-    return d
-
-
-def _recurrence_next(
-    pt: str, mult: int, start: date, wadj: str, ref: date,
-) -> date | None:
-    """First occurrence strictly after ``ref``; None when the
-    recurrence yields nothing (``once`` already past, unknown type)."""
-    mult = max(int(mult or 1), 1)
-    adjusted_start = _adjust_for_weekend(pt, wadj, start)
-    if ref < adjusted_start:
-        return adjusted_start
-    nxt = ref
-    if pt == "once":
-        return None
-    if pt in _PT_MONTHISH:
-        m = mult * 12 if pt == "year" else mult
-        # Step 1: forward one period, passing exactly one occurrence.
-        if (wadj == "back" and pt in _PT_WEEKEND_ADJUSTED
-                and nxt.isoweekday() in (6, 7)):
-            nxt -= timedelta(days=1 if nxt.isoweekday() == 6 else 2)
-        if (wadj == "back" and pt in _PT_WEEKEND_ADJUSTED
-                and nxt.isoweekday() == 5):
-            tmp_sat, tmp_sun = nxt + timedelta(days=1), nxt + timedelta(days=2)
-            if pt == "end of month":
-                if (_is_last_of_month(nxt) or _is_last_of_month(tmp_sat)
-                        or _is_last_of_month(tmp_sun)):
-                    nxt = _add_months(nxt, m)
-                else:
-                    nxt = _add_months(nxt, m - 1)
-            else:
-                if tmp_sat.day == start.day:
-                    nxt = _add_months(tmp_sat, m)
-                elif tmp_sun.day == start.day:
-                    nxt = _add_months(tmp_sun, m)
-                elif nxt.day >= start.day:
-                    nxt = _add_months(nxt, m)
-                elif _is_last_of_month(nxt):
-                    nxt = _add_months(nxt, m)
-                elif _is_last_of_month(tmp_sat):
-                    nxt = _add_months(tmp_sat, m)
-                elif _is_last_of_month(tmp_sun):
-                    nxt = _add_months(tmp_sun, m)
-                else:
-                    nxt = _add_months(nxt, m - 1)
-        elif (_is_last_of_month(nxt)
-              or (pt in ("month", "year") and nxt.day >= start.day)
-              or (pt in ("nth weekday", "last weekday")
-                  and _nth_weekday_compare(start, nxt, pt) <= 0)):
-            nxt = _add_months(nxt, m)
-        else:
-            nxt = _add_months(nxt, m - 1)
-        # Step 2: back up to the base phase, then align the day.
-        n_months = 12 * (nxt.year - start.year) + (nxt.month - start.month)
-        nxt = _add_months(nxt, -(n_months % m))
-        dim = monthrange(nxt.year, nxt.month)[1]
-        if pt in ("nth weekday", "last weekday"):
-            nxt += timedelta(days=_nth_weekday_compare(start, nxt, pt))
-        elif pt == "end of month" or start.day >= dim:
-            nxt = nxt.replace(day=dim)
-        else:
-            nxt = nxt.replace(day=start.day)
-        return _adjust_for_weekend(pt, wadj, nxt)
-    if pt in ("week", "day"):
-        step = mult * 7 if pt == "week" else mult
-        nxt = nxt + timedelta(days=step)
-        return nxt - timedelta(days=(nxt - start).days % step)
-    return None
 
 
 def _gdate(v) -> date | None:

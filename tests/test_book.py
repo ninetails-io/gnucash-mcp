@@ -2170,8 +2170,9 @@ class TestGetBookSummaryBudgetHeadline:
         assert headline(gc.get_book_summary()) != before
 
     def test_format_components(self, budget_book: Path):
-        """Headline format: name, % used, % elapsed, variance,
-        optional ⚠. Currency-free, all percentage values."""
+        """Headline format (spec B5): name, spent, expected by
+        today from the budget's own per-period targets, variance
+        against expected, optional ⚠."""
         gc = GnuCashBook(str(budget_book))
         self._make_budget_covering_today(gc, "Test Budget")
         gc.set_budget_amount(
@@ -2183,33 +2184,22 @@ class TestGetBookSummaryBudgetHeadline:
         budget_line = next(
             l for l in result.split("\n") if l.startswith("Budget (")
         )
-        # Format pieces — no currency markers (this is %).
-        assert "% used" in budget_line
-        assert "% elapsed" in budget_line
-        # Either "+X% over pace" / "X% under pace" / "on pace" form.
-        assert (
-            "over pace" in budget_line
-            or "under pace" in budget_line
-            or "on pace" in budget_line
-        )
+        assert "USD" in budget_line and " spent / " in budget_line
+        assert "expected by today" in budget_line
+        assert "%)" in budget_line or "(on pace)" in budget_line
 
     def test_overspend_variance_warns_at_10_pct(
         self, budget_book: Path,
     ):
-        """Variance > +10% (used% ahead of elapsed% by more than
-        10 points) earns a ⚠ marker."""
-        # Build a fresh budget book where we control exact numbers.
+        """Spending more than 10% ahead of expected-by-today earns
+        a ⚠ marker."""
         gc = GnuCashBook(str(budget_book))
-        # Anchor the budget to start of current year, num_periods=12
-        # → covers ~all of this calendar year.
         self._make_budget_covering_today(gc, "Overspend")
-        # Tiny budget target → easy to exceed.
         gc.set_budget_amount(
             budget_name="Overspend",
             account="Expenses:Groceries",
             amount="100",  # $100/month × 12 = $1,200 total
         )
-        # Big actual spend in the budget's accounts.
         gc.create_transaction(
             description="Massive grocery run",
             splits=[
@@ -2223,13 +2213,13 @@ class TestGetBookSummaryBudgetHeadline:
         budget_line = next(
             l for l in result.split("\n") if l.startswith("Budget (")
         )
-        # Used: 5000 / 1200 = 416% (capped semantically by intent).
-        # Variance vs elapsed = ~416 - elapsed%, well over +10.
+        assert " spent / " in budget_line
         assert "⚠" in budget_line
-        assert "over pace" in budget_line
+        assert "(+" in budget_line
 
     def test_underspend_no_warning(self, budget_book: Path):
-        """Variance ≤ +10% (under pace or close) → no warning marker."""
+        """Nothing spent against a positive expected → negative
+        variance, no warning marker."""
         gc = GnuCashBook(str(budget_book))
         self._make_budget_covering_today(gc, "Underspend")
         gc.set_budget_amount(
@@ -2237,15 +2227,97 @@ class TestGetBookSummaryBudgetHeadline:
             account="Expenses:Groceries",
             amount="10000",
         )
-        # No actuals at all in the budgeted account during the
-        # budget period.
         result = gc.get_book_summary()
         budget_line = next(
             l for l in result.split("\n") if l.startswith("Budget (")
         )
         assert "⚠" not in budget_line
-        # 0% used vs ~partial-year% elapsed → "under pace".
-        assert "under pace" in budget_line
+        assert "(-" in budget_line
+
+    def test_pace_follows_per_period_targets(self, budget_book: Path):
+        """Spec B5: January insurance budgeted only in period 0 and
+        paid in January is ON pace all year — not "over pace"
+        because the linear model spread it across twelve months.
+        A December-only target expects nothing before December."""
+        today = date.today()
+        if today.month == 1 or today.month == 12:
+            pytest.skip("needs a month strictly between January and December")
+        gc = GnuCashBook(str(budget_book))
+        # Fresh accounts: the fixture already spends on Groceries.
+        gc.create_account(name="Insurance", account_type="EXPENSE", parent="Expenses")
+        gc.create_account(name="Gifts", account_type="EXPENSE", parent="Expenses")
+        self._make_budget_covering_today(gc, "Lumpy")
+        gc.set_budget_amount(
+            budget_name="Lumpy", account="Expenses:Insurance",
+            amount="1200", period=0,
+        )
+        gc.set_budget_amount(
+            budget_name="Lumpy", account="Expenses:Gifts",
+            amount="900", period=11,
+        )
+        gc.create_transaction(
+            description="Annual insurance",
+            splits=[
+                {"account": "Expenses:Insurance", "amount": "1200"},
+                {"account": "Assets:Checking", "amount": "-1200"},
+            ],
+            trans_date=date(today.year, 1, 15),
+            check_duplicates=False,
+        )
+        line = next(
+            l for l in gc.get_book_summary().split("\n")
+            if l.startswith("Budget (")
+        )
+        assert line == (
+            "Budget (Lumpy): USD 1,200 spent / USD 1,200 expected by today "
+            "(on pace)"
+        ), line
+
+    def test_yearly_recurrence_paces(self, budget_book: Path):
+        """A yearly budget (one period) pro-rates its target by the
+        day of the year — the Recurrence.cpp port handles every
+        period type, not just month and week."""
+        today = date.today()
+        gc = GnuCashBook(str(budget_book))
+        gc.create_budget(name="Annual", year=today.year, num_periods=1)
+        with gc.open(readonly=False) as book:
+            from piecash.budget import Budget
+            b = book.session.query(Budget).filter_by(name="Annual").one()
+            b.recurrence.recurrence_period_type = "year"
+            b.recurrence.recurrence_mult = 1
+            book.save()
+        gc.set_budget_amount(
+            budget_name="Annual", account="Expenses:Groceries", amount="3650",
+        )
+        line = next(
+            l for l in gc.get_book_summary().split("\n")
+            if l.startswith("Budget (Annual)")
+        )
+        days_in_year = (date(today.year, 12, 31) - date(today.year, 1, 1)).days + 1
+        expected = int(
+            (Decimal(3650) * (today.timetuple().tm_yday) / days_in_year)
+            .quantize(Decimal("1"))
+        )
+        assert f"USD {expected:,} expected by today" in line, line
+
+    def test_unsupported_period_type_is_named_not_omitted(
+        self, budget_book: Path,
+    ):
+        gc = GnuCashBook(str(budget_book))
+        self._make_budget_covering_today(gc, "Odd")
+        gc.set_budget_amount(
+            budget_name="Odd", account="Expenses:Groceries", amount="10",
+        )
+        with gc.open(readonly=False) as book:
+            from piecash.budget import Budget
+            b = book.session.query(Budget).filter_by(name="Odd").one()
+            b.recurrence.recurrence_period_type = "once"
+            book.save()
+        result = gc.get_book_summary()
+        assert (
+            "Budget (Odd): period type 'once' is not one the server can "
+            "pace — no headline computed"
+        ) in result
 
     def test_multiple_budgets_picks_latest_start(
         self, budget_book: Path,

@@ -63,6 +63,7 @@ def _describe_check_failure(check: str, exc: BaseException) -> str:
 from gnucash_mcp.book._base import (
     _rollback_if_aborted,
     _txn_sort_key,
+    _budget_period_bounds,
     _budget_targets,
     _account_to_compact_line,
     _account_to_dict,
@@ -839,8 +840,9 @@ class CoreMixin:
             for anchor_date, label in anchors
         ]
 
-    # Budget overspend threshold: variance over +10% (used% ahead of
-    # elapsed%) earns ⚠ — breathing room for lumpy household spending.
+    # Budget overspend threshold: spending more than 10% ahead of the
+    # budget's own expected-by-today earns ⚠ — breathing room for
+    # lumpy household spending (spec B5 kept the number).
     _BUDGET_WARN_VARIANCE_PCT = 10
 
     # Runway ⚠ threshold: under ~two months, a household should be
@@ -1622,15 +1624,30 @@ class CoreMixin:
         to the latest start date. None (→ section omitted) when no
         budget covers today.
 
-        Returns ``{name, used_pct, elapsed_pct, variance_pct}``,
-        percentages quantized to whole numbers:
+        Returns ``{name, currency, spent, expected, used_pct,
+        variance_pct}``:
 
-        - ``used_pct`` = actuals in budgeted accounts ÷ targets × 100
-        - ``elapsed_pct`` = (today − start + 1) ÷ period length × 100
-        - ``variance_pct`` = used − elapsed (positive = ahead of pace)
+        - ``spent`` = actuals in budgeted EXPENSE accounts through
+          today, in the book default.
+        - ``expected`` = the budget's own targets for every fully
+          elapsed period, plus the current period's target × the
+          fraction of that period elapsed (spec B5). Pace used to
+          be linear in time over the whole span, so a January
+          insurance target read over pace all year and a heavy
+          December read under pace until December.
+        - ``used_pct`` = spent ÷ total targets × 100 (the whole-
+          budget consumption the report tools also show).
+        - ``variance_pct`` = (spent − expected) ÷ expected × 100;
+          ``None`` when nothing is expected yet.
 
-        Actuals come from EXPENSE/INCOME splits in budgeted accounts
-        AND their descendants — children roll up to a budgeted
+        Period boundaries come from ``_budget_period_bounds`` (the
+        Recurrence.cpp port), so every GnuCash period type paces.
+        A type the port can't handle returns
+        ``{name, unsupported_period_type}`` — rendered as a line
+        saying so, never omitted silently.
+
+        Actuals come from EXPENSE splits in budgeted accounts AND
+        their descendants — children roll up to a budgeted
         ancestor, but a separately-budgeted descendant stays on its
         own line so its actuals aren't double-counted (matches
         ``get_budget_report``).
@@ -1641,55 +1658,58 @@ class CoreMixin:
         if not budgets:
             return None
 
-        from dateutil.relativedelta import relativedelta
-
         today = date.today()
         candidate = None
+        unsupported = None
         for b in budgets:
+            bounds = _budget_period_bounds(b)
             rec = b.recurrence
             period_start = rec.recurrence_period_start
             if isinstance(period_start, datetime):
                 period_start = period_start.date()
-
-            period_type = rec.recurrence_period_type
-            mult = rec.recurrence_mult
-            num_periods = b.num_periods
-            if period_type == "month":
-                period_end = (
-                    period_start
-                    + relativedelta(months=mult * num_periods)
-                    - timedelta(days=1)
-                )
-            elif period_type == "week":
-                period_end = (
-                    period_start
-                    + timedelta(weeks=mult * num_periods)
-                    - timedelta(days=1)
-                )
-            else:
-                # Unknown recurrence type — skip.
+            if bounds is None:
+                # Can't tell whether it covers today; the best
+                # guess is by start date, and it is named, not
+                # dropped.
+                if period_start <= today and (
+                    unsupported is None
+                    or period_start > unsupported["start"]
+                ):
+                    unsupported = {
+                        "budget": b, "start": period_start,
+                        "period_type": rec.recurrence_period_type,
+                    }
                 continue
-
+            period_end = bounds[-1][1]
             if period_start <= today <= period_end:
                 if candidate is None or period_start > candidate["start"]:
                     candidate = {
                         "budget": b,
                         "start": period_start,
                         "end": period_end,
+                        "bounds": bounds,
                     }
 
         if candidate is None:
+            if unsupported is not None:
+                return {
+                    "name": unsupported["budget"].name,
+                    "unsupported_period_type": unsupported["period_type"],
+                }
             return None
 
         budget = candidate["budget"]
         period_start = candidate["start"]
         period_end = candidate["end"]
+        bounds = candidate["bounds"]
+        default_currency = self._require_default_currency(book)
 
         # Targets FX-convert at the period-end rate — raw sums would
         # be apples-to-oranges against default-currency actuals
         # (mirrors get_budget_report).
         factors = self._account_conversion_factors(book, period_end)
         total_budgeted = Decimal("0")
+        targets_by_period: dict[int, Decimal] = {}
         budgeted_accounts: list = []
         budgeted_account_guids: set[str] = set()
         for ba, ba_amount in _budget_targets(book, budget):
@@ -1702,8 +1722,13 @@ class CoreMixin:
             if factor is not None:
                 ba_amount = ba_amount * factor
             total_budgeted += ba_amount
-            budgeted_accounts.append(ba.account)
-            budgeted_account_guids.add(ba.account.guid)
+            targets_by_period[ba.period_num] = (
+                targets_by_period.get(ba.period_num, Decimal("0"))
+                + ba_amount
+            )
+            if ba.account.guid not in budgeted_account_guids:
+                budgeted_accounts.append(ba.account)
+                budgeted_account_guids.add(ba.account.guid)
 
         if total_budgeted <= 0:
             return None
@@ -1726,8 +1751,7 @@ class CoreMixin:
         # period must value at its own rates, not today's.
         # Actuals stop at today, like every other "now" surface on
         # the dashboard: a bill pre-entered for later in the period
-        # is not yet "used" (spec A7). The pace comparison below is
-        # elapsed-to-today, so the two sides now cover the same days.
+        # is not yet "used" (spec A7).
         actuals_end = min(period_end, today)
         actuals = Decimal("0")
         for txn in transactions:
@@ -1745,23 +1769,32 @@ class CoreMixin:
                     s, s.account, factors.get(s.account.guid),
                 )
 
-        # Period progression.
-        total_days = (period_end - period_start).days + 1
-        elapsed_days = (today - period_start).days + 1
-        elapsed_days = max(0, min(elapsed_days, total_days))
+        # Expected by today: elapsed periods in full, the current
+        # one pro-rated by days.
+        expected = Decimal("0")
+        for p, (p_start, p_end) in enumerate(bounds):
+            target = targets_by_period.get(p, Decimal("0"))
+            if p_end < today:
+                expected += target
+            elif p_start <= today <= p_end:
+                total_days = (p_end - p_start).days + 1
+                elapsed_days = (today - p_start).days + 1
+                expected += target * Decimal(elapsed_days) / Decimal(total_days)
 
-        elapsed_pct = (
-            Decimal(elapsed_days) / Decimal(total_days) * Decimal(100)
-        ).quantize(Decimal("1"))
         used_pct = (
             actuals / total_budgeted * Decimal(100)
         ).quantize(Decimal("1"))
-        variance_pct = used_pct - elapsed_pct
+        variance_pct = (
+            ((actuals - expected) / expected * Decimal(100)).quantize(Decimal("1"))
+            if expected > 0 else None
+        )
 
         return {
             "name": budget.name,
+            "currency": default_currency.mnemonic,
+            "spent": actuals.quantize(Decimal("1")),
+            "expected": expected.quantize(Decimal("1")),
             "used_pct": used_pct,
-            "elapsed_pct": elapsed_pct,
             "variance_pct": variance_pct,
         }
 
@@ -3013,28 +3046,41 @@ class CoreMixin:
         """Render the Budget headline line.
 
         One line for the budget covering today. ``None`` = no
-        budget exists or none covers today → omit. Variance
-        over ``_BUDGET_WARN_VARIANCE_PCT`` earns ⚠ (spending
-        ahead of pace).
+        budget exists or none covers today → omit. Spent against
+        the budget's own expected-by-today; a variance over
+        ``_BUDGET_WARN_VARIANCE_PCT`` earns ⚠ (spending ahead of
+        the targets). A budget whose period type the server can't
+        pace says so.
         """
         if budget is None:
             return []
-        used = int(budget["used_pct"])
-        elapsed = int(budget["elapsed_pct"])
-        variance = int(budget["variance_pct"])
-        if variance > 0:
-            variance_str = f"(+{variance}% over pace)"
+        if "unsupported_period_type" in budget:
+            return [
+                f"Budget ({budget['name']}): period type "
+                f"'{budget['unsupported_period_type']}' is not one the "
+                f"server can pace — no headline computed"
+            ]
+        cur = budget["currency"]
+        spent = int(budget["spent"])
+        expected = int(budget["expected"])
+        variance = budget["variance_pct"]
+        warn = ""
+        if variance is None:
+            if spent > 0:
+                variance_str = "(ahead of targets)"
+                warn = " ⚠"
+            else:
+                variance_str = "(on pace)"
+        elif variance > 0:
+            variance_str = f"(+{int(variance)}%)"
+            warn = " ⚠" if variance > self._BUDGET_WARN_VARIANCE_PCT else ""
         elif variance < 0:
-            variance_str = f"({-variance}% under pace)"
+            variance_str = f"({int(variance)}%)"
         else:
             variance_str = "(on pace)"
-        warn = (
-            " ⚠" if variance > self._BUDGET_WARN_VARIANCE_PCT else ""
-        )
         return [
-            f"Budget ({budget['name']}): "
-            f"{used}% used / {elapsed}% elapsed "
-            f"{variance_str}{warn}"
+            f"Budget ({budget['name']}): {cur} {spent:,} spent / "
+            f"{cur} {expected:,} expected by today {variance_str}{warn}"
         ]
 
     def get_book_summary(self) -> str:

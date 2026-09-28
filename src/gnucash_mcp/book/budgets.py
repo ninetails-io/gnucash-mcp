@@ -20,6 +20,7 @@ from piecash.kvp import Slot
 
 from gnucash_mcp.book._base import (
     _BUDGET_SCRUB_FLIP,
+    _budget_period_bounds,
     _BUDGET_UNREVERSED_BOGUS_KEY,
     _BUDGET_UNREVERSED_FEATURE,
     _BUDGET_UNREVERSED_DESCRIPTION,
@@ -321,25 +322,15 @@ class BudgetsMixin:
                 f"(0-{budget.num_periods - 1})"
             )
 
-        rec = budget.recurrence
-        anchor = rec.recurrence_period_start
-        if isinstance(anchor, datetime):
-            anchor = anchor.date()
-
-        period_type = rec.recurrence_period_type
-        mult = rec.recurrence_mult
-
-        if period_type == "month":
-            delta = relativedelta(months=mult)
-        elif period_type == "week":
-            delta = relativedelta(weeks=mult)
-        else:
-            raise ValueError(f"Unsupported period type: {period_type}")
-
-        start = anchor + delta * period_num
-        end = anchor + delta * (period_num + 1) - timedelta(days=1)
-
-        return start, end
+        # One rule for period boundaries, shared with the dashboard
+        # headline: the Recurrence.cpp port (spec B5).
+        bounds = _budget_period_bounds(budget)
+        if bounds is None:
+            raise ValueError(
+                f"Unsupported period type: "
+                f"{budget.recurrence.recurrence_period_type}"
+            )
+        return bounds[period_num]
 
     def _current_period(self, budget) -> int | None:
         """Get the current period number based on today's date.
