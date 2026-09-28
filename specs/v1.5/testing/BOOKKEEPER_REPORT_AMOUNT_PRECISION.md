@@ -120,3 +120,35 @@ litter sits in `abe-bench/` awaiting it, per the plan.
 
 Countersigned for round 2: Abe VI. The currencies come from the ISO
 table now, and the tools speak one argot.
+
+## Part C — desktop GUI gate: CLOSED (PASS), 2026-09-27 evening
+
+Driven remotely via desktop control on the round-1 looped copy:
+- **Opened cleanly.** Only routine dialogs (Since Last Run — cancelled,
+  both due reminders); status bar read "File alex-precision.gnucash
+  opened", no warnings. The Due Invoices Reminder itself showed 000019
+  at **3,400.00** — the credit-note application rendered by GnuCash's
+  own UI. First launch note: GnuCash tried to reopen its previous book
+  (`mysql://…`) and hit the lock held by the running mysql-backend
+  server — declined "Open Anyway"; the desktop and that server will
+  fight over the mysql book whenever both are up.
+- **Amounts render.** Register showed 12.35 and 12.00 exactly;
+  Checking's on-screen balance ($45,467.30) tied the battery
+  arithmetic to the penny.
+- **Edit.** 12.35 → 12.36 in the register; propagation coherent
+  (Checking −0.01, Expenses +0.01 in the tree).
+- **Save-close-reopen.** Quit and relaunched: book reopened clean,
+  tabs restored, 12.36 persisted on screen.
+- **Storage after the DESKTOP's own write:** `1236/100` — the same
+  fraction convention the branch writes. Server and GnuCash agree at
+  the storage layer, which is the whole claim of `1af4209`.
+- Shares-in-GUI not reached (see note): verified at storage
+  (`68142/10000`) and in two server lenses; value rows render
+  correctly in journal and checking registers.
+- Environment note, not code: an invisible floating Emoji & Symbols
+  palette intercepted clicks across ~a third of the screen; the gate
+  was driven around it with window moves, menus and keyboard. Close it
+  before future remote GUI gates.
+
+**Verdict: gate closed. The branch's storage changes survive GnuCash
+desktop's open–edit–save–reopen. Full battery: 13/13 + Part C.**
