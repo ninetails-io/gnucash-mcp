@@ -811,8 +811,8 @@ class CoreMixin:
         Returns formatted warning strings ordered by category::
 
             data integrity → far-future entries → backup health →
-            critically low cash → overdue invoices/bills →
-            overdue scheduled → stale prices
+            overdrawn accounts → critically low cash →
+            overdue invoices/bills → overdue scheduled → stale prices
 
         Within each category, most-severe first. Operational urgency
         outranks data-quality cleanup, except integrity defects
@@ -898,6 +898,55 @@ class CoreMixin:
                 f"search_transactions to inspect"
             )
 
+        # ── 2a. Overdrawn accounts ──
+        # A single BANK/CASH account below zero as of today. Low-cash
+        # skips non-positive balances and runway flags only when the
+        # WHOLE liquid pool is negative, so checking at -300 beside
+        # savings at 10,000 was flagged nowhere (spec A4). Each
+        # account renders in its own commodity (the overdraft is a
+        # fact in that currency; no rate needed); the cross-account
+        # sort converts where a rate exists, as the integrity sort
+        # does. Known false positive: a credit line typed BANK —
+        # the fix is the account's type, which is the user's call.
+        overdrawn: list[str] = []
+        try:
+            template_guids = self._template_account_guids(book)
+            overdrawn_entries: list[tuple[Decimal, str]] = []
+            for account in accounts:
+                if not self._is_cash_watch_account(
+                    account, book, template_guids,
+                ):
+                    continue
+                balance_qty = self._own_splits_balance(
+                    account, as_of=today,
+                )
+                if balance_qty >= 0:
+                    continue
+                if account.commodity == default_currency:
+                    sort_key = balance_qty
+                else:
+                    rate = rates_for_sort.get(account.commodity.guid)
+                    sort_key = (
+                        balance_qty * rate if rate is not None
+                        else balance_qty
+                    )
+                leaf = account.fullname.split(":")[-1]
+                amount = balance_qty.quantize(
+                    _commodity_quantum(account.commodity)
+                )
+                overdrawn_entries.append((
+                    sort_key,
+                    f"Overdrawn: {leaf} at "
+                    f"{account.commodity.mnemonic} {amount:,}",
+                ))
+            # Most negative first.
+            overdrawn_entries.sort(key=lambda e: e[0])
+            overdrawn = [msg for _, msg in overdrawn_entries]
+        except Exception as exc:
+            check_failures.append(
+                self._check_failed(book, "Overdraft", exc)
+            )
+
         # ── 2. Critically low cash ──
         # Threshold = 1 day of the ACCOUNT'S OWN outflow, not the
         # household's burn. Measured against total burn, a thin
@@ -917,22 +966,11 @@ class CoreMixin:
                 )
                 low_cash_entries: list[tuple[Decimal, str]] = []
                 for account in accounts:
-                    if account.type not in ("BANK", "CASH"):
-                        continue
-                    if self._is_auto_balancing_account(
-                        account, book.root_account
+                    # Same account filter as the overdraft check
+                    # above — the two warnings watch one set.
+                    if not self._is_cash_watch_account(
+                        account, book, template_guids,
                     ):
-                        # A suspense/Imbalance balance isn't spendable
-                        # cash — it's surfaced by the integrity section
-                        # above. Counting it here fires a bogus
-                        # "critically low cash" on a few euros parked
-                        # for clarification.
-                        continue
-                    if account.placeholder:
-                        continue
-                    if account.guid in template_guids:
-                        continue
-                    if self._is_in_retirement_subtree(account):
                         continue
 
                     # "Now" warning: cap at today so a future-
@@ -942,9 +980,8 @@ class CoreMixin:
                         account, as_of=today,
                     )
                     if balance_qty <= 0:
-                        # Zero = unused, not low. Negative = overdraft,
-                        # captured separately by runway's
-                        # negative_liquid path.
+                        # Zero = unused, not low. Negative = overdrawn,
+                        # its own line above.
                         continue
 
                     # Convert to default currency for the threshold
@@ -965,7 +1002,10 @@ class CoreMixin:
                         continue
 
                     leaf = account.fullname.split(":")[-1]
-                    amount_str = f"{int(balance_default):,}"
+                    # A warning that names an amount renders at the
+                    # currency's quantum, never rounded to a whole
+                    # unit (0.75 must not read as 0).
+                    amount_str = f"{balance_default.quantize(_commodity_quantum(default_currency)):,}"
                     low_cash_entries.append((
                         balance_default,
                         f"Critically low cash: {leaf} at "
@@ -1314,6 +1354,7 @@ class CoreMixin:
             + check_failures
             + legacy_recipe
             + backup_health
+            + overdrawn
             + low_cash
             + overdue_invoices
             + overdue_sched_lines
@@ -1561,6 +1602,29 @@ class CoreMixin:
         """
         return (
             account.type in self._RUNWAY_LIQUID_TYPES
+            and account.guid not in template_guids
+            and not account.placeholder
+            and not self._is_auto_balancing_account(
+                account, book.root_account,
+            )
+            and not self._is_in_retirement_subtree(account)
+        )
+
+    def _is_cash_watch_account(
+        self, account, book: piecash.Book, template_guids: set,
+    ) -> bool:
+        """True when ``account`` is money the household spends from
+        day to day, which the low-cash and overdraft warnings watch:
+        a BANK/CASH account that isn't a template, a placeholder, a
+        suspense/Imbalance account (a few euros parked for
+        clarification aren't spendable cash — the integrity section
+        surfaces those), or retirement money.
+
+        One filter for both warnings, so an account can't be
+        "critically low" under one and invisible to the other.
+        """
+        return (
+            account.type in ("BANK", "CASH")
             and account.guid not in template_guids
             and not account.placeholder
             and not self._is_auto_balancing_account(

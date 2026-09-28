@@ -3159,6 +3159,108 @@ class TestGetBookSummaryWarnings:
         assert warnings_idx < accounts_idx
 
 
+class TestGetBookSummaryOverdraft:
+    """``Overdrawn: <leaf> at <CUR> -X`` — dashboard-accuracy spec
+    A4. Low-cash skips balances at or below zero and runway flags
+    only when the whole liquid pool is negative, so an individual
+    overdraft beside a healthy savings balance was flagged nowhere.
+    """
+
+    def _seed(self, gc: GnuCashBook, account: str, target: str) -> None:
+        """Drive ``account`` to an absolute balance of ``target`` as
+        of three days ago (the fixture's Checking already holds a
+        positive balance)."""
+        delta = Decimal(target) - gc.get_balance(account)
+        gc.create_transaction(
+            description=f"seed {account}",
+            splits=[
+                {"account": account, "amount": str(delta)},
+                {"account": "Income:Salary", "amount": str(-delta)},
+            ],
+            trans_date=date.today() - timedelta(days=3),
+            check_duplicates=False,
+        )
+
+    @staticmethod
+    def _warnings(result: str) -> str:
+        if "Warnings:" not in result:
+            return ""
+        return result.split("Warnings:")[1].split("Accounts:")[0]
+
+    def test_overdrawn_checking_beside_healthy_savings(
+        self, test_book: Path,
+    ):
+        gc = GnuCashBook(str(test_book))
+        gc.create_account(name="Savings", account_type="BANK", parent="Assets")
+        self._seed(gc, "Assets:Savings", "10000")
+        self._seed(gc, "Assets:Checking", "-300")
+        result = gc.get_book_summary()
+        block = self._warnings(result)
+        lines = [ln for ln in block.splitlines() if "Overdrawn" in ln]
+        assert lines == ["  ⚠ Overdrawn: Checking at USD -300.00"], block
+        # Runway still reads the pool as positive — the overdraft
+        # is not double-reported as "0 days".
+        assert "0 days ⚠" not in result
+
+    def test_overdrawn_sorts_most_negative_first_and_precedes_low_cash(
+        self, test_book: Path,
+    ):
+        gc = GnuCashBook(str(test_book))
+        gc.create_account(name="Savings", account_type="BANK", parent="Assets")
+        gc.create_account(name="Wallet", account_type="CASH", parent="Assets")
+        self._seed(gc, "Assets:Savings", "-50.25")
+        self._seed(gc, "Assets:Checking", "-1200")
+        # A thin wallet with its own outflow trips low-cash.
+        self._seed(gc, "Assets:Wallet", "1000")
+        gc.create_transaction(
+            description="wallet spend",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "999.50"},
+                {"account": "Assets:Wallet", "amount": "-999.50"},
+            ],
+            trans_date=date.today() - timedelta(days=1),
+            check_duplicates=False,
+        )
+        block = self._warnings(gc.get_book_summary())
+        flagged = [
+            ln.strip() for ln in block.splitlines()
+            if "Overdrawn" in ln or "Critically low cash" in ln
+        ]
+        assert flagged[:2] == [
+            "⚠ Overdrawn: Checking at USD -1,200.00",
+            "⚠ Overdrawn: Savings at USD -50.25",
+        ], block
+        # The low-cash amount renders at the currency's quantum too.
+        assert flagged[2].startswith("⚠ Critically low cash: Wallet at USD 0.50")
+
+    def test_future_dated_deposit_does_not_clear_an_overdraft(
+        self, test_book: Path,
+    ):
+        gc = GnuCashBook(str(test_book))
+        self._seed(gc, "Assets:Checking", "-300")
+        gc.create_transaction(
+            description="payday next week",
+            splits=[
+                {"account": "Assets:Checking", "amount": "5000"},
+                {"account": "Income:Salary", "amount": "-5000"},
+            ],
+            trans_date=date.today() + timedelta(days=7),
+            check_duplicates=False,
+        )
+        assert "Overdrawn: Checking at USD -300.00" in gc.get_book_summary()
+
+    def test_retirement_and_placeholder_accounts_are_not_watched(
+        self, test_book: Path,
+    ):
+        gc = GnuCashBook(str(test_book))
+        gc.create_account(
+            name="Retirement", account_type="BANK", parent="Assets",
+        )
+        gc.set_account_slot("Assets:Retirement", "is_retirement", "1")
+        self._seed(gc, "Assets:Retirement", "-300")
+        assert "Overdrawn" not in gc.get_book_summary()
+
+
 class TestGetBookSummaryLastEntry:
     """``Last entry`` line — distinguishes "books are caught up"
     from "200 transactions of catch-up first." The bookkeeper's
