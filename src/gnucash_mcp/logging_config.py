@@ -1959,8 +1959,13 @@ def _fmt_credit_note_apply(entry: dict) -> list[str]:
     time_part = _extract_time(entry)
     params = entry.get("params") or {}
     after = entry.get("after_state") or {}
-    cn_id = params.get("credit_note_id", "")
-    target_id = params.get("applies_to_invoice_id", "")
+    # The tool speaks id / applies_to_id since 2026-09-27; the old
+    # names stay as fallbacks for replaying older entries.
+    cn_id = params.get("id") or params.get("credit_note_id", "")
+    target_id = (
+        params.get("applies_to_id")
+        or params.get("applies_to_invoice_id", "")
+    )
     amount = after.get("amount_applied", "")
     cn_remaining = after.get("credit_note_remaining", "")
     target_remaining = after.get("target_remaining", "")

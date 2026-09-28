@@ -1363,6 +1363,62 @@ class TestConsolidatedBusinessSurface:
         ))
         assert ok.get("error") is None, ok
 
+    def test_apply_credit_note_speaks_its_siblings_names(
+        self, setup_book_env,
+    ):
+        """Every document tool takes the document as ``id``, and
+        credit-note creation names its target ``applies_to_id``;
+        apply_credit_note now does too (the bookkeeper tripped on
+        credit_note_id / applies_to_invoice_id, 2026-09-27). The audit
+        line names both documents."""
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+
+        server_module.create_account(
+            name="Accounts Receivable", account_type="RECEIVABLE",
+            parent="Assets",
+        )
+        c = json.loads(server_module.create_party(
+            party_type="customer", name="Symmetry LLC",
+        ))
+        docs = {}
+        for kind, price in (("invoice", "500.00"), ("credit_note", "100.00")):
+            extra = (
+                {"party_type": "customer", "applies_to_id": docs["invoice"]}
+                if kind == "credit_note" else {}
+            )
+            doc = json.loads(server_module.create_document(
+                document_type=kind, owner_id=c["id"], **extra,
+            ))
+            docs[kind] = doc["id"]
+            server_module.add_document_entry(
+                document_type=kind, id=doc["id"], account="Income:Salary",
+                description="Work", quantity="1", price=price,
+                **({"party_type": "customer"} if kind == "credit_note" else {}),
+            )
+            posted = json.loads(server_module.post_document(
+                id=doc["id"], document_type=kind,
+                post_account="Assets:Accounts Receivable",
+                **({"party_type": "customer"} if kind == "credit_note" else {}),
+            ))
+            assert posted.get("error") is None, posted
+
+        result = json.loads(server_module.apply_credit_note(
+            id=docs["credit_note"], applies_to_id=docs["invoice"],
+            party_type="customer",
+        ))
+        assert result["status"] == "applied", result
+        assert result["amount_applied"] == "100.00"
+
+        rendered = _format_audit_entry_text({
+            "classification": "write", "entity_type": "credit_note",
+            "operation": "apply", "timestamp": "2026-09-27T12:00:00",
+            "params": {"id": docs["credit_note"],
+                       "applies_to_id": docs["invoice"]},
+            "after_state": result,
+        })
+        assert f"APPLY CREDIT NOTE  id:{docs['credit_note']}" in rendered
+        assert f"against: {docs['invoice']}" in rendered
+
     def test_delete_document_credit_note_id_collision(
         self, setup_book_env,
     ):

@@ -32,6 +32,7 @@ from gnucash_mcp.book._base import (
     _commodity_quantum,
     _gnc_bool,
     _guid_prefix_map,
+    _new_split,
     _sx_to_compact_line,
     _to_decimal,
     _unique_prefix,
@@ -465,9 +466,8 @@ class SchedulingMixin:
             notes=notes or None,
             post_date=start,
             splits=[
-                piecash.Split(
-                    account=template_acct,
-                    value=Decimal("0"), quantity=Decimal("0"),
+                _new_split(
+                    template_acct, Decimal("0"), Decimal("0"), currency,
                     memo=leg.get("memo") or "",
                     action=leg.get("action") or "",
                 )

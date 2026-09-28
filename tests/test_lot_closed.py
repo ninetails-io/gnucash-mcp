@@ -230,28 +230,32 @@ class TestChokepointLock:
         text = (self.BOOK_DIR / "investments.py").read_text()
         assert re.search(r"^\s*split\.lot = lot\s*$", text, re.M)
 
-    AMOUNT_WRITE = re.compile(r"^\s*(split|s)\.(quantity|value)\s*=[^=]")
+    # A split's amounts written directly: ``split.value = …`` or the
+    # tuple form ``split.value, split.quantity = …``.
+    AMOUNT_WRITE = re.compile(
+        r"^\s*(\w*split\w*|s)\.(quantity|value)\s*(=[^=]|,\s*\w+\.)"
+    )
 
     def test_every_amount_write_forgets_the_flag(self):
         """GnuCash's ``mark_split`` resets the lot on every
-        ``xaccSplitSetAmount`` / ``SetValue``; each write of a split's
-        amount here is followed within a few lines by
-        ``_lot_forget_flag(<split>.lot)``."""
+        ``xaccSplitSetAmount`` / ``SetValue``. Here the only writer of
+        a split's amounts is ``_set_split_amounts``, and it resets the
+        flag; any other direct write skips the reset."""
         offenders = []
         for path in sorted(self.BOOK_DIR.glob("*.py")):
-            lines = path.read_text().splitlines()
-            for i, line in enumerate(lines):
-                m = self.AMOUNT_WRITE.search(line)
-                if not m:
-                    continue
-                window = "\n".join(lines[i + 1:i + 9])
-                if f"_lot_forget_flag({m.group(1)}.lot)" not in window:
-                    offenders.append(f"{path.name}:{i + 1}: {line.strip()}")
-        assert not offenders, "\n".join(offenders)
+            for lineno, line in enumerate(path.read_text().splitlines(), 1):
+                if self.AMOUNT_WRITE.search(line):
+                    offenders.append(f"{path.name}:{lineno}: {line.strip()}")
+        base = (self.BOOK_DIR / "_base.py").read_text()
+        helper = base[base.index("def _set_split_amounts"):]
+        helper = helper[:helper.index("\ndef ")]
+        assert [o for o in offenders if not o.startswith("_base.py")] == []
+        assert "_lot_forget_flag(split.lot)" in helper
 
     def test_the_amount_scanner_is_not_vacuous(self):
-        lines = (self.BOOK_DIR / "reconciliation.py").read_text().splitlines()
-        assert sum(1 for l in lines if self.AMOUNT_WRITE.search(l)) >= 4
+        """The helper's own write is the one the scanner must see."""
+        lines = (self.BOOK_DIR / "_base.py").read_text().splitlines()
+        assert sum(1 for l in lines if self.AMOUNT_WRITE.search(l)) == 1
 
     def test_no_literal_writes(self):
         offenders = []

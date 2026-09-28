@@ -3,6 +3,15 @@
 Usage: uv run python mcpcall.py BOOK CALLS.json
 CALLS.json is a list of [tool_name, {args}] pairs, run in order in one
 server session. Each reply is printed exactly as the client receives it.
+REPO=<checkout> runs the server from another checkout (a develop
+worktree for the "before" side), as loop.py does.
+
+Keep test books in a user-private directory, not /tmp: the server's
+log sidecar ({book}.mcp) refuses a world-writable parent directory
+(mode 0777). Optional oracle, not a dependency: GnuCash desktop's
+gnucash-cli (in the app bundle, /Applications/Gnucash.app/Contents/
+MacOS/) can load a looped copy and run a report through GnuCash's own
+engine.
 """
 import asyncio
 import json
@@ -12,7 +21,7 @@ import sys
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
-REPO = "/Users/stephen/Projects/gnucash-mcp"
+REPO = os.environ.get("REPO", "/Users/stephen/Projects/gnucash-mcp")
 
 
 async def main(book: str, calls: list) -> None:

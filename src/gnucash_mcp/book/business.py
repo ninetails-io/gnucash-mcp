@@ -27,6 +27,8 @@ from gnucash_mcp.book._base import (
     _commodity_quantum,
     _dialect_name,
     _gnc_bool,
+    _money_precision_error,
+    _new_split,
     _rollback_if_aborted,
     _slot_value_str,
     _to_decimal,
@@ -1335,10 +1337,8 @@ class BusinessMixin:
         )
         split = None
         if not dry_run:
-            split = piecash.Split(
-                account=fx_acct,
-                value=Decimal("0"),
-                quantity=fx_quantity,
+            split = _new_split(
+                fx_acct, Decimal("0"), fx_quantity, inv.currency,
                 memo=fx_memo,
                 action="Payment",
             )
@@ -2461,6 +2461,20 @@ class BusinessMixin:
             .all()
         )
 
+    def _document_currency(self, book, code: str):
+        """The currency a party or document names: from the book, or
+        added from the ISO table if unseen — the rule
+        ``create_transaction`` and ``create_price`` already follow.
+        Refusing an unseen code sent a caller to ``create_commodity``
+        to invent one (a USD at fraction 10000). A code that isn't ISO
+        4217 is refused."""
+        try:
+            return self._get_or_create_currency(book, code)
+        except ValueError:
+            raise ValueError(
+                f"Currency not found: {code} is not an ISO 4217 code"
+            )
+
     def _document_status(
         self, book, inv, **known,
     ) -> tuple[str, dict | None]:
@@ -2670,13 +2684,7 @@ class BusinessMixin:
         )
 
         if currency:
-            currency_obj = None
-            for c in book.currencies:
-                if c.mnemonic == currency:
-                    currency_obj = c
-                    break
-            if not currency_obj:
-                raise ValueError(f"Currency not found: {currency}")
+            currency_obj = self._document_currency(book, currency)
         else:
             currency_obj = self._require_default_currency(book)
 
@@ -2834,12 +2842,7 @@ class BusinessMixin:
             changed["name"] = name
 
         if currency is not None:
-            # ``_get_or_create_currency`` auto-loads unseen ISO codes
-            # (same convention as ``create_price``).
-            try:
-                new_currency = self._get_or_create_currency(book, currency)
-            except ValueError:
-                raise ValueError(f"Currency not found: {currency}")
+            new_currency = self._document_currency(book, currency)
             if new_currency != entity.currency:
                 entity.currency = new_currency
                 changed["currency"] = currency
@@ -4331,13 +4334,7 @@ class BusinessMixin:
                     )
 
             if currency:
-                currency_obj = None
-                for c in book.currencies:
-                    if c.mnemonic == currency:
-                        currency_obj = c
-                        break
-                if not currency_obj:
-                    raise ValueError(f"Currency not found: {currency}")
+                currency_obj = self._document_currency(book, currency)
                 currency_guid = currency_obj.guid
             else:
                 # Owner currency first, book default as defensive
@@ -5888,10 +5885,9 @@ class BusinessMixin:
             # brokerage vocabulary on a client bill. Forward-only:
             # existing transactions are never rewritten to conform.
             doc_action = type_string
-            ar_ap_split = piecash.Split(
-                account=post_acct,
-                value=ar_ap_value,
-                quantity=_qty_for_split(post_acct, ar_ap_value),
+            ar_ap_split = _new_split(
+                post_acct, ar_ap_value,
+                _qty_for_split(post_acct, ar_ap_value), inv.currency,
                 memo="",
                 action=doc_action,
                 reconcile_date=datetime(1970, 1, 1),
@@ -5913,10 +5909,10 @@ class BusinessMixin:
                     split_value = -acct_total
 
                 piecash_splits.append(
-                    piecash.Split(
-                        account=entry_acct,
-                        value=split_value,
-                        quantity=_qty_for_split(entry_acct, split_value),
+                    _new_split(
+                        entry_acct, split_value,
+                        _qty_for_split(entry_acct, split_value),
+                        inv.currency,
                         memo="",
                         action=doc_action,
                     )
@@ -6280,6 +6276,15 @@ class BusinessMixin:
                     f"post it before recording payment"
                 )
 
+            # In the invoice's currency; a sub-unit amount is a typo,
+            # and rounding it at storage would pay what the reply
+            # didn't say.
+            error = _money_precision_error(
+                payment_amount, inv.currency, "Payment amount",
+            )
+            if error:
+                raise error
+
             is_bill = self._is_bill_side(self._effective_owner_type(book, inv))
 
             pay_acct = self._resolve_account(book, payment_account)
@@ -6547,10 +6552,9 @@ class BusinessMixin:
                 disc_value_sign = -1 if effective_is_bill else 1
                 discount_booked = True
                 if not dry_run:
-                    discount_split = piecash.Split(
-                        account=discount_acct,
-                        value=disc_value_sign * expected,
-                        quantity=disc_value_sign * disc_quantity,
+                    discount_split = _new_split(
+                        discount_acct, disc_value_sign * expected,
+                        disc_value_sign * disc_quantity, inv.currency,
                         memo="Early-payment discount",
                         action="Payment",
                     )
@@ -6766,17 +6770,15 @@ class BusinessMixin:
                 _attach_extras(result)
                 return result
 
-            ar_ap_split = piecash.Split(
-                account=post_acct,
-                value=proposed[0]["value"],
-                quantity=proposed[0]["quantity"],
+            ar_ap_split = _new_split(
+                post_acct, proposed[0]["value"], proposed[0]["quantity"],
+                inv.currency,
                 memo="",
                 action="Payment",
             )
-            bank_split = piecash.Split(
-                account=pay_acct,
-                value=proposed[1]["value"],
-                quantity=proposed[1]["quantity"],
+            bank_split = _new_split(
+                pay_acct, proposed[1]["value"], proposed[1]["quantity"],
+                inv.currency,
                 memo=memo,
                 action="Payment",
             )
@@ -7107,17 +7109,15 @@ class BusinessMixin:
                 f"Credit applied: {credit_note_id} → "
                 f"{applies_to_invoice_id}"
             )
-            cn_split = piecash.Split(
-                account=post_acct,
-                value=cn_split_value,
-                quantity=cn_split_value,
+            cn_split = _new_split(
+                post_acct, cn_split_value, cn_split_value,
+                post_acct.commodity,
                 memo=f"Net against {applies_to_invoice_id}",
                 action="Payment",
             )
-            target_split = piecash.Split(
-                account=post_acct,
-                value=target_split_value,
-                quantity=target_split_value,
+            target_split = _new_split(
+                post_acct, target_split_value, target_split_value,
+                post_acct.commodity,
                 memo=f"Credit from {credit_note_id}",
                 action="Payment",
             )
