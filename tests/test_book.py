@@ -3159,6 +3159,93 @@ class TestGetBookSummaryWarnings:
         assert warnings_idx < accounts_idx
 
 
+class TestGetBookSummaryBalanceIntegrity:
+    """``N unbalanced transactions (oldest …) — get_transaction to
+    inspect`` — dashboard-accuracy spec A8. Integrity checks looked
+    only at Imbalance/Orphan balances, so a transaction whose split
+    values don't sum to zero (raw-SQL imports, other tools,
+    corruption) was never reported unless GnuCash had parked the
+    remainder itself."""
+
+    @staticmethod
+    def _integrity_lines(result: str) -> list[str]:
+        return [
+            ln.strip() for ln in result.splitlines()
+            if "unbalanced transaction" in ln
+        ]
+
+    def test_engineered_unbalanced_transaction_yields_one_line(
+        self, test_book: Path,
+    ):
+        gc = GnuCashBook(str(test_book))
+        assert self._integrity_lines(gc.get_book_summary()) == []
+        when = date.today() - timedelta(days=40)
+        created = gc.create_transaction(
+            description="Will be broken",
+            splits=[
+                {"account": "Assets:Checking", "amount": "100"},
+                {"account": "Income:Salary", "amount": "-100"},
+            ],
+            trans_date=when,
+        )
+        # Break it the way a foreign writer would: one split's value
+        # edited underneath the transaction.
+        from sqlalchemy import text
+        with gc.open(readonly=False) as book:
+            book.session.execute(
+                text(
+                    "UPDATE splits SET value_num = value_num + 500 "
+                    "WHERE tx_guid LIKE :g AND value_num > 0"
+                ),
+                {"g": created["guid"] + "%"},
+            )
+            book.save()
+        lines = self._integrity_lines(gc.get_book_summary())
+        assert lines == [
+            f"⚠ 1 unbalanced transaction (oldest {when.isoformat()}) "
+            f"— get_transaction to inspect"
+        ]
+
+    def test_value_quantity_disagreement_on_same_commodity_split(
+        self, test_book: Path,
+    ):
+        """A USD split in a USD transaction whose value and quantity
+        differ is the other shape of the same defect."""
+        gc = GnuCashBook(str(test_book))
+        created = gc.create_transaction(
+            description="Quantity drift",
+            splits=[
+                {"account": "Assets:Checking", "amount": "100"},
+                {"account": "Income:Salary", "amount": "-100"},
+            ],
+            trans_date=date.today() - timedelta(days=2),
+        )
+        from sqlalchemy import text
+        with gc.open(readonly=False) as book:
+            book.session.execute(
+                text(
+                    "UPDATE splits SET quantity_num = quantity_num + 1 "
+                    "WHERE tx_guid LIKE :g AND value_num > 0"
+                ),
+                {"g": created["guid"] + "%"},
+            )
+            book.save()
+        assert len(self._integrity_lines(gc.get_book_summary())) == 1
+
+    @pytest.mark.parametrize(
+        "sample",
+        ["alex-chen-morales.gnucash", "lin-wei.gnucash", "sabine-brenner.gnucash"],
+    )
+    def test_sample_books_are_balanced(self, sample, tmp_path):
+        src = Path(__file__).resolve().parent.parent / "samples" / sample
+        if not src.exists():
+            pytest.skip(f"{sample} not present")
+        import shutil
+        path = tmp_path / sample
+        shutil.copy(src, path)
+        assert self._integrity_lines(GnuCashBook(str(path)).get_book_summary()) == []
+
+
 class TestGetBookSummaryOverdraft:
     """``Overdrawn: <leaf> at <CUR> -X`` — dashboard-accuracy spec
     A4. Low-cash skips balances at or below zero and runway flags

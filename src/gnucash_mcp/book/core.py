@@ -885,6 +885,59 @@ class CoreMixin:
         integrity.sort(key=lambda pair: pair[0], reverse=True)
         integrity = [msg for _, msg in integrity]
 
+        # ── 1b. Balance integrity ──
+        # A transaction whose non-voided split values don't sum to
+        # zero, or whose same-commodity split carries a value that
+        # disagrees with its quantity, was never entered through
+        # GnuCash (raw-SQL imports, other tools, corruption) — desktop
+        # parks a remainder in Imbalance instead, which the check
+        # above catches. One pass over the preloaded split graph;
+        # one line (spec A8).
+        try:
+            unbalanced = 0
+            oldest_unbalanced: date | None = None
+            for txn in transactions:
+                total = Decimal("0")
+                defect = False
+                txn_currency_guid = (
+                    txn.currency.guid if txn.currency is not None else None
+                )
+                for s in txn.splits:
+                    if _is_voided(s):
+                        continue
+                    value = Decimal(str(s.value))
+                    total += value
+                    if (
+                        s.account.commodity is not None
+                        and s.account.commodity.guid == txn_currency_guid
+                        and value != Decimal(str(s.quantity))
+                    ):
+                        defect = True
+                if total != 0:
+                    defect = True
+                if not defect:
+                    continue
+                unbalanced += 1
+                d = txn.post_date
+                if d is not None and (
+                    oldest_unbalanced is None or d < oldest_unbalanced
+                ):
+                    oldest_unbalanced = d
+            if unbalanced:
+                oldest = (
+                    f" (oldest {oldest_unbalanced.isoformat()})"
+                    if oldest_unbalanced is not None else ""
+                )
+                integrity.append(
+                    f"{unbalanced} unbalanced transaction"
+                    f"{'s' if unbalanced != 1 else ''}{oldest} — "
+                    f"get_transaction to inspect"
+                )
+        except Exception as exc:
+            check_failures.append(
+                self._check_failed(book, "Balance-integrity", exc)
+            )
+
         # A transaction dated more than a year ahead is almost always
         # a typo (2062 for 2026). It is excluded from "Last entry"
         # (``_entry_dates``), and named here so it gets fixed rather

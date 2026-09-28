@@ -49,8 +49,8 @@ check, exc)`, which in order:
   first failure plus a count: `… — 3 documents skipped`.
 
 Check names: `Business-count`, `Active-jobs`, `Overdue-schedule`,
-`Overdraft`, `Low-cash`, `Overdue-document`, `Stale-price`,
-`Backup-health`, `Legacy-recipe`.
+`Balance-integrity`, `Overdraft`, `Low-cash`, `Overdue-document`,
+`Stale-price`, `Backup-health`, `Legacy-recipe`.
 
 ## Placement
 
