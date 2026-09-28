@@ -3159,6 +3159,118 @@ class TestGetBookSummaryWarnings:
         assert warnings_idx < accounts_idx
 
 
+class TestStalePriceReadsValuationRate:
+    """Dashboard-accuracy spec A5: the stale-price collector keyed
+    on ``p.commodity`` only, while ``_rates_as_of`` also rates a
+    commodity that appears only as the QUOTE side of a pair and
+    chains through a pivot. Staleness is now the date of the rate
+    valuation actually uses."""
+
+    @staticmethod
+    def _stale_lines(result: str) -> list[str]:
+        return [
+            ln.strip() for ln in result.splitlines() if "Stale price" in ln
+        ]
+
+    @staticmethod
+    def _book(path, default: str, held: list[tuple[str, str]]):
+        """``default``-currency book with one BANK account per
+        ``(currency, balance)`` in ``held``, opened from equity."""
+        book = piecash.create_book(str(path), currency=default, overwrite=True)
+        root = book.root_account
+        base = book.default_currency
+        currencies = {default: base}
+        assets = piecash.Account(
+            name="Assets", type="ASSET", parent=root,
+            commodity=base, placeholder=True,
+        )
+        equity = piecash.Account(
+            name="Opening", type="EQUITY", parent=root, commodity=base,
+        )
+        for code, balance in held:
+            if code not in currencies:
+                currencies[code] = factories.create_currency_from_ISO(code)
+                book.session.add(currencies[code])
+            acct = piecash.Account(
+                name=f"{code} Account", type="BANK", parent=assets,
+                commodity=currencies[code],
+            )
+            amt = Decimal(balance)
+            book.session.add(piecash.Transaction(
+                currency=currencies[code], description="open",
+                post_date=date.today() - timedelta(days=10),
+                splits=[
+                    piecash.Split(account=acct, value=amt, quantity=amt),
+                    piecash.Split(account=equity, value=-amt, quantity=-amt),
+                ],
+            ))
+        book.save()
+        return book, currencies
+
+    def test_inverse_only_rate_is_not_stale(self, tmp_path):
+        """EUR book holding USD, priced only as ``1 EUR = 1.08 USD``
+        (commodity EUR, currency USD) today: the USD account values
+        off the inverse, so no stale line — and no phantom "USD no
+        price on file"."""
+        book, cur = self._book(tmp_path / "eur.gnucash", "EUR", [("USD", "1080")])
+        book.session.add(piecash.Price(
+            commodity=cur["EUR"], currency=cur["USD"],
+            date=date.today(), value=Decimal("1.08"),
+        ))
+        book.save()
+        book.close()
+        result = GnuCashBook(str(tmp_path / "eur.gnucash")).get_book_summary()
+        assert self._stale_lines(result) == [], result
+        # ... and the account values through that inverse rate.
+        assert "USD Account: 1080 USD @ 0.925" in result and "(EUR 1000.00)" in result, result
+
+    def test_inverse_only_rate_goes_stale_by_its_own_date(self, tmp_path):
+        book, cur = self._book(tmp_path / "eur2.gnucash", "EUR", [("USD", "1080")])
+        book.session.add(piecash.Price(
+            commodity=cur["EUR"], currency=cur["USD"],
+            date=date.today() - timedelta(days=45), value=Decimal("1.08"),
+        ))
+        book.save()
+        book.close()
+        result = GnuCashBook(str(tmp_path / "eur2.gnucash")).get_book_summary()
+        assert self._stale_lines(result) == [
+            "⚠ Stale price: USD last updated 45 days ago"
+        ], result
+
+    def test_chained_rate_is_as_old_as_its_oldest_leg(self, tmp_path):
+        """USD book holding GBP; GBP is priced only in EUR (today)
+        and EUR in USD (40 days ago). The valuation chains GBP→EUR→
+        USD, so GBP is stale at 40 days, named with its path."""
+        book, cur = self._book(tmp_path / "usd.gnucash", "USD", [("GBP", "500")])
+        eur = factories.create_currency_from_ISO("EUR")
+        book.session.add(eur)
+        book.session.add(piecash.Price(
+            commodity=cur["GBP"], currency=eur,
+            date=date.today(), value=Decimal("1.17"),
+        ))
+        book.session.add(piecash.Price(
+            commodity=eur, currency=cur["USD"],
+            date=date.today() - timedelta(days=40), value=Decimal("1.08"),
+        ))
+        book.save()
+        book.close()
+        result = GnuCashBook(str(tmp_path / "usd.gnucash")).get_book_summary()
+        assert self._stale_lines(result) == [
+            "⚠ Stale price: GBP last updated 40 days ago (via EUR)"
+        ], result
+        assert "(via EUR)" in next(
+            ln for ln in result.splitlines() if "GBP Account" in ln
+        )
+
+    def test_no_price_on_file_means_cost_basis_fallback(self, tmp_path):
+        book, cur = self._book(tmp_path / "np.gnucash", "USD", [("GBP", "500")])
+        book.close()
+        result = GnuCashBook(str(tmp_path / "np.gnucash")).get_book_summary()
+        assert self._stale_lines(result) == [
+            "⚠ Stale price: GBP no price on file"
+        ], result
+
+
 class TestDashboardOverdueAgreesWithOutstanding:
     """Dashboard-accuracy spec A1: the Receivables line's overdue
     count, the Past-due warnings, and get_outstanding_documents'

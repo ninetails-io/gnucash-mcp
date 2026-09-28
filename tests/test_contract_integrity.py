@@ -810,6 +810,24 @@ class TestDashboardHonestFailure:
             + "\n".join(f"  {o}" for o in offenders)
         )
 
+    def test_stale_price_collector_reads_the_valuation_rate(self):
+        """Dashboard-accuracy spec A5: the stale-price warning reads
+        ``_rates_as_of_dated`` — the map valuation uses — never a
+        commodity's own price rows via ``_find_prices``. Keyed on
+        price rows, a EUR book's USD accounts read "no price on
+        file" forever while valuing correctly off the inverse."""
+        tree = ast.parse(self._CORE.read_text(), filename=str(self._CORE))
+        fn = next(
+            n for n in ast.walk(tree)
+            if isinstance(n, ast.FunctionDef) and n.name == "_collect_warnings"
+        )
+        called = {
+            sub.func.attr for sub in ast.walk(fn)
+            if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute)
+        }
+        assert "_find_prices" not in called
+        assert "_rates_as_of_dated" in called
+
     def test_core_never_reads_a_lot_balance_directly(self):
         """Dashboard-accuracy spec A1: every paid/due answer on the
         dashboard comes from ``_document_settlement``. A direct

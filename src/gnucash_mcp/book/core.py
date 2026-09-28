@@ -1245,78 +1245,74 @@ class CoreMixin:
                 )
 
         # ── 4. Stale prices ──
+        # Staleness is the date of the rate VALUATION uses
+        # (``_rates_as_of_dated`` — the same map behind the asset
+        # lines and runway), never a commodity's own price rows: a
+        # EUR book storing "1 EUR = 1.08 USD" values its USD
+        # accounts off the inverse and used to read "USD no price
+        # on file" forever; a chain is as old as its oldest leg
+        # (spec A5). "No price on file" means exactly that the map
+        # has no entry and valuation fell back to cost basis.
         stale_prices: list[str] = []
         try:
             # Template accounts would mark GnuCash's ``template``
             # pseudo-commodity in-use and misfire a permanent
             # "no price on file" warning on desktop-created books.
             template_guids = self._template_account_guids(book)
-            in_use: set = set()
-            # Securities held in a nonzero quantity somewhere. A
-            # fund swapped out to zero keeps its account (history)
-            # and its commodity, but a quote for it values nothing —
-            # the warning nagged a live book to price an empty 401k
-            # fund (2026-09-24). Currencies are exempt: flow reports
-            # convert foreign transactions at their rate whether or
-            # not any account holds a balance.
+            # Commodities valuation needs a rate for: every non-
+            # default account commodity — securities only while
+            # held in a nonzero quantity. A fund swapped out to
+            # zero keeps its account (history) and its commodity,
+            # but a quote for it values nothing — the warning
+            # nagged a live book to price an empty 401k fund
+            # (2026-09-24). Currencies are exempt from the held
+            # filter: a zero-balance foreign account still needs
+            # the rate for its history.
+            in_use: dict[str, object] = {}
             held: set = set()
             for a in accounts:
-                if a.type != "ROOT" and a.guid not in template_guids:
-                    in_use.add(a.commodity.guid)
-                    if (
-                        a.commodity.namespace != "CURRENCY"
-                        and a.commodity.guid not in held
-                        and self._own_splits_balance(a, as_of=today) != 0
-                    ):
-                        held.add(a.commodity.guid)
-
-            # One pass over the price list builds both signals: in-use
-            # commodities and latest market-price date. ``market_only``
-            # is applied before ``in_use.add`` — marking first would
-            # tag commodities that only have piecash auto-placeholder
-            # prices as in-use and misfire the "no price on file"
-            # warning.
-            cutoff = today - timedelta(days=self._STALE_PRICE_DAYS)
-            by_commodity_latest: dict[str, date] = {}
-            for p in self._find_prices(book, market_only=True):
-                in_use.add(p.commodity.guid)
-                p_date = p.date
-                if hasattr(p_date, "date") and callable(p_date.date):
-                    p_date = p_date.date()
-                cguid = p.commodity.guid
+                if a.type == "ROOT" or a.guid in template_guids:
+                    continue
+                c = a.commodity
+                if c is None or c.guid == default_currency.guid:
+                    continue
+                in_use[c.guid] = c
                 if (
-                    cguid not in by_commodity_latest
-                    or p_date > by_commodity_latest[cguid]
+                    c.namespace != "CURRENCY"
+                    and c.guid not in held
+                    and self._own_splits_balance(a, as_of=today) != 0
                 ):
-                    by_commodity_latest[cguid] = p_date
+                    held.add(c.guid)
+
+            dated = self._rates_as_of_dated(book, today, default_currency)
+            cutoff = today - timedelta(days=self._STALE_PRICE_DAYS)
 
             # (sort_key, message) — no-price entries sort to the
             # top as most stale.
             stale_entries: list[tuple[int, str, str]] = []
-            for commodity in book.commodities:
-                if commodity == default_currency:
-                    continue
-                if commodity.guid not in in_use:
-                    continue
+            for cguid, commodity in in_use.items():
                 if (
                     commodity.namespace != "CURRENCY"
-                    and commodity.guid not in held
+                    and cguid not in held
                 ):
                     continue
-                latest = by_commodity_latest.get(commodity.guid)
-                if latest is None:
+                entry = dated.get(cguid)
+                if entry is None:
                     stale_entries.append((
                         10**9,  # arbitrary large sort key — top
                         commodity.mnemonic,
                         f"Stale price: {commodity.mnemonic} no price on file",
                     ))
-                elif latest < cutoff:
-                    days_old = (today - latest).days
+                    continue
+                _rate, rate_date, via = entry
+                if rate_date < cutoff:
+                    days_old = (today - rate_date).days
+                    via_note = f" ({via})" if via else ""
                     stale_entries.append((
                         days_old,
                         commodity.mnemonic,
                         f"Stale price: {commodity.mnemonic} "
-                        f"last updated {days_old} days ago",
+                        f"last updated {days_old} days ago{via_note}",
                     ))
             stale_entries.sort(key=lambda e: (-e[0], e[1]))
             stale_prices = self._rollup_warnings(
