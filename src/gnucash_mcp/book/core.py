@@ -802,6 +802,12 @@ class CoreMixin:
     # quotes are likely skewing net-worth and runway numbers.
     _STALE_PRICE_DAYS = 30
 
+    # A non-default currency nobody holds is still checked for
+    # staleness while a transaction this recent used it (spec B1,
+    # ruled 2026-09-28). Beyond that, its history converts at
+    # monthly closes and a fresh rate would change nothing.
+    _STALE_CURRENCY_ACTIVITY_DAYS = 90
+
     def _overdue_scheduled_warnings(
         self, book: piecash.Book, today: date,
         failures: list[str] | None = None,
@@ -1246,15 +1252,17 @@ class CoreMixin:
             # pseudo-commodity in-use and misfire a permanent
             # "no price on file" warning on desktop-created books.
             template_guids = self._template_account_guids(book)
-            # Commodities valuation needs a rate for: every non-
-            # default account commodity — securities only while
-            # held in a nonzero quantity. A fund swapped out to
-            # zero keeps its account (history) and its commodity,
-            # but a quote for it values nothing — the warning
-            # nagged a live book to price an empty 401k fund
-            # (2026-09-24). Currencies are exempt from the held
-            # filter: a zero-balance foreign account still needs
-            # the rate for its history.
+            # A commodity is checked only while its rate matters
+            # today: an account holds a nonzero balance in it (a
+            # fund swapped out to zero keeps its account and its
+            # commodity, but a quote for it values nothing — the
+            # warning nagged a live book to price an empty 401k
+            # fund, 2026-09-24), or, for a currency, a transaction
+            # in the last _STALE_CURRENCY_ACTIVITY_DAYS is
+            # denominated in it or touches an account in it. Old
+            # transactions convert at their own month's rate, which
+            # never goes stale, so a zero-balance EUR account from a
+            # 2019 trip no longer warns forever (spec B1).
             in_use: dict[str, object] = {}
             held: set = set()
             for a in accounts:
@@ -1265,11 +1273,23 @@ class CoreMixin:
                     continue
                 in_use[c.guid] = c
                 if (
-                    c.namespace != "CURRENCY"
-                    and c.guid not in held
+                    c.guid not in held
                     and self._own_splits_balance(a, as_of=today) != 0
                 ):
                     held.add(c.guid)
+            recent_currencies: set = set()
+            activity_start = today - timedelta(
+                days=self._STALE_CURRENCY_ACTIVITY_DAYS,
+            )
+            for txn in transactions:
+                d = txn.post_date
+                if d is None or d < activity_start or d > today:
+                    continue
+                if txn.currency is not None:
+                    recent_currencies.add(txn.currency.guid)
+                for s in txn.splits:
+                    if s.account.commodity is not None:
+                        recent_currencies.add(s.account.commodity.guid)
 
             dated = self._rates_as_of_dated(book, today, default_currency)
             cutoff = today - timedelta(days=self._STALE_PRICE_DAYS)
@@ -1278,9 +1298,11 @@ class CoreMixin:
             # top as most stale.
             stale_entries: list[tuple[int, str, str]] = []
             for cguid, commodity in in_use.items():
-                if (
+                if cguid in held:
+                    pass
+                elif (
                     commodity.namespace != "CURRENCY"
-                    and cguid not in held
+                    or cguid not in recent_currencies
                 ):
                     continue
                 entry = dated.get(cguid)

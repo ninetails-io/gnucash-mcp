@@ -2537,6 +2537,18 @@ class TestGetBookSummaryWarnings:
             commodity=usd,
         )
         b.session.add(opening)
+        # The receivable holds a balance — a currency nobody holds
+        # and nobody has used lately is not checked (spec B1).
+        b.session.add(piecash.Transaction(
+            currency=eur, description="open",
+            post_date=date.today() - timedelta(days=400),
+            splits=[
+                piecash.Split(account=ar_eur, value=Decimal("100"),
+                              quantity=Decimal("100")),
+                piecash.Split(account=opening, value=Decimal("-100"),
+                              quantity=Decimal("-100")),
+            ],
+        ))
         b.save()
 
         # Seed an old EUR price (well past the 30-day staleness
@@ -3259,6 +3271,50 @@ class TestStalePriceReadsValuationRate:
         assert "(via EUR)" in next(
             ln for ln in result.splitlines() if "GBP Account" in ln
         )
+
+    def test_currency_is_stale_only_when_it_matters_today(self, tmp_path):
+        """Spec B1: a zero-balance EUR account from a 2019 trip
+        triggered a stale warning forever. A currency is checked
+        only while an account holds it, or a transaction in the
+        last 90 days used it."""
+        path = tmp_path / "trip.gnucash"
+        book, cur = self._book(path, "USD", [("EUR", "300")])
+        eur_acct = next(a for a in book.accounts if a.name == "EUR Account")
+        equity = next(a for a in book.accounts if a.name == "Opening")
+        # Spend it all, years ago: balance zero, no recent activity.
+        with_dates = [date.today() - timedelta(days=9), date(2019, 6, 1)]
+        for s in eur_acct.splits:
+            s.transaction.post_date = with_dates[1]
+        book.session.add(piecash.Transaction(
+            currency=cur["EUR"], description="spent",
+            post_date=date(2019, 6, 2),
+            splits=[
+                piecash.Split(account=eur_acct, value=Decimal("-300"),
+                              quantity=Decimal("-300")),
+                piecash.Split(account=equity, value=Decimal("300"),
+                              quantity=Decimal("300")),
+            ],
+        ))
+        book.session.add(piecash.Price(
+            commodity=cur["EUR"], currency=cur["USD"],
+            date=date(2019, 6, 30), value=Decimal("1.12"),
+        ))
+        book.save()
+        book.close()
+        gc = GnuCashBook(str(path))
+        assert self._stale_lines(gc.get_book_summary()) == []
+        # A EUR transaction last week brings the check back ...
+        gc.create_transaction(
+            description="coffee", currency="EUR",
+            splits=[
+                {"account": "Assets:EUR Account", "amount": "-5"},
+                {"account": "Opening", "amount": "5", "quantity": "5.60"},
+            ],
+            trans_date=with_dates[0], check_duplicates=False,
+        )
+        lines = self._stale_lines(gc.get_book_summary())
+        assert len(lines) == 1 and lines[0].startswith("⚠ Stale price: EUR last updated")
+        # ... as does holding a balance, whatever the activity.
 
     def test_no_price_on_file_means_cost_basis_fallback(self, tmp_path):
         book, cur = self._book(tmp_path / "np.gnucash", "USD", [("GBP", "500")])
