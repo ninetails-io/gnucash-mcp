@@ -1579,6 +1579,80 @@ class TestRunwayCashBurn:
         # burn would have read 650 (taxes 500 + groceries 150).
         assert (burn * 180).quantize(Decimal("0.01")) == Decimal("550")
 
+    def test_burn_is_cash_leaving_a_cash_account(self, test_book: Path):
+        """Spec B7: selling shares into ASSET-typed brokerage cash
+        netted as money leaving the pool (the STOCK leg is liquid,
+        the ASSET cash leg is not). Burn now needs cash to have
+        left the pool AND a BANK/CASH account: the smaller of the
+        two outflows."""
+        gc = GnuCashBook(str(test_book))
+        gc.create_account(name="Brokerage Cash", account_type="ASSET",
+                          parent="Assets")
+        gc.create_commodity(mnemonic="VTI", fullname="Vanguard Total",
+                            namespace="FUND")
+        gc.create_account(name="VTI", account_type="STOCK", parent="Assets",
+                          commodity="VTI", commodity_namespace="FUND")
+        gc.create_account(name="Rent", account_type="EXPENSE", parent="Expenses")
+        when = date.today() - timedelta(days=10)
+        # Buy 10 VTI at 100 from checking, then sell them into
+        # brokerage cash: neither burns.
+        gc.create_transaction(
+            description="Buy",
+            splits=[
+                {"account": "Assets:VTI", "amount": "1000", "quantity": "10"},
+                {"account": "Assets:Checking", "amount": "-1000"},
+            ],
+            trans_date=when, check_duplicates=False,
+        )
+        gc.create_transaction(
+            description="Sell into brokerage cash",
+            splits=[
+                {"account": "Assets:VTI", "amount": "-1000", "quantity": "-10"},
+                {"account": "Assets:Brokerage Cash", "amount": "1000"},
+            ],
+            trans_date=when, check_duplicates=False,
+        )
+        # Rent from checking burns the rent.
+        gc.create_transaction(
+            description="Rent",
+            splits=[
+                {"account": "Expenses:Rent", "amount": "1500"},
+                {"account": "Assets:Checking", "amount": "-1500"},
+            ],
+            trans_date=when, check_duplicates=False,
+        )
+        with gc.open(readonly=True) as book:
+            burn = gc._daily_cash_burn(book, list(book.transactions))
+        assert (burn * 180).quantize(Decimal("0.01")) == Decimal("1500")
+
+    def test_cards_owed_shown_beside_runway(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        gc.create_account(name="Card", account_type="CREDIT", parent="Liabilities")
+        when = date.today() - timedelta(days=10)
+        gc.create_transaction(
+            description="Card charge",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "1234"},
+                {"account": "Liabilities:Card", "amount": "-1234"},
+            ],
+            trans_date=when, check_duplicates=False,
+        )
+        gc.create_transaction(
+            description="Rent",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "300"},
+                {"account": "Assets:Checking", "amount": "-300"},
+            ],
+            trans_date=when, check_duplicates=False,
+        )
+        line = next(
+            ln for ln in gc.get_book_summary().splitlines()
+            if ln.startswith("Runway:")
+        )
+        assert line.endswith("-day avg; cards owe USD 1,234)"), line
+        # Not subtracted: liquid is the fixture's checking minus rent.
+        assert "cards owe" in line and "liquid" in line
+
     def test_numerator_and_burn_share_one_pool(self):
         """Runway's liquid sum and the burn read the same predicate
         — the pool can't be edited in one place and not the other.

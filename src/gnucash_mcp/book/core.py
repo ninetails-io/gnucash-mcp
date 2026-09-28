@@ -1912,11 +1912,24 @@ class CoreMixin:
         """Average daily cash leaving the liquid pool over the last
         ``days`` days.
 
-        Per transaction, the liquid legs (``_is_runway_liquid``) net
-        together; a negative net is cash out, a positive one (pay,
-        refunds) is ignored — runway asks how long the pool lasts
-        with nothing coming in. Netting keeps checking→savings and
-        checking→brokerage moves at zero. This is a transcribed
+        Per transaction, two nets: the liquid legs
+        (``_is_runway_liquid``) together, and just the BANK/CASH
+        legs among them. The burn is the SMALLER of the two
+        outflows — ``max(0, -max(pool_net, cash_net))`` — so cash
+        must have left the pool AND left a cash account (spec B7):
+
+        - selling shares into ASSET-typed brokerage cash: the pool
+          shrinks but no cash leg moved → 0 (it used to read as
+          money leaving, because the STOCK leg is liquid and the
+          ASSET cash leg is not);
+        - checking → brokerage: cash out, pool unchanged → 0;
+        - checking → rent, or a card payment: both fall → the amount.
+
+        (The spec wrote the rule as ``-min(pool_net, cash_net)``,
+        which is the larger outflow; its own examples fix the
+        intent.) A positive net (pay, refunds) is ignored — runway
+        asks how long the pool lasts with nothing coming in.
+        Netting keeps checking→savings at zero. This is a transcribed
         fact, not a spending model: payroll withholding never
         touches the pool and doesn't count, while card and loan
         payments do — at the pace actually paid, paydown included
@@ -1961,29 +1974,36 @@ class CoreMixin:
             legs = [s for s in txn.splits if liquid(s.account)]
             if not legs:
                 continue
-            net = sum(
-                (Decimal(str(s.value)) for s in legs), Decimal("0"),
-            )
-            if txn.currency != default_currency:
+
+            def leg_amounts(subset: list) -> Decimal:
+                net = sum(
+                    (Decimal(str(s.value)) for s in subset), Decimal("0"),
+                )
+                if txn.currency == default_currency:
+                    return net
                 rate = rates.get(txn.currency.guid)
                 if rate is not None:
-                    net *= rate
-                else:
-                    if factors is None:
-                        factors = self._account_conversion_factors(
-                            book, today,
+                    return net * rate
+                nonlocal factors
+                if factors is None:
+                    factors = self._account_conversion_factors(book, today)
+                return sum(
+                    (
+                        self._split_in_default_currency(
+                            s, s.account, factors.get(s.account.guid),
                         )
-                    net = sum(
-                        (
-                            self._split_in_default_currency(
-                                s, s.account, factors.get(s.account.guid),
-                            )
-                            for s in legs
-                        ),
-                        Decimal("0"),
-                    )
-            if net < 0:
-                cash_out -= net
+                        for s in subset
+                    ),
+                    Decimal("0"),
+                )
+
+            pool_net = leg_amounts(legs)
+            cash_net = leg_amounts(
+                [s for s in legs if s.account.type in ("BANK", "CASH")]
+            )
+            burn = -max(pool_net, cash_net)
+            if burn > 0:
+                cash_out += burn
         return cash_out / Decimal(days)
 
     def _account_daily_outflows(
@@ -2092,12 +2112,34 @@ class CoreMixin:
         if daily_burn <= 0:
             return None
 
+        # Card balances already owed are shown beside runway, not
+        # subtracted from it (spec B7): whether the card is paid
+        # from savings or carried is the reader's call.
+        cards_owe = Decimal("0")
+        for account in accounts:
+            if (
+                account.type != "CREDIT"
+                or account.guid in template_guids
+                or account.placeholder
+            ):
+                continue
+            balance = self._own_splits_balance(account, as_of=today)
+            if balance == 0:
+                continue
+            converted, _ = self._market_value(
+                account, balance,
+                book=book, rates=rates,
+                default_currency=default_currency, today=today,
+            )
+            cards_owe += -converted
+
         if liquid < 0:
             return {
                 "negative_liquid": True,
                 "liquid": liquid.quantize(Decimal("1")),
                 "daily_burn": daily_burn.quantize(Decimal("1")),
                 "burn_window_days": burn_window,
+                "cards_owe": cards_owe.quantize(Decimal("1")),
             }
 
         runway_days = int(liquid / daily_burn)
@@ -2107,6 +2149,7 @@ class CoreMixin:
             "liquid": liquid.quantize(Decimal("1")),
             "daily_burn": daily_burn.quantize(Decimal("1")),
             "burn_window_days": burn_window,
+            "cards_owe": cards_owe.quantize(Decimal("1")),
         }
 
     def _monthly_net_income(
@@ -2492,8 +2535,13 @@ class CoreMixin:
         """
         if runway is None:
             return []
+        cards = int(runway.get("cards_owe") or 0)
+        cards_part = f"; cards owe {currency} {cards:,}" if cards else ""
         if runway.get("negative_liquid"):
-            return ["Runway: 0 days — liquid position is negative ⚠"]
+            return [
+                f"Runway: 0 days — liquid position is negative ⚠"
+                f"{cards_part}"
+            ]
         days = runway["runway_days"]
         liquid = int(runway["liquid"])
         burn = int(runway["daily_burn"])
@@ -2503,7 +2551,7 @@ class CoreMixin:
             f"Runway: {days} days{warn} "
             f"({currency} {liquid:,} liquid / "
             f"{currency} {burn:,}/day cash out incl. debt paydown, "
-            f"{window}-day avg)"
+            f"{window}-day avg{cards_part})"
         ]
 
     # ── Summary collector / section renderers ────────────────────
