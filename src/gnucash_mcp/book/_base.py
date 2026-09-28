@@ -2340,8 +2340,8 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
 
         Returns the non-zero counts / flags, keyed the way each
         module's response already reports them: ``templates_migrated``,
-        ``invoice_links_migrated``, ``book_stamped``,
-        ``book_scrubbed``.
+        ``invoice_links_migrated``, ``due_dates_backfilled``,
+        ``book_stamped``, ``book_scrubbed``.
         """
         out: dict = {}
         sweep = getattr(self, "_migrate_all_legacy", None)
@@ -2354,6 +2354,11 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
             n = rename(book)
             if n:
                 out["invoice_links_migrated"] = n
+        backfill = getattr(self, "_backfill_due_dates", None)
+        if backfill is not None:
+            n = backfill(book)
+            if n:
+                out["due_dates_backfilled"] = n
         stamp = getattr(self, "_ensure_budget_unreversed", None)
         if stamp is not None:
             from piecash.budget import Budget

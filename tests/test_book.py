@@ -2970,15 +2970,14 @@ class TestGetBookSummaryWarnings:
         assert "Office Depot" in warnings_block
         assert "15 days overdue" in warnings_block
 
-    def test_past_due_invoice_without_terms_falls_back_to_30_days(
+    def test_past_due_invoice_without_terms_is_due_on_posting(
         self, business_book: Path,
     ):
         """An invoice posted without an explicit due_date AND
-        without a billterm falls back to date_posted + 30 days.
-        The warning anchors the days count to that assumption
-        ('N days past 30-day default') and tags '(no term set)'
-        so the bookkeeper sees both the duration and the data
-        gap without the string reading as contractual."""
+        without a billterm is due on its posting date — what
+        desktop does (gncBillTermComputeDueDate(NULL, post) is the
+        posting date). The pre-1.5 30-day default and its
+        '(no term set)' wording are gone (spec A2)."""
         gc = GnuCashBook(str(business_book))
         gc.create_customer(name="No Terms Co", currency="USD")
         gc.create_invoice(
@@ -2992,8 +2991,7 @@ class TestGetBookSummaryWarnings:
             quantity="1",
             price="1500",
         )
-        # post_date 50 days ago + 30-day fallback = 20 days past.
-        # No due_date passed → falls back.
+        # post_date 50 days ago, no due_date, no terms: due that day.
         gc.post_invoice(
             invoice_id="000001",
             post_account="Assets:Accounts Receivable",
@@ -3006,10 +3004,10 @@ class TestGetBookSummaryWarnings:
         )[0]
         assert "Past due invoice" in warnings_block
         assert "No Terms Co" in warnings_block
-        assert "20 days past 30-day default" in warnings_block
-        assert "(no term set)" in warnings_block
-        # Regression: the old wording shouldn't reappear.
-        assert "20 days overdue" not in warnings_block
+        assert "50 days overdue" in warnings_block
+        # The old wording is gone for good.
+        assert "30-day default" not in warnings_block
+        assert "(no term set)" not in warnings_block
         assert "(posted without terms)" not in warnings_block
 
     def test_credit_note_never_ages_into_dashboard_warnings(

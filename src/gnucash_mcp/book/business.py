@@ -177,9 +177,8 @@ def _format_outstanding_invoices_compact(rows: list[dict]) -> str:
     apart at a glance. ``(CN)`` marks credit notes — their amount is
     unsettled credit available to apply or refund, not money owed,
     so the due column reads "credit available" instead of an aging
-    count. When the due date came from the 30-day default
-    (``no_terms``), the days count says "past 30-day default" so it
-    doesn't read as contractual.
+    count. The due date is desktop's: the document's terms over
+    the posting date, or the posting date itself with no terms.
     """
     if not rows:
         return ""
@@ -226,12 +225,7 @@ def _format_outstanding_invoices_compact(rows: list[dict]) -> str:
         if days is None:
             days_str = ""
         elif days > 0:
-            # "past due" reads as contractual; "past 30-day default"
-            # anchors to the assumption when no term was set.
-            if r.get("no_terms"):
-                days_str = f"  {days} days past 30-day default"
-            else:
-                days_str = f"  {days} days past due"
+            days_str = f"  {days} days past due"
         elif days == 0:
             days_str = "  due today"
         else:
@@ -2227,39 +2221,133 @@ class BusinessMixin:
             total += Decimal(str(split.quantity))
         return total
 
+    # GnuCash's two billing-term types, as the SQL backend stores
+    # them in ``billterms.type`` (gnc-bill-term-sql.cpp, a string
+    # column; gncBillTerm.c switches on the enum these name).
+    # Pinned by tests/test_billterm_due_date.py.
+    _TERM_TYPE_DAYS = "GNC_TERM_TYPE_DAYS"
+    _TERM_TYPE_PROXIMO = "GNC_TERM_TYPE_PROXIMO"
+
     @staticmethod
-    def _resolve_invoice_due_date(
-        book, inv,
-    ) -> tuple[date | None, bool]:
-        """Resolve an invoice/bill due date through three sources.
+    def _billterm_due_date(term, post_date: date) -> date:
+        """``gncBillTermComputeDueDate``, ported verbatim from
+        GnuCash ``libgnucash/engine/gncBillTerm.c`` (stable, read
+        2026-09-28): ``compute_time`` / ``compute_monthyear``. A
+        port, not a reinterpretation — like ``_recurrence_next``
+        and Recurrence.cpp — so the server and desktop's Due Bills
+        Reminder name the same day.
 
-        Returns ``(due_date, no_terms_flag)``; ``due_date`` is None
-        when the invoice isn't posted. ``no_terms_flag`` is True
-        when the 30-day default was used, so callers annotate the
-        rendering as approximated.
+        - ``None`` terms: the posting date
+          (``if (!term) return post_date;``).
+        - **DAYS**: posting date + ``due_days``.
+        - **PROXIMO** (``compute_monthyear``): a ``cutoff`` of 0 or
+          below is relative to the posting month's end (``cutoff +=
+          gnc_date_get_last_mday(...)``: -3 is the 25th in February,
+          the 27th in June). A posting day on or before the cutoff
+          is due NEXT month; after it, the month after. The due
+          day is ``due_days`` clamped to the due month's last day
+          (``if (days < day) day = days``). ``gnc_dmy2time64_neutral``
+          normalizes a day below 1 the way ``mktime`` does — day 0
+          is the last day of the previous month — so a proximo
+          term with ``due_days = 0`` follows that too.
 
-        Resolution order — first source that resolves wins:
+        The C file's own worked example (cutoff 19, due day 20):
+        posted 14-06-2010 → due 20-07-2010; posted 22-06-2010 →
+        the month after next, the 20th (its comment says
+        20-02-2010, a typo for 20-08-2010 — the code is what is
+        ported here).
+        """
+        import calendar
 
-        1. ``trans-date-due`` slot on the posting transaction
-           (present when the user passed ``due_date`` explicitly).
-        2. ``Invoice.terms`` billterm — ``duedays`` added to
-           ``date_posted``. Read raw via SQL; the ORM relationship
-           is unreliable through some access paths.
-        3. 30-day default.
+        if term is None:
+            return post_date
+        due_days = int(term.duedays or 0)
+        term_type = term.type
+        if term_type == BusinessMixin._TERM_TYPE_DAYS:
+            return post_date + timedelta(days=due_days)
+        if term_type == BusinessMixin._TERM_TYPE_PROXIMO:
+            iday, imonth, iyear = post_date.day, post_date.month, post_date.year
+            cutoff = int(term.cutoff or 0)
+            if cutoff <= 0:
+                cutoff += calendar.monthrange(iyear, imonth)[1]
+            if iday <= cutoff:
+                # We apply this to next month
+                imonth += 1
+            else:
+                # We apply to the following month
+                imonth += 2
+            if imonth > 12:
+                iyear += 1
+                imonth -= 12
+            day = calendar.monthrange(iyear, imonth)[1]
+            if due_days < day:
+                day = due_days
+            if day < 1:
+                # mktime normalization: day 0 = last day of the
+                # month before, day -1 the one before that.
+                return date(iyear, imonth, 1) + timedelta(days=day - 1)
+            return date(iyear, imonth, day)
+        # ``switch`` with no default: the neutral posting date.
+        return post_date
 
-        Single chokepoint so the warnings collector and
-        ``get_outstanding_invoices`` produce identical due-date math.
+    @staticmethod
+    def _invoice_billterm(book, inv):
+        """The document's Billterm row, or ``None``. Read via the raw
+        ``terms`` column; the ORM relationship is unreliable through
+        some access paths. A lookup failure clears an aborted
+        PostgreSQL transaction and reads as no terms."""
+        from sqlalchemy import text
+
+        try:
+            terms_row = book.session.execute(
+                text("SELECT terms FROM invoices WHERE guid = :guid"),
+                {"guid": inv.guid},
+            ).first()
+            term_guid = terms_row[0] if terms_row else None
+            if not term_guid:
+                return None
+            from piecash.business.invoice import Billterm
+
+            return (
+                book.session.query(Billterm)
+                .filter_by(guid=term_guid)
+                .first()
+            )
+        except Exception:
+            _rollback_if_aborted(book.session)
+            return None
+
+    @staticmethod
+    def _resolve_invoice_due_date(book, inv) -> date | None:
+        """A posted document's due date; ``None`` when unposted.
+
+        1. The ``trans-date-due`` slot on the posting transaction —
+           what desktop writes on every post
+           (``gncInvoicePostToAccount`` → ``xaccTransSetDateDue``),
+           and what ``post_document`` writes since 1.5.
+        2. Otherwise the same math desktop would have used:
+           ``_billterm_due_date`` over the document's terms, which
+           is the posting date when there are none. A server-posted
+           document without the slot is a shape desktop never
+           writes; ``_backfill_due_dates`` adds the slot on the next
+           business write, so both paths give one answer.
+
+        The pre-1.5 30-day default is gone (spec A2, ruled
+        2026-09-28): a document with no terms is due on its posting
+        date, as in desktop. Single chokepoint so the warnings
+        collector and ``get_outstanding_invoices`` produce identical
+        due-date math.
         """
         from sqlalchemy import text
 
         if not _is_invoice_posted(inv):
-            return None, False
+            return None
 
         txn = inv.post_txn
         if txn is None:
-            return None, False
+            return None
 
-        # Step 1: explicit due-date slot.
+        # Step 1: the slot.
         row = book.session.execute(
             text(
                 "SELECT gdate_val FROM slots "
@@ -2280,54 +2368,63 @@ class BusinessMixin:
                 # overdue warning. Normalize to digits first.
                 digits = gdate_val.strip().replace("-", "")[:8]
                 if len(digits) == 8 and digits.isdigit():
-                    return (
-                        date(int(digits[:4]), int(digits[4:6]),
-                             int(digits[6:8])),
-                        False,
+                    return date(
+                        int(digits[:4]), int(digits[4:6]), int(digits[6:8]),
                     )
-                return date.fromisoformat(gdate_val[:10]), False
+                return date.fromisoformat(gdate_val[:10])
             if isinstance(gdate_val, datetime):
-                return gdate_val.date(), False
-            return gdate_val, False
+                return gdate_val.date()
+            return gdate_val
 
-        # Step 2: billterm via the raw ``terms`` column.
-        try:
-            terms_row = book.session.execute(
-                text(
-                    "SELECT terms FROM invoices "
-                    "WHERE guid = :guid"
-                ),
-                {"guid": inv.guid},
-            ).first()
-            term_guid = terms_row[0] if terms_row else None
-            if term_guid:
-                from piecash.business.invoice import Billterm
-
-                bt = (
-                    book.session.query(Billterm)
-                    .filter_by(guid=term_guid)
-                    .first()
-                )
-                if bt and bt.duedays:
-                    posted = inv.date_posted
-                    if isinstance(posted, datetime):
-                        posted = posted.date()
-                    return (
-                        posted + timedelta(days=int(bt.duedays)),
-                        False,
-                    )
-        except Exception:
-            # The billterm lookup is optional — Step 3's 30-day
-            # default covers the miss. Clear an aborted transaction
-            # first so the fallback, and everything after it in this
-            # call, isn't querying a poisoned connection.
-            _rollback_if_aborted(book.session)
-
-        # Step 3: 30-day default. Annotate.
+        # Step 2: the port, over the terms (posting date when none).
         posted = inv.date_posted
         if isinstance(posted, datetime):
             posted = posted.date()
-        return posted + timedelta(days=30), True
+        return BusinessMixin._billterm_due_date(
+            BusinessMixin._invoice_billterm(book, inv), posted,
+        )
+
+    def _backfill_due_dates(self, book) -> int:
+        """Write path only: give every posted document whose posting
+        transaction lacks ``trans-date-due`` the slot desktop would
+        have written — ``_billterm_due_date`` over its terms, the
+        posting date when there are none. Server posts before 1.5
+        wrote the slot only when the caller passed ``due_date``;
+        desktop writes it on every post. A rename of nothing, an
+        insert of one slot per document, nothing posted; every
+        business write calls it through ``_upgrade_book_shapes``.
+        Returns how many slots were written.
+        """
+        from sqlalchemy import text
+        from piecash.business.invoice import Invoice
+
+        with_slot = {
+            r[0] for r in book.session.execute(
+                text(
+                    "SELECT obj_guid FROM slots "
+                    "WHERE name = 'trans-date-due'"
+                ),
+            ).fetchall()
+        }
+        n = 0
+        for inv in book.session.query(Invoice).filter(
+            Invoice.date_posted.isnot(None),
+        ).all():
+            if not _is_invoice_posted(inv):
+                continue
+            txn = inv.post_txn
+            if txn is None or txn.guid in with_slot:
+                continue
+            posted = inv.date_posted
+            if isinstance(posted, datetime):
+                posted = posted.date()
+            due = self._billterm_due_date(
+                self._invoice_billterm(book, inv), posted,
+            )
+            self._write_gdate_slot(book, txn.guid, "trans-date-due", due)
+            with_slot.add(txn.guid)
+            n += 1
+        return n
 
     def _document_settlement(
         self, book, inv, *, is_bill=None, is_credit_note=None,
@@ -5835,9 +5932,30 @@ class BusinessMixin:
             # fallback. Same pattern as pay_invoice.
             txn_desc = description if description is not None else owner_name
 
-            parsed_due = (
+            # Desktop always writes trans-date-due on post, and
+            # terms win: gncBillTermComputeDueDate overrides the
+            # dialog's date. A tool response has no field for the
+            # user to watch change, so a caller's due_date that
+            # disagrees with the terms is refused instead of
+            # overridden (spec A2). Without terms the caller's date
+            # stands, defaulting to the posting date as in desktop.
+            requested_due = (
                 date.fromisoformat(due_date) if due_date else None
             )
+            term = self._invoice_billterm(book, inv)
+            if term is not None:
+                parsed_due = self._billterm_due_date(term, parsed_date)
+                if requested_due is not None and requested_due != parsed_due:
+                    raise ValueError(
+                        f"due_date {requested_due.isoformat()} disagrees "
+                        f"with the document's terms '{term.name}', "
+                        f"which put it due {parsed_due.isoformat()} "
+                        f"for a {parsed_date.isoformat()} posting. Omit "
+                        f"due_date to use the terms (as GnuCash does), "
+                        f"or change the document's terms first."
+                    )
+            else:
+                parsed_due = requested_due or parsed_date
 
             # Converts invoice-currency values to each account's
             # commodity via the shared ``_convert_invoice_amount``
@@ -5951,10 +6069,11 @@ class BusinessMixin:
             self._write_gncinvoice_slot(
                 book, lot.guid, inv.guid
             )
-            if parsed_due:
-                self._write_gdate_slot(
-                    book, txn.guid, "trans-date-due", parsed_due
-                )
+            # Every post carries trans-date-due, as desktop's does
+            # (gncInvoicePostToAccount → xaccTransSetDateDue).
+            self._write_gdate_slot(
+                book, txn.guid, "trans-date-due", parsed_due
+            )
 
             book.save()
 
@@ -8088,9 +8207,7 @@ class BusinessMixin:
                 # collector. No aging clock on credit notes (nothing
                 # past due about money the business owes) or
                 # overpaid docs (nothing left to collect).
-                due_date, no_terms = self._resolve_invoice_due_date(
-                    book, inv,
-                )
+                due_date = self._resolve_invoice_due_date(book, inv)
                 days_past_due = (
                     (today - due_date).days
                     if due_date is not None
@@ -8128,7 +8245,6 @@ class BusinessMixin:
                         else None
                     ),
                     "days_past_due": days_past_due,
-                    "no_terms": False if is_credit_note else no_terms,
                     "original_amount": str(grand_total),
                     "amount_paid": str(amount_paid),
                     "amount_due": str(amount_due),

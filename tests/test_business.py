@@ -6032,7 +6032,6 @@ class TestCreditNoteDisplayPolish:
         assert cn_row["type"] == "credit_note"
         assert cn_row["due_date"] is None
         assert cn_row["days_past_due"] is None
-        assert cn_row["no_terms"] is False
 
     def test_dashboard_ar_nets_credit_notes_against_invoices(
         self, business_book,
@@ -10149,14 +10148,13 @@ class TestPhase3CommsContracts:
         assert "Acme Corp" in compact
         assert "due:2026-02-01" in compact
         assert "posted:2026-01-01" in compact
-        # By 2026-04-28 (test fixture's "today") this is 86 days past
-        # an explicit due date — no "30-day default" annotation.
         assert "past due" in compact
-        assert "30-day default" not in compact
 
-    def test_outstanding_compact_no_terms_annotates_default(
+    def test_outstanding_compact_no_terms_due_on_posting(
         self, business_book,
     ):
+        """No due_date and no billterm: due on the posting date, as
+        desktop computes it (spec A2) — no '30-day default'."""
         gb = GnuCashBook(str(business_book))
         gb.create_customer(name="Acme Corp")
         gb.create_invoice(customer_id="000001")
@@ -10168,10 +10166,12 @@ class TestPhase3CommsContracts:
             invoice_id="000001",
             post_account="Assets:Accounts Receivable",
             post_date="2026-01-01",
-            # no due_date and no billterm — falls back to 30-day default
+            # no due_date and no billterm — due on the posting date
         )
         compact = gb.get_outstanding_invoices()
-        assert "30-day default" in compact
+        assert "due:2026-01-01" in compact
+        assert "days past due" in compact
+        assert "30-day default" not in compact
 
     def test_outstanding_compact_marks_bill_with_tag(
         self, business_book,
@@ -10725,8 +10725,7 @@ class TestCnyBugReportFollowups:
     ):
         """The compact-format ``get_outstanding_invoices`` template
         was concatenating "days past " with " past due" and producing
-        "X days past past due". Should read either "X days past due"
-        (contractual) or "X days past 30-day default" (no terms)."""
+        "X days past past due". Should read "X days past due"."""
         gb = GnuCashBook(str(business_book))
         gb.create_customer(name="Acme Corp")
         gb.create_invoice(customer_id="000001")
@@ -10749,11 +10748,11 @@ class TestCnyBugReportFollowups:
         # And the correct form is present.
         assert "past due" in compact
 
-    def test_outstanding_invoices_no_terms_renders_30_day_default(
+    def test_outstanding_invoices_no_terms_renders_past_due(
         self, business_book,
     ):
-        """No-terms branch should annotate as ``"X days past 30-day
-        default"`` — also doesn't have the duplicated word."""
+        """No terms: due on the posting date, rendered ``"X days
+        past due"`` — and never the duplicated word."""
         gb = GnuCashBook(str(business_book))
         gb.create_customer(name="Acme Corp")
         gb.create_invoice(customer_id="000001")
@@ -10761,7 +10760,7 @@ class TestCnyBugReportFollowups:
             invoice_id="000001", account="Income:Sales",
             description="Consulting", quantity="1", price="500.00",
         )
-        # No due_date and no billterm — falls to 30-day default.
+        # No due_date and no billterm — due on the posting date.
         gb.post_invoice(
             invoice_id="000001",
             post_account="Assets:Accounts Receivable",
@@ -10769,7 +10768,8 @@ class TestCnyBugReportFollowups:
         )
         compact = gb.get_outstanding_invoices()
         assert "past past" not in compact
-        assert "30-day default" in compact
+        assert "days past due" in compact
+        assert "30-day default" not in compact
 
     # ── Bug 2: pay_invoice should reuse existing FX accounts ─────
 

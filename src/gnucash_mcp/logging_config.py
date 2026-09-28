@@ -2136,6 +2136,13 @@ def _shape_upgrade_lines(after: dict) -> list[str]:
             f"{_INDENT}{n} invoice link{'s' if n != 1 else ''} renamed "
             f"to GnuCash's key (desktop-navigable, nothing posted)"
         )
+    n = after.get("due_dates_backfilled")
+    if n:
+        lines.append(
+            f"{_INDENT}{n} posted document{'s' if n != 1 else ''} given "
+            f"GnuCash's trans-date-due slot (terms over posting date; "
+            f"nothing posted)"
+        )
     if after.get("book_stamped"):
         lines.append(
             f'{_INDENT}book stamped: "{after["book_stamped"]}" '

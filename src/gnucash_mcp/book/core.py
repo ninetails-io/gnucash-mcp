@@ -275,7 +275,7 @@ class CoreMixin:
             {
               "inv": Invoice, "is_bill": bool, "is_credit_note": bool,
               "amount_due": Decimal,   # signed, quantized; < 0 = overpaid
-              "due_date": date | None, "no_terms": bool,
+              "due_date": date | None,
               "overdue": bool, "days_overdue": int | None,
             }
 
@@ -346,9 +346,9 @@ class CoreMixin:
                 )
                 continue
             try:
-                due_date, no_terms = (
+                due_date = (
                     resolve_due(book, inv)
-                    if resolve_due is not None else (None, False)
+                    if resolve_due is not None else None
                 )
             except Exception as exc:
                 # Due-date resolution can fail on corrupt term
@@ -357,7 +357,7 @@ class CoreMixin:
                 due_failures.append(
                     self._check_failed(book, "Overdue-document", exc)
                 )
-                due_date, no_terms = None, False
+                due_date = None
             try:
                 amount_due = st["amount_due"]
                 overdue = (
@@ -372,7 +372,6 @@ class CoreMixin:
                     "is_credit_note": is_credit_note,
                     "amount_due": amount_due,
                     "due_date": due_date,
-                    "no_terms": no_terms,
                     "overdue": overdue,
                     "days_overdue": (
                         (today - due_date).days if overdue else None
@@ -1202,23 +1201,11 @@ class CoreMixin:
                             else default_currency.mnemonic
                         )
                         amount_str = f"{row['amount_due']:,}"
-                        # With no term set, anchor the count to the
-                        # assumption ("past 30-day default") rather
-                        # than "overdue", which reads as contractual
-                        # and contradicts "(no term set)".
-                        if row["no_terms"]:
-                            msg = (
-                                f"Past due {doc_type}: {owner_name} "
-                                f"{days_overdue} days past 30-day "
-                                f"default, {currency} {amount_str} "
-                                f"(no term set)"
-                            )
-                        else:
-                            msg = (
-                                f"Past due {doc_type}: {owner_name} "
-                                f"{days_overdue} days overdue, "
-                                f"{currency} {amount_str}"
-                            )
+                        msg = (
+                            f"Past due {doc_type}: {owner_name} "
+                            f"{days_overdue} days overdue, "
+                            f"{currency} {amount_str}"
+                        )
                         overdue_inv_entries.append(
                             (days_overdue, msg),
                         )
