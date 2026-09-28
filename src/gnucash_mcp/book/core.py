@@ -224,7 +224,7 @@ class CoreMixin:
     _LAST_ENTRY_WARN_DAYS = 14
 
     # ── Honest failure for the dashboard collectors ────────────────
-    # Every ``except`` in _business_summary_counts,
+    # Every ``except`` in _open_documents, _business_summary_counts,
     # _overdue_scheduled_warnings, and _collect_warnings routes through
     # _check_failed (locked by TestDashboardHonestFailure in
     # test_contract_integrity.py). Spec:
@@ -260,8 +260,140 @@ class CoreMixin:
         n = len(lines)
         return f"{lines[0]} — {n} {noun}{'' if n == 1 else 's'} skipped"
 
+    def _open_documents(
+        self, book, failures: list[str] | None = None,
+    ) -> list[dict]:
+        """One pass over the book's posted documents, through
+        ``_document_settlement`` — the same seam ``get_document`` and
+        ``get_outstanding_documents`` read — so the dashboard's
+        Receivables/Payables counts and its overdue warnings agree
+        with the detail tools by construction (spec A1). Nothing in
+        core reads a lot balance directly.
+
+        Returns one dict per OPEN document (``balance != 0``)::
+
+            {
+              "inv": Invoice, "is_bill": bool, "is_credit_note": bool,
+              "amount_due": Decimal,   # signed, quantized; < 0 = overpaid
+              "due_date": date | None, "no_terms": bool,
+              "overdue": bool, "days_overdue": int | None,
+            }
+
+        *Overdue* means open, ``amount_due > 0``, not a credit note,
+        and ``due_date < today`` — exactly the rows
+        ``get_outstanding_documents`` gives ``days_past_due > 0``.
+        An overpaid document is open but never overdue: the old
+        ``abs()`` over the raw lot balance rendered a customer's
+        overpayment as "Past due … USD 50" owed TO the business.
+
+        Empty when the business module isn't loaded. Item failures
+        are recorded through ``_check_failed`` and summarized into
+        ``failures``; the document is skipped, never guessed.
+        """
+        settle = getattr(self, "_document_settlement", None)
+        if settle is None:
+            return []
+        try:
+            from piecash.business.invoice import Invoice
+        except ImportError:
+            return []
+
+        today = date.today()
+        resolve_due = getattr(self, "_resolve_invoice_due_date", None)
+        get_is_cn = getattr(self, "_get_is_credit_note", None)
+        resolve_ot = getattr(self, "_resolve_owner_type_and_job", None)
+        is_bill_side = getattr(self, "_is_bill_side", None)
+
+        try:
+            posted = book.session.query(Invoice).filter(
+                Invoice.date_posted.isnot(None),
+            ).all()
+        except Exception as exc:
+            line = self._check_failed(book, "Business-count", exc)
+            if failures is not None:
+                failures.append(line)
+            return []
+
+        rows: list[dict] = []
+        item_failures: list[str] = []
+        due_failures: list[str] = []
+        for inv in posted:
+            try:
+                is_credit_note = (
+                    bool(get_is_cn(inv)) if get_is_cn is not None else False
+                )
+                # Polymorphic owner: a job-attached document's side
+                # comes from the job's owner (BusinessMixin
+                # chokepoints); a plain ``owner_type == 4`` drops it.
+                eff_ot = (
+                    resolve_ot(book, inv)[0]
+                    if resolve_ot is not None else inv.owner_type
+                )
+                is_bill = (
+                    is_bill_side(eff_ot)
+                    if is_bill_side is not None else eff_ot in (4, 5)
+                )
+                st = settle(
+                    book, inv, is_bill=is_bill,
+                    is_credit_note=is_credit_note,
+                )
+                if st is None or st["balance"] == 0:
+                    continue
+            except Exception as exc:
+                # Recorded, not swallowed — see _check_failed.
+                item_failures.append(
+                    self._check_failed(book, "Business-count", exc)
+                )
+                continue
+            try:
+                due_date, no_terms = (
+                    resolve_due(book, inv)
+                    if resolve_due is not None else (None, False)
+                )
+            except Exception as exc:
+                # Due-date resolution can fail on corrupt term
+                # records; the document still counts as open, only
+                # its overdue-ness is unknowable.
+                due_failures.append(
+                    self._check_failed(book, "Overdue-document", exc)
+                )
+                due_date, no_terms = None, False
+            try:
+                amount_due = st["amount_due"]
+                overdue = (
+                    not is_credit_note
+                    and amount_due > 0
+                    and due_date is not None
+                    and due_date < today
+                )
+                rows.append({
+                    "inv": inv,
+                    "is_bill": is_bill,
+                    "is_credit_note": is_credit_note,
+                    "amount_due": amount_due,
+                    "due_date": due_date,
+                    "no_terms": no_terms,
+                    "overdue": overdue,
+                    "days_overdue": (
+                        (today - due_date).days if overdue else None
+                    ),
+                })
+            except Exception as exc:
+                # Recorded, not swallowed — see _check_failed.
+                item_failures.append(
+                    self._check_failed(book, "Business-count", exc)
+                )
+        if failures is not None:
+            for bucket in (item_failures, due_failures):
+                if bucket:
+                    failures.append(
+                        self._summarize_item_failures(bucket, "document")
+                    )
+        return rows
+
     def _business_summary_counts(
         self, book, failures: list[str] | None = None,
+        open_documents: list[dict] | None = None,
     ) -> dict:
         """Action-signal counts for the get_book_summary business
         lines: open/overdue invoices and bills, active jobs. Returns
@@ -270,6 +402,10 @@ class CoreMixin:
         The summary's principle: tell the LLM what needs attention,
         not what exists — these counts are actionable; account
         structure is shown elsewhere.
+
+        ``open_documents`` is the ``_open_documents`` pass
+        get_book_summary already ran (shared with the overdue
+        warnings); ``None`` runs it here for direct callers.
         """
         out = {
             "open_invoices": 0,
@@ -278,99 +414,29 @@ class CoreMixin:
             "overdue_bills": 0,
             "active_jobs": 0,
         }
-        calc_lot_balance = getattr(self, "_calculate_lot_balance", None)
-        if calc_lot_balance is None:
+        if getattr(self, "_document_settlement", None) is None:
             return out
         try:
-            from piecash.business.invoice import Invoice, Job
+            from piecash.business.invoice import Job
         except ImportError:
             return out
 
-        today = date.today()
-        resolve_due = getattr(self, "_resolve_invoice_due_date", None)
+        if open_documents is None:
+            open_documents = self._open_documents(book, failures=failures)
 
-        # Open = posted with non-zero lot balance, so partial
-        # payments and credit notes adjust the counts correctly.
-        #
-        # Pre-index accounts and lots once — per-invoice SQL lookups
-        # plus linear lot scans are an N+1 pattern on a surface that
-        # runs on every dashboard call.
-        accounts_by_guid = {
-            acct.guid: acct for acct in book.accounts
-        }
-        lots_by_guid: dict[str, object] = {}
-        for acct in book.accounts:
-            for lot in acct.lots:
-                lots_by_guid[lot.guid] = lot
-
-        item_failures: list[str] = []
-        for inv in book.session.query(Invoice).filter(
-            Invoice.date_posted.isnot(None),
-        ).all():
-            try:
-                post_acct = accounts_by_guid.get(inv.post_acc_guid)
-                if post_acct is None:
-                    continue
-                lot_obj = lots_by_guid.get(inv.post_lot_guid)
-                if lot_obj is None:
-                    continue
-                balance = calc_lot_balance(lot_obj)
-                if balance == 0:
-                    continue
-            except Exception as exc:
-                # Recorded, not swallowed — see _check_failed.
-                item_failures.append(
-                    self._check_failed(book, "Business-count", exc)
-                )
-                continue
-
-            # Credit notes stay in the OPEN counts but never age
-            # into overdue — they're money the business OWES.
-            # Matches get_outstanding_invoices.
-            is_credit_note = False
-            get_is_cn = getattr(self, "_get_is_credit_note", None)
-            if get_is_cn is not None:
-                try:
-                    is_credit_note = bool(get_is_cn(inv))
-                except Exception as exc:
-                    item_failures.append(
-                        self._check_failed(book, "Business-count", exc)
-                    )
-
-            is_overdue = False
-            if resolve_due is not None and not is_credit_note:
-                try:
-                    due_date, _ = resolve_due(book, inv)
-                    if due_date is not None and due_date < today:
-                        is_overdue = True
-                except Exception as exc:
-                    # Due-date resolution can fail on corrupt term
-                    # records; the document still counts as open.
-                    item_failures.append(
-                        self._check_failed(book, "Business-count", exc)
-                    )
-
-            if inv.owner_type == 4:  # vendor bill
+        # Credit notes stay in the OPEN counts but never age into
+        # overdue — they're money the business OWES (``overdue`` is
+        # already False for them; see _open_documents).
+        for row in open_documents:
+            if row["is_bill"]:
                 out["open_bills"] += 1
-                if is_overdue:
+                if row["overdue"]:
                     out["overdue_bills"] += 1
             else:
-                # owner_type 2/3/5 render as receivables unless the
-                # post account is PAYABLE (vouchers: company owes
-                # employees → folded into open_bills).
-                if post_acct.type == "PAYABLE":
-                    out["open_bills"] += 1
-                    if is_overdue:
-                        out["overdue_bills"] += 1
-                else:
-                    out["open_invoices"] += 1
-                    if is_overdue:
-                        out["overdue_invoices"] += 1
+                out["open_invoices"] += 1
+                if row["overdue"]:
+                    out["overdue_invoices"] += 1
 
-        if item_failures and failures is not None:
-            failures.append(
-                self._summarize_item_failures(item_failures, "document")
-            )
         try:
             out["active_jobs"] = book.session.query(Job).filter(
                 Job.active == 1,
@@ -805,6 +871,7 @@ class CoreMixin:
         last_entry_days_behind: int | None = None,
         check_failures: list[str] | None = None,
         far_future: tuple[int, date] | None = None,
+        open_documents: list[dict] | None = None,
     ) -> list[str]:
         """Collect warnings for the consolidated Warnings section.
 
@@ -830,7 +897,9 @@ class CoreMixin:
         computes it here for direct callers. ``far_future`` is
         ``_entry_dates``' ``(count, latest)`` of transactions dated
         more than ``_FAR_FUTURE_DAYS`` ahead — a typo class, rendered
-        with the integrity lines.
+        with the integrity lines. ``open_documents`` is the
+        ``_open_documents`` pass shared with the business counts;
+        ``None`` runs it here.
         """
         today = date.today()
         if check_failures is None:
@@ -1074,15 +1143,18 @@ class CoreMixin:
             )
 
         # ── 3. Overdue invoices and bills ──
-        # Posted, non-zero lot balance, due date past. Requires
-        # BusinessMixin's _calculate_lot_balance; gracefully skipped
-        # otherwise.
+        # Rendered from the ``_open_documents`` pass (settlement
+        # chokepoint), so the count here is the Receivables/Payables
+        # line's overdue count and get_outstanding_documents'
+        # ``days_past_due > 0`` rows. Amounts render at the lot
+        # commodity's quantum: 0.75 must not read as "USD 0".
         overdue_invoices: list[str] = []
-        calc_lot_balance = getattr(self, "_calculate_lot_balance", None)
-        if calc_lot_balance is not None:
+        if open_documents is None:
+            open_documents = self._open_documents(
+                book, failures=check_failures,
+            )
+        if open_documents:
             try:
-                from piecash.business.invoice import Invoice
-                from sqlalchemy import text
                 # Polymorphic owner + effective side (BusinessMixin
                 # chokepoints). The side-keyed finders rendered every
                 # overdue voucher and job-attached bill as "Past due
@@ -1100,40 +1172,12 @@ class CoreMixin:
                 )
                 overdue_inv_entries: list[tuple[int, str]] = []
                 item_failures: list[str] = []
-                get_is_cn = getattr(
-                    self, "_get_is_credit_note", None,
-                )
-                for inv in book.session.query(Invoice).filter(
-                    Invoice.date_posted.isnot(None)
-                ).all():
+                for row in open_documents:
+                    if not row["overdue"]:
+                        continue
+                    inv = row["inv"]
                     try:
-                        # Credit notes never age into past-due —
-                        # their balance is money the business OWES.
-                        # get_outstanding_invoices exempts them too;
-                        # the two surfaces must agree.
-                        if get_is_cn is not None and get_is_cn(inv):
-                            continue
-
-                        # _resolve_invoice_due_date keeps this and
-                        # get_outstanding_invoices on identical math;
-                        # no_terms flags the 30-day-default branch.
-                        resolve_due = getattr(
-                            self, "_resolve_invoice_due_date", None,
-                        )
-                        if resolve_due is None:
-                            continue
-                        due_date, no_terms = resolve_due(book, inv)
-                        if due_date is None or due_date >= today:
-                            continue
-
-                        lot = inv.post_lot
-                        if lot is None:
-                            continue
-                        balance = calc_lot_balance(lot)
-                        if balance == 0:
-                            continue
-
-                        days_overdue = (today - due_date).days
+                        days_overdue = row["days_overdue"]
                         eff_ot = (
                             effective_owner_type(book, inv)
                             if effective_owner_type is not None
@@ -1157,12 +1201,12 @@ class CoreMixin:
                             if inv.currency
                             else default_currency.mnemonic
                         )
-                        amount_str = f"{int(abs(balance)):,}"
+                        amount_str = f"{row['amount_due']:,}"
                         # With no term set, anchor the count to the
                         # assumption ("past 30-day default") rather
                         # than "overdue", which reads as contractual
                         # and contradicts "(no term set)".
-                        if no_terms:
+                        if row["no_terms"]:
                             msg = (
                                 f"Past due {doc_type}: {owner_name} "
                                 f"{days_overdue} days past 30-day "
@@ -2942,8 +2986,11 @@ class CoreMixin:
             # and rendered as warnings — a check that could not run is
             # never reported as "all clear".
             check_failures: list[str] = []
+            # One settlement pass feeds the Receivables/Payables
+            # counts AND the overdue warnings (spec A1).
+            open_docs = self._open_documents(book, failures=check_failures)
             biz_counts = self._business_summary_counts(
-                book, failures=check_failures,
+                book, failures=check_failures, open_documents=open_docs,
             )
 
             # Section renderers chain in output order — reorder by
@@ -2975,6 +3022,7 @@ class CoreMixin:
                 last_entry_days_behind=days_behind_for_warnings,
                 check_failures=check_failures,
                 far_future=entry_dates["far_future"],
+                open_documents=open_docs,
             )
             if warnings:
                 lines.append("Warnings:")

@@ -3159,6 +3159,127 @@ class TestGetBookSummaryWarnings:
         assert warnings_idx < accounts_idx
 
 
+class TestDashboardOverdueAgreesWithOutstanding:
+    """Dashboard-accuracy spec A1: the Receivables line's overdue
+    count, the Past-due warnings, and get_outstanding_documents'
+    ``days_past_due > 0`` rows are one number, because all three
+    read ``_document_settlement``. The book holds the three shapes
+    that used to disagree: an overpaid invoice (rendered "Past due
+    … USD 50" through ``abs()``), a credit note, and a 0.75
+    residual (rendered "USD 0" through ``int()``)."""
+
+    def _post(self, gc, customer_id, price, due_days_ago):
+        inv = gc.create_invoice(
+            customer_id=customer_id,
+            date_opened=(date.today() - timedelta(days=60)).isoformat(),
+        )
+        gc.add_invoice_entry(
+            invoice_id=inv["id"], account="Income:Sales",
+            description="Service", quantity="1", price=price,
+        )
+        gc.post_invoice(
+            invoice_id=inv["id"],
+            post_account="Assets:Accounts Receivable",
+            post_date=(date.today() - timedelta(days=60)).isoformat(),
+            due_date=(date.today() - timedelta(days=due_days_ago)).isoformat(),
+        )
+        return inv["id"]
+
+    def test_three_shapes(self, business_book: Path):
+        from sqlalchemy import text
+        gc = GnuCashBook(str(business_book))
+        gc.create_customer(name="Residual Co", currency="USD")
+        gc.create_customer(name="Overpaid Co", currency="USD")
+        gc.create_customer(name="Credit Co", currency="USD")
+
+        # 1. A 0.75 residual, 20 days overdue.
+        residual = self._post(gc, "000001", "100.75", 20)
+        gc.pay_invoice(
+            invoice_id=residual, payment_account="Assets:Checking",
+            amount="100", payment_date=date.today().isoformat(),
+        )
+
+        # 2. An overpaid invoice, due date long past. pay_invoice
+        # refuses overpayment now, but warning-era books carry it:
+        # engineer the state the way those books hold it.
+        overpaid = self._post(gc, "000002", "100", 30)
+        gc.pay_invoice(
+            invoice_id=overpaid, payment_account="Assets:Checking",
+            amount="100", payment_date=date.today().isoformat(),
+        )
+        with gc.open(readonly=False) as book:
+            lot_guid, post_tx = book.session.execute(
+                text(
+                    "SELECT post_lot, post_txn FROM invoices "
+                    "WHERE id = :id"
+                ),
+                {"id": overpaid},
+            ).first()
+            pay_tx = book.session.execute(
+                text(
+                    "SELECT tx_guid FROM splits WHERE lot_guid = :lot "
+                    "AND tx_guid != :post"
+                ),
+                {"lot": lot_guid, "post": post_tx},
+            ).scalar()
+            # A/R leg -100 -> -150; bank leg +100 -> +150 (USD/100).
+            book.session.execute(
+                text(
+                    "UPDATE splits SET value_num = value_num - 5000, "
+                    "quantity_num = quantity_num - 5000 "
+                    "WHERE tx_guid = :tx AND lot_guid = :lot"
+                ),
+                {"tx": pay_tx, "lot": lot_guid},
+            )
+            book.session.execute(
+                text(
+                    "UPDATE splits SET value_num = value_num + 5000, "
+                    "quantity_num = quantity_num + 5000 "
+                    "WHERE tx_guid = :tx AND (lot_guid IS NULL OR lot_guid != :lot)"
+                ),
+                {"tx": pay_tx, "lot": lot_guid},
+            )
+            book.save()
+
+        # 3. An unapplied credit note.
+        cn = gc.create_credit_note(
+            owner_id="000003", owner_type="customer",
+            date_opened=(date.today() - timedelta(days=90)).isoformat(),
+        )
+        gc.add_credit_note_entry(
+            credit_note_id=cn["id"], account="Income:Sales",
+            description="Service credit", quantity="1", price="500",
+        )
+        gc.post_invoice(
+            invoice_id=cn["id"], post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+            post_date=(date.today() - timedelta(days=90)).isoformat(),
+        )
+
+        outstanding = gc.get_outstanding_invoices(compact=False)["invoices"]
+        assert len(outstanding) == 3
+        by_name = {r["owner_name"]: r for r in outstanding}
+        assert by_name["Overpaid Co"]["overpaid"] is True
+        assert by_name["Overpaid Co"]["days_past_due"] is None
+        overdue_rows = [
+            r for r in outstanding if (r["days_past_due"] or 0) > 0
+        ]
+        assert [r["owner_name"] for r in overdue_rows] == ["Residual Co"]
+
+        result = gc.get_book_summary()
+        receivables = next(
+            ln for ln in result.splitlines() if ln.startswith("Receivables:")
+        )
+        assert "(3 invoices, 1 overdue;" in receivables, receivables
+        past_due = [
+            ln.strip() for ln in result.splitlines() if "Past due" in ln
+        ]
+        assert past_due == [
+            "⚠ Past due invoice: Residual Co 20 days overdue, USD 0.75"
+        ], past_due
+        assert len(past_due) == len(overdue_rows)
+
+
 class TestGetBookSummaryBalanceIntegrity:
     """``N unbalanced transactions (oldest …) — get_transaction to
     inspect`` — dashboard-accuracy spec A8. Integrity checks looked
@@ -14392,8 +14513,10 @@ class TestDashboardHonestFailure:
         self, business_book: Path, monkeypatch,
     ):
         """Two posted, overdue invoices whose due-date resolution
-        raises: one line per check with the skipped count, and no
-        'Past due' line pretending the check ran."""
+        raises: one line with the skipped count, and no 'Past due'
+        line pretending the check ran. One line, not two — the
+        counts and the warnings read one settlement pass (spec A1),
+        so a failed due-date lookup is one failed check."""
         gb = GnuCashBook(str(business_book))
         gb.create_customer(name="Flaky Terms Co")
         for _ in range(2):
@@ -14420,15 +14543,11 @@ class TestDashboardHonestFailure:
             "⚠ Overdue-document check failed: RuntimeError: "
             "terms unreadable — 2 documents skipped"
         ) in warnings_block
-        assert (
-            "⚠ Business-count check failed: RuntimeError: "
-            "terms unreadable — 2 documents skipped"
-        ) in warnings_block
-        assert warnings_block.count("check failed") == 2
+        assert warnings_block.count("check failed") == 1
         assert "Past due" not in warnings_block
         # The documents still count as open — only overdue-ness was
         # unknowable.
-        assert "2 invoices" in result or "open" in result.lower()
+        assert "(2 invoices, 0 overdue;" in result
 
     def test_healthy_book_has_no_failure_lines(self, test_book: Path):
         result = GnuCashBook(str(test_book)).get_book_summary()
