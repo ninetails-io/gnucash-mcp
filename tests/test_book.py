@@ -1,6 +1,6 @@
 """Tests for GnuCashBook wrapper."""
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -9412,6 +9412,125 @@ class TestModeAgreement:
         grouped_out = Decimal(out_row.split("\t")[-2])
         assert Decimal(single["outflows"]) == Decimal("325.00")
         assert Decimal(single["outflows"]) == grouped_out
+
+    # ── Dashboard monthly net (spec A6) ──────────────────────────
+
+    @staticmethod
+    def _dashboard_full_months(gc: GnuCashBook) -> dict[str, Decimal]:
+        """``{"Apr 2026": Decimal("+1247"), ...}`` from the rendered
+        Monthly net section, MTD row excluded (it is a partial
+        month; the reports have no same-day window)."""
+        result = gc.get_book_summary()
+        marker = "Monthly net (income - expenses, last 6 months):\n"
+        if marker not in result:
+            return {}
+        section = result.split(marker, 1)[1]
+        out: dict[str, Decimal] = {}
+        for line in section.splitlines():
+            if not line.startswith("  ") or "(MTD)" in line:
+                if line.startswith("  "):
+                    continue
+                break
+            label, value = line.strip().split(": ", 1)
+            out[label] = Decimal(value.replace(",", ""))
+        return out
+
+    def _assert_dashboard_agrees_with_flow_reports(self, gc: GnuCashBook):
+        months = self._dashboard_full_months(gc)
+        if not months:
+            pytest.skip("no full month with activity in the window")
+        for label, shown in months.items():
+            start = datetime.strptime(label, "%b %Y").date()
+            end = (
+                date(start.year + (start.month == 12),
+                     start.month % 12 + 1, 1) - timedelta(days=1)
+            )
+            income = Decimal(gc.income_by_source(
+                start_date=start, end_date=end, compact=False,
+            )["total"])
+            spending = Decimal(gc.spending_by_category(
+                start_date=start, end_date=end, compact=False,
+            )["total"])
+            expected = (income - spending).quantize(Decimal("1"))
+            assert shown == expected, (
+                f"{label}: dashboard {shown} != income {income} - "
+                f"spending {spending}"
+            )
+
+    def test_dashboard_monthly_net_agrees_with_flow_reports(self, tmp_path):
+        """Spec A6: the dashboard's monthly net converted every
+        month at TODAY's rate, contradicting the monthly-close
+        invariant — its March disagreed with cash_flow's March on
+        a multi-currency book. Now each full month equals
+        income_by_source minus spending_by_category for that
+        month. A EUR expense two months ago and a fresh, very
+        different rate today make the old policy visibly wrong."""
+        path = tmp_path / "fx_dash.gnucash"
+        book = piecash.create_book(str(path), currency="USD", overwrite=True)
+        root = book.root_account
+        usd = book.default_currency
+        eur = factories.create_currency_from_ISO("EUR")
+        book.session.add(eur)
+        expenses = piecash.Account(
+            name="Expenses", type="EXPENSE", parent=root,
+            commodity=usd, placeholder=True,
+        )
+        travel = piecash.Account(
+            name="EU Travel", type="EXPENSE", parent=expenses,
+            commodity=eur,
+        )
+        assets = piecash.Account(
+            name="Assets", type="ASSET", parent=root,
+            commodity=usd, placeholder=True,
+        )
+        eur_bank = piecash.Account(
+            name="EUR Account", type="BANK", parent=assets,
+            commodity=eur,
+        )
+        today = date.today()
+        two_ago = (today.replace(day=1) - timedelta(days=1)).replace(day=1)
+        two_ago = (two_ago - timedelta(days=1)).replace(day=15)
+        two_ago_end = (
+            date(two_ago.year + (two_ago.month == 12),
+                 two_ago.month % 12 + 1, 1) - timedelta(days=1)
+        )
+        book.session.add(piecash.Transaction(
+            currency=eur, description="trip", post_date=two_ago,
+            splits=[
+                piecash.Split(account=travel,
+                              value=Decimal("100"), quantity=Decimal("100")),
+                piecash.Split(account=eur_bank,
+                              value=Decimal("-100"), quantity=Decimal("-100")),
+            ],
+        ))
+        for d, rate in ((two_ago_end, "1.05"), (today, "2.00")):
+            book.session.add(piecash.Price(
+                commodity=eur, currency=usd, date=d, value=Decimal(rate),
+            ))
+        book.save()
+        book.close()
+        gc = GnuCashBook(str(path))
+        months = self._dashboard_full_months(gc)
+        # Month's close, not today's 2.00: -100 * 1.05.
+        assert months[two_ago.strftime("%b %Y")] == Decimal("-105")
+        self._assert_dashboard_agrees_with_flow_reports(gc)
+
+    @pytest.mark.parametrize(
+        "sample", ["lin-wei.gnucash", "sabine-brenner.gnucash"],
+    )
+    def test_dashboard_monthly_net_agrees_on_sample_books(
+        self, sample, tmp_path,
+    ):
+        """The same agreement on the multi-currency sample oracles
+        (Lin Wei, CNY; Sabine, EUR). Skips once the frozen books
+        age out of the dashboard's six-month window."""
+        src = Path(__file__).resolve().parent.parent / "samples" / sample
+        if not src.exists():
+            pytest.skip(f"{sample} not present")
+        import shutil
+        path = tmp_path / sample
+        shutil.copy(src, path)
+        self._assert_dashboard_agrees_with_flow_reports(GnuCashBook(str(path)))
 
 
 class TestGroupByBreakdown:

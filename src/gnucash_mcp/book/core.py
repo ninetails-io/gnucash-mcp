@@ -1784,14 +1784,16 @@ class CoreMixin:
         misleads without a like-for-like anchor. The MTD bucket
         itself stops at today for the same reason (spec A7).
 
-        Each split converts to the book default at the most recent
-        market rate — raw ``split.value`` sums mix currencies.
+        Each split converts to the book default at its own MONTH's
+        closing rate (``_monthly_conversion_factors``) — the flow-
+        report quantum ``income_by_source`` and
+        ``spending_by_category`` use, so a month here equals
+        income minus spending there (locked by
+        ``TestModeAgreement``). Today's rate for every month made
+        the dashboard's March disagree with cash_flow's March on a
+        multi-currency book (spec A6).
         """
         today = date.today()
-        # One factors map applied uniformly — this summary surface
-        # deliberately uses today's rates for every month (per-month
-        # rates would need net_worth's per-boundary restructure).
-        factors = self._account_conversion_factors(book, today)
 
         # Calendar-month windows, oldest → newest. Plain (year,
         # month) arithmetic keeps core free of dateutil.
@@ -1828,6 +1830,9 @@ class CoreMixin:
         # prior month" same-day comparison unlike-for-like).
         window_end = min(month_ends[-1], today)
         has_activity = False
+        monthly_factors = self._monthly_conversion_factors(
+            book, window_start, window_end,
+        )
 
         # Prior-month same-day-window accumulator for the MTD
         # comparable (clamped: Jul 30 compares against Jun 30, and
@@ -1860,7 +1865,8 @@ class CoreMixin:
                 if atype not in ("INCOME", "EXPENSE"):
                     continue
                 amt = self._split_in_default_currency(
-                    s, s.account, factors.get(s.account.guid),
+                    s, s.account,
+                    self._monthly_factor(monthly_factors, txn, s.account),
                 )
                 # INCOME is stored negative (credit-natural) and
                 # flips to a positive contribution; EXPENSE is

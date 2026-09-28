@@ -20,6 +20,7 @@ from decimal import Decimal
 
 import piecash
 
+from gnucash_mcp._format import _enumerate_periods, _period_label
 
 # ── FX staleness cap ───────────────────────────────────────────────
 #
@@ -701,6 +702,57 @@ class CurrencyMixin:
             else:
                 factors[acct.guid] = rates.get(acct.commodity.guid)
         return factors
+
+    def _monthly_conversion_factors(
+        self,
+        book: piecash.Book,
+        start_date: date,
+        end_date: date,
+    ) -> dict[str, dict[str, Decimal | None]]:
+        """``{YYYY-MM: {account_guid: factor}}`` covering the range —
+        the FLOW-report valuation quantum (GB-1 ruling, 2026-07-07).
+
+        Flow reports (spending / income / cash_flow) value every
+        split at its own MONTH's closing rate, in single-period and
+        group_by modes alike. Month is the quantum because it makes
+        totals granularity-invariant (quarter/year/single are sums of
+        month-valued splits), matches the ``group_by="month"``
+        numbers users had already seen before unification, and is a
+        recognizable accounting convention (monthly close). Anchors
+        clamp to ``end_date`` via ``_enumerate_periods``, so a
+        partial final month values at the range end and the
+        forecast-price convention (``_anchor_for_as_of``) applies
+        through ``_account_conversion_factors`` as everywhere else.
+
+        STOCK reports (balance_sheet, net_worth) are deliberately
+        different: they value holdings as of their report date, not
+        per flow month.
+        """
+        # Lives on the always-composed CurrencyMixin (not the
+        # optional ReportingMixin) because the dashboard's monthly
+        # net uses it too (spec A6): one quantum for every flow.
+        return {
+            pl: self._account_conversion_factors(book, anchor)
+            for pl, anchor in _enumerate_periods(
+                start_date, end_date, "month",
+            )
+        }
+
+    @staticmethod
+    def _monthly_factor(
+        monthly_factors: dict[str, dict[str, Decimal | None]],
+        txn,
+        account,
+    ) -> Decimal | None:
+        """The conversion factor for one split under the monthly
+        quantum: its transaction's month, its account. ``None`` (no
+        rate on file that month, or a month outside the built range)
+        falls back to ``split.value`` in
+        ``_split_in_default_currency`` — the same degradation as
+        every other missing-rate path.
+        """
+        month = _period_label(txn.post_date, "month")
+        return monthly_factors.get(month, {}).get(account.guid)
 
     @staticmethod
     def _split_in_default_currency(
