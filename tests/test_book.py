@@ -3205,8 +3205,9 @@ class TestGetBookSummaryLastEntry:
         transaction post_date is in the future (e.g. a scheduled-
         transaction instantiation that posts ahead of time), the
         line must not render as "(yesterday)" or "(N days
-        behind)". Future-dated transactions are normal — but a
-        date 31 days in the future shouldn't be called "yesterday."
+        behind)". A future entry never stands in for the last
+        entry: with nothing on or before today the line says so,
+        and the future entry is counted beside it.
         """
         # 31 days in the future = "next month" in the bookkeeper's
         # repro case.
@@ -3217,9 +3218,10 @@ class TestGetBookSummaryLastEntry:
             l for l in result.splitlines()
             if l.startswith("Last entry:")
         )
-        assert "future-dated" in last_line
-        assert "31 days ahead" in last_line
-        # Future-dated entries are not "behind" — no ⚠.
+        assert "none on or before today" in last_line
+        latest = (date.today() + timedelta(days=31)).isoformat()
+        assert f"(1 future-dated, latest {latest})" in last_line
+        # Nothing to be behind on — no ⚠.
         assert "⚠" not in last_line
         # And specifically NOT mislabeled as recent past.
         assert "yesterday" not in last_line
@@ -3229,7 +3231,7 @@ class TestGetBookSummaryLastEntry:
         self, tmp_path: Path,
     ):
         """Boundary: one day ahead is still future-dated, not
-        "today" — the cutoff is strictly ``days_behind >= 0``."""
+        "today" — ``_entry_dates`` caps ``last`` strictly at today."""
         path = self._book_with_last_entry_n_days_ago(tmp_path, -1)
         gc = GnuCashBook(str(path))
         result = gc.get_book_summary()
@@ -3237,8 +3239,58 @@ class TestGetBookSummaryLastEntry:
             l for l in result.splitlines()
             if l.startswith("Last entry:")
         )
-        assert "future-dated" in last_line
-        assert "1 days ahead" in last_line
+        assert "none on or before today" in last_line
+        assert "1 future-dated" in last_line
+        assert "today)" not in last_line
+
+    def test_future_dated_entry_does_not_hide_staleness(
+        self, tmp_path: Path,
+    ):
+        """Dashboard-accuracy spec A3: "Last entry" was
+        ``max(post_date)`` over every transaction, so one entry
+        dated ahead — a bill posted ahead, or a 2062 typo —
+        switched off the staleness ⚠ and the staleness note that
+        frames the time-based warnings. The last entry is the
+        latest on or before today; future entries are counted
+        beside it, and one more than a year ahead gets its own ⚠.
+        """
+        path = self._book_with_last_entry_n_days_ago(tmp_path, 30)
+        gc = GnuCashBook(str(path))
+        typo = date(2062, 3, 15)
+        gc.create_transaction(
+            description="Typo year",
+            splits=[
+                {"account": "Assets:Checking", "amount": "10"},
+                {"account": "Income:Salary", "amount": "-10"},
+            ],
+            trans_date=typo,
+        )
+        result = gc.get_book_summary()
+        lines = result.splitlines()
+        last_line = next(l for l in lines if l.startswith("Last entry:"))
+        thirty = (date.today() - timedelta(days=30)).isoformat()
+        assert last_line.startswith(f"Last entry: {thirty} (30 days behind) ⚠")
+        assert "(1 future-dated, latest 2062-03-15)" in last_line
+        # The true data range still spans the future entry.
+        range_line = next(l for l in lines if l.startswith("Data range:"))
+        assert range_line.endswith("to 2062-03-15")
+        # The typo-class entry earns its own warning.
+        assert (
+            "⚠ 1 transaction dated more than a year ahead "
+            "(latest 2062-03-15)"
+        ) in result
+        # ... and a bill posted ahead by a week does not.
+        gc.create_transaction(
+            description="Posted ahead",
+            splits=[
+                {"account": "Assets:Checking", "amount": "10"},
+                {"account": "Income:Salary", "amount": "-10"},
+            ],
+            trans_date=date.today() + timedelta(days=7),
+        )
+        result = gc.get_book_summary()
+        assert "(2 future-dated, latest 2062-03-15)" in result
+        assert "1 transaction dated more than a year ahead" in result
 
 
 class TestGetBookSummaryUpcomingScheduled:

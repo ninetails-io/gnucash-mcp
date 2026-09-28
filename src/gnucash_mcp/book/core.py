@@ -804,13 +804,15 @@ class CoreMixin:
         overdue_scheduled: list[dict] | None = None,
         last_entry_days_behind: int | None = None,
         check_failures: list[str] | None = None,
+        far_future: tuple[int, date] | None = None,
     ) -> list[str]:
         """Collect warnings for the consolidated Warnings section.
 
         Returns formatted warning strings ordered by category::
 
-            data integrity → backup health → critically low cash →
-            overdue invoices/bills → overdue scheduled → stale prices
+            data integrity → far-future entries → backup health →
+            critically low cash → overdue invoices/bills →
+            overdue scheduled → stale prices
 
         Within each category, most-severe first. Operational urgency
         outranks data-quality cleanup, except integrity defects
@@ -825,7 +827,10 @@ class CoreMixin:
 
         ``overdue_scheduled`` lets get_book_summary pass the list it
         already computed (shared with the Scheduled line); ``None``
-        computes it here for direct callers.
+        computes it here for direct callers. ``far_future`` is
+        ``_entry_dates``' ``(count, latest)`` of transactions dated
+        more than ``_FAR_FUTURE_DAYS`` ahead — a typo class, rendered
+        with the integrity lines.
         """
         today = date.today()
         if check_failures is None:
@@ -879,6 +884,19 @@ class CoreMixin:
                 ))
         integrity.sort(key=lambda pair: pair[0], reverse=True)
         integrity = [msg for _, msg in integrity]
+
+        # A transaction dated more than a year ahead is almost always
+        # a typo (2062 for 2026). It is excluded from "Last entry"
+        # (``_entry_dates``), and named here so it gets fixed rather
+        # than quietly stretching the data range forever.
+        if far_future is not None:
+            far_count, far_latest = far_future
+            integrity.append(
+                f"{far_count} transaction{'s' if far_count != 1 else ''} "
+                f"dated more than a year ahead (latest "
+                f"{far_latest.isoformat()}) — likely a typo; "
+                f"search_transactions to inspect"
+            )
 
         # ── 2. Critically low cash ──
         # Threshold = 1 day of the ACCOUNT'S OWN outflow, not the
@@ -2288,24 +2306,92 @@ class CoreMixin:
             )
         return lines
 
+    # A transaction dated further ahead than this is almost always a
+    # typo (2062 for 2026), not a posted-ahead bill. It earns its own
+    # warning line; see ``_entry_dates``.
+    _FAR_FUTURE_DAYS = 365
+
+    @classmethod
+    def _entry_dates(cls, transactions: list, today: date) -> dict:
+        """The dashboard's one reading of "when was the book last
+        touched", from the template-filtered transaction list::
+
+            {
+              "first": date | None,          # earliest post_date
+              "last": date | None,           # latest post_date <= today
+              "future_count": int,           # post_date > today
+              "future_latest": date | None,  # latest of those
+              "far_future": (count, latest) | None,
+                                             # > _FAR_FUTURE_DAYS ahead
+            }
+
+        ``last`` stops at today. It used to be ``max(post_date)``
+        over everything, so one entry dated ahead — a bill posted
+        ahead to next week, or a 2062 typo — switched off the
+        staleness ⚠ and the staleness note that frames the
+        time-based warnings (dashboard-accuracy spec, A3). Future
+        entries are counted and reported beside the line instead.
+        """
+        first: date | None = None
+        last: date | None = None
+        future_count = 0
+        future_latest: date | None = None
+        far_count = 0
+        far_latest: date | None = None
+        far_cutoff = today + timedelta(days=cls._FAR_FUTURE_DAYS)
+        for txn in transactions:
+            d = txn.post_date
+            if d is None:  # old-book artifact
+                continue
+            if first is None or d < first:
+                first = d
+            if d > today:
+                future_count += 1
+                if future_latest is None or d > future_latest:
+                    future_latest = d
+                if d > far_cutoff:
+                    far_count += 1
+                    if far_latest is None or d > far_latest:
+                        far_latest = d
+            elif last is None or d > last:
+                last = d
+        return {
+            "first": first,
+            "last": last,
+            "future_count": future_count,
+            "future_latest": future_latest,
+            "far_future": (
+                (far_count, far_latest) if far_count else None
+            ),
+        }
+
     def _render_book_metadata(
         self,
         currency: str,
         first_date: date | None,
         last_date: date | None,
+        *,
+        future_count: int = 0,
+        future_latest: date | None = None,
     ) -> list[str]:
         """Render Book / Currency / Data range / Last entry header.
 
         ``Last entry`` carries a staleness signal —
         the answer to "let's reconcile" vs "let's enter 200
-        transactions first" pivots on it. Four cases keyed on
-        ``(today - last_date).days``:
+        transactions first" pivots on it. ``last_date`` is the
+        latest post_date on or before today (``_entry_dates``), so
+        the cases key on ``(today - last_date).days``:
 
-        - ``< 0``  → future-dated (normal for scheduled-txn ahead-of-
-          today posting). ``(future-dated, N days ahead)``.
         - ``= 0``  → today.
         - ``= 1``  → yesterday.
         - ``> 1``  → N days behind. ⚠ past ``_LAST_ENTRY_WARN_DAYS``.
+
+        Future-dated entries never stand in for the last entry;
+        they are appended as ``(N future-dated, latest YYYY-MM-DD)``
+        so a posted-ahead bill is visible without hiding the gap.
+        A book whose only entries are ahead of today reads ``none
+        on or before today``. ``Data range`` stays the true span,
+        future entries included.
         """
         lines = [
             # ``source.display_name`` rather than ``book_path``: a
@@ -2314,26 +2400,29 @@ class CoreMixin:
             f"Book: {self.source.display_name}",
             f"Currency: {currency}",
         ]
-        if first_date and last_date:
+        range_end = future_latest if future_latest else last_date
+        if first_date and range_end:
             lines.append(
                 f"Data range: {first_date.isoformat()} "
-                f"to {last_date.isoformat()}"
+                f"to {range_end.isoformat()}"
             )
+        future_note = (
+            f" ({future_count} future-dated, "
+            f"latest {future_latest.isoformat()})"
+            if future_count and future_latest else ""
+        )
         if last_date is not None:
             today = date.today()
             days_behind = (today - last_date).days
-            if days_behind < 0:
-                lines.append(
-                    f"Last entry: {last_date.isoformat()} "
-                    f"(future-dated, {-days_behind} days ahead)"
-                )
-            elif days_behind == 0:
+            if days_behind == 0:
                 lines.append(
                     f"Last entry: {last_date.isoformat()} (today)"
+                    f"{future_note}"
                 )
             elif days_behind == 1:
                 lines.append(
                     f"Last entry: {last_date.isoformat()} (yesterday)"
+                    f"{future_note}"
                 )
             else:
                 warn = (
@@ -2343,8 +2432,12 @@ class CoreMixin:
                 )
                 lines.append(
                     f"Last entry: {last_date.isoformat()} "
-                    f"({days_behind} days behind){warn}"
+                    f"({days_behind} days behind){warn}{future_note}"
                 )
+        elif future_count:
+            lines.append(
+                f"Last entry: none on or before today{future_note}"
+            )
         return lines
 
     @staticmethod
@@ -2695,16 +2788,9 @@ class CoreMixin:
                 if not self._is_template_transaction(t, template_guids)
             ]
             total_txns = len(transactions)
-            first_date: date | None = None
-            last_date: date | None = None
-            for txn in transactions:
-                d = txn.post_date
-                if d is None:  # old-book artifact
-                    continue
-                if first_date is None or d < first_date:
-                    first_date = d
-                if last_date is None or d > last_date:
-                    last_date = d
+            entry_dates = self._entry_dates(transactions, today)
+            first_date = entry_dates["first"]
+            last_date = entry_dates["last"]
 
             # Cross-mixin stats.
             all_sx = book.session.query(ScheduledTransaction).all()
@@ -2733,6 +2819,8 @@ class CoreMixin:
             lines.extend(
                 self._render_book_metadata(
                     currency, first_date, last_date,
+                    future_count=entry_dates["future_count"],
+                    future_latest=entry_dates["future_latest"],
                 )
             )
 
@@ -2753,6 +2841,7 @@ class CoreMixin:
                 overdue_scheduled=overdue_sched,
                 last_entry_days_behind=days_behind_for_warnings,
                 check_failures=check_failures,
+                far_future=entry_dates["far_future"],
             )
             if warnings:
                 lines.append("Warnings:")
