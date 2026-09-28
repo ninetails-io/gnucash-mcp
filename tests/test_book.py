@@ -3719,6 +3719,105 @@ class TestGetBookSummaryBalanceIntegrity:
         assert self._integrity_lines(GnuCashBook(str(path)).get_book_summary()) == []
 
 
+class TestLowCashScheduledOutflow:
+    """Spec B6. Low-cash fired only when the balance fell under one
+    day of the account's average outflow, so checking at 400 with
+    a 2,100 mortgage scheduled in 3 days stayed silent."""
+
+    @staticmethod
+    def _set_checking(gc, target):
+        delta = Decimal(target) - gc.get_balance("Assets:Checking")
+        gc.create_transaction(
+            description="adjust",
+            splits=[
+                {"account": "Assets:Checking", "amount": str(delta)},
+                {"account": "Income:Salary", "amount": str(-delta)},
+            ],
+            trans_date=date.today() - timedelta(days=2),
+            check_duplicates=False,
+        )
+
+    @staticmethod
+    def _low_cash_lines(result):
+        return [
+            ln.strip() for ln in result.splitlines()
+            if "Low cash" in ln or "Critically low cash" in ln
+        ]
+
+    def test_scheduled_bill_exceeding_balance_warns(self, scheduled_book):
+        gc = GnuCashBook(str(scheduled_book))
+        self._set_checking(gc, "400")
+        due = date.today() + timedelta(days=3)
+        gc.create_scheduled_transaction(
+            name="Mortgage", description="Mortgage",
+            splits=[
+                {"account": "Expenses:Rent", "amount": "2100"},
+                {"account": "Assets:Checking", "amount": "-2100"},
+            ],
+            start_date=due.isoformat(), frequency="monthly",
+        )
+        assert self._low_cash_lines(gc.get_book_summary()) == [
+            f"⚠ Low cash: Checking at USD 400.00, USD 2,100.00 scheduled "
+            f"out by {due.isoformat()}"
+        ]
+
+    def test_balance_covering_the_week_does_not_warn(self, scheduled_book):
+        gc = GnuCashBook(str(scheduled_book))
+        self._set_checking(gc, "2500")
+        gc.create_scheduled_transaction(
+            name="Mortgage", description="Mortgage",
+            splits=[
+                {"account": "Expenses:Rent", "amount": "2100"},
+                {"account": "Assets:Checking", "amount": "-2100"},
+            ],
+            start_date=(date.today() + timedelta(days=3)).isoformat(),
+            frequency="monthly",
+        )
+        assert self._low_cash_lines(gc.get_book_summary()) == []
+
+    def test_bill_beyond_the_week_does_not_count(self, scheduled_book):
+        gc = GnuCashBook(str(scheduled_book))
+        self._set_checking(gc, "400")
+        gc.create_scheduled_transaction(
+            name="Mortgage", description="Mortgage",
+            splits=[
+                {"account": "Expenses:Rent", "amount": "2100"},
+                {"account": "Assets:Checking", "amount": "-2100"},
+            ],
+            start_date=(date.today() + timedelta(days=10)).isoformat(),
+            frequency="monthly",
+        )
+        assert self._low_cash_lines(gc.get_book_summary()) == []
+
+    def test_new_account_pace_divides_by_its_own_age(self, test_book):
+        """A five-day-old wallet that spent 90 of its 100 has a pace
+        of 18/day, not 0.5/day over the 180-day window — its 10
+        left is under one day of outflow."""
+        gc = GnuCashBook(str(test_book))
+        gc.create_account(name="Wallet", account_type="CASH", parent="Assets")
+        gc.create_transaction(
+            description="fund",
+            splits=[
+                {"account": "Assets:Wallet", "amount": "100"},
+                {"account": "Assets:Checking", "amount": "-100"},
+            ],
+            trans_date=date.today() - timedelta(days=5), check_duplicates=False,
+        )
+        gc.create_transaction(
+            description="spend",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "90"},
+                {"account": "Assets:Wallet", "amount": "-90"},
+            ],
+            trans_date=date.today() - timedelta(days=1), check_duplicates=False,
+        )
+        lines = self._low_cash_lines(gc.get_book_summary())
+        assert lines == [
+            "⚠ Critically low cash: Wallet at USD 10.00 "
+            "(under 1 day of its own outflow)"
+        ], lines
+
+
 class TestGetBookSummaryOverdraft:
     """``Overdrawn: <leaf> at <CUR> -X`` — dashboard-accuracy spec
     A4. Low-cash skips balances at or below zero and runway flags

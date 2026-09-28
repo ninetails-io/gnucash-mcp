@@ -849,6 +849,10 @@ class CoreMixin:
     # actively concerned about cash position, not just tracking it.
     _RUNWAY_WARN_DAYS = 60
 
+    # Low-cash trigger 2 looks this far ahead at scheduled cash out
+    # (spec B6, ruled 2026-09-28) — a week of bills.
+    _LOW_CASH_SCHEDULE_DAYS = 7
+
     # Burn-rate averaging window. 180 days smooths billing cycles
     # and seasonality without diluting recent changes; the iteration
     # is gated to splits within the window.
@@ -1191,7 +1195,18 @@ class CoreMixin:
         low_cash: list[str] = []
         try:
             own_out = self._account_daily_outflows(book, transactions)
-            if own_out:
+            # Second trigger (spec B6): the balance is below the
+            # account's scheduled cash out over the next
+            # _LOW_CASH_SCHEDULE_DAYS days — checking at 400 with a
+            # 2,100 mortgage due in 3 days is low whatever its
+            # average pace says. Same recipes and cash-leg rule as
+            # the Scheduled line (``_upcoming_cash_legs``).
+            sched_fn = getattr(self, "_scheduled_cash_out_by_account", None)
+            scheduled_out = (
+                sched_fn(book, days=self._LOW_CASH_SCHEDULE_DAYS)
+                if sched_fn is not None else {}
+            )
+            if own_out or scheduled_out:
                 template_guids = self._template_account_guids(book)
                 rates = self._rates_as_of(
                     book, today, default_currency,
@@ -1227,17 +1242,32 @@ class CoreMixin:
                             continue
                         balance_default = balance_qty * rate
 
-                    # Own-commodity comparison: balance and pace are
-                    # in the same units, no rate needed.
-                    pace = own_out.get(account.guid, Decimal("0"))
-                    if pace <= 0 or balance_qty >= pace:
-                        continue
-
                     leaf = account.fullname.split(":")[-1]
                     # A warning that names an amount renders at the
                     # currency's quantum, never rounded to a whole
                     # unit (0.75 must not read as 0).
-                    amount_str = f"{balance_default.quantize(_commodity_quantum(default_currency)):,}"
+                    quantum = _commodity_quantum(default_currency)
+                    amount_str = f"{balance_default.quantize(quantum):,}"
+
+                    # Trigger 2: scheduled bills this week exceed
+                    # the balance (both in the book default).
+                    sched = scheduled_out.get(account.guid)
+                    if sched is not None and balance_default < sched[0]:
+                        low_cash_entries.append((
+                            balance_default,
+                            f"Low cash: {leaf} at "
+                            f"{default_currency.mnemonic} {amount_str}, "
+                            f"{default_currency.mnemonic} "
+                            f"{sched[0].quantize(quantum):,} scheduled "
+                            f"out by {sched[1].isoformat()}",
+                        ))
+                        continue
+
+                    # Trigger 1: own-commodity comparison — balance
+                    # and pace are in the same units, no rate needed.
+                    pace = own_out.get(account.guid, Decimal("0"))
+                    if pace <= 0 or balance_qty >= pace:
+                        continue
                     low_cash_entries.append((
                         balance_default,
                         f"Critically low cash: {leaf} at "
@@ -1970,9 +2000,19 @@ class CoreMixin:
         today = date.today()
         window_start = today - timedelta(days=days)
         out: dict[str, Decimal] = {}
+        # Each account's pace divides by ITS OWN age when that is
+        # shorter than the window (spec B6): a new account's outflow
+        # spread across 180 days made its warning nearly impossible
+        # to trigger.
+        first_split: dict[str, date] = {}
         for txn in transactions:
             if txn.post_date is None:  # old-book artifact
                 continue
+            for s in txn.splits:
+                if s.account.type in ("BANK", "CASH"):
+                    g = s.account.guid
+                    if g not in first_split or txn.post_date < first_split[g]:
+                        first_split[g] = txn.post_date
             if txn.post_date < window_start or txn.post_date > today:
                 continue
             net: dict[str, Decimal] = {}
@@ -1985,7 +2025,11 @@ class CoreMixin:
             for guid, amt in net.items():
                 if amt < 0:
                     out[guid] = out.get(guid, Decimal("0")) - amt
-        return {g: v / Decimal(days) for g, v in out.items()}
+        result: dict[str, Decimal] = {}
+        for g, v in out.items():
+            age = max(1, (today - first_split[g]).days)
+            result[g] = v / Decimal(min(days, age))
+        return result
 
     def _runway_metrics(
         self,

@@ -1042,36 +1042,26 @@ class SchedulingMixin:
                     "scheduled_transactions": page,
                 }
 
-    def _upcoming_within_days(
-        self, book, days: int = 7,
-    ) -> dict:
-        """Summary stats for scheduled transactions due within
-        ``days`` days: ``{"count": int, "cash_out": Decimal,
-        "cash_in": Decimal, "unrated": int, "legacy": int}``.
+    def _upcoming_cash_legs(self, book, days: int = 7) -> dict:
+        """One pass over the schedules due within ``days`` days —
+        the shared source for the Scheduled line
+        (``_upcoming_within_days``) and the low-cash scheduled-
+        outflow trigger (``_scheduled_cash_out_by_account``), so the
+        two can't drift (spec B6)::
 
-        Money is measured on each occurrence's CASH legs — splits
-        into BANK/CASH accounts outside a retirement subtree, the
-        same accounts the low-cash check reads — netted per
-        occurrence: negative lands in ``cash_out``, positive in
-        ``cash_in``. A signless sum of positive splits (the old
-        ``total``) added a paycheck's gross to the week's bills —
-        USD 6,777 "due" on a live book whose real outflow was
-        USD 1,931. Netting per occurrence also keeps a
-        checking→savings sweep out of both columns, and a paycheck
-        counts only what reaches checking, not the 401k/FSA/tax
-        legs. A schedule with no cash leg (a charge to a card)
-        still counts toward ``count`` but moves no cash this week.
+            {"count": int, "unrated": int, "legacy": int,
+             "occurrences": [{"due": date,
+                              "legs": [(account_guid, amount)]}]}
 
-        Amounts are in the BOOK DEFAULT currency: foreign-currency
-        templates convert at the latest market rate; templates
-        whose currency has no rate on file are counted but excluded
-        from the sums (``unrated`` reports how many, so the summary
-        line can say so instead of silently understating). Feeds
-        the get_book_summary Scheduled line; lives here so a book
-        class built without scheduling lacks the method and the
-        summary skips the line via ``hasattr``.
+        ``legs`` are each occurrence's CASH legs — splits into
+        BANK/CASH accounts outside a retirement subtree, the same
+        accounts the low-cash check reads — in the BOOK DEFAULT
+        currency: foreign-currency templates convert at the latest
+        market rate; templates whose currency has no rate on file
+        are counted but carry no legs (``unrated`` reports how
+        many). An overdue occurrence belongs to the dashboard's
+        overdue bucket (same ``_sx_next_due``), not here.
         """
-
         today = date.today()
         window_end = today + timedelta(days=days)
 
@@ -1079,10 +1069,9 @@ class SchedulingMixin:
         rates = self._rates_as_of(book, today, default_currency)
 
         count = 0
-        cash_out = Decimal("0")
-        cash_in = Decimal("0")
         unrated = 0
         legacy = 0
+        occurrences: list[dict] = []
         for sx in book.session.query(ScheduledTransaction).all():
             # Recipes still in the pre-native shape are invisible
             # to desktop until their first write migrates them.
@@ -1091,9 +1080,6 @@ class SchedulingMixin:
             if not sx.enabled:
                 continue
 
-            # An overdue occurrence belongs to the dashboard's
-            # overdue bucket (same _sx_next_due), not to "due in
-            # next N days" — counting it here too would double it.
             next_occ = self._sx_next_due(sx)
             if not next_occ or next_occ < today or next_occ > window_end:
                 continue
@@ -1101,9 +1087,7 @@ class SchedulingMixin:
             count += 1
             # splits-json amounts are denominated in the template's
             # currency (the ``currency`` slot; absent = book
-            # default). Foreign templates convert at the latest
-            # market rate; no rate on file → counted, excluded from
-            # the total, reported via ``unrated``.
+            # default).
             rate = Decimal("1")
             recipe = self._sx_recipe(book, sx)
             sx_cur = recipe["currency"]
@@ -1115,25 +1099,88 @@ class SchedulingMixin:
                 if rate is None:
                     unrated += 1
                     continue
-            net = Decimal("0")
+            legs = []
             for s in recipe["splits"]:
-                if self._sx_split_is_cash(book, s.get("account", "")):
-                    net += _to_decimal(s["amount"]) * rate
+                acct = self._sx_split_cash_account(
+                    book, s.get("account", ""),
+                )
+                if acct is not None:
+                    legs.append((acct.guid, _to_decimal(s["amount"]) * rate))
+            occurrences.append({"due": next_occ, "legs": legs})
+        return {
+            "count": count, "unrated": unrated, "legacy": legacy,
+            "occurrences": occurrences,
+        }
+
+    def _upcoming_within_days(
+        self, book, days: int = 7,
+    ) -> dict:
+        """Summary stats for scheduled transactions due within
+        ``days`` days: ``{"count": int, "cash_out": Decimal,
+        "cash_in": Decimal, "unrated": int, "legacy": int}``.
+
+        Money is measured on each occurrence's cash legs
+        (``_upcoming_cash_legs``), netted per occurrence: negative
+        lands in ``cash_out``, positive in ``cash_in``. A signless
+        sum of positive splits (the old ``total``) added a
+        paycheck's gross to the week's bills — USD 6,777 "due" on
+        a live book whose real outflow was USD 1,931. Netting per
+        occurrence also keeps a checking→savings sweep out of both
+        columns, and a paycheck counts only what reaches checking,
+        not the 401k/FSA/tax legs. A schedule with no cash leg (a
+        charge to a card) still counts toward ``count`` but moves
+        no cash this week. Feeds the get_book_summary Scheduled
+        line; lives here so a book class built without scheduling
+        lacks the method and the summary skips the line via
+        ``hasattr``.
+        """
+        legs = self._upcoming_cash_legs(book, days)
+        cash_out = Decimal("0")
+        cash_in = Decimal("0")
+        for occ in legs["occurrences"]:
+            net = sum((amt for _g, amt in occ["legs"]), Decimal("0"))
             if net < 0:
                 cash_out += -net
             else:
                 cash_in += net
         return {
-            "count": count, "cash_out": cash_out, "cash_in": cash_in,
-            "unrated": unrated, "legacy": legacy,
+            "count": legs["count"], "cash_out": cash_out, "cash_in": cash_in,
+            "unrated": legs["unrated"], "legacy": legs["legacy"],
         }
 
-    def _sx_split_is_cash(self, book, ref: str) -> bool:
-        """True when a recipe split's account is spendable cash:
+    def _scheduled_cash_out_by_account(
+        self, book, days: int = 7,
+    ) -> dict[str, tuple[Decimal, date]]:
+        """``{account_guid: (cash_out, latest_due)}`` — each cash
+        account's scheduled net outflow over the next ``days`` days,
+        in the book default, and the last date it lands. Per
+        occurrence an account's legs net (a sweep in and out of the
+        same account is nothing); a negative net is outflow. The
+        low-cash check's second trigger (spec B6): a balance below
+        the week's scheduled bills is low, however healthy the
+        account's average pace looks.
+        """
+        out: dict[str, tuple[Decimal, date]] = {}
+        for occ in self._upcoming_cash_legs(book, days)["occurrences"]:
+            net: dict[str, Decimal] = {}
+            for guid, amt in occ["legs"]:
+                net[guid] = net.get(guid, Decimal("0")) + amt
+            for guid, amt in net.items():
+                if amt >= 0:
+                    continue
+                prev = out.get(guid)
+                out[guid] = (
+                    (prev[0] if prev else Decimal("0")) - amt,
+                    max(prev[1], occ["due"]) if prev else occ["due"],
+                )
+        return out
+
+    def _sx_split_cash_account(self, book, ref: str):
+        """The recipe split's account when it is spendable cash:
         BANK/CASH, outside a retirement subtree — the low-cash
-        check's notion of cash. ``ref`` is a stored recipe account:
-        a full GUID, or a path on pre-GUID templates. A vanished
-        account is not cash.
+        check's notion of cash; else ``None``. ``ref`` is a stored
+        recipe account: a full GUID, or a path on pre-GUID
+        templates. A vanished account is not cash.
         """
         if len(ref) == 32 and _HEX_GUID_RE.fullmatch(ref):
             acct = book.session.query(
@@ -1142,8 +1189,15 @@ class SchedulingMixin:
         else:
             acct = self._find_account(book, ref)
         if acct is None or acct.type not in ("BANK", "CASH"):
-            return False
-        return not self._is_in_retirement_subtree(acct)
+            return None
+        if self._is_in_retirement_subtree(acct):
+            return None
+        return acct
+
+    def _sx_split_is_cash(self, book, ref: str) -> bool:
+        """True when a recipe split's account is spendable cash —
+        see ``_sx_split_cash_account``."""
+        return self._sx_split_cash_account(book, ref) is not None
 
     def get_upcoming_transactions(
         self,
