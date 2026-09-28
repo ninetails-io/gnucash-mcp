@@ -1476,9 +1476,14 @@ class CoreMixin:
         # — raw quantities from a foreign-currency budgeted account
         # would wildly miscalibrate used_pct, and a historical
         # period must value at its own rates, not today's.
+        # Actuals stop at today, like every other "now" surface on
+        # the dashboard: a bill pre-entered for later in the period
+        # is not yet "used" (spec A7). The pace comparison below is
+        # elapsed-to-today, so the two sides now cover the same days.
+        actuals_end = min(period_end, today)
         actuals = Decimal("0")
         for txn in transactions:
-            if txn.post_date < period_start or txn.post_date > period_end:
+            if txn.post_date < period_start or txn.post_date > actuals_end:
                 continue
             for s in txn.splits:
                 if s.account.guid not in rollup_guids:
@@ -1776,7 +1781,8 @@ class CoreMixin:
         the prior month's net over the SAME day window (day 1
         through today's day-of-month, clamped to the prior
         month's length) — a partial month next to full months
-        misleads without a like-for-like anchor.
+        misleads without a like-for-like anchor. The MTD bucket
+        itself stops at today for the same reason (spec A7).
 
         Each split converts to the book default at the most recent
         market rate — raw ``split.value`` sums mix currencies.
@@ -1816,7 +1822,11 @@ class CoreMixin:
 
         nets = [Decimal("0") for _ in month_starts]
         window_start = month_starts[0]
-        window_end = month_ends[-1]
+        # A "now" surface stops at today: the current month is a
+        # month-to-date figure, so a bill posted ahead to the 28th
+        # must not count on the 25th (it would also make the "vs
+        # prior month" same-day comparison unlike-for-like).
+        window_end = min(month_ends[-1], today)
         has_activity = False
 
         # Prior-month same-day-window accumulator for the MTD

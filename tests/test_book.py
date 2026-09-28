@@ -1357,6 +1357,31 @@ class TestGetBookSummaryMonthlyNet:
         oldest_label = self._months_ago(5).strftime("%b %Y")
         assert oldest_label in rows[5]
 
+    def test_mtd_stops_at_today(self, test_book: Path):
+        """Dashboard-accuracy spec A7: the MTD bucket summed through
+        month-end, so a bill posted ahead to the 28th already
+        counted on the 25th. A future-dated expense in the current
+        month must not move the MTD row."""
+        today = date.today()
+        tomorrow = today + timedelta(days=1)
+        if tomorrow.month != today.month:
+            pytest.skip("no future date left in the current month")
+        gc = GnuCashBook(str(test_book))
+        self._seed_income(gc, "1000", today)
+        before = gc.get_book_summary()
+        self._seed_expense(gc, "5000", tomorrow, "Posted ahead")
+        after = gc.get_book_summary()
+
+        def mtd_row(result: str) -> str:
+            section = result.split(
+                "Monthly net (income - expenses, last 6 months):\n", 1,
+            )[1]
+            return section.split("\n", 1)[0]
+
+        assert "(MTD)" in mtd_row(before)
+        assert "+1,000" in mtd_row(before)
+        assert mtd_row(after) == mtd_row(before)
+
     def test_current_month_marked_mtd(self, test_book: Path):
         """The current calendar month is partial — its row carries
         a (MTD) suffix on the label."""
@@ -2099,6 +2124,50 @@ class TestGetBookSummaryBudgetHeadline:
         )
         result = gc.get_book_summary()
         assert "Budget (Annual Test):" in result
+
+    def test_actuals_stop_at_today(self, budget_book: Path):
+        """Dashboard-accuracy spec A7: budget actuals summed through
+        the budget's end date, so a pre-entered bill already read
+        as "used". A future-dated expense inside the budget span
+        must not move the headline."""
+        today = date.today()
+        tomorrow = today + timedelta(days=1)
+        if tomorrow.year != today.year:
+            pytest.skip("no future date left in this year's budget")
+        gc = GnuCashBook(str(budget_book))
+        self._make_budget_covering_today(gc, "Ahead")
+        gc.set_budget_amount(
+            budget_name="Ahead", account="Expenses:Groceries",
+            amount="500",
+        )
+
+        def headline(result: str) -> str:
+            return next(
+                l for l in result.split("\n") if l.startswith("Budget (")
+            )
+
+        before = headline(gc.get_book_summary())
+        gc.create_transaction(
+            description="Pre-entered bill",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "4000"},
+                {"account": "Assets:Checking", "amount": "-4000"},
+            ],
+            trans_date=tomorrow,
+            check_duplicates=False,
+        )
+        assert headline(gc.get_book_summary()) == before
+        # The same entry dated today does count.
+        gc.create_transaction(
+            description="Bill today",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "4000"},
+                {"account": "Assets:Checking", "amount": "-4000"},
+            ],
+            trans_date=today,
+            check_duplicates=False,
+        )
+        assert headline(gc.get_book_summary()) != before
 
     def test_format_components(self, budget_book: Path):
         """Headline format: name, % used, % elapsed, variance,
