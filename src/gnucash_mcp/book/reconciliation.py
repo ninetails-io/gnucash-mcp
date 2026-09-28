@@ -138,7 +138,8 @@ class ReconciliationMixin:
         One row per reconcilable account with activity, bucketed by
         the same classification the dashboard uses (agree-by-
         construction): ``behind`` (most-behind first), ``never``,
-        ``current``, ``dormant`` ($0, fully reconciled, idle), and
+        ``current``, ``dormant`` ($0 and idle: fully reconciled, or never
+        reconciled with no activity in 180 days), and
         ``excluded`` (the account's ``no_reconcile`` slot — set via
         set_account_slot — opts it out of dashboard warnings;
         loans and escrow payables with no statement to reconcile).

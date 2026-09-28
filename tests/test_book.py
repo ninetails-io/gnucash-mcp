@@ -3446,6 +3446,120 @@ class TestDashboardOverdueAgreesWithOutstanding:
         assert len(past_due) == len(overdue_rows)
 
 
+class TestClosedAccountsGoQuiet:
+    """Spec B3. "Never reconciled ⚠" fired forever on a zero-balance
+    card paid off years ago, and nothing on the dashboard read
+    GnuCash's ``hidden`` flag — desktop's way of closing an
+    account."""
+
+    @staticmethod
+    def _card(gc, name, when, amount, hidden=False):
+        gc.create_account(name=name, account_type="CREDIT", parent="Liabilities")
+        gc.create_transaction(
+            description=f"{name} charge",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": amount},
+                {"account": f"Liabilities:{name}", "amount": f"-{amount}"},
+            ],
+            trans_date=when, check_duplicates=False,
+        )
+        gc.create_transaction(
+            description=f"{name} payoff",
+            splits=[
+                {"account": f"Liabilities:{name}", "amount": amount},
+                {"account": "Assets:Checking", "amount": f"-{amount}"},
+            ],
+            trans_date=when + timedelta(days=1), check_duplicates=False,
+        )
+        if hidden:
+            with gc.open(readonly=False) as book:
+                gc._find_account(book, f"Liabilities:{name}").hidden = 1
+                book.save()
+
+    @staticmethod
+    def _recon(result):
+        return result.split("Reconciliation:")[1].split("\nNet worth")[0]
+
+    def test_paid_off_card_never_reconciled_is_dormant(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        self._card(gc, "Old Card", date.today() - timedelta(days=400), "120")
+        recon = self._recon(gc.get_book_summary())
+        assert "1 account dormant ($0, idle)" in recon, recon
+        status = gc.get_reconciliation_status()
+        assert "Liabilities:Old Card\tdormant\t" in status
+
+    def test_recently_active_zero_card_is_still_never_reconciled(
+        self, test_book: Path,
+    ):
+        gc = GnuCashBook(str(test_book))
+        self._card(gc, "Live Card", date.today() - timedelta(days=30), "120")
+        recon = self._recon(gc.get_book_summary())
+        assert "dormant" not in recon
+        assert "Liabilities:Live Card\tnever\t" in gc.get_reconciliation_status()
+
+    def test_hidden_zero_balance_account_is_excluded(self, tmp_path: Path):
+        """Hidden with nothing in it: out of reconciliation and out
+        of the stale-price check (a EUR card closed years ago no
+        longer keeps EUR in use)."""
+        path = tmp_path / "closed.gnucash"
+        book = piecash.create_book(str(path), currency="USD", overwrite=True)
+        root = book.root_account
+        usd = book.default_currency
+        eur = factories.create_currency_from_ISO("EUR")
+        book.session.add(eur)
+        liab = piecash.Account(
+            name="Liabilities", type="LIABILITY", parent=root,
+            commodity=usd, placeholder=True,
+        )
+        card = piecash.Account(
+            name="EUR Card", type="CREDIT", parent=liab, commodity=eur,
+            hidden=1,
+        )
+        equity = piecash.Account(
+            name="Opening", type="EQUITY", parent=root, commodity=eur,
+        )
+        long_ago = date.today() - timedelta(days=900)
+        for amt in ("-100", "100"):
+            book.session.add(piecash.Transaction(
+                currency=eur, description="x", post_date=long_ago,
+                splits=[
+                    piecash.Split(account=card, value=Decimal(amt),
+                                  quantity=Decimal(amt)),
+                    piecash.Split(account=equity, value=-Decimal(amt),
+                                  quantity=-Decimal(amt)),
+                ],
+            ))
+        book.session.add(piecash.Price(
+            commodity=eur, currency=usd, date=long_ago, value=Decimal("1.1"),
+        ))
+        book.save()
+        book.close()
+        result = GnuCashBook(str(path)).get_book_summary()
+        assert "Stale price" not in result, result
+        assert "never reconciled" not in result
+        status = GnuCashBook(str(path)).get_reconciliation_status()
+        assert "excluded (hidden, zero balance)" in status
+
+    def test_hidden_account_with_a_balance_stays_visible(self, test_book: Path):
+        """Money sitting in a closed account is itself a finding."""
+        gc = GnuCashBook(str(test_book))
+        gc.create_account(name="Hidden Card", account_type="CREDIT", parent="Liabilities")
+        gc.create_transaction(
+            description="charge",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "40"},
+                {"account": "Liabilities:Hidden Card", "amount": "-40"},
+            ],
+            trans_date=date.today() - timedelta(days=400), check_duplicates=False,
+        )
+        with gc.open(readonly=False) as book:
+            gc._find_account(book, "Liabilities:Hidden Card").hidden = 1
+            book.save()
+        recon = self._recon(gc.get_book_summary())
+        assert "never reconciled ⚠" in recon
+        assert "Liabilities:Hidden Card\tnever\t" in gc.get_reconciliation_status()
+
+
 class TestGetBookSummaryBalanceIntegrity:
     """``N unbalanced transactions (oldest …) — get_transaction to
     inspect`` — dashboard-accuracy spec A8. Integrity checks looked
@@ -14056,7 +14170,7 @@ class TestReconciliationDormancy:
         gc = GnuCashBook(str(test_book))
         self._card_with_history(gc, "Old Apple Card", pay_off=True)
         summary = gc.get_book_summary()
-        assert "1 account dormant ($0, fully reconciled)" in summary
+        assert "1 account dormant ($0, idle)" in summary
         assert "Old Apple Card" not in summary.split("Reconciliation:")[1]
 
     def test_carried_balance_stays_warned(self, test_book: Path):

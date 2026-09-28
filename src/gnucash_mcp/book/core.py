@@ -221,6 +221,11 @@ class CoreMixin:
     # than the last reconcile date (spec B2, ruled 2026-09-28).
     _RECONCILE_OUTSTANDING_NOTE_DAYS = 90
 
+    # A never-reconciled account with a zero balance and no activity
+    # this long is dormant — a card paid off years ago — not a
+    # standing ⚠ (spec B3, ruled 2026-09-28).
+    _RECONCILE_DORMANT_DAYS = 180
+
     # "Last transaction" staleness threshold for the book-summary
     # warning. Beyond this many days since the most recent
     # transaction post_date, the dashboard's "Last entry" line
@@ -513,6 +518,22 @@ class CoreMixin:
                     "excluded": True,
                 })
                 continue
+            # Desktop's way of closing an account is the ``hidden``
+            # flag. Hidden with a zero balance is closed: out of the
+            # dashboard, listed here as excluded. Hidden with money
+            # still in it stays visible — that is itself a finding
+            # (spec B3).
+            if account.hidden and self._own_splits_balance(
+                account, as_of=today,
+            ) == 0:
+                results.append({
+                    "account": account.fullname,
+                    "status": "excluded (hidden, zero balance)",
+                    "days_behind": None,
+                    "unreconciled_count": 0,
+                    "excluded": True,
+                })
+                continue
 
             # Single pass over splits derives latest_y_date, has_yc
             # (the ASSET gate), any_splits, unreconciled_count, and
@@ -525,6 +546,7 @@ class CoreMixin:
             has_yc = False
             any_splits = False
             balance = Decimal("0")
+            last_activity_date = None
             pending: list = []
             for s in account.splits:
                 # Voided splits are zombies, not reconcilable
@@ -534,6 +556,11 @@ class CoreMixin:
                     continue
                 any_splits = True
                 balance += s.quantity
+                pd = s.transaction.post_date
+                if pd is not None and pd <= today and (
+                    last_activity_date is None or pd > last_activity_date
+                ):
+                    last_activity_date = pd
                 rstate = s.reconcile_state
                 if rstate in ("y", "c"):
                     has_yc = True
@@ -614,6 +641,11 @@ class CoreMixin:
                     "status": "never reconciled",
                     "days_behind": None,
                     "unreconciled_count": unreconciled_count,
+                    "balance_zero": balance == 0,
+                    "days_idle": (
+                        (today - last_activity_date).days
+                        if last_activity_date is not None else None
+                    ),
                 })
             else:
                 # Lag anchors to the OLDEST backlog split (dated
@@ -1322,11 +1354,13 @@ class CoreMixin:
                 c = a.commodity
                 if c is None or c.guid == default_currency.guid:
                     continue
+                balance = self._own_splits_balance(a, as_of=today)
+                # A hidden, zero-balance account is closed (spec
+                # B3): it doesn't put its commodity in use.
+                if a.hidden and balance == 0:
+                    continue
                 in_use[c.guid] = c
-                if (
-                    c.guid not in held
-                    and self._own_splits_balance(a, as_of=today) != 0
-                ):
+                if c.guid not in held and balance != 0:
                     held.add(c.guid)
             recent_currencies: set = set()
             activity_start = today - timedelta(
@@ -2157,17 +2191,26 @@ class CoreMixin:
         get_reconciliation_status, so the aggregate counts and the
         drill-down table agree by construction.
 
-        Buckets: ``excluded`` (no_reconcile opt-out), ``never``,
-        ``behind`` (stale with pending work OR a carried balance —
-        months of silence on a carried balance means missing
-        entries, since interest posts monthly), ``dormant`` (stale
-        but $0 and fully reconciled: nothing owed, nothing a
-        statement could reveal — the bookkeeper's stamped-dormant-
-        cards finding), ``current``.
+        Buckets: ``excluded`` (no_reconcile opt-out, or hidden with
+        a zero balance), ``never``, ``behind`` (stale with pending
+        work OR a carried balance — months of silence on a carried
+        balance means missing entries, since interest posts
+        monthly), ``dormant`` (stale but $0 and fully reconciled:
+        nothing owed, nothing a statement could reveal — the
+        bookkeeper's stamped-dormant-cards finding; or never
+        reconciled, $0, and idle past ``_RECONCILE_DORMANT_DAYS`` —
+        a card paid off years ago, spec B3), ``current``.
         """
         if entry.get("excluded"):
             return "excluded"
         if entry["status"] == "never reconciled":
+            idle = entry.get("days_idle")
+            if (
+                entry.get("balance_zero")
+                and idle is not None
+                and idle > self._RECONCILE_DORMANT_DAYS
+            ):
+                return "dormant"
             return "never"
         if entry["days_behind"] > self._RECONCILE_WARN_DAYS:
             if (
@@ -2273,7 +2316,7 @@ class CoreMixin:
             plural = "s" if dormant_count != 1 else ""
             out.append(
                 f"  {dormant_count} account{plural} dormant "
-                f"($0, fully reconciled)"
+                f"($0, idle)"
             )
         if never_count:
             plural = "s" if never_count != 1 else ""
