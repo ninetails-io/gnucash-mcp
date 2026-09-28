@@ -214,6 +214,13 @@ class CoreMixin:
     # ~2-week grace period.
     _RECONCILE_WARN_DAYS = 45
 
+    # Unreconciled splits dated BEFORE an account's last reconcile
+    # are outstanding items (a cheque that never cleared), not
+    # backlog: they don't make the account "behind". They earn a
+    # note — no stronger — once the oldest is this many days older
+    # than the last reconcile date (spec B2, ruled 2026-09-28).
+    _RECONCILE_OUTSTANDING_NOTE_DAYS = 90
+
     # "Last transaction" staleness threshold for the book-summary
     # warning. Beyond this many days since the most recent
     # transaction post_date, the dashboard's "Last entry" line
@@ -517,10 +524,8 @@ class CoreMixin:
             latest_y_date = None
             has_yc = False
             any_splits = False
-            unreconciled_count = 0
-            unreconciled_value = Decimal("0")
-            oldest_unreconciled_date = None
             balance = Decimal("0")
+            pending: list = []
             for s in account.splits:
                 # Voided splits are zombies, not reconcilable
                 # activity — they must not make an account
@@ -539,17 +544,60 @@ class CoreMixin:
                     ):
                         latest_y_date = pd
                 if _is_unreconciled(s):
-                    unreconciled_count += 1
-                    unreconciled_value += s.quantity
-                    pd = s.transaction.post_date
-                    # Null post_date (an old-book artifact) still
-                    # counts as backlog; it just can't anchor the
-                    # oldest-date lag display.
-                    if pd is not None and (
-                        oldest_unreconciled_date is None
-                        or pd < oldest_unreconciled_date
+                    pending.append(s)
+
+            # Two kinds of pending work (spec B2). Splits dated
+            # AFTER the last reconcile are backlog: they anchor
+            # "behind". Splits dated on or before it are
+            # OUTSTANDING ITEMS — a cheque that never cleared —
+            # which used to make a monthly-reconciled account read
+            # "6 years behind"; they get a note instead. With no
+            # reconcile on record everything is backlog. A null
+            # post_date (an old-book artifact) still counts as
+            # backlog; it just can't anchor a date.
+            unreconciled_count = 0
+            unreconciled_value = Decimal("0")
+            oldest_unreconciled_date = None
+            outstanding_count = 0
+            outstanding_value = Decimal("0")
+            outstanding_oldest_date = None
+            for s in pending:
+                pd = s.transaction.post_date
+                if (
+                    latest_y_date is not None
+                    and pd is not None
+                    and pd <= latest_y_date
+                ):
+                    outstanding_count += 1
+                    outstanding_value += s.quantity
+                    if (
+                        outstanding_oldest_date is None
+                        or pd < outstanding_oldest_date
                     ):
-                        oldest_unreconciled_date = pd
+                        outstanding_oldest_date = pd
+                    continue
+                unreconciled_count += 1
+                unreconciled_value += s.quantity
+                if pd is not None and (
+                    oldest_unreconciled_date is None
+                    or pd < oldest_unreconciled_date
+                ):
+                    oldest_unreconciled_date = pd
+            outstanding: dict = {}
+            if outstanding_count:
+                outstanding = {
+                    "outstanding_count": outstanding_count,
+                    "outstanding_value": str(outstanding_value),
+                    "outstanding_oldest_date":
+                        outstanding_oldest_date.isoformat(),
+                    "commodity": account.commodity.mnemonic,
+                    # The "worth a look" signal: an item older than
+                    # the reconcile by more than the grace window.
+                    "outstanding_note": (
+                        (latest_y_date - outstanding_oldest_date).days
+                        > self._RECONCILE_OUTSTANDING_NOTE_DAYS
+                    ),
+                }
 
             # ASSET passes only with reconcilable history (see
             # docstring).
@@ -568,11 +616,12 @@ class CoreMixin:
                     "unreconciled_count": unreconciled_count,
                 })
             else:
-                # Lag anchors to the OLDEST unreconciled split when
-                # there's pending work — the honest scope-of-work
-                # signal ("6 years behind", not "4 months since the
-                # last reconcile"). Fully-caught-up accounts fall
-                # back to latest_y_date staleness.
+                # Lag anchors to the OLDEST backlog split (dated
+                # after the last reconcile) when there is backlog —
+                # the honest scope-of-work signal ("6 months
+                # behind", not "4 months since the last reconcile").
+                # Caught-up accounts fall back to latest_y_date
+                # staleness. Outstanding items never move the lag.
                 if unreconciled_count > 0 \
                         and oldest_unreconciled_date is not None:
                     days_behind = (today - oldest_unreconciled_date).days
@@ -586,6 +635,7 @@ class CoreMixin:
                         "latest_y_date": latest_y_date.isoformat(),
                         "oldest_unreconciled_date":
                             oldest_unreconciled_date.isoformat(),
+                        **outstanding,
                     })
                 else:
                     days_behind = (today - latest_y_date).days
@@ -596,6 +646,7 @@ class CoreMixin:
                         "days_behind": days_behind,
                         "unreconciled_count": unreconciled_count,
                         "latest_y_date": latest_y_date.isoformat(),
+                        **outstanding,
                     })
 
         results.sort(key=lambda r: r["account"])
@@ -2197,6 +2248,24 @@ class CoreMixin:
                 out.append(
                     f"  {leaf}: {entry['status']} {lag} ⚠"
                 )
+        # Outstanding items (spec B2): unreconciled splits older
+        # than the last reconcile, once the oldest is past the
+        # grace window. A note, never a ⚠ — the account isn't
+        # behind; a cheque that never cleared is worth a look.
+        for entry in reconciliation:
+            if not entry.get("outstanding_note"):
+                continue
+            if self._classify_reconciliation(entry) == "excluded":
+                continue
+            leaf = entry["account"].split(":")[-1]
+            n = entry["outstanding_count"]
+            amt = Decimal(entry["outstanding_value"])
+            out.append(
+                f"  {leaf}: {n} outstanding item{'s' if n != 1 else ''} "
+                f"older than last reconcile (oldest "
+                f"{entry['outstanding_oldest_date']}, "
+                f"{entry['commodity']} {_format_number(abs(amt))} net)"
+            )
         if current_count:
             plural = "s" if current_count != 1 else ""
             out.append(f"  {current_count} account{plural} current")

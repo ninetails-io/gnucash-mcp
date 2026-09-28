@@ -4045,89 +4045,114 @@ class TestGetBookSummaryReconciliationSplitCount:
         assert "⚠" in recon_line
 
 
-class TestReconciliationLagFromOldestUnreconciled:
-    """The lag rendered for an account with pending reconciliation
-    work must reflect the OLDEST unreconciled split, not the
-    LATEST reconciled split. The bookkeeper plans against the
-    scope of work — "4 months behind" implies one sitting; "6
-    years behind" implies six years of statements. Misreporting
-    the lag costs a day of mismatched expectations.
+class TestReconciliationBehindVsOutstanding:
+    """Spec B2: "behind" is measured from the oldest unreconciled
+    split AFTER the last reconcile. Unreconciled splits dated
+    before it are outstanding items — a cheque that never cleared
+    — which get a note, no stronger, once the oldest is more than
+    90 days older than the last reconcile. Pre-B2 the lag anchored
+    to the oldest unreconciled split of any date, so one stale
+    cheque made a monthly-reconciled account read "6 years
+    behind ⚠".
     """
 
-    def test_lag_reflects_oldest_unreconciled_not_latest_y(
+    @staticmethod
+    def _add(gc, when, amount, description):
+        with gc.open(readonly=False) as book:
+            checking = gc._find_account(book, "Assets:Checking")
+            opening = gc._find_account(book, "Equity:Opening Balance")
+            book.session.add(piecash.Transaction(
+                currency=book.default_currency,
+                description=description, post_date=when,
+                splits=[
+                    piecash.Split(account=checking, value=Decimal(amount)),
+                    piecash.Split(account=opening, value=-Decimal(amount)),
+                ],
+            ))
+            book.save()
+
+    @staticmethod
+    def _reconcile_all_through(gc, through):
+        from datetime import datetime as _dt
+        with gc.open(readonly=False) as book:
+            checking = gc._find_account(book, "Assets:Checking")
+            for s in checking.splits:
+                if s.transaction.post_date <= through:
+                    s.reconcile_state = "y"
+                    s.reconcile_date = _dt.combine(through, _dt.min.time())
+            book.save()
+
+    def test_one_stale_cheque_is_a_note_not_years_behind(
         self, test_book: Path,
     ):
-        """Reconcile a RECENT split; leave an OLD split unreconciled.
-        The dashboard lag should describe the old gap, not the
-        recent reconciliation date.
-        """
-        from datetime import date as _date, timedelta, datetime as _dt
         gc = GnuCashBook(str(test_book))
-
-        # Add an OLD unreconciled split (5 years ago).
-        old_date = _date.today() - timedelta(days=5 * 365)
+        old_date = date.today() - timedelta(days=5 * 365)
+        recent = date.today() - timedelta(days=10)
+        self._add(gc, old_date, "100", "Cheque that never cleared")
+        self._add(gc, recent, "50", "Recent deposit")
+        self._reconcile_all_through(gc, recent)
+        # Un-reconcile just the old cheque.
         with gc.open(readonly=False) as book:
             checking = gc._find_account(book, "Assets:Checking")
-            opening = gc._find_account(book, "Equity:Opening Balance")
-            book.session.add(piecash.Transaction(
-                currency=book.default_currency,
-                description="Old skipped deposit",
-                post_date=old_date,
-                splits=[
-                    piecash.Split(account=checking, value=Decimal("100")),
-                    piecash.Split(account=opening, value=Decimal("-100")),
-                ],
-            ))
-            book.save()
-
-        # Reconcile a RECENT split (10 days ago) on Checking.
-        recent_date = _date.today() - timedelta(days=10)
-        with gc.open(readonly=False) as book:
-            checking = gc._find_account(book, "Assets:Checking")
-            opening = gc._find_account(book, "Equity:Opening Balance")
-            book.session.add(piecash.Transaction(
-                currency=book.default_currency,
-                description="Recent reconciled deposit",
-                post_date=recent_date,
-                splits=[
-                    piecash.Split(account=checking, value=Decimal("50")),
-                    piecash.Split(account=opening, value=Decimal("-50")),
-                ],
-            ))
-            book.save()
             for s in checking.splits:
-                if s.transaction.post_date == recent_date:
-                    s.reconcile_state = "y"
-                    s.reconcile_date = _dt.combine(
-                        recent_date, _dt.min.time(),
-                    )
+                if s.transaction.post_date == old_date:
+                    s.reconcile_state = "n"
             book.save()
 
         result = gc.get_book_summary()
-        recon_line = next(
-            l for l in result.splitlines()
-            if "Checking" in l and "oldest:" in l
-        )
-        # Lag must NOT be "10 days behind" / "1 week behind" — that
-        # would describe the gap to ``latest_y_date``, not the real
-        # scope of work.
-        assert "10 days behind" not in recon_line, (
-            f"lag computed from latest_y_date instead of oldest "
-            f"unreconciled: {recon_line!r}"
-        )
-        # It should land in the "years" branch — 5 years ago.
+        recon = result.split("Reconciliation:")[1].split("\nNet worth")[0]
+        # Current, not behind — no per-account ⚠ line.
+        assert "1 account current" in recon, recon
+        assert "behind" not in recon
+        assert "⚠" not in recon
+        # The cheque is an outstanding item, with its date and amount.
         assert (
-            "5 years behind" in recon_line
-            or "4 years behind" in recon_line
-        ), (
-            f"expected years-scale lag from oldest unreconciled; "
-            f"got: {recon_line!r}"
-        )
-        # And the oldest date itself appears in the line.
-        assert old_date.isoformat() in recon_line, (
-            f"oldest date {old_date} not surfaced in line: "
-            f"{recon_line!r}"
-        )
+            f"  Checking: 1 outstanding item older than last reconcile "
+            f"(oldest {old_date.isoformat()}, USD 100.00 net)"
+        ) in recon, recon
+
+        # The drill-down makes the same split.
+        status = gc.get_reconciliation_status()
+        line = next(ln for ln in status.splitlines() if "Assets:Checking" in ln)
+        assert "\tcurrent\t" in line
+        assert f"1 outstanding older than last reconcile (oldest: {old_date.isoformat()})" in line
+        assert "unreconciled" not in line
+
+    def test_recent_outstanding_item_gets_no_note(self, test_book: Path):
+        """An item less than 90 days older than the last reconcile
+        is ordinary float, not a signal."""
+        gc = GnuCashBook(str(test_book))
+        recent = date.today() - timedelta(days=10)
+        float_date = recent - timedelta(days=30)
+        self._add(gc, float_date, "100", "In transit")
+        self._add(gc, recent, "50", "Recent deposit")
+        self._reconcile_all_through(gc, recent)
+        with gc.open(readonly=False) as book:
+            checking = gc._find_account(book, "Assets:Checking")
+            for s in checking.splits:
+                if s.transaction.post_date == float_date:
+                    s.reconcile_state = "n"
+            book.save()
+        recon = gc.get_book_summary().split("Reconciliation:")[1].split("\nNet worth")[0]
+        assert "outstanding" not in recon
+        assert "1 account current" in recon
+
+    def test_backlog_after_last_reconcile_still_reads_behind(
+        self, test_book: Path,
+    ):
+        """Splits dated after the last reconcile are backlog and
+        anchor the lag as before."""
+        gc = GnuCashBook(str(test_book))
+        old = date.today() - timedelta(days=200)
+        self._add(gc, old, "100", "Reconciled long ago")
+        self._reconcile_all_through(gc, old)
+        backlog = date.today() - timedelta(days=120)
+        self._add(gc, backlog, "50", "Never reconciled since")
+        recon = gc.get_book_summary().split("Reconciliation:")[1].split("\nNet worth")[0]
+        line = next(ln for ln in recon.splitlines() if "Checking" in ln)
+        assert "4 months behind" in line and f"oldest: {backlog.isoformat()}" in line
+        assert "⚠" in line
+        assert "outstanding" not in recon
 
 
 class TestGetBookSummaryBusinessSignals:

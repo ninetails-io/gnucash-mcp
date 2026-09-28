@@ -181,6 +181,15 @@ class ReconciliationMixin:
                                 f"{r['oldest_unreconciled_date']})"
                             )
                         cells.append(cell)
+                    # Same split the dashboard makes (spec B2):
+                    # items older than the last reconcile are not
+                    # backlog and never make the account behind.
+                    m = r.get("outstanding_count")
+                    if m:
+                        cells.append(
+                            f"{m} outstanding older than last reconcile "
+                            f"(oldest: {r['outstanding_oldest_date']})"
+                        )
                     lines.append("\t".join(cells))
                 return "\n".join(lines)
             return {
