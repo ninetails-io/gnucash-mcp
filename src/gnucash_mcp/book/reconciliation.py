@@ -503,6 +503,11 @@ class ReconciliationMixin:
                 split.reconcile_state = "y"
                 split.reconcile_date = reconcile_datetime
 
+            # What desktop's reconcile window records on Finish:
+            # the statement cycle the dashboard's threshold reads
+            # (spec B4).
+            self._write_reconcile_info(book, account, statement_date)
+
             book.save()
 
             # Computed info only — the audit log reads the statement

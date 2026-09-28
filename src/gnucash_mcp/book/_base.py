@@ -2372,6 +2372,222 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
                     out["book_scrubbed"] = True
         return out
 
+    # ── Desktop's reconcile-info frame ─────────────────────────────
+    # Key names verbatim from libgnucash/engine/Account.cpp (stable,
+    # read 2026-09-28): KEY_RECONCILE_INFO("reconcile-info");
+    # xaccAccountSetReconcileLastDate → {"reconcile-info","last-date"}
+    # (int64 time64); xaccAccountSetReconcileLastInterval →
+    # {"reconcile-info","last-interval","months"} and {...,"days"}
+    # (int64). Pinned by tests/test_reconcile_info.py. The SQL
+    # backend stores a frame as a FRAME slot on the owner whose
+    # guid_val names the frame, and each child on that frame guid
+    # under its full path name — the shape the desktop-gated
+    # sched-xaction and gncInvoice frames already follow.
+    _RECONCILE_INFO_FRAME = "reconcile-info"
+    _RECONCILE_LAST_DATE = "last-date"
+    _RECONCILE_LAST_INTERVAL = "last-interval"
+    _RECONCILE_INTERVAL_MONTHS = "months"
+    _RECONCILE_INTERVAL_DAYS = "days"
+
+    @staticmethod
+    def _reconcile_interval(
+        prev_statement_date: date, statement_date: date,
+        prev_interval: "tuple[int, int] | None",
+    ) -> "tuple[int, int] | None":
+        """``gnc_save_reconcile_interval`` (gnucash/gnome/
+        window-reconcile.cpp), ported verbatim: the ``(months,
+        days)`` desktop remembers after a reconcile, or ``None``
+        when it would remember nothing.
+
+        days = whole days between the two statement dates. Exactly
+        28 is ambiguous (four weeks or one month) and keeps the
+        previous answer's shape: months if the last interval was
+        one month (the default when none is stored), else 28 days.
+        More than 28 is counted in calendar months, days 0. A
+        negative result is not remembered.
+        """
+        days = (statement_date - prev_statement_date).days
+        months = 0
+        if days == 28:
+            prev_months = 1 if prev_interval is None else prev_interval[0]
+            if prev_months == 1:
+                months, days = 1, 0
+        elif days > 28:
+            months = (
+                (12 * statement_date.year + statement_date.month)
+                - (12 * prev_statement_date.year + prev_statement_date.month)
+            )
+            days = 0
+        if months >= 0 and days >= 0:
+            return months, days
+        return None
+
+    @staticmethod
+    def _read_reconcile_info_all(book) -> dict:
+        """``{account_guid: {"last_date": date | None, "months": int
+        | None, "days": int | None}}`` for every account carrying a
+        ``reconcile-info`` frame — three portable queries for the
+        whole book, never one per account. ``last-date`` is a
+        time64; it reads back as the local calendar day."""
+        from sqlalchemy import text
+
+        frames = {
+            r[1]: r[0] for r in book.session.execute(
+                text(
+                    "SELECT obj_guid, guid_val FROM slots "
+                    "WHERE name = :f AND slot_type = 9 "
+                    "AND guid_val IS NOT NULL"
+                ),
+                {"f": BaseGnuCashBook._RECONCILE_INFO_FRAME},
+            ).fetchall()
+        }
+        if not frames:
+            return {}
+        out = {
+            acct: {"last_date": None, "months": None, "days": None}
+            for acct in frames.values()
+        }
+        f = BaseGnuCashBook._RECONCILE_INFO_FRAME
+        for r in book.session.execute(
+            text(
+                "SELECT obj_guid, int64_val FROM slots "
+                "WHERE name = :n AND int64_val IS NOT NULL"
+            ),
+            {"n": f"{f}/{BaseGnuCashBook._RECONCILE_LAST_DATE}"},
+        ).fetchall():
+            acct = frames.get(r[0])
+            if acct is not None:
+                out[acct]["last_date"] = datetime.fromtimestamp(
+                    int(r[1])
+                ).date()
+        sub = f"{f}/{BaseGnuCashBook._RECONCILE_LAST_INTERVAL}"
+        subframes = {
+            r[1]: frames[r[0]] for r in book.session.execute(
+                text(
+                    "SELECT obj_guid, guid_val FROM slots "
+                    "WHERE name = :n AND slot_type = 9 "
+                    "AND guid_val IS NOT NULL"
+                ),
+                {"n": sub},
+            ).fetchall()
+            if r[0] in frames
+        }
+        if subframes:
+            for r in book.session.execute(
+                text(
+                    "SELECT obj_guid, name, int64_val FROM slots "
+                    "WHERE name IN (:m, :d) AND int64_val IS NOT NULL"
+                ),
+                {
+                    "m": f"{sub}/{BaseGnuCashBook._RECONCILE_INTERVAL_MONTHS}",
+                    "d": f"{sub}/{BaseGnuCashBook._RECONCILE_INTERVAL_DAYS}",
+                },
+            ).fetchall():
+                acct = subframes.get(r[0])
+                if acct is None:
+                    continue
+                key = "months" if r[1].endswith("/months") else "days"
+                out[acct][key] = int(r[2])
+        return out
+
+    def _write_reconcile_info(self, book, account, statement_date: date) -> None:
+        """Record a reconcile the way desktop's window does on
+        Finish: remember the interval since the previous statement
+        (``_reconcile_interval``; nothing when there was no previous
+        date), then set ``last-date`` to the statement date. Rows
+        take desktop's frame shape and are updated in place when the
+        frame already exists, so a book reconciled from both sides
+        keeps one frame. Every raw write is verified."""
+        import uuid
+
+        from piecash.kvp import KVP_Type, Slot
+        from sqlalchemy import text
+
+        info = self._read_reconcile_info_all(book).get(account.guid)
+        prev_date = info["last_date"] if info else None
+        prev_interval = (
+            (info["months"], info["days"])
+            if info and info["months"] is not None and info["days"] is not None
+            else None
+        )
+        label = f"reconcile-info for {account.fullname}"
+
+        def frame_guid(owner: str, name: str) -> str:
+            row = book.session.execute(
+                text(
+                    "SELECT guid_val FROM slots WHERE obj_guid = :o "
+                    "AND name = :n AND slot_type = 9"
+                ),
+                {"o": owner, "n": name},
+            ).first()
+            if row and row[0]:
+                return row[0]
+            guid = uuid.uuid4().hex
+            book.session.execute(
+                Slot.__table__.insert().values(
+                    obj_guid=owner, name=name,
+                    slot_type=KVP_Type.KVP_TYPE_FRAME, guid_val=guid,
+                )
+            )
+            _verify_composite_write(
+                book.session, Slot.__table__,
+                {"obj_guid": owner, "name": name}, label,
+            )
+            return guid
+
+        def put_int64(owner: str, name: str, value: int) -> None:
+            exists = book.session.execute(
+                text(
+                    "SELECT 1 FROM slots WHERE obj_guid = :o AND name = :n"
+                ),
+                {"o": owner, "n": name},
+            ).first()
+            if exists:
+                book.session.execute(
+                    Slot.__table__.update()
+                    .where(
+                        (Slot.__table__.c.obj_guid == owner)
+                        & (Slot.__table__.c.name == name)
+                    )
+                    .values(slot_type=KVP_Type.KVP_TYPE_GINT64, int64_val=value)
+                )
+            else:
+                book.session.execute(
+                    Slot.__table__.insert().values(
+                        obj_guid=owner, name=name,
+                        slot_type=KVP_Type.KVP_TYPE_GINT64, int64_val=value,
+                    )
+                )
+            _verify_composite_write(
+                book.session, Slot.__table__,
+                {"obj_guid": owner, "name": name, "int64_val": value}, label,
+            )
+
+        f = self._RECONCILE_INFO_FRAME
+        frame = frame_guid(account.guid, f)
+        if prev_date is not None:
+            interval = self._reconcile_interval(
+                prev_date, statement_date, prev_interval,
+            )
+            if interval is not None:
+                sub = f"{f}/{self._RECONCILE_LAST_INTERVAL}"
+                subframe = frame_guid(frame, sub)
+                put_int64(
+                    subframe, f"{sub}/{self._RECONCILE_INTERVAL_MONTHS}",
+                    interval[0],
+                )
+                put_int64(
+                    subframe, f"{sub}/{self._RECONCILE_INTERVAL_DAYS}",
+                    interval[1],
+                )
+        # Desktop stores the statement date as a day-end time64
+        # (gnc_time64_get_day_end_gdate); local time, as it does.
+        day_end = datetime.combine(statement_date, datetime.max.time())
+        put_int64(
+            frame, f"{f}/{self._RECONCILE_LAST_DATE}",
+            int(day_end.replace(microsecond=0).timestamp()),
+        )
+
     def _strip_guid_slots(
         self, book, obj_guids: list[str], label: str, objects=(),
     ) -> None:

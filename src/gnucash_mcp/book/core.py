@@ -214,6 +214,13 @@ class CoreMixin:
     # ~2-week grace period.
     _RECONCILE_WARN_DAYS = 45
 
+    # When desktop has recorded the account's statement cycle
+    # (``reconcile-info/last-interval``), the threshold is that
+    # interval plus this grace; a quarterly or annual statement no
+    # longer reads "behind" every month (spec B4, ruled 2026-09-28).
+    # One month plus grace equals the fixed default.
+    _RECONCILE_GRACE_DAYS = 15
+
     # Unreconciled splits dated BEFORE an account's last reconcile
     # are outstanding items (a cheque that never cleared), not
     # backlog: they don't make the account "behind". They earn a
@@ -488,6 +495,7 @@ class CoreMixin:
         """
         template_guids = self._template_account_guids(book)
         today = date.today()
+        reconcile_info = self._read_reconcile_info_all(book)
 
         results: list[dict] = []
         for account in accounts:
@@ -497,6 +505,16 @@ class CoreMixin:
                 continue
             if account.placeholder:
                 continue
+            # Per-account threshold from the statement cycle desktop
+            # (or reconcile_account) recorded; the fixed default
+            # otherwise. Months count as 30 days here — the lag
+            # display already rounds on a 30.44-day month.
+            info = reconcile_info.get(account.guid)
+            warn_days = self._RECONCILE_WARN_DAYS
+            if info and info["months"] is not None and info["days"] is not None:
+                cycle = info["months"] * 30 + info["days"]
+                if cycle > 0:
+                    warn_days = cycle + self._RECONCILE_GRACE_DAYS
 
             if account.type not in self._RECONCILABLE_TYPES \
                     and account.type != "ASSET":
@@ -667,6 +685,7 @@ class CoreMixin:
                         "latest_y_date": latest_y_date.isoformat(),
                         "oldest_unreconciled_date":
                             oldest_unreconciled_date.isoformat(),
+                        "warn_days": warn_days,
                         **outstanding,
                     })
                 else:
@@ -678,6 +697,7 @@ class CoreMixin:
                         "days_behind": days_behind,
                         "unreconciled_count": unreconciled_count,
                         "latest_y_date": latest_y_date.isoformat(),
+                        "warn_days": warn_days,
                         **outstanding,
                     })
 
@@ -2212,7 +2232,9 @@ class CoreMixin:
             ):
                 return "dormant"
             return "never"
-        if entry["days_behind"] > self._RECONCILE_WARN_DAYS:
+        if entry["days_behind"] > entry.get(
+            "warn_days", self._RECONCILE_WARN_DAYS,
+        ):
             if (
                 entry["unreconciled_count"] == 0
                 and entry.get("balance_zero")
@@ -5852,6 +5874,10 @@ class CoreMixin:
             piecash_splits[0].reconcile_state = "y"
             piecash_splits[0].reconcile_date = rec_dt
             built.append((ln, txn_obj, src))
+
+        # A statement commit is a reconcile: record it the way
+        # desktop's window does (spec B4).
+        self._write_reconcile_info(book, account, statement_date)
 
         book.save()
 
