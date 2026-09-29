@@ -77,10 +77,18 @@ Production book and registered books untouched.
     `cards owe USD 21,927` constant throughout.
 
 ## Routed around
-1. **The plan's baselines live in the UNCOMMITTED samples.** Committed
-   `823cbc9` Alex has 990 unreconciled and no 2024 outstanding split;
-   only the dirty working-tree copy reproduces Part A/B's 992+1.
-   Commit the samples with the branch or the numbers dangle.
+1. **The plan's baselines bind to an unversioned artifact — by
+   design, so fingerprint it.** The samples are deliberately kept out
+   of commits (blob doctrine: skip-worktree, pre-commit guard, CI
+   regenerates from frozen bases), and committing them would bloat the
+   repo forever — the bookkeeper's first draft of this note said
+   "commit them" and is hereby retracted. But the plan's 992+1
+   baseline reproduces only from the maintainer's working-tree copy of
+   the moment: a future re-run can't tell drift from regression. Small
+   fix: the plan (or the capture rig) records the sample's sha256 at
+   capture time, so any re-run knows whether it holds the same book.
+   (For this run: worked from the working-tree copies as the plan's
+   own `cp samples/…` instructs; baseline matched exactly.)
 2. **`update_scheduled_transaction` cannot move a start date** (accepts
    enabled/end_date/notes…), so step 4's "move the schedule's start"
    is not expressible; tested the boundary by delete-and-recreate.
