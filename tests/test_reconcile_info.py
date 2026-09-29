@@ -11,9 +11,7 @@ verbatim; the interval port is table-tested against
 """
 
 from datetime import date, datetime, timedelta
-from decimal import Decimal
 
-import piecash
 import pytest
 from sqlalchemy import text
 

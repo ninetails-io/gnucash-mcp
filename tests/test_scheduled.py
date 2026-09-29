@@ -2,13 +2,12 @@
 
 from datetime import date, timedelta
 from decimal import Decimal
-from dateutil.relativedelta import relativedelta
 from unittest.mock import patch
 
 import pytest
+from dateutil.relativedelta import relativedelta
 
 from gnucash_mcp.book import GnuCashBook
-
 
 # ── Create ──────────────────────────────────────────────────
 
@@ -554,6 +553,7 @@ class TestUpdateScheduled:
         leaving last_occur alone. Monthly from the 15th moved to
         the 3rd is due on the 3rd from then on."""
         from datetime import timedelta
+
         from sqlalchemy import text
         gb = GnuCashBook(str(scheduled_book))
         old_start = (date.today() + timedelta(days=40)).replace(day=15)
@@ -1089,7 +1089,8 @@ class TestScheduledCurrency:
         """A foreign template's bill-list amount carries its
         currency code — '25.00' from an EUR schedule must not read
         as a book-default amount."""
-        from datetime import date as _date, timedelta as _td
+        from datetime import date as _date
+        from datetime import timedelta as _td
 
         gc = GnuCashBook(str(multi_currency_book))
         self._eur_accounts(gc)
@@ -1114,7 +1115,8 @@ class TestScheduledCurrency:
         """Dashboard 7-day total: foreign templates convert at the
         latest market rate; with no rate on file they're counted
         but flagged unrated instead of silently mixed in."""
-        from datetime import date as _date, timedelta as _td
+        from datetime import date as _date
+        from datetime import timedelta as _td
 
         gc = GnuCashBook(str(multi_currency_book))
         self._eur_accounts(gc)
@@ -1191,6 +1193,7 @@ def _make_legacy(book_path, sx_name, *, refs="guid", description=True,
     write — so the guards that read it need tests that can still
     construct it."""
     import json
+
     from sqlalchemy import text
     gb = GnuCashBook(str(book_path))
     with gb.open(readonly=False) as book:
@@ -1527,8 +1530,8 @@ class TestTornWriteLate:
         delete-template-then-save, which commits the partial rows;
         it only looked clean because piecash's
         Account.scheduled_transaction cascade swept them out."""
-        from sqlalchemy import text
         from piecash.kvp import Slot
+        from sqlalchemy import text
         gb = GnuCashBook(str(scheduled_book))
         real_insert = Slot.__table__.insert
         calls = {"n": 0}

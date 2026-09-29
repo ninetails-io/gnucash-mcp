@@ -2256,7 +2256,7 @@ class TestGetBookSummaryBudgetHeadline:
         )
         result = gc.get_book_summary()
         budget_line = next(
-            l for l in result.split("\n") if l.startswith("Budget (")
+            ln for ln in result.split("\n") if ln.startswith("Budget (")
         )
         assert "USD" in budget_line and " spent / " in budget_line
         assert "expected by today" in budget_line
@@ -2285,7 +2285,7 @@ class TestGetBookSummaryBudgetHeadline:
         )
         result = gc.get_book_summary()
         budget_line = next(
-            l for l in result.split("\n") if l.startswith("Budget (")
+            ln for ln in result.split("\n") if ln.startswith("Budget (")
         )
         assert " spent / " in budget_line
         assert "⚠" in budget_line
@@ -2303,7 +2303,7 @@ class TestGetBookSummaryBudgetHeadline:
         )
         result = gc.get_book_summary()
         budget_line = next(
-            l for l in result.split("\n") if l.startswith("Budget (")
+            ln for ln in result.split("\n") if ln.startswith("Budget (")
         )
         assert "⚠" not in budget_line
         assert "(-" in budget_line
@@ -2339,8 +2339,8 @@ class TestGetBookSummaryBudgetHeadline:
             check_duplicates=False,
         )
         line = next(
-            l for l in gc.get_book_summary().split("\n")
-            if l.startswith("Budget (")
+            ln for ln in gc.get_book_summary().split("\n")
+            if ln.startswith("Budget (")
         )
         assert line == (
             "Budget (Lumpy): USD 1,200 spent / USD 1,200 expected by today "
@@ -2364,8 +2364,8 @@ class TestGetBookSummaryBudgetHeadline:
             budget_name="Annual", account="Expenses:Groceries", amount="3650",
         )
         line = next(
-            l for l in gc.get_book_summary().split("\n")
-            if l.startswith("Budget (Annual)")
+            ln for ln in gc.get_book_summary().split("\n")
+            if ln.startswith("Budget (Annual)")
         )
         days_in_year = (date(today.year, 12, 31) - date(today.year, 1, 1)).days + 1
         expected = int(

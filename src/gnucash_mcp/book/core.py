@@ -1976,13 +1976,13 @@ class CoreMixin:
             if not legs:
                 continue
 
-            def leg_amounts(subset: list) -> Decimal:
+            def leg_amounts(subset: list, currency=txn.currency) -> Decimal:
                 net = sum(
                     (Decimal(str(s.value)) for s in subset), Decimal("0"),
                 )
-                if txn.currency == default_currency:
+                if currency == default_currency:
                     return net
-                rate = rates.get(txn.currency.guid)
+                rate = rates.get(currency.guid)
                 if rate is not None:
                     return net * rate
                 nonlocal factors

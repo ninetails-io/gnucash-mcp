@@ -9,11 +9,10 @@ piecash blocks the Budget / Recurrence / BudgetAmount constructors
 SQLAlchemy Core API paired with _verify_* round-trip checks.
 """
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from decimal import ROUND_HALF_EVEN, Decimal
 
 import piecash
-from dateutil.relativedelta import relativedelta
 from piecash._common import Recurrence
 from piecash.budget import Budget, BudgetAmount
 from piecash.kvp import Slot
@@ -22,7 +21,6 @@ from gnucash_mcp.book._base import (
     _BUDGET_SCRUB_FLIP,
     _budget_period_bounds,
     _BUDGET_UNREVERSED_BOGUS_KEY,
-    _BUDGET_UNREVERSED_FEATURE,
     _BUDGET_UNREVERSED_DESCRIPTION,
     _BUDGET_UNREVERSED_KEY,
     _budget_scrub_policy,

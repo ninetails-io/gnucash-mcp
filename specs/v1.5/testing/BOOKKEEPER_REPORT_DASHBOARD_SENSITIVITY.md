@@ -9,6 +9,14 @@ Production book and registered books untouched.
 
 ## Verdict: Part B 16/16 PASS — and **Part C step 2 FAIL: desktop cannot read A2's `trans-date-due` slots**. The gate caught a shipping-stopper the server-side battery could not see. Six route-around notes. *(Superseded: fixed in `bbd86a0`; Part C re-run CLOSED, PASS — see the end of this report.)*
 
+Sample fingerprints (route-around 1), sha256 of the books the rounds
+copied — the committed samples at `736e24e`, and the working-tree
+Alex the plan's `cp samples/…` actually took:
+- `samples/alex-chen-morales.gnucash` @ 736e24e: `52baebdb3174281e277414ec9e144bbeece0c67a69f18f66575ffefd5f5dbf30`
+- `samples/lin-wei.gnucash` @ 736e24e: `2cdae934d64d39accf37d067ed33ce62726efc2f5b9f4b2bdfabb0148a72029d`
+- `samples/sabine-brenner.gnucash` @ 736e24e: `4fa9e86696648ffaa8f4e05f39818da9d8133b11794c9801727a27190fae81b8`
+- working-tree `samples/alex-chen-morales.gnucash` (2026-09-29): `f521c2e5fb115d2292de3cb024c463458ddff94e744f26f82ed13924cfa38521`
+
 ## Part B — step by step
 1. **Baseline — PASS.** Checking `992 splits … 18 months behind, oldest
    2025-04-01` + `1 outstanding item older than last reconcile (oldest

@@ -177,9 +177,10 @@ against it.
     11 only. Expected line: `Budget (2026 Test): USD <groceries spent
     in January> spent / USD 1,200 expected by today (…)` — expected is
     the January target in full and nothing of December's. Then set
-    Groceries `500` for all periods: expected becomes
-    `1,200 + 500 × (months fully elapsed) + 500 × (day of month ÷
-    days in month)`, rounded; `get_budget_report` per-period targets
+    Groceries `500` for all periods — which REPLACES period 0's
+    1,200 (round-1 route-around 4): expected becomes
+    `500 × (months fully elapsed) + 500 × (day of month ÷ days in
+    month)`, rounded; `get_budget_report` per-period targets
     reconcile to it.
 16. **Runway burn ignores a share sale into brokerage cash (B7).**
     `create_account` `Assets:Investments:Brokerage:Cash` type ASSET.

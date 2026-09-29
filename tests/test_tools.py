@@ -663,7 +663,8 @@ class TestReconcileAccountTool:
     def test_future_statement_date_warns(self, setup_book_env):
         """A statement is not dated in the future: the reconcile goes
         through and the response carries the warning."""
-        from datetime import date as _date, timedelta
+        from datetime import date as _date
+        from datetime import timedelta
         from decimal import Decimal
 
         unreconciled = json.loads(
