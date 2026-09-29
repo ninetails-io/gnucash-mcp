@@ -207,16 +207,27 @@ and 14 applied. Never the production book.
    and post a new customer invoice with `Net 30`. Server:
    `get_outstanding_documents` shows `due_date` = posting + 30 and
    `get_book_summary` ages it from that date.
-4. **The reconcile dialog reads the server's frame.** Actions →
-   Reconcile on Savings Account. Expected: the Statement Date
-   proposed is `2026-10-31` (last-date 2026-07-31 plus the recorded
-   3-month interval; the last day of the month is kept). Cancel.
-5. **Desktop's reconcile is read back.** Reconcile Savings Account in
-   desktop with statement date `2026-10-31`, Finish. Server:
-   `get_reconciliation_status` shows Savings `through 2026-10-31`.
-   Optional, stricter: the sqlite query from step 14 still shows ONE
-   `reconcile-info` row for Savings, `last-date` on 2026-10-31,
-   `months` 3.
+4. **The reconcile dialog reads the server's frame.** Desktop clamps
+   a proposal past today to today (`startRecnWindow`), so the
+   account must have been reconciled twice a month apart in the
+   PAST. From the server: `create_account`
+   `Assets:Current Assets:Gate Test` (BANK); two `100` deposits from
+   Income:Salary dated `2026-05-15` and `2026-06-15`;
+   `reconcile_account` `reconcile_all` with `statement_date`
+   `2026-05-31` (balance 100), then `2026-06-30` (balance 200). Then
+   Actions → Reconcile on Gate Test. Expected: Statement Date
+   proposed is `2026-07-31` (last-date 2026-06-30 plus the recorded
+   1-month interval; the last day of the month is kept). Cancel.
+5. **Desktop's reconcile is read back.** Reconcile Gate Test in
+   desktop with the proposed `2026-07-31` and ending balance 200,
+   Finish, save, quit. Then:
+
+        sqlite3 /tmp/alex-dash.gnucash "SELECT s.name, s.int64_val FROM slots s WHERE s.name LIKE 'reconcile-info%' AND s.obj_guid IN (SELECT guid FROM accounts WHERE name = 'Gate Test') OR s.obj_guid IN (SELECT guid_val FROM slots WHERE name LIKE 'reconcile-info%' AND obj_guid IN (SELECT guid FROM accounts WHERE name = 'Gate Test'));"
+
+   Expected: ONE `reconcile-info` frame for the account, `last-date`
+   on 2026-07-31 (a day-end local time64), `last-interval/months` 1,
+   `days` 0. A server session on the copy reads Gate Test as
+   `through 2026-07-31`.
 6. **Edit, save, close, reopen.** Change one amount in the Checking
    register, save, quit, reopen. Expected: clean; the server's
    `get_book_summary` still answers.

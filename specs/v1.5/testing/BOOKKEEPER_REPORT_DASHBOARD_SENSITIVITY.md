@@ -189,11 +189,19 @@ GDate rows in place (59 timespec rows after; desktop's own untouched).
   (desktop reading the native recipes); cancelled, nothing posted.
 - **C3 — PASS** (unchanged from the first run: desktop's Net-30
   specimen reads back as 2026-10-28).
-- **C4 proposal — NOT YET CONFIRMED.** Expected: Actions → Reconcile
-  on Savings proposes 2026-10-31 (the server-written last date plus
-  its recorded 3-month interval, last day of month kept). The
-  maintainer reconciled on that date (C5 below), but has not yet
-  reported what the dialog proposed unaided.
+- **C4 proposal — FAIL as written; the plan was wrong, not the
+  server.** Desktop proposed today's date. `startRecnWindow`
+  (window-reconcile.cpp) computes last date + interval and then
+  clamps: `if (*statement_date > today) *statement_date = today;`.
+  Savings' last date 2026-07-31 + 3 months = 2026-10-31 is after
+  2026-09-28, so today is what desktop proposes — it read the frame
+  and applied its own rule. The plan's expected value ignored the
+  clamp, and its C5 instruction to reconcile ON 2026-10-31 asked for
+  a future statement date, which no statement can carry (the
+  maintainer's objection; desktop accepts it silently, as does
+  `reconcile_account` — see the follow-up below). Valid re-check:
+  a fresh account reconciled twice a month apart in the past, so the
+  proposal lands before today (`Gate Test` below).
 - **C5 desktop reconcile read back — PASS, strict.** After Finish on
   2026-10-31 the slots hold ONE `reconcile-info` frame:
   `last-date` 1793516399 (2026-10-31 23:59:59 local, desktop's
@@ -203,6 +211,11 @@ GDate rows in place (59 timespec rows after; desktop's own untouched).
   beside it.
 - **C6 edit-save-reopen — NOT YET CONFIRMED.** Expected: clean reopen,
   reminders fire again.
+
+Follow-up for the maintainer: neither desktop nor `reconcile_account`
+refuses a statement date in the future. A statement can't be dated
+after today; a future date is a typo. Whether the server should
+refuse (or warn) is a tool-behavior call and is not in this branch.
 
 Route-around: the maintainer drove C4–C6 at the screen. Claude's
 desktop control could open the copy and read every dialog, but a
