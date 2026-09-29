@@ -629,6 +629,60 @@ class TestReconcileAccountTool:
         data = json.loads(result)
         assert data["status"] == "reconciled"
 
+    def test_closing_balance_is_the_shared_name(self, setup_book_env):
+        """``closing_balance`` — the name enter_statement uses — is
+        accepted; ``statement_balance`` still works; both given and
+        disagreeing is refused; neither is refused (bookkeeper
+        route-around 3, ruled 2026-09-29)."""
+        from decimal import Decimal
+
+        unreconciled = json.loads(
+            server_module.get_unreconciled_splits("Assets:Checking", verbose=True)
+        )
+        total = sum((Decimal(s["amount"]) for s in unreconciled["splits"]), Decimal("0"))
+        guids = [s["guid"] for s in unreconciled["splits"]]
+
+        data = json.loads(server_module.reconcile_account(
+            account="Assets:Checking", statement_date="2024-01-31",
+            closing_balance=str(total), statement_balance="1.00",
+            split_guids=guids,
+        ))
+        assert "disagree" in data["error"]
+        data = json.loads(server_module.reconcile_account(
+            account="Assets:Checking", statement_date="2024-01-31",
+            split_guids=guids,
+        ))
+        assert "closing_balance is required" in data["error"]
+        data = json.loads(server_module.reconcile_account(
+            account="Assets:Checking", statement_date="2024-01-31",
+            closing_balance=str(total), split_guids=guids,
+        ))
+        assert data["status"] == "reconciled"
+        assert "warning" not in data
+
+    def test_future_statement_date_warns(self, setup_book_env):
+        """A statement is not dated in the future: the reconcile goes
+        through and the response carries the warning."""
+        from datetime import date as _date, timedelta
+        from decimal import Decimal
+
+        unreconciled = json.loads(
+            server_module.get_unreconciled_splits("Assets:Checking", verbose=True)
+        )
+        total = sum((Decimal(s["amount"]) for s in unreconciled["splits"]), Decimal("0"))
+        guids = [s["guid"] for s in unreconciled["splits"]]
+        tomorrow = (_date.today() + timedelta(days=1)).isoformat()
+        data = json.loads(server_module.reconcile_account(
+            account="Assets:Checking", statement_date=tomorrow,
+            closing_balance=str(total), split_guids=guids,
+        ))
+        assert data["status"] == "reconciled"
+        assert data["warning"] == (
+            f"statement_date {tomorrow} is after today "
+            f"({_date.today().isoformat()}) — a statement is not dated "
+            f"in the future; check the transcription"
+        )
+
     def test_reconcile_account_balance_mismatch(self, setup_book_env):
         """Should return error when balance doesn't match."""
         unreconciled = json.loads(

@@ -234,6 +234,22 @@ def _recurrence_next(
 
 
 
+def _future_statement_warning(statement_date: date) -> str | None:
+    """A statement is not dated in the future; one that is, is a
+    typo. The reconcile goes through (desktop accepts the date too)
+    and the response says so — the one sentence ``reconcile_account``
+    and ``enter_statement`` both use (maintainer ruling, 2026-09-29).
+    ``None`` for today or earlier."""
+    today = date.today()
+    if statement_date <= today:
+        return None
+    return (
+        f"statement_date {statement_date.isoformat()} is after today "
+        f"({today.isoformat()}) — a statement is not dated in the "
+        f"future; check the transcription"
+    )
+
+
 def _budget_period_bounds(budget) -> "list[tuple[date, date]] | None":
     """``[(start, end)]`` for every period of a budget, from its
     recurrence row through ``_recurrence_next`` — the Recurrence.cpp

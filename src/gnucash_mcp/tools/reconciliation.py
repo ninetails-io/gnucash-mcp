@@ -130,7 +130,8 @@ def register(mcp, get_book) -> None:
     def reconcile_account(
         account: str,
         statement_date: str,
-        statement_balance: str,
+        statement_balance: str | None = None,
+        closing_balance: str | None = None,
         split_guids: Annotated[
             list[str] | None,
             Field(
@@ -216,21 +217,49 @@ def register(mcp, get_book) -> None:
         through_date default keeps each sweep inside its own
         statement.
 
+        A statement dated after today goes through but the response
+        carries a ``warning`` — a statement is not dated in the
+        future.
+
         Args:
             account: Account ref: full path (e.g. 'Assets:Bank:Checking'), %short GUID, or full 32-char GUID
             statement_date: Statement ending date (YYYY-MM-DD)
-            statement_balance: Expected balance from statement (as string, e.g., '1234.56')
+            closing_balance: The statement's closing balance, exactly as
+                printed (as string, e.g. '1234.56') — the same name
+                enter_statement uses. One of closing_balance or
+                statement_balance is required.
+            statement_balance: Same value under this tool's original
+                name; still accepted.
             split_guids: List of split GUIDs to reconcile (targeted mode). Omit for bulk mode.
             reconcile_all: When true, reconcile all unreconciled splits up to through_date.
             through_date: Date filter for bulk mode (YYYY-MM-DD); defaults to statement_date.
         """
+        if closing_balance is None and statement_balance is None:
+            raise ValueError(
+                "closing_balance is required (statement_balance is the "
+                "same value under this tool's original name)"
+            )
+        if (
+            closing_balance is not None
+            and statement_balance is not None
+            and closing_balance != statement_balance
+        ):
+            raise ValueError(
+                f"closing_balance {closing_balance} and statement_balance "
+                f"{statement_balance} name the same number and disagree — "
+                f"pass one"
+            )
+        balance = (
+            closing_balance if closing_balance is not None
+            else statement_balance
+        )
         book = get_book()
         stmt_date = date.fromisoformat(statement_date)
         through = _parse_iso_date(through_date)
         result = book.reconcile_account(
             account_name=account,
             statement_date=stmt_date,
-            statement_balance=statement_balance,
+            statement_balance=balance,
             split_guids=split_guids,
             reconcile_all=reconcile_all,
             through_date=through,

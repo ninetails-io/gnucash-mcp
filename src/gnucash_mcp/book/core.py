@@ -68,6 +68,7 @@ from gnucash_mcp.book._base import (
     _account_to_compact_line,
     _account_to_dict,
     _commodity_quantum,
+    _future_statement_warning,
     _gnc_bool,
     _guid_prefix_map,
     _is_unreconciled,
@@ -5191,6 +5192,12 @@ class CoreMixin:
                 reconciled_balance.quantize(quantum) - opening_book
             )
             warn_rows: list[tuple[str, str]] = []
+            # A statement dated after today is a typo; it goes
+            # through, and the warnings table says so in both
+            # modes (same sentence as reconcile_account).
+            future_msg = _future_statement_warning(statement_date)
+            if future_msg:
+                warn_rows.append(("*", future_msg))
             if opening_gap != 0:
                 gap_msg = (
                     f"account's reconciled balance "

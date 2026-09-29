@@ -15,6 +15,7 @@ from decimal import Decimal
 
 from gnucash_mcp.book._base import (
     _commodity_quantum,
+    _future_statement_warning,
     _is_unreconciled,
     _is_voided,
     _set_split_amounts,
@@ -513,11 +514,15 @@ class ReconciliationMixin:
             # Computed info only — the audit log reads the statement
             # inputs from tool params and the reconciled-split list
             # from the staged before-state above.
-            return {
+            result = {
                 "splits_reconciled": len(splits_to_reconcile),
                 "new_reconciled_balance": str(new_balance),
                 "status": "reconciled",
             }
+            warning = _future_statement_warning(statement_date)
+            if warning:
+                result["warning"] = warning
+            return result
 
     def void_transaction(self, guid: str, reason: str) -> dict:
         """Void a transaction (proper accounting void, not delete).

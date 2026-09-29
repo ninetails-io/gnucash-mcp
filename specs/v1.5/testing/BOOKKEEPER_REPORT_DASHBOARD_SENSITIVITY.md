@@ -96,12 +96,16 @@ Production book and registered books untouched.
 3. **`reconcile_account` wants `statement_balance`** where
    `enter_statement` says `closing_balance` — a third argot for the
    same number; my first guess (`ending_balance`) matched neither.
+   *(Maintainer, 2026-09-29: `reconcile_account` now accepts
+   `closing_balance`; the original name still works.)*
 4. **Step 15's formula vs the tool:** an all-periods
    `set_budget_amount` overwrites period 0; the plan's expected-value
    line assumed January survived. Behavior is right; the plan sentence
    isn't.
 5. **`get_unreconciled_splits` has no count-only mode**; pulled a
-   50-row page for its total line.
+   50-row page for its total line. *(Maintainer: it has one —
+   `limit=0` returns the indicator and totals only, as the tool's
+   docstring says. A documentation miss on the plan's side.)*
 6. **`mcpcall.py` continues past isError** — my bad `start_date` call
    errored and the following delete still ran, silently destroying the
    schedule under test. Fine for a harness, but battery authors should
