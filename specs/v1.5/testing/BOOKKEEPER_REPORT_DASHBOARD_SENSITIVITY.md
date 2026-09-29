@@ -245,3 +245,48 @@ Route-around: the maintainer drove C4–C6 at the screen. Claude's
 desktop control could open the copy and read every dialog, but a
 CleanShot X overlay refused every click, so the dialogs were
 dismissed by hand.
+
+## Round 2 — addendum (2026-09-29 morning), branch at `24f2ea2`: 5/5 PASS
+
+Fresh copy (`abe-bench/alex-r2.gnucash`, from the working-tree sample).
+
+1. **Backfill converts on first business write — PASS.** First post
+   reported `due_dates_backfilled: 54`; storage reads a single row
+   `6|55` — every due date a timespec, no type-10 survivors. The
+   second business write carried no backfill key.
+2. **Future statement date warns, both tools — PASS.** Reconcile at
+   +7 days succeeded with the scripted sentence verbatim
+   (`…is after today… a statement is not dated in the future; check
+   the transcription`); `enter_statement`'s dry run carries the same
+   sentence as a `*` warnings row; the past-dated reconcile carried
+   no warning key.
+3. **`closing_balance` argot unified — PASS.** Works alone; both
+   names with different values refused (`…name the same number and
+   disagree — pass one`); neither refused (`closing_balance is
+   required (statement_balance is the same value under this tool's
+   original name)`). The refusal renders as an audit ERROR line.
+4. **`start_date` moves a schedule's phase — PASS.** Auto Loan
+   Payment: response `start_date 2026-09-03`,
+   `next_occurrence 2026-09-03`; upcoming lists it on a 3rd; audit
+   reads `start_date: 2025-01-15 → 2026-09-03 (recurrence rows moved
+   with it)`; `last_occurrence 2026-07-15` untouched. Round-1
+   route-around 2: RESOLVED.
+5. **Count-only — PASS, with a round-1 correction.** `limit=0` gives
+   `Showing 0 of 993 splits (…)` plus the totals footer
+   (`993 splits  cleared:0  uncleared:29513.38`) and nothing else.
+   Round-1 route-around 5 ("no count-only mode") was WRONG — the
+   mode existed; the bookkeeper didn't try `limit=0`. Retracted.
+   (And 993 on the fresh copy = the 992+1 baseline, tying B2 again.)
+
+Routed around this round: nothing — every call landed on its first
+form. Round-1 route-arounds 2, 3 and 5 are now closed (fixed, fixed,
+retracted); 1 and 4 remain open notes; 6 stands as advice.
+
+**Remaining before merge: the desktop gate re-run.** `alex-r2` now
+holds only type-6 rows — C2 should pass on sight (Due column
+populated, reminders firing), then C4/C5/C6 as planned.
+
+*(Maintainer, 2026-09-29: the desktop gate re-run is already closed —
+C1–C6 passed on the round-1 copy after the fix, above. The same
+writer produced `alex-r2`'s rows; a second desktop pass on it is
+optional.)*
