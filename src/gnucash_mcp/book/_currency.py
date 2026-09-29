@@ -137,7 +137,13 @@ def _to_date(dt: date | datetime) -> date:
 # deliberately feed-ranked despite the prefix, so it needs its own
 # explicit demotion below the generic ``user:*`` tier.
 _MANUAL_PRICE_SOURCES = frozenset({"user:price", "user:price-editor"})
-_FEED_PRICE_SOURCES = frozenset({"user:market-data"})
+# A quote feed is "Finance::Quote" — GnuCash's own string. The
+# server's earlier "user:market-data" (and the generators'
+# underscored twin) was never one desktop knew; reads never write,
+# so an unconverted book still ranks those rows as feeds.
+_FEED_PRICE_SOURCES = frozenset({
+    "Finance::Quote", "user:market-data", "user:market_data",
+})
 
 
 def _price_source_rank(source: str | None) -> int:

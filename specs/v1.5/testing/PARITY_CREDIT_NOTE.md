@@ -177,3 +177,28 @@ converters (`billterm_refcounts_recomputed`,
 every referencing document; the base held 0), and it writes
 `credit-note` 0 on a plain document where the server wrote nothing.
 Every other column matched.
+
+## Price twin — 2026-09-29 evening
+
+The maintainer added one price in desktop's Price Editor (AAPL, 200,
+today) and reported the finding himself: every other price in the
+book listed its source as **Invalid**. The generators wrote
+`user:market_data`, a string GnuCash has never had; the editor
+shows anything outside `gnc-pricedb.h`'s list that way. The desktop
+row differed from the server's in two columns: `source`
+(`user:price-editor`) and `date` (`10:59:00` UTC, the neutral time;
+the server stored local midnight, `07:00:00` UTC here). Value
+`200/1` matched; type `last` matched.
+
+Fixed with a validating writer and a converter
+(`price_sources_normalized`, `price_dates_normalized`): the writer
+refuses a source string desktop would show as Invalid, maps the two
+market-data strings to `Finance::Quote`, and stamps the date at the
+neutral time by raw SQL, since piecash's `Price.date` column can
+only bind a date at local midnight. The same column is why piecash's
+save-time `Price.validate` re-queries the row at midnight and raises
+`NoResultFound` on any desktop-written price the server touches;
+`book/investments.py` replaces it with a by-day comparison. Every
+price write runs the converter. Unprobed: whether desktop reduces a
+fractional price's `value_num/value_denom` (the one specimen was a
+whole number).

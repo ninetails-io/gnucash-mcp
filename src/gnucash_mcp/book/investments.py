@@ -12,7 +12,7 @@ Depends on shared helpers from BaseGnuCashBook:
     (module-level in _base)
 """
 
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 
 import piecash
@@ -29,11 +29,53 @@ from gnucash_mcp.book._base import (
     _is_market_price,
     _is_voided,
     _lot_to_compact_line,
+    _neutral_time,
+    _verify_none_remaining,
     _to_date,
     _to_decimal,
     _unique_prefix,
 )
 from gnucash_mcp._format import _format_number, _paginate
+
+
+def _price_validate(self) -> None:
+    """Replacement for piecash's ``Price.validate``. The original
+    re-queries the row by ``date=self.date``; that column binds a
+    date at LOCAL midnight, the only shape piecash itself writes, so
+    a price stored at GnuCash's neutral time (every price desktop's
+    editor writes, and ours since the price twin of 2026-09-29) never
+    matches and ``.one()`` raises ``NoResultFound`` on any save that
+    touches it. Same uniqueness rule, compared by calendar day."""
+    same_day = [
+        p for p in self.book.session.query(Price).filter_by(
+            commodity=self.commodity, currency=self.currency, source=self.source,
+        )
+        if _to_date(p.date) == _to_date(self.date)
+    ]
+    if len(same_day) > 1:
+        raise ValueError("{} already exists in this book".format(self))
+
+
+Price.validate = _price_validate
+
+
+def _price_row_utc(raw) -> "datetime | None":
+    """UTC-aware datetime of a raw ``prices.date`` value: the
+    ``YYYY-MM-DD HH:MM:SS`` string SQLite stores, or the naive/aware
+    datetime a database driver returns."""
+    from datetime import timezone
+
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        digits = "".join(ch for ch in raw if ch.isdigit()).ljust(14, "0")
+        raw = datetime(
+            int(digits[0:4]), int(digits[4:6]), int(digits[6:8]),
+            int(digits[8:10]), int(digits[10:12]), int(digits[12:14]),
+        )
+    if isinstance(raw, datetime):
+        return raw.astimezone(timezone.utc) if raw.tzinfo else raw.replace(tzinfo=timezone.utc)
+    return None
 
 
 class InvestmentsMixin:
@@ -305,6 +347,115 @@ class InvestmentsMixin:
                 "status": "created",
             }
 
+    # gnc-pricedb.h, verbatim: the only source strings GnuCash's
+    # price editor recognizes. Anything else renders as "Invalid"
+    # (gnc_price_source_string_to_enum), which is how every price the
+    # sample generators wrote as ``user:market_data`` looked in
+    # desktop (2026-09-29). Spellings the server's own history used
+    # map to the string GnuCash uses for a quote feed.
+    _GNC_PRICE_SOURCES = frozenset({
+        "user:price-editor", "Finance::Quote", "user:price",
+        "user:xfer-dialog", "user:split-register", "user:split-import",
+        "user:stock-split", "user:stock-transaction", "user:invoice-post",
+        "temporary", "invalid",
+    })
+    _PRICE_SOURCE_ALIASES = {
+        "user:market_data": "Finance::Quote",
+        "user:market-data": "Finance::Quote",
+    }
+    # gnc-pricedb.h PRICE_TYPE_*: "bid", "ask", "last", "nav",
+    # "transaction", "unknown".
+    _GNC_PRICE_TYPES = frozenset({"bid", "ask", "last", "nav", "transaction", "unknown"})
+
+    @staticmethod
+    def _gnc_price_source(source: str) -> str:
+        source = InvestmentsMixin._PRICE_SOURCE_ALIASES.get(source, source)
+        if source not in InvestmentsMixin._GNC_PRICE_SOURCES:
+            raise ValueError(
+                f"Price source {source!r} is not one GnuCash recognizes "
+                f"(it would show as Invalid in the price editor). Use one "
+                f"of: {', '.join(sorted(InvestmentsMixin._GNC_PRICE_SOURCES))}. "
+                f"A quote feed is 'Finance::Quote'; a price you typed is "
+                f"'user:price'."
+            )
+        return source
+
+    @staticmethod
+    def _gnc_price_type(price_type: str) -> str:
+        if price_type not in InvestmentsMixin._GNC_PRICE_TYPES:
+            raise ValueError(
+                f"Price type {price_type!r} is not one GnuCash recognizes. "
+                f"Use one of: {', '.join(sorted(InvestmentsMixin._GNC_PRICE_TYPES))}."
+            )
+        return price_type
+
+    def _migrate_price_shapes(self, book) -> dict:
+        """Write path only: price rows the server (or its generators)
+        wrote before 2026-09-29 to desktop's shape — a source string
+        GnuCash recognizes (``user:market_data`` and its hyphenated
+        twin become ``Finance::Quote``, any other unknown string
+        ``user:price``) and the date at the neutral time. Amounts
+        untouched. Runs through ``_upgrade_book_shapes``."""
+        from datetime import time
+        from sqlalchemy import text
+
+        out: dict = {}
+        sources = 0
+        dates = 0
+        rows = book.session.execute(
+            text("SELECT guid, source, date FROM prices")
+        ).fetchall()
+        for guid, src, raw in rows:
+            src = src or ""
+            if src not in self._GNC_PRICE_SOURCES:
+                new_src = self._PRICE_SOURCE_ALIASES.get(src, "user:price")
+                book.session.execute(
+                    text("UPDATE prices SET source = :s WHERE guid = :g"),
+                    {"s": new_src, "g": guid},
+                )
+                left = book.session.execute(
+                    text("SELECT COUNT(*) FROM prices WHERE guid = :g AND source <> :s"),
+                    {"s": new_src, "g": guid},
+                ).scalar()
+                _verify_none_remaining(left, f"price {guid[:8]} source → {new_src}")
+                sources += 1
+            as_utc = _price_row_utc(raw)
+            if as_utc is not None and as_utc.time() != time(10, 59):
+                # The server bound local midnight; the intended day is
+                # that instant's local date (what piecash reads back).
+                self._stamp_price_date(book, guid, as_utc.astimezone().date())
+                dates += 1
+        if sources:
+            out["price_sources_normalized"] = sources
+        if dates:
+            out["price_dates_normalized"] = dates
+        if sources or dates:
+            book.session.expire_all()
+            self._invalidate_price_caches(book)
+        return out
+
+    @staticmethod
+    def _stamp_price_date(book, guid: str, price_date: date) -> None:
+        """Set one price row's ``date`` to the neutral time (10:59:00
+        UTC), the way desktop's price editor stores it. piecash's
+        ``Price.date`` column accepts only a bare date and binds it
+        at LOCAL midnight, so the ORM can't write this shape; one
+        portable UPDATE, verified by read-back. Bound as the
+        ``YYYY-MM-DD HH:MM:SS`` string GnuCash stores in SQLite and
+        PostgreSQL/MySQL cast to a timestamp."""
+        from sqlalchemy import text
+
+        stamp = _neutral_time(price_date).strftime("%Y-%m-%d %H:%M:%S")
+        book.session.execute(
+            text("UPDATE prices SET date = :d WHERE guid = :g"),
+            {"d": stamp, "g": guid},
+        )
+        left = book.session.execute(
+            text("SELECT COUNT(*) FROM prices WHERE guid = :g AND date <> :d"),
+            {"d": stamp, "g": guid},
+        ).scalar()
+        _verify_none_remaining(left, f"price {guid[:8]} date → {stamp}")
+
     @staticmethod
     def _upsert_price(
         book, comm, resolved_currency, price_date,
@@ -320,6 +471,8 @@ class InvestmentsMixin:
 
         Returns ``"updated"`` or ``"created"``.
         """
+        source = InvestmentsMixin._gnc_price_source(source)
+        price_type = InvestmentsMixin._gnc_price_type(price_type)
         # Indexed query, not a full book.prices walk.
         candidates = book.session.query(Price).filter_by(
             commodity_guid=comm.guid,
@@ -336,8 +489,10 @@ class InvestmentsMixin:
             existing.value = _to_decimal(value)
             existing.type = price_type
             return "updated"
-        # piecash expects datetime.date, not datetime.datetime
-        piecash.Price(
+        # Desktop stores a price's date at the neutral time (10:59:00
+        # UTC); piecash binds a bare date at local midnight (price
+        # twin, 2026-09-29), so the row is flushed and re-stamped.
+        created = piecash.Price(
             commodity=comm,
             currency=resolved_currency,
             date=price_date,
@@ -345,6 +500,8 @@ class InvestmentsMixin:
             type=price_type,
             source=source,
         )
+        book.flush()
+        InvestmentsMixin._stamp_price_date(book, created.guid, price_date)
         return "created"
 
     @staticmethod
@@ -574,10 +731,12 @@ class InvestmentsMixin:
                         f"date (manual sources win same-date ties)"
                     )
 
+            shapes: dict = {}
             if wrote:
+                shapes = self._upgrade_book_shapes(book)
                 book.save()
                 self._invalidate_price_caches(book)
-            return self._prices_envelope(prices, by_ref)
+            return {**self._prices_envelope(prices, by_ref), **shapes}
 
     @staticmethod
     def _prices_envelope(prices: list[dict], by_ref: dict) -> dict:
@@ -649,6 +808,11 @@ class InvestmentsMixin:
                     book, currency,
                 )
 
+            # A price write converts the book's pre-1.5 shapes first
+            # (generator sources desktop shows as Invalid, midnight
+            # dates) so this row and the existing ones share one
+            # convention.
+            shapes = self._upgrade_book_shapes(book)
             status = self._upsert_price(
                 book, comm, resolved_currency, price_date,
                 value, price_type, source,
@@ -667,6 +831,7 @@ class InvestmentsMixin:
                 "value": value,
                 "type": price_type,
                 "status": "updated" if existing else "created",
+                **shapes,
             }
             outranked_by = self._same_date_outranker(
                 book, comm, resolved_currency, price_date, source,

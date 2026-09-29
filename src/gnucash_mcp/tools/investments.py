@@ -248,7 +248,13 @@ def register(mcp, get_book) -> None:
             date: ISO date (YYYY-MM-DD). Defaults to today.
             price_type: "nav" (default, mutual funds), "last", "bid",
                 "ask", or "unknown".
-            source: Source identifier. Default "user:price".
+            source: Where the price came from, one of the strings GnuCash's
+                price editor recognizes: "user:price" (default, a price you
+                typed), "Finance::Quote" (a quote feed), "user:price-editor",
+                "user:xfer-dialog", "user:split-register", "user:split-import",
+                "user:stock-split", "user:stock-transaction",
+                "user:invoice-post", "temporary". Anything else would show as
+                Invalid in desktop and is refused.
         """
         book = get_book()
         price_date = date_type.fromisoformat(date) if date else None

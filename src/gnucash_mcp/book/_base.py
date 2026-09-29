@@ -2570,6 +2570,9 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         if n:
             out["split_reconcile_dates_filled"] = n
         out.update(self._migrate_reconcile_conventions(book))
+        prices = getattr(self, "_migrate_price_shapes", None)
+        if prices is not None:
+            out.update(prices(book))
         stamp = getattr(self, "_ensure_budget_unreversed", None)
         if stamp is not None:
             from piecash.budget import Budget

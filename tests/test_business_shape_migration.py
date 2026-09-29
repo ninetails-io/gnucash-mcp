@@ -247,3 +247,41 @@ def test_terms_refcount_and_credit_note_flag_follow_desktop(business_book):
     assert out["credit_note_flags_completed"] == 1
     assert _rows(p, "SELECT refcount FROM billterms WHERE name = 'Net 30'")[0][0] == 1
     assert _rows(p, "SELECT COUNT(*) FROM slots WHERE name = 'credit-note' AND int64_val = 0")[0][0] == 1
+
+
+def test_prices_carry_gnucash_source_and_neutral_time(test_book):
+    """Price twin (2026-09-29): desktop's price editor shows any source
+    string outside gnc-pricedb.h's list as Invalid — every generator
+    price (``user:market_data``) did — and stores the date at the
+    neutral time. The writer validates and maps; the converter
+    rewrites old rows."""
+    import pytest
+    gc = GnuCashBook(str(test_book))
+    p = str(test_book)
+    gc.create_commodity(mnemonic="AAPL", fullname="Apple", namespace="NASDAQ")
+    gc.create_price(commodity="AAPL", namespace="NASDAQ", value="200",
+                    price_date=date(2026, 9, 29))
+    gc.create_price(commodity="AAPL", namespace="NASDAQ", value="201",
+                    price_date=date(2026, 9, 28), source="user:market_data")
+    rows = _rows(p, "SELECT source, type, date FROM prices ORDER BY date")
+    assert rows == [("Finance::Quote", "nav", "2026-09-28 10:59:00"),
+                    ("user:price", "nav", "2026-09-29 10:59:00")]
+    with pytest.raises(ValueError, match="Invalid in the price editor"):
+        gc.create_price(commodity="AAPL", namespace="NASDAQ", value="1",
+                        price_date=date(2026, 9, 27), source="user:whatever")
+    with pytest.raises(ValueError, match="not one GnuCash recognizes"):
+        gc.create_price(commodity="AAPL", namespace="NASDAQ", value="1",
+                        price_date=date(2026, 9, 27), price_type="close")
+    # Old shapes: an unknown source and a midnight date.
+    with gc.open(readonly=False) as book:
+        book.session.execute(text(
+            "UPDATE prices SET source = 'user:market-data', date = '2026-09-29 07:00:00'"
+        ))
+        book.save()
+    with gc.open(readonly=False) as book:
+        out = gc._upgrade_book_shapes(book)
+        book.save()
+    assert out["price_sources_normalized"] == 2
+    assert out["price_dates_normalized"] == 2
+    assert {s for s, in _rows(p, "SELECT source FROM prices")} == {"Finance::Quote"}
+    assert {d[11:] for d, in _rows(p, "SELECT date FROM prices")} == {"10:59:00"}

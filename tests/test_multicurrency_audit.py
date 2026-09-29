@@ -716,26 +716,39 @@ class TestSameDatePriceTieBreak:
     ):
         """The bookkeeper's three-tier ruling: an unrecognized ``user:*``
         source (an explicit operator act) outranks feeds but does
-        NOT silently override a deliberate manual quote."""
+        NOT silently override a deliberate manual quote.
+
+        Since the price twin (2026-09-29) the writer refuses a source
+        desktop's editor would show as Invalid, and every price write
+        converts such rows — so the middle tier is engineered the way
+        real books carry it: rows some earlier writer left, flipped
+        by raw SQL after the last write. Reads never convert, so the
+        ranking still has to hold for them."""
         from datetime import date
+        from sqlalchemy import text
         gc = GnuCashBook(str(multi_currency_book))
-        d = date(2026, 3, 31)
-        gc.create_price("EUR", "CURRENCY", "1.30", price_date=d,
-                        source="user:market-data")
-        gc.create_price("EUR", "CURRENCY", "1.20", price_date=d,
-                        source="user:test-fx")
-        with gc.open(readonly=True) as book:
-            eur = book.commodities(mnemonic="EUR")
-            usd = book.default_currency
-            assert gc._find_exchange_rate(book, eur, usd, d) == \
-                Decimal("1.20")
-        # A known-manual quote still beats the custom user source.
-        gc.create_price("EUR", "CURRENCY", "1.10", price_date=d,
+        d1 = date(2026, 3, 31)   # custom vs feed
+        d2 = date(2026, 4, 30)   # custom vs manual
+        for d in (d1, d2):
+            gc.create_price("EUR", "CURRENCY", "1.30", price_date=d,
+                            source="Finance::Quote")
+            gc.create_price("EUR", "CURRENCY", "1.20", price_date=d,
+                            source="user:price-editor")
+        gc.create_price("EUR", "CURRENCY", "1.10", price_date=d2,
                         source="user:price")
+        with gc.open(readonly=False) as book:
+            book.session.execute(text(
+                "UPDATE prices SET source = 'user:test-fx' "
+                "WHERE source = 'user:price-editor'"
+            ))
+            book.save()
         with gc.open(readonly=True) as book:
             eur = book.commodities(mnemonic="EUR")
             usd = book.default_currency
-            assert gc._find_exchange_rate(book, eur, usd, d) == \
+            assert gc._find_exchange_rate(book, eur, usd, d1) == \
+                Decimal("1.20")
+            # A known-manual quote still beats the custom user source.
+            assert gc._find_exchange_rate(book, eur, usd, d2) == \
                 Decimal("1.10")
 
     def test_create_price_notes_when_outranked(

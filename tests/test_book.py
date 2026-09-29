@@ -13114,7 +13114,7 @@ class TestDeletePrice:
         gc_book.create_price(
             commodity="VTSAX", namespace="FUND", value="127.99",
             currency="USD", price_date=date(2026, 2, 7),
-            source="user:yfinance",
+            source="Finance::Quote",
         )
 
         with pytest.raises(ValueError) as exc_info:
@@ -13128,7 +13128,7 @@ class TestDeletePrice:
         # trailing zeros from stored values; check the integer
         # part to stay implementation-agnostic.
         assert "user:price" in msg
-        assert "user:yfinance" in msg
+        assert "Finance::Quote" in msg
         assert "127.5" in msg
         assert "127.99" in msg
         assert "source=" in msg
@@ -13146,12 +13146,12 @@ class TestDeletePrice:
         gc_book.create_price(
             commodity="VTSAX", namespace="FUND", value="127.99",
             currency="USD", price_date=date(2026, 2, 7),
-            source="user:yfinance",
+            source="Finance::Quote",
         )
 
         result = gc_book.delete_price(
             commodity="VTSAX", namespace="FUND",
-            price_date=date(2026, 2, 7), source="user:yfinance",
+            price_date=date(2026, 2, 7), source="Finance::Quote",
         )
 
         assert Decimal(result["value"]) == Decimal("127.99")
