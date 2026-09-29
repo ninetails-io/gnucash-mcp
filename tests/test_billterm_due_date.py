@@ -96,15 +96,26 @@ class TestPort:
 
 
 def _slot(gc, invoice_id):
+    """The due date desktop would read: the trans-date-due row must
+    be a slot_type 6 timespec at 10:59:00 (GnuCash's neutral clock
+    time), and there must be exactly one."""
     with gc.open(readonly=True) as book:
-        return book.session.execute(
+        rows = book.session.execute(
             text(
-                "SELECT s.gdate_val FROM slots s JOIN invoices i "
+                "SELECT s.slot_type, s.timespec_val, s.gdate_val "
+                "FROM slots s JOIN invoices i "
                 "ON s.obj_guid = i.post_txn WHERE i.id = :id "
                 "AND s.name = 'trans-date-due'"
             ),
             {"id": invoice_id},
-        ).scalar()
+        ).fetchall()
+    if not rows:
+        return None
+    assert len(rows) == 1, rows
+    slot_type, ts, gd = rows[0]
+    assert int(slot_type) == 6 and gd is None, rows[0]
+    assert str(ts).endswith("10:59:00"), rows[0]
+    return str(ts)[:10]
 
 
 def _posted_invoice(gc, customer_id="000001", term=None, price="100"):
@@ -141,7 +152,7 @@ class TestPostWritesDueDate:
             invoice_id=iid, post_account="Assets:Accounts Receivable",
             post_date="2026-03-10",
         )
-        assert str(_slot(gc, iid)).replace("-", "")[:8] == "20260310"
+        assert _slot(gc, iid) == "2026-03-10"
         row = gc.get_outstanding_invoices(compact=False)["invoices"][0]
         assert row["due_date"] == "2026-03-10"
         assert "no_terms" not in row
@@ -154,7 +165,7 @@ class TestPostWritesDueDate:
             invoice_id=iid, post_account="Assets:Accounts Receivable",
             post_date="2026-03-10", due_date="2026-04-01",
         )
-        assert str(_slot(gc, iid)).replace("-", "")[:8] == "20260401"
+        assert _slot(gc, iid) == "2026-04-01"
 
     def test_days_term_sets_the_due_date(self, business_book):
         gc = GnuCashBook(str(business_book))
@@ -165,7 +176,7 @@ class TestPostWritesDueDate:
             invoice_id=iid, post_account="Assets:Accounts Receivable",
             post_date="2026-03-10",
         )
-        assert str(_slot(gc, iid)).replace("-", "")[:8] == "20260409"
+        assert _slot(gc, iid) == "2026-04-09"
 
     def test_proximo_term_sets_the_due_date(self, business_book):
         """Cutoff 19, due day 20, posted the 22nd: the month after
@@ -178,7 +189,7 @@ class TestPostWritesDueDate:
             invoice_id=iid, post_account="Assets:Accounts Receivable",
             post_date="2026-06-22",
         )
-        assert str(_slot(gc, iid)).replace("-", "")[:8] == "20260820"
+        assert _slot(gc, iid) == "2026-08-20"
         row = gc.get_outstanding_invoices(compact=False)["invoices"][0]
         assert row["due_date"] == "2026-08-20"
 
@@ -193,7 +204,7 @@ class TestPostWritesDueDate:
             invoice_id=iid, post_account="Assets:Accounts Receivable",
             post_date="2026-03-10",
         )
-        assert str(_slot(gc, iid)).replace("-", "")[:8] == "20260310"
+        assert _slot(gc, iid) == "2026-03-10"
 
     def test_terms_win_disagreeing_due_date_is_refused(self, business_book):
         gc = GnuCashBook(str(business_book))
@@ -210,7 +221,7 @@ class TestPostWritesDueDate:
             invoice_id=iid, post_account="Assets:Accounts Receivable",
             post_date="2026-03-10", due_date="2026-04-09",
         )
-        assert str(_slot(gc, iid)).replace("-", "")[:8] == "20260409"
+        assert _slot(gc, iid) == "2026-04-09"
 
 
 class TestBackfill:
@@ -248,8 +259,72 @@ class TestBackfill:
             post_date="2026-03-15",
         )
         assert result["due_dates_backfilled"] == 2
-        assert str(_slot(gc, termed)).replace("-", "")[:8] == "20260409"
-        assert str(_slot(gc, bare)).replace("-", "")[:8] == "20260312"
+        assert _slot(gc, termed) == "2026-04-09"
+        assert _slot(gc, bare) == "2026-03-12"
+
+
+class TestDesktopShape:
+    def test_row_matches_the_desktop_specimen(self, business_book):
+        """Desktop, posting a Net-30 invoice on 2026-09-28, wrote
+        ``slot_type 6 | timespec_val 2026-10-28 10:59:00`` (looped
+        copy, 2026-09-28). The server's row must be byte-for-byte
+        that shape; the GDate row it used to write rendered as no
+        due date at all in desktop."""
+        gc = GnuCashBook(str(business_book))
+        gc.create_billterm(name="Net 30", due_days=30)
+        gc.create_customer(name="Acme")
+        iid = _posted_invoice(gc, term="Net 30")
+        gc.post_invoice(
+            invoice_id=iid, post_account="Assets:Accounts Receivable",
+            post_date="2026-09-28",
+        )
+        with gc.open(readonly=True) as book:
+            row = book.session.execute(
+                text(
+                    "SELECT s.slot_type, s.timespec_val, s.gdate_val, "
+                    "s.int64_val, s.double_val, s.numeric_val_num, "
+                    "s.numeric_val_denom FROM slots s JOIN invoices i "
+                    "ON s.obj_guid = i.post_txn WHERE i.id = :id "
+                    "AND s.name = 'trans-date-due'"
+                ),
+                {"id": iid},
+            ).fetchall()
+        # The specimen row, every column: 6 | 0 | NULL | NULL |
+        # '2026-10-28 10:59:00' | NULL | 0 | 1 | NULL.
+        assert [tuple(r) for r in row] == [
+            (6, "2026-10-28 10:59:00", None, 0, None, 0, 1)
+        ]
+
+    def test_backfill_rewrites_old_gdate_rows_in_place(self, business_book):
+        """A pre-fix book holds GDate rows (slot_type 10, YYYYMMDD).
+        The next business write converts each to the timespec row,
+        keeping the date it held, and counts it."""
+        gc = GnuCashBook(str(business_book))
+        gc.create_customer(name="Acme")
+        iid = _posted_invoice(gc)
+        gc.post_invoice(
+            invoice_id=iid, post_account="Assets:Accounts Receivable",
+            post_date="2026-03-10", due_date="2026-04-01",
+        )
+        with gc.open(readonly=False) as book:
+            book.session.execute(
+                text(
+                    "UPDATE slots SET slot_type = 10, timespec_val = NULL, "
+                    "gdate_val = '20260401' WHERE name = 'trans-date-due'"
+                )
+            )
+            book.save()
+        # Reads still understand the old row ...
+        row = gc.get_outstanding_invoices(compact=False)["invoices"][0]
+        assert row["due_date"] == "2026-04-01"
+        # ... and the next write rewrites it.
+        second = _posted_invoice(gc)
+        result = gc.post_invoice(
+            invoice_id=second, post_account="Assets:Accounts Receivable",
+            post_date="2026-03-12",
+        )
+        assert result["due_dates_backfilled"] == 1
+        assert _slot(gc, iid) == "2026-04-01"
 
 
 class TestDashboardAgrees:

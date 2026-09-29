@@ -2163,26 +2163,69 @@ class BusinessMixin:
         )
 
     @staticmethod
-    def _write_gdate_slot(book, obj_guid: str, name: str, date_val: date):
-        """Write a gdate-typed slot on an object.
+    def _write_due_date_slot(book, txn_guid: str, due: date) -> None:
+        """Write ``trans-date-due`` the way GnuCash does — and only
+        that way.
 
-        Used for trans-date-due and date-posted slots on invoice
-        posting transactions.
+        ``xaccTransSetDateDue`` stores a ``Time64`` KVP value; the SQL
+        backend writes it as a ``slot_type`` 6 (timespec) row with
+        ``timespec_val`` at GnuCash's neutral clock time, 10:59:00
+        UTC — the same convention as ``transactions.post_date``.
+        Desktop-posted specimen (2026-09-28): ``6 |
+        2026-10-28 10:59:00``. The server wrote this key as a GDate
+        row (``slot_type`` 10, ``gdate_val`` ``YYYYMMDD``) from 1.2
+        through the first cut of 1.5 — a shape ``xaccTransRetDateDue``
+        cannot decode, so desktop showed no due date at all (Find
+        Invoice's Due column empty, the Invoices Due Reminder silent,
+        Receivable Aging all "Current"; bookkeeper report,
+        2026-09-28). An existing row of either type is rewritten in
+        place, never duplicated. The write is verified.
         """
-        from piecash.kvp import Slot, KVP_Type
+        from datetime import timezone
 
-        book.session.execute(
-            Slot.__table__.insert().values(
-                obj_guid=obj_guid,
-                name=name,
-                slot_type=KVP_Type.KVP_TYPE_GDATE,
-                gdate_val=date_val,
-            )
+        from piecash.kvp import KVP_Type, Slot
+        from sqlalchemy import text
+
+        stamp = datetime(
+            due.year, due.month, due.day, 10, 59, 0, tzinfo=timezone.utc,
         )
+        exists = book.session.execute(
+            text(
+                "SELECT 1 FROM slots WHERE obj_guid = :o "
+                "AND name = 'trans-date-due'"
+            ),
+            {"o": txn_guid},
+        ).first()
+        if exists:
+            book.session.execute(
+                Slot.__table__.update()
+                .where(
+                    (Slot.__table__.c.obj_guid == txn_guid)
+                    & (Slot.__table__.c.name == "trans-date-due")
+                )
+                .values(
+                    slot_type=KVP_Type.KVP_TYPE_TIMESPEC,
+                    timespec_val=stamp, gdate_val=None,
+                )
+            )
+        else:
+            book.session.execute(
+                # Column for column what desktop's SQL backend wrote
+                # for this key: the unused double is NULL there, and
+                # piecash's default would make it 0.0.
+                Slot.__table__.insert().values(
+                    obj_guid=txn_guid,
+                    name="trans-date-due",
+                    slot_type=KVP_Type.KVP_TYPE_TIMESPEC,
+                    timespec_val=stamp,
+                    double_val=None,
+                )
+            )
         _verify_composite_write(
             book.session, Slot.__table__,
-            {"obj_guid": obj_guid, "name": name},
-            f"Gdate slot '{name}' for {obj_guid[:8]}",
+            {"obj_guid": txn_guid, "name": "trans-date-due",
+             "slot_type": KVP_Type.KVP_TYPE_TIMESPEC},
+            f"trans-date-due for {txn_guid[:8]}",
         )
 
     @staticmethod
@@ -2347,17 +2390,26 @@ class BusinessMixin:
         if txn is None:
             return None
 
-        # Step 1: the slot.
+        # Step 1: the slot. GnuCash's row is a timespec (slot_type
+        # 6) at the neutral clock time, whose date is the due date;
+        # the server's pre-fix rows were GDate (slot_type 10,
+        # ``YYYYMMDD``), read here until the backfill rewrites them.
         row = book.session.execute(
             text(
-                "SELECT gdate_val FROM slots "
+                "SELECT timespec_val, gdate_val FROM slots "
                 "WHERE obj_guid = :guid "
                 "AND name = 'trans-date-due'"
             ),
             {"guid": txn.guid},
         ).first()
         if row and row[0]:
-            gdate_val = row[0]
+            ts = row[0]
+            if isinstance(ts, datetime):
+                return ts.date()
+            digits = str(ts).strip().replace("-", "")[:8]
+            return date(int(digits[:4]), int(digits[4:6]), int(digits[6:8]))
+        if row and row[1]:
+            gdate_val = row[1]
             if isinstance(gdate_val, str):
                 # GnuCash GDATE columns return a compact ``YYYYMMDD``
                 # string; other paths yield ISO ``YYYY-MM-DD``. Python
@@ -2386,7 +2438,8 @@ class BusinessMixin:
 
     def _backfill_due_dates(self, book) -> int:
         """Write path only: give every posted document whose posting
-        transaction lacks ``trans-date-due`` the slot desktop would
+        transaction lacks ``trans-date-due`` — or carries the
+        server's old GDate row for it — the slot desktop would
         have written — ``_billterm_due_date`` over its terms, the
         posting date when there are none. Server posts before 1.5
         wrote the slot only when the caller passed ``due_date``;
@@ -2398,15 +2451,32 @@ class BusinessMixin:
         from sqlalchemy import text
         from piecash.business.invoice import Invoice
 
-        with_slot = {
-            r[0] for r in book.session.execute(
-                text(
-                    "SELECT obj_guid FROM slots "
-                    "WHERE name = 'trans-date-due'"
-                ),
-            ).fetchall()
-        }
         n = 0
+        # Rows the server wrote as GDate (slot_type 10) before the
+        # fix: rewrite each in place as GnuCash's timespec row,
+        # keeping the date it holds (an explicit due date, or the
+        # port's answer) — desktop can't decode the old row at all.
+        with_slot: set[str] = set()
+        for obj_guid, slot_type, gdate_val in book.session.execute(
+            text(
+                "SELECT obj_guid, slot_type, gdate_val FROM slots "
+                "WHERE name = 'trans-date-due'"
+            ),
+        ).fetchall():
+            with_slot.add(obj_guid)
+            if int(slot_type) == 6 or not gdate_val:
+                continue
+            if isinstance(gdate_val, datetime):
+                held = gdate_val.date()
+            elif isinstance(gdate_val, date):
+                held = gdate_val
+            else:
+                digits = str(gdate_val).strip().replace("-", "")[:8]
+                held = date(
+                    int(digits[:4]), int(digits[4:6]), int(digits[6:8]),
+                )
+            self._write_due_date_slot(book, obj_guid, held)
+            n += 1
         for inv in book.session.query(Invoice).filter(
             Invoice.date_posted.isnot(None),
         ).all():
@@ -2421,7 +2491,7 @@ class BusinessMixin:
             due = self._billterm_due_date(
                 self._invoice_billterm(book, inv), posted,
             )
-            self._write_gdate_slot(book, txn.guid, "trans-date-due", due)
+            self._write_due_date_slot(book, txn.guid, due)
             with_slot.add(txn.guid)
             n += 1
         return n
@@ -6071,9 +6141,7 @@ class BusinessMixin:
             )
             # Every post carries trans-date-due, as desktop's does
             # (gncInvoicePostToAccount → xaccTransSetDateDue).
-            self._write_gdate_slot(
-                book, txn.guid, "trans-date-due", parsed_due
-            )
+            self._write_due_date_slot(book, txn.guid, parsed_due)
 
             book.save()
 
