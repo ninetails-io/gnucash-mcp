@@ -2175,6 +2175,13 @@ def _shape_upgrade_lines(after: dict) -> list[str]:
             f"{_INDENT}{n} split{'s' if n != 1 else ''} given desktop's epoch "
             f"reconcile_date (was NULL; nothing posted)"
         )
+    parts = []
+    if after.get("reconcile_dates_normalized"):
+        parts.append(f"{after['reconcile_dates_normalized']} statement date(s) moved to day end")
+    if after.get("reconcile_frames_completed"):
+        parts.append(f"{after['reconcile_frames_completed']} reconcile-info frame(s) given include-children")
+    if parts:
+        lines.append(f"{_INDENT}reconcile rows brought to desktop's shape: " + ", ".join(parts))
     n = after.get("credit_note_entries_unresolved")
     if n:
         lines.append(

@@ -16,6 +16,7 @@ from decimal import Decimal
 from gnucash_mcp.book._base import (
     _account_unit,
     _commodity_quantum,
+    _day_end,
     _future_statement_warning,
     _is_unreconciled,
     _is_voided,
@@ -105,9 +106,7 @@ class ReconciliationMixin:
 
             if state == "y":
                 if reconcile_date:
-                    split.reconcile_date = datetime.combine(
-                        reconcile_date, datetime.min.time()
-                    )
+                    split.reconcile_date = _day_end(reconcile_date)
                 else:
                     split.reconcile_date = datetime.now()
             elif state == "n":
@@ -500,7 +499,9 @@ class ReconciliationMixin:
                 {"splits": [_split_state_dict(s) for s in splits_to_reconcile]}
             )
 
-            reconcile_datetime = datetime.combine(statement_date, datetime.min.time())
+            # Desktop dates a reconciled split at the statement's local
+            # day end (gnc_time64_get_day_end), not midnight.
+            reconcile_datetime = _day_end(statement_date)
             for split in splits_to_reconcile:
                 split.reconcile_state = "y"
                 split.reconcile_date = reconcile_datetime

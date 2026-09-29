@@ -234,6 +234,13 @@ def _recurrence_next(
 
 
 
+def _day_end(d: date) -> datetime:
+    """``gnc_time64_get_day_end``: 23:59:59 local on the date, what
+    desktop stores for a reconciled split's reconcile_date and the
+    account's reconcile-info last-date (twin, 2026-09-29)."""
+    return datetime.combine(d, datetime.max.time()).replace(microsecond=0).astimezone()
+
+
 def _neutral_time(d: date) -> datetime:
     """GnuCash's neutral time of day for a date-valued timestamp:
     10:59:00 UTC (``gnc_time64_get_day_neutral``), the convention
@@ -2562,6 +2569,7 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         n = self._migrate_split_reconcile_dates(book)
         if n:
             out["split_reconcile_dates_filled"] = n
+        out.update(self._migrate_reconcile_conventions(book))
         stamp = getattr(self, "_ensure_budget_unreversed", None)
         if stamp is not None:
             from piecash.budget import Budget
@@ -2785,11 +2793,97 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
                 )
         # Desktop stores the statement date as a day-end time64
         # (gnc_time64_get_day_end_gdate); local time, as it does.
-        day_end = datetime.combine(statement_date, datetime.max.time())
         put_int64(
             frame, f"{f}/{self._RECONCILE_LAST_DATE}",
-            int(day_end.replace(microsecond=0).timestamp()),
+            int(_day_end(statement_date).timestamp()),
         )
+        # Finish also records the include-children status (0 unless
+        # the dialog's box was ticked); never overwrite a user's 1.
+        children_key = f"{f}/include-children"
+        if not book.session.execute(
+            text("SELECT 1 FROM slots WHERE obj_guid = :o AND name = :n"),
+            {"o": frame, "n": children_key},
+        ).first():
+            put_int64(frame, children_key, 0)
+
+    @staticmethod
+    def _migrate_reconcile_conventions(book) -> dict:
+        """Write path only: reconciled splits the server dated at local
+        midnight move to the statement date's local day-end (desktop's
+        reconcile_date), and reconcile-info frames the server wrote
+        without ``include-children`` get desktop's 0. Server-dated
+        rows are recognized by their time of day; one UPDATE per
+        distinct old value, verified by re-count."""
+        from datetime import timezone
+
+        from piecash.core.transaction import Split
+        from piecash.kvp import KVP_Type, Slot
+        from sqlalchemy import text
+
+        out: dict = {}
+        olds = [
+            r[0] for r in book.session.execute(
+                text(
+                    "SELECT DISTINCT reconcile_date FROM splits "
+                    "WHERE reconcile_state = 'y' AND reconcile_date IS NOT NULL"
+                ),
+            ).fetchall()
+        ]
+        moved = 0
+        for old in olds:
+            if isinstance(old, str):
+                old_dt = datetime.fromisoformat(old)
+            elif isinstance(old, datetime):
+                old_dt = old
+            else:
+                continue
+            as_utc = old_dt if old_dt.tzinfo else old_dt.replace(tzinfo=timezone.utc)
+            local = as_utc.astimezone()
+            if local.time() != datetime.min.time():
+                continue  # not the server's midnight shape
+            new = _day_end(local.date())
+            book.session.execute(
+                Split.__table__.update()
+                .where(Split.__table__.c.reconcile_state == "y")
+                .where(Split.__table__.c.reconcile_date == as_utc)  # tz-aware: no local shift
+                .values(reconcile_date=new)
+            )
+            left = book.session.execute(
+                text(
+                    "SELECT COUNT(*) FROM splits WHERE reconcile_state = 'y' "
+                    "AND reconcile_date = :old"
+                ),
+                {"old": old},
+            ).scalar()
+            _verify_none_remaining(left, f"reconcile_date {old} → day end")
+            moved += 1
+        if moved:
+            out["reconcile_dates_normalized"] = moved
+
+        frames = [
+            r[0] for r in book.session.execute(
+                text(
+                    "SELECT guid_val FROM slots WHERE name = 'reconcile-info' "
+                    "AND slot_type = 9 AND guid_val NOT IN ("
+                    "SELECT obj_guid FROM slots WHERE name = 'reconcile-info/include-children')"
+                ),
+            ).fetchall()
+        ]
+        for frame in frames:
+            book.session.execute(
+                Slot.__table__.insert().values(
+                    obj_guid=frame, name="reconcile-info/include-children",
+                    slot_type=KVP_Type.KVP_TYPE_GINT64, int64_val=0,
+                )
+            )
+            _verify_composite_write(
+                book.session, Slot.__table__,
+                {"obj_guid": frame, "name": "reconcile-info/include-children"},
+                "include-children on a reconcile-info frame",
+            )
+        if frames:
+            out["reconcile_frames_completed"] = len(frames)
+        return out
 
     @staticmethod
     def _migrate_split_reconcile_dates(book) -> int:

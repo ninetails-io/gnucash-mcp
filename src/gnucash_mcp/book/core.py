@@ -68,6 +68,7 @@ from gnucash_mcp.book._base import (
     _account_to_compact_line,
     _account_to_dict,
     _commodity_quantum,
+    _day_end,
     _future_statement_warning,
     _gnc_bool,
     _guid_prefix_map,
@@ -5984,9 +5985,8 @@ class CoreMixin:
         })
 
         # Mutate: claims first (annotations + state), then builds.
-        rec_dt = datetime.combine(
-            statement_date, datetime.min.time()
-        )
+        # Desktop's reconcile_date: the statement's local day end.
+        rec_dt = _day_end(statement_date)
         for ln, s in claims:
             if ln.get("raw"):
                 s.memo = ln["raw"]

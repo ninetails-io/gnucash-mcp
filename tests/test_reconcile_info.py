@@ -196,3 +196,52 @@ class TestThresholdFollowsCycle:
         self._reconciled_days_ago(gc, 76)
         self._reconciled_days_ago(gc, 46)  # 30 days -> 1 month -> 45
         assert "behind" in self._checking_line(gc)
+
+
+class TestReconciledSplitDate:
+    """Desktop's reconcile_date on a reconciled split is the statement
+    date's LOCAL day end (gnc_time64_get_day_end; the Bank Charges
+    twin, 2026-09-29, read 2026-09-30 06:59:59 UTC on a PDT desktop
+    for a 09/29 statement), and its Finish writes
+    reconcile-info/include-children 0."""
+
+    def test_reconcile_account_dates_at_day_end_and_completes_the_frame(self, test_book):
+        gc = GnuCashBook(str(test_book))
+        _reconcile(gc, date(2026, 1, 31), "jan")
+        with gc.open(readonly=True) as book:
+            acct = gc._find_account(book, "Assets:Checking")
+            dates = {s.reconcile_date for s in acct.splits if s.reconcile_state == "y"}
+        assert len(dates) == 1
+        (d,) = dates
+        assert d.astimezone().strftime("%Y-%m-%d %H:%M:%S") == "2026-01-31 23:59:59"
+        rows = _rows(gc, "Assets:Checking")
+        assert rows["reconcile-info/include-children"] == (1, 0)
+
+    def test_converter_moves_midnight_dates_and_completes_frames(self, test_book):
+        gc = GnuCashBook(str(test_book))
+        _reconcile(gc, date(2026, 1, 31), "jan")
+        from datetime import datetime
+        with gc.open(readonly=False) as book:
+            # The server's old shapes: local midnight, no include-children.
+            acct = gc._find_account(book, "Assets:Checking")
+            for s in acct.splits:
+                if s.reconcile_state == "y":
+                    s.reconcile_date = datetime.combine(date(2026, 1, 31), datetime.min.time())
+            book.session.execute(
+                text("DELETE FROM slots WHERE name = 'reconcile-info/include-children'")
+            )
+            book.save()
+        with gc.open(readonly=False) as book:
+            out = gc._upgrade_book_shapes(book)
+            book.save()
+        assert out["reconcile_dates_normalized"] == 1
+        assert out["reconcile_frames_completed"] == 1
+        with gc.open(readonly=True) as book:
+            acct = gc._find_account(book, "Assets:Checking")
+            d = next(s.reconcile_date for s in acct.splits if s.reconcile_state == "y")
+        assert d.astimezone().strftime("%H:%M:%S") == "23:59:59"
+        assert _rows(gc, "Assets:Checking")["reconcile-info/include-children"] == (1, 0)
+        with gc.open(readonly=False) as book:
+            again = gc._upgrade_book_shapes(book)
+        assert "reconcile_dates_normalized" not in again
+        assert "reconcile_frames_completed" not in again

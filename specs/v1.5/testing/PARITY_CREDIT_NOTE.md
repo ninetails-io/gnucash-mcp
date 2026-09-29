@@ -152,3 +152,14 @@ server NULL. Fixed at `_new_split` with a converter
 (`split_reconcile_dates_filled`). Open candidate from the same
 look: the time of day the server stores on a *reconciled* split
 (local midnight) against desktop's, not yet sampled.
+
+## Reconcile twin — 2026-09-29 afternoon
+
+The maintainer reconciled Bank Charges in desktop. Desktop's
+`reconcile_date` on the reconciled splits: `2026-09-30 06:59:59`
+UTC = the statement date's local day end (`gnc_time64_get_day_end`,
+the same convention as `reconcile-info/last-date`); the server
+wrote local midnight. Desktop's Finish also wrote
+`reconcile-info/include-children` 0, which the server's frame
+lacked. Both fixed on the write side with a converter
+(`reconcile_dates_normalized`, `reconcile_frames_completed`).
