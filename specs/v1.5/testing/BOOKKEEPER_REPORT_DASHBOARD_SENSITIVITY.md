@@ -7,7 +7,7 @@ WORKING-TREE Alex and Lin Wei samples (see route-around 1) in
 `~/Projects/abe-bench/` (`alex-dash`, `lin-dash`). Today: 2026-09-28.
 Production book and registered books untouched.
 
-## Verdict: Part B 16/16 PASS. Part C (desktop gate) is the maintainer's, per the plan — open. Six route-around notes, two of them plan fixes.
+## Verdict: Part B 16/16 PASS — and **Part C step 2 FAIL: desktop cannot read A2's `trans-date-due` slots**. The gate caught a shipping-stopper the server-side battery could not see. Six route-around notes.
 
 ## Part B — step by step
 1. **Baseline — PASS.** Checking `992 splits … 18 months behind, oldest
@@ -119,3 +119,31 @@ per the plan's note that the gate can take the litter.
 Signed: Abe VI. Every warning named its number at the quantum, every
 due date is GnuCash's own arithmetic, and the dashboard now flinches at
 exactly the things a bookkeeper flinches at.
+
+
+## Part C — desktop gate, 2026-09-28 evening (maintainer at the screen, bookkeeper on storage)
+
+**Step C2 FAIL.** On the looped copy, desktop shows: no due-documents
+reminder at open (the bills reminder fired on this same desktop
+yesterday against the precision book), Business → Invoices Due
+Reminder a silent no-op, Receivable Aging entirely "Current", and
+Find Invoice's Due column EMPTY for every server-written slot except
+one absurdity — invoice 000013 (gdate_val `20260131`, slot_type 10)
+rendered as **04/04/7161**.
+
+Diagnosis: the server (A2 and its backfill, `due_dates_backfilled:
+54`) writes `trans-date-due` as a piecash GDate (slot_type 10,
+`gdate_val` YYYYMMDD). GnuCash desktop stores that key as a time64
+(gncInvoice's `xaccTransSetDateDue`) and cannot decode ours: it treats
+the documents as having no due date at all (worse than the
+precision-era books, which have NO slot and fall back to
+due-on-posting). Every server-side check in Part B passed because the
+server reads its own format — the precise blind spot Part C exists
+to cover.
+
+Fix direction: write the slot exactly as GnuCash's SQL backend does
+for this key (time64/timespec row; confirm against a desktop-posted
+specimen), and re-run the backfill on affected books. A
+desktop-posted Net-30 specimen is being captured on the looped copy
+for byte-level comparison. Steps C3–C6 deferred until the format fix
+lands; re-run the whole gate then.
