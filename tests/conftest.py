@@ -1356,6 +1356,11 @@ def pathological_book(tmp_path: Path) -> PathologicalBook:
                 piecash.Split(account=chk, value=Decimal("300")),
             ],
         )
+        # The stored flag is desktop's -1; piecash's guard reads -1 as
+        # closed, so cache the computed answer first, as every server
+        # write path does.
+        from gnucash_mcp.book._base import _lot_cache_flag
+        _lot_cache_flag(lot_obj)
         ar_split.lot = lot_obj
         b.save()
 

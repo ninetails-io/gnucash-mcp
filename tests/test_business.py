@@ -6246,10 +6246,11 @@ class TestAddInvoiceEntry:
         fetched = gb.get_invoice("000001")
         assert fetched["entries"][0]["date"] == "2026-08-15"
 
-    def test_entry_date_stored_at_neutral_time(self, business_book):
-        """The raw stored value sits at GnuCash's neutral 10:59 —
-        timezone-proof for the raw-SQL display path (which
-        truncates the stored string) in every real-world zone."""
+    def test_entry_date_stored_at_local_noon(self, business_book):
+        """The raw stored value is desktop's: the entry ledger stores a
+        line's date at LOCAL noon (datecell-gnome.c, gnc_mktime of the
+        cell's tm; the parity twin's PDT specimen reads 19:00:00 UTC),
+        unlike the document dates, which sit at the neutral 10:59 UTC."""
         import sqlite3
 
         gb = GnuCashBook(str(business_book))
@@ -6269,7 +6270,9 @@ class TestAddInvoiceEntry:
             ).fetchone()[0]
         finally:
             conn.close()
-        assert raw == "2026-08-15 10:59:00"
+        from datetime import datetime as _dt, time as _time, timezone as _tz
+        expected = _dt.combine(date(2026, 8, 15), _time(12, 0)).astimezone(_tz.utc)
+        assert raw == expected.strftime("%Y-%m-%d %H:%M:%S")
 
     def test_rejects_non_income_account(self, business_book):
         """Invoice entries must post to INCOME accounts. Pre-fix any
@@ -7623,9 +7626,9 @@ class TestPayInvoice:
         assert second["status"] == "paid"
         assert Decimal(second["remaining_balance"]) == Decimal("0")
 
-    def test_memo_lands_on_bank_split_only(self, business_book):
-        """User memo annotates the cash movement; the A/R//A/P split
-        keeps its action='Payment' convention with an empty memo."""
+    def test_memo_lands_on_both_splits(self, business_book):
+        """Desktop's Process Payment puts the memo on both legs of the
+        payment (parity twin); so does pay_invoice."""
         gb = GnuCashBook(str(business_book))
         self._post_invoice(gb, "500.00")
         result = gb.pay_invoice(
@@ -7637,7 +7640,7 @@ class TestPayInvoice:
         txn = gb.get_transaction(result["transaction_guid"])
         memos = {s["account"]: s.get("memo", "") for s in txn["splits"]}
         assert memos["Assets:Checking"] == "check #1042"
-        assert memos["Assets:Accounts Receivable"] == ""
+        assert memos["Assets:Accounts Receivable"] == "check #1042"
 
     def test_no_memo_keeps_prior_shape(self, business_book):
         gb = GnuCashBook(str(business_book))
@@ -7802,20 +7805,23 @@ class TestPayInvoice:
             amount="500",
         )
 
-        # Check lot is_closed = 1 in the database — the value GnuCash
-        # caches for a zero-balance lot (gnc_lot_get_balance). -1 is
-        # LOT_CLOSED_UNKNOWN, which desktop would recompute.
+        # The stored flag is desktop's -1 (LOT_CLOSED_UNKNOWN: GnuCash
+        # resets it on every split change and recomputes on read);
+        # closed-ness is the computed answer, read the way desktop
+        # reads it.
+        from gnucash_mcp.book._base import _lot_is_closed
         conn = sqlite3.connect(str(business_book))
         try:
             lots = conn.execute(
                 "SELECT is_closed FROM lots WHERE account_guid IN "
                 "(SELECT guid FROM accounts WHERE name = 'Accounts Receivable')"
             ).fetchall()
-            assert any(
-                row[0] == 1 for row in lots
-            ), "lot should be closed with is_closed=1"
+            assert all(row[0] == -1 for row in lots), lots
         finally:
             conn.close()
+        with gb.open(readonly=True) as book:
+            ar = next(a for a in book.accounts if a.name == "Accounts Receivable")
+            assert all(_lot_is_closed(lot) for lot in ar.lots)
 
     def test_partial_payment_does_not_close_lot(self, business_book):
         """Partial payment leaves lot open."""
@@ -7835,11 +7841,13 @@ class TestPayInvoice:
                 "SELECT is_closed FROM lots WHERE account_guid IN "
                 "(SELECT guid FROM accounts WHERE name = 'Accounts Receivable')"
             ).fetchall()
-            assert all(
-                row[0] == 0 for row in lots
-            ), "lot should remain open after partial payment"
+            assert all(row[0] == -1 for row in lots), lots
         finally:
             conn.close()
+        from gnucash_mcp.book._base import _lot_is_closed
+        with gb.open(readonly=True) as book:
+            ar = next(a for a in book.accounts if a.name == "Accounts Receivable")
+            assert not any(_lot_is_closed(lot) for lot in ar.lots)
 
     def test_cross_currency_payment_uses_price_table(self, business_book):
         """EUR invoice paid from USD Checking converts at book.prices rate.
@@ -9248,6 +9256,11 @@ class TestOverpaymentGuard:
                 if a.fullname == "Assets:Checking"
             )
             lot_obj = ar.lots[0]
+            # The stored flag is -1 (desktop's); piecash's guard reads
+            # -1 as "closed", so cache the computed answer first, as
+            # every server write path does.
+            from gnucash_mcp.book._base import _lot_cache_flag
+            _lot_cache_flag(lot_obj)
             ar_split = piecash.Split(
                 account=ar, value=Decimal("-300"),
             )

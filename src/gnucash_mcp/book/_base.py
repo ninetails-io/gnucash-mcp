@@ -234,6 +234,17 @@ def _recurrence_next(
 
 
 
+def _neutral_time(d: date) -> datetime:
+    """GnuCash's neutral time of day for a date-valued timestamp:
+    10:59:00 UTC (``gnc_time64_get_day_neutral``), the convention
+    behind ``transactions.post_date`` and, on desktop, a document's
+    ``date_opened`` / ``date_posted``. Timezone-aware so piecash's
+    local→UTC conversion is a no-op."""
+    from datetime import timezone
+
+    return datetime(d.year, d.month, d.day, 10, 59, 0, tzinfo=timezone.utc)
+
+
 def _future_statement_warning(statement_date: date) -> str | None:
     """A statement is not dated in the future; one that is, is a
     typo. The reconcile goes through (desktop accepts the date too)
@@ -2530,6 +2541,9 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
             n = voids(book)
             if n:
                 out["voids_migrated"] = n
+        biz = getattr(self, "_migrate_business_shapes", None)
+        if biz is not None:
+            out.update(biz(book))
         stamp = getattr(self, "_ensure_budget_unreversed", None)
         if stamp is not None:
             from piecash.budget import Budget

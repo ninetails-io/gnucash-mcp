@@ -2150,6 +2150,31 @@ def _shape_upgrade_lines(after: dict) -> list[str]:
             f"rewritten in GnuCash's void shape (numeric originals, "
             f"read-only; nothing posted)"
         )
+    biz_parts = []
+    for key, label in (
+        ("credit_note_entries_migrated", "credit-note entry signs"),
+        ("credit_applications_migrated", "credit applications as lot links"),
+        ("document_dates_normalized", "document dates at the neutral time"),
+        ("entries_normalized", "entry defaults"),
+        ("lot_flags_reset", "lot flags left to GnuCash"),
+        ("payment_memos_completed", "payment memos on both legs"),
+        ("payment_slots_pruned", "payment date-posted slots removed"),
+        ("lot_notes_pruned", "empty lot notes removed"),
+    ):
+        n = after.get(key)
+        if n:
+            biz_parts.append(f"{n} {label}")
+    if biz_parts:
+        lines.append(
+            f"{_INDENT}business rows brought to desktop's shape: "
+            + ", ".join(biz_parts) + " (nothing posted)"
+        )
+    n = after.get("credit_note_entries_unresolved")
+    if n:
+        lines.append(
+            f"{_INDENT}{n} unposted credit note{'s' if n != 1 else ''} with "
+            f"mixed-sign lines left as is — review before posting"
+        )
     if after.get("book_stamped"):
         lines.append(
             f'{_INDENT}book stamped: "{after["book_stamped"]}" '
