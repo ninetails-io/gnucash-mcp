@@ -119,3 +119,23 @@ fire, totals identical to the desktop twin ($450,762.93 net).
 **Verdict:** one shipping stopper (entry quantity sign, both
 directions), one write-shape difference to bring to parity when
 convenient, three low-weight column conventions.
+
+### Outcome — 2026-09-29, `test/slot-shapes`
+
+Ruling: desktop parity means shape parity in the data file, not
+tolerance. Every line in the table is fixed on the server's write
+side, with a converter under `_upgrade_book_shapes`
+(`_migrate_business_shapes`) for rows already on disk, and the twin
+re-run until the dump matched:
+
+    diff desktop.txt server2.txt → empty (25 lines each)
+
+The dump orders transactions by type rather than entry time (the
+two sides did the same two operations in opposite order) and maps
+the invoice's own posting GUIDs to roles; neither is a storage
+difference. The desktop dump is now a fixture
+(`tests/fixtures/parity_credit_note_desktop.txt`) and
+`tests/test_parity_credit_note.py` reproduces the server side from
+the frozen sample and expects it verbatim, with the one
+machine-dependent line (the entry date at the desktop's local noon)
+rendered for the zone the test runs in.
