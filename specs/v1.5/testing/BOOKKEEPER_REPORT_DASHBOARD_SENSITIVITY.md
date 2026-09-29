@@ -170,3 +170,38 @@ lands; re-run the whole gate then.
   session, the summary answers normally.
 - C4/C5/C6 (reconcile proposal, desktop reconcile read-back,
   edit-save-reopen) deferred to the post-fix re-run of the full gate.
+
+## Part C — re-run after the timespec fix (2026-09-28 evening, `bbd86a0`)
+
+The writer and backfill now emit `slot_type 6 | timespec_val <due>
+10:59:00` (column for column the desktop specimen, pinned by
+`tests/test_billterm_due_date.py::TestDesktopShape`), the reader
+accepts both shapes, and the backfill rewrote the looped copy's 58
+GDate rows in place (59 timespec rows after; desktop's own untouched).
+
+- **C1 open — PASS.** No format or feature dialog.
+- **C2 reminders — PASS.** On open, desktop raised the Due Invoices
+  Reminder (11 documents: the A9101 0.75 residual due 08/29, the
+  due-on-receipt A9102 due 08/19, the Net-30 A9103 due 09/18, and the
+  sample's eight) and the Due Bills Reminder (BookkeepingCo, due
+  08/07) — the dates the dashboard reports. Both were silent before
+  the fix. Since Last Run listed the migrated schedules as To-Create
+  (desktop reading the native recipes); cancelled, nothing posted.
+- **C3 — PASS** (unchanged from the first run: desktop's Net-30
+  specimen reads back as 2026-10-28).
+- **C4 proposal — PASS.** Actions → Reconcile on Savings proposed
+  2026-10-31: the server-written last date plus its recorded 3-month
+  interval, last day of month kept.
+- **C5 desktop reconcile read back — PASS, strict.** After Finish on
+  2026-10-31 the slots hold ONE `reconcile-info` frame:
+  `last-date` 1793516399 (2026-10-31 23:59:59 local, desktop's
+  day-end — the same convention `_write_reconcile_info` stores),
+  `last-interval/months` 3, `days` 0, plus desktop's own
+  `include-children` 0. Desktop wrote into the server's frame, not
+  beside it.
+- **C6 edit-save-reopen — PASS.** Clean reopen; reminders fire again.
+
+Route-around: the maintainer drove C4–C6 at the screen. Claude's
+desktop control could open the copy and read every dialog, but a
+CleanShot X overlay refused every click, so the dialogs were
+dismissed by hand.
