@@ -7,7 +7,7 @@ WORKING-TREE Alex and Lin Wei samples (see route-around 1) in
 `~/Projects/abe-bench/` (`alex-dash`, `lin-dash`). Today: 2026-09-28.
 Production book and registered books untouched.
 
-## Verdict: Part B 16/16 PASS — and **Part C step 2 FAIL: desktop cannot read A2's `trans-date-due` slots**. The gate caught a shipping-stopper the server-side battery could not see. Six route-around notes.
+## Verdict: Part B 16/16 PASS — and **Part C step 2 FAIL: desktop cannot read A2's `trans-date-due` slots**. The gate caught a shipping-stopper the server-side battery could not see. Six route-around notes. *(Superseded: fixed in `bbd86a0`; Part C re-run CLOSED, PASS — see the end of this report.)*
 
 ## Part B — step by step
 1. **Baseline — PASS.** Checking `992 splits … 18 months behind, oldest
@@ -220,8 +220,14 @@ GDate rows in place (59 timespec rows after; desktop's own untouched).
 - **C4 on Gate Test — PASS.** Unaided, the Reconcile dialog proposed
   07/31/2026: 2026-06-30 plus the server-recorded 1-month interval,
   last day of month kept, before today so no clamp.
-- **C6 edit-save-reopen — NOT YET CONFIRMED.** Expected: clean reopen,
-  reminders fire again.
+- **C6 edit-save-reopen — PASS.** Petty Cash 450.00 → 451.00 in the
+  register, save, quit, reopen: clean, the same three dialogs and
+  nothing else.
+
+**Part C verdict: CLOSED, PASS** on `bbd86a0` (C1–C6). The gate did its
+job twice over: it caught the due-date slot shape the server-side
+battery could not see, and it caught the plan's own error about
+desktop's future-date clamp.
 
 Follow-up for the maintainer: neither desktop nor `reconcile_account`
 refuses a statement date in the future. A statement can't be dated
