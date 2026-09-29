@@ -2278,6 +2278,14 @@ def _fmt_scheduled_transaction_update(entry: dict) -> list[str]:
             lines.append(f"{_INDENT}enabled: {old} → {new}")
         else:
             lines.append(f"{_INDENT}enabled: {new}")
+    if "start_date" in params and params["start_date"] is not None:
+        old = before.get("start_date")
+        new = params["start_date"]
+        if old != new:
+            lines.append(
+                f"{_INDENT}start_date: {old or '(none)'} → {new} "
+                f"(recurrence rows moved with it)"
+            )
     if "end_date" in params and params["end_date"] is not None:
         old = before.get("end_date")
         new = params["end_date"] if params["end_date"] != "" else None

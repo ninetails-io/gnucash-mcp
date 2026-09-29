@@ -93,6 +93,9 @@ Production book and registered books untouched.
    enabled/end_date/notes…), so step 4's "move the schedule's start"
    is not expressible; tested the boundary by delete-and-recreate.
    Either give the tool a date-mover or reword the step.
+   *(Maintainer, 2026-09-29: `update_scheduled_transaction` now takes
+   `start_date`, moving the recurrence rows and the schedule's start
+   together as desktop's editor does.)*
 3. **`reconcile_account` wants `statement_balance`** where
    `enter_statement` says `closing_balance` — a third argot for the
    same number; my first guess (`ending_balance`) matched neither.

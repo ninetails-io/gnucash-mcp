@@ -1552,12 +1552,22 @@ class SchedulingMixin:
         enabled: bool | None = None,
         end_date: str | None = None,
         notes: str | None = None,
+        start_date: str | None = None,
     ) -> dict:
         """Update a scheduled transaction.
 
         Args:
             guid: Scheduled transaction GUID.
             enabled: Enable or disable.
+            start_date: ``"YYYY-MM-DD"`` to move the schedule's start.
+                What desktop's editor does on OK: the recurrence rows
+                take the new date as their period start
+                (``gnc_sx_set_schedule``) and the schedule's own
+                ``start_date`` follows (``xaccSchedXactionSetStartDate``);
+                ``last_occur`` is untouched. The start is the
+                PHASE anchor — monthly from the 15th becomes monthly
+                from the 3rd for every future occurrence — which is
+                the point: it is a mover, not a relabel.
             end_date: ``"YYYY-MM-DD"`` to set, ``""`` to clear,
                 ``None`` (default) to leave unchanged. The
                 empty-string sentinel exists because ``None``
@@ -1584,6 +1594,9 @@ class SchedulingMixin:
             self._stage_audit_before({
                 "name": sx.name,
                 "enabled": bool(sx.enabled),
+                "start_date": (
+                    sx.start_date.isoformat() if sx.start_date else None
+                ),
                 "end_date": (
                     sx.end_date.isoformat() if sx.end_date else None
                 ),
@@ -1614,6 +1627,27 @@ class SchedulingMixin:
                     sx.end_date = None
                 else:
                     sx.end_date = date.fromisoformat(end_date)
+
+            if start_date is not None:
+                new_start = date.fromisoformat(start_date)
+                if sx.end_date and new_start > sx.end_date:
+                    raise ValueError(
+                        f"start_date {new_start.isoformat()} is after the "
+                        f"schedule's end date {sx.end_date.isoformat()}"
+                    )
+                # Every recurrence row moves with the start, as the
+                # editor rebuilds them from one start date.
+                book.session.execute(
+                    Recurrence.__table__.update()
+                    .where(Recurrence.__table__.c.obj_guid == sx.guid)
+                    .values(recurrence_period_start=new_start)
+                )
+                _verify_composite_write(
+                    book.session, Recurrence.__table__,
+                    {"obj_guid": sx.guid, "recurrence_period_start": new_start},
+                    f"recurrence start for scheduled transaction '{sx.name}'",
+                )
+                sx.start_date = new_start
 
             if notes is not None:
                 # Upsert as delete-then-insert: the slot table has
