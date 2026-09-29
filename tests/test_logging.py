@@ -647,6 +647,14 @@ class TestBudgetAndScheduledAuditHandlers:
             "start_date: 2026-11-15 → 2026-11-03 (recurrence rows moved with it)"
         ) in rendered
 
+    def test_void_migration_line(self):
+        from gnucash_mcp.logging_config import _shape_upgrade_lines
+        lines = _shape_upgrade_lines({"voids_migrated": 2})
+        assert lines == [
+            " " * 10 + "2 voided transactions rewritten in GnuCash's void shape "
+            "(numeric originals, read-only; nothing posted)"
+        ]
+
     def test_scheduled_update_end_date_clear(self):
         from gnucash_mcp.logging_config import _format_audit_entry_text
         entry = {

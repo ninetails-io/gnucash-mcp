@@ -2143,6 +2143,13 @@ def _shape_upgrade_lines(after: dict) -> list[str]:
             f"GnuCash's trans-date-due slot (terms over posting date; "
             f"nothing posted)"
         )
+    n = after.get("voids_migrated")
+    if n:
+        lines.append(
+            f"{_INDENT}{n} voided transaction{'s' if n != 1 else ''} "
+            f"rewritten in GnuCash's void shape (numeric originals, "
+            f"read-only; nothing posted)"
+        )
     if after.get("book_stamped"):
         lines.append(
             f'{_INDENT}book stamped: "{after["book_stamped"]}" '

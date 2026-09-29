@@ -9742,42 +9742,155 @@ class TestReconcileAccount:
 class TestVoidTransaction:
     """Tests for void_transaction method."""
 
-    def test_void_time_slot_is_timezone_aware(self, test_book: Path):
-        """The ``void-time`` slot must store a tz-aware ISO string
-        so a later reader can reconstruct the absolute void instant
-        across DST transitions and timezone changes. Pre-fix this
-        was naive ``datetime.now().isoformat()`` whose
-        interpretation depended on the host's current zone."""
-        from datetime import datetime as _dt
-        gc_book = GnuCashBook(str(test_book))
-        transactions = gc_book.list_transactions(compact=False)["transactions"]
-        guid = transactions[0]["guid"]
-
-        gc_book.void_transaction(guid=guid, reason="test")
-
-        # Read the raw value out of the slots table — the
-        # SlotString wrapper's repr contains the value but isn't
-        # itself directly parseable. Going through SQL gives us
-        # the stored ISO string verbatim.
+    @staticmethod
+    def _slot_rows(gc_book, guids):
         from sqlalchemy import text
         with gc_book.open(readonly=True) as book:
-            txn = next(
-                t for t in book.transactions if t.guid.startswith(guid[:8])
-            )
-            row = book.session.execute(
+            q = ",".join(f":g{i}" for i in range(len(guids)))
+            return book.session.execute(
                 text(
-                    "SELECT string_val FROM slots "
-                    "WHERE obj_guid = :guid AND name = :name"
+                    "SELECT obj_guid, name, slot_type, string_val, "
+                    "numeric_val_num, numeric_val_denom FROM slots "
+                    f"WHERE obj_guid IN ({q}) ORDER BY obj_guid, name"
                 ),
-                {"guid": txn.guid, "name": "void-time"},
-            ).first()
-        void_time_str = row[0]
-        parsed = _dt.fromisoformat(void_time_str)
-        # Pre-fix the slot stored a NAIVE ``datetime.now()`` whose
-        # absolute meaning depended on the host's current zone.
-        assert parsed.tzinfo is not None, (
-            f"void-time must be tz-aware, got naive: {void_time_str!r}"
+                {f"g{i}": g for i, g in enumerate(guids)},
+            ).fetchall()
+
+    def test_void_writes_gnucash_shape(self, test_book: Path):
+        """xaccTransVoid / xaccSplitVoid, key for key: void-reason
+        and void-time as strings, the time in GnuCash's own ISO
+        8601 (UTC, ``YYYY-MM-DD HH:MM:SS``, a space — Python's 'T'
+        form fails gnc-datetime's parser and desktop then does not
+        see the void at all), notes stashed in void-former-notes and
+        set to "Voided transaction", the transaction read-only, and
+        each split's originals as NUMERIC void-former-amount /
+        void-former-value. Pre-fix the server wrote STRING slots
+        under void-former-value and an invented void-former-quantity."""
+        import re
+        gc_book = GnuCashBook(str(test_book))
+        created = gc_book.create_transaction(
+            description="Will void", notes="keep me",
+            splits=[
+                {"account": "Assets:Checking", "amount": "-42.50"},
+                {"account": "Expenses:Groceries", "amount": "42.50"},
+            ],
+            trans_date=date.today() - timedelta(days=1),
         )
+        gc_book.void_transaction(guid=created["guid"], reason="test")
+        with gc_book.open(readonly=True) as book:
+            txn = gc_book._find_transaction(book, created["guid"])
+            txn_guid = txn.guid
+            split_guids = [s.guid for s in txn.splits]
+            assert txn.notes == "Voided transaction"
+        rows = self._slot_rows(gc_book, [txn_guid] + split_guids)
+        by = {(r[0], r[1]): r for r in rows}
+        assert by[(txn_guid, "void-reason")][2:4] == (4, "test")
+        assert by[(txn_guid, "void-former-notes")][2:4] == (4, "keep me")
+        assert by[(txn_guid, "trans-read-only")][2:4] == (4, "Transaction Voided")
+        void_time = by[(txn_guid, "void-time")][3]
+        assert re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", void_time), void_time
+        for sg in split_guids:
+            amount = by[(sg, "void-former-amount")]
+            value = by[(sg, "void-former-value")]
+            assert amount[2] == 3 and value[2] == 3  # KVP_TYPE_NUMERIC
+            assert abs(amount[4]) == 4250 and amount[5] == 100
+            assert abs(value[4]) == 4250 and value[5] == 100
+            assert (sg, "void-former-quantity") not in by
+
+    def test_unvoid_restores_from_gnucash_shape(self, test_book: Path):
+        """A void desktop made (numeric former amounts, no legacy
+        keys) unvoids here to the original amounts and notes, and
+        clears every void key including read-only."""
+        gc_book = GnuCashBook(str(test_book))
+        created = gc_book.create_transaction(
+            description="Desktop void", notes="original",
+            splits=[
+                {"account": "Assets:Checking", "amount": "-10"},
+                {"account": "Expenses:Groceries", "amount": "10"},
+            ],
+            trans_date=date.today() - timedelta(days=1),
+        )
+        # Engineer desktop's shape directly.
+        with gc_book.open(readonly=False) as book:
+            txn = gc_book._find_transaction(book, created["guid"])
+            txn["void-former-notes"] = "original"
+            txn.notes = "Voided transaction"
+            txn["void-reason"] = "desktop"
+            txn["void-time"] = "2026-09-29 17:00:00"
+            txn["trans-read-only"] = "Transaction Voided"
+            for s in txn.splits:
+                s["void-former-amount"] = Decimal(str(s.quantity))
+                s["void-former-value"] = Decimal(str(s.value))
+                s.value = Decimal("0")
+                s.quantity = Decimal("0")
+                s.reconcile_state = "v"
+            book.save()
+        gc_book.unvoid_transaction(created["guid"])
+        with gc_book.open(readonly=True) as book:
+            txn = gc_book._find_transaction(book, created["guid"])
+            assert txn.notes == "original"
+            assert sorted(abs(s.value) for s in txn.splits) == [Decimal("10")] * 2
+            assert all(s.reconcile_state == "n" for s in txn.splits)
+            guids = [txn.guid] + [s.guid for s in txn.splits]
+        names = {r[1] for r in self._slot_rows(gc_book, guids)}
+        assert not names & {
+            "void-reason", "void-time", "void-former-notes", "trans-read-only",
+            "void-former-amount", "void-former-value",
+        }
+
+    def test_legacy_void_converts_on_the_next_write(self, test_book: Path):
+        """A pre-fix void (STRING void-former-value, invented
+        void-former-quantity, 'T' void-time, no read-only) is
+        rewritten into GnuCash's shape by the next converting write,
+        keeping the amounts it held, and reported as voids_migrated."""
+        gc_book = GnuCashBook(str(test_book))
+        created = gc_book.create_transaction(
+            description="Old void",
+            splits=[
+                {"account": "Assets:Checking", "amount": "-7.25"},
+                {"account": "Expenses:Groceries", "amount": "7.25"},
+            ],
+            trans_date=date.today() - timedelta(days=1),
+        )
+        with gc_book.open(readonly=False) as book:
+            txn = gc_book._find_transaction(book, created["guid"])
+            txn["void-reason"] = "old"
+            txn["void-time"] = "2026-03-01T09:00:00-08:00"
+            for s in txn.splits:
+                s["void-former-value"] = str(s.value)
+                s["void-former-quantity"] = str(s.quantity)
+                s.value = Decimal("0")
+                s.quantity = Decimal("0")
+                s.reconcile_state = "v"
+            book.save()
+        # Any converting write: void a second transaction.
+        other = gc_book.create_transaction(
+            description="Another",
+            splits=[
+                {"account": "Assets:Checking", "amount": "-1"},
+                {"account": "Expenses:Groceries", "amount": "1"},
+            ],
+            trans_date=date.today() - timedelta(days=1),
+        )
+        result = gc_book.void_transaction(other["guid"], reason="x")
+        assert result["voids_migrated"] == 1
+        with gc_book.open(readonly=True) as book:
+            txn = gc_book._find_transaction(book, created["guid"])
+            guids = [txn.guid] + [s.guid for s in txn.splits]
+            txn_guid = txn.guid
+        by = {(r[0], r[1]): r for r in self._slot_rows(gc_book, guids)}
+        assert by[(txn_guid, "void-time")][3] == "2026-03-01 17:00:00"
+        assert (txn_guid, "trans-read-only") in by
+        for (obj, name), row in by.items():
+            if obj == txn_guid:
+                continue
+            assert name in ("void-former-amount", "void-former-value"), name
+            assert row[2] == 3 and abs(row[4]) == 725 and row[5] == 100
+        # ... and it unvoids to what it held.
+        gc_book.unvoid_transaction(created["guid"])
+        with gc_book.open(readonly=True) as book:
+            txn = gc_book._find_transaction(book, created["guid"])
+            assert sorted(abs(s.value) for s in txn.splits) == [Decimal("7.25")] * 2
 
     def test_void_transaction_success(self, test_book: Path):
         """Should void a transaction."""
