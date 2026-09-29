@@ -171,6 +171,31 @@ def _commit(gc, statement_book, **kw):
     )
 
 
+class TestFutureStatementDate:
+    """A statement dated after today is a typo; it goes through and
+    the warnings table says so in both modes, with the sentence
+    reconcile_account uses (ruled 2026-09-29)."""
+
+    def test_dry_run_warns(self, statement_book):
+        from datetime import timedelta
+        gc = GnuCashBook(str(statement_book))
+        tomorrow = date.today() + timedelta(days=1)
+        res = gc.enter_statement(
+            "Assets:Checking", tomorrow, _OPEN, _CLOSE,
+            _checking_lines(), dry_run=True,
+        )
+        assert (
+            f"*\tstatement_date {tomorrow.isoformat()} is after today "
+            f"({date.today().isoformat()}) — a statement is not dated in "
+            f"the future; check the transcription"
+        ) in res["warnings"]
+
+    def test_past_statement_has_no_such_row(self, statement_book):
+        gc = GnuCashBook(str(statement_book))
+        res = _dry(gc)
+        assert "is after today" not in res["warnings"]
+
+
 # ── Grammar ────────────────────────────────────────────────────────
 
 

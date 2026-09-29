@@ -627,6 +627,26 @@ class TestBudgetAndScheduledAuditHandlers:
         assert 'UPDATE SCHEDULED  "Monthly Rent"' in rendered
         assert "enabled: True → False" in rendered
 
+    def test_scheduled_update_start_date_move(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        entry = {
+            "classification": "write",
+            "entity_type": "scheduled_transaction",
+            "operation": "update",
+            "timestamp": "2026-09-29T09:00:00",
+            "params": {"guid": "abcdef01", "start_date": "2026-11-03"},
+            "before_state": {
+                "name": "Monthly Rent",
+                "enabled": True,
+                "start_date": "2026-11-15",
+                "end_date": None,
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert (
+            "start_date: 2026-11-15 → 2026-11-03 (recurrence rows moved with it)"
+        ) in rendered
+
     def test_scheduled_update_end_date_clear(self):
         from gnucash_mcp.logging_config import _format_audit_entry_text
         entry = {

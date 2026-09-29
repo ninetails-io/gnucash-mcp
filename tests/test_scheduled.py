@@ -2,13 +2,12 @@
 
 from datetime import date, timedelta
 from decimal import Decimal
-from dateutil.relativedelta import relativedelta
 from unittest.mock import patch
 
 import pytest
+from dateutil.relativedelta import relativedelta
 
 from gnucash_mcp.book import GnuCashBook
-
 
 # ── Create ──────────────────────────────────────────────────
 
@@ -547,6 +546,59 @@ class TestUpdateScheduled:
         )
         assert result["end_date"] == "2026-12-31"
 
+    def test_move_start_date_moves_the_phase(self, scheduled_book):
+        """Desktop parity: the editor's OK rewrites the recurrence
+        rows from the new start (gnc_sx_set_schedule) and sets the
+        schedule's start_date (xaccSchedXactionSetStartDate),
+        leaving last_occur alone. Monthly from the 15th moved to
+        the 3rd is due on the 3rd from then on."""
+        from datetime import timedelta
+
+        from sqlalchemy import text
+        gb = GnuCashBook(str(scheduled_book))
+        old_start = (date.today() + timedelta(days=40)).replace(day=15)
+        sx = gb.create_scheduled_transaction(
+            name="Rent", description="Rent",
+            splits=[
+                {"account": "Expenses:Rent", "amount": "1850.00"},
+                {"account": "Assets:Checking", "amount": "-1850.00"},
+            ],
+            start_date=old_start.isoformat(), frequency="monthly",
+        )
+        new_start = old_start.replace(day=3)
+        result = gb.update_scheduled_transaction(
+            sx["guid"], start_date=new_start.isoformat(),
+        )
+        assert result["start_date"] == new_start.isoformat()
+        with gb.open(readonly=True) as book:
+            row = gb._find_scheduled_transaction(book, sx["guid"])
+            starts = book.session.execute(
+                text(
+                    "SELECT recurrence_period_start FROM recurrences "
+                    "WHERE obj_guid = :g"
+                ),
+                {"g": row.guid},
+            ).fetchall()
+            assert len(starts) == 1
+            assert str(starts[0][0]).replace("-", "")[:8] == new_start.strftime("%Y%m%d")
+            assert row.start_date == new_start
+            assert row.last_occur is None
+            assert gb._sx_next_due(row) == new_start
+
+    def test_move_start_past_end_is_refused(self, scheduled_book):
+        gb = GnuCashBook(str(scheduled_book))
+        sx = gb.create_scheduled_transaction(
+            name="Rent", description="Rent",
+            splits=[
+                {"account": "Expenses:Rent", "amount": "1850.00"},
+                {"account": "Assets:Checking", "amount": "-1850.00"},
+            ],
+            start_date="2026-01-01", frequency="monthly",
+            end_date="2026-06-30",
+        )
+        with pytest.raises(ValueError, match="after the schedule's end date"):
+            gb.update_scheduled_transaction(sx["guid"], start_date="2026-07-15")
+
     def test_not_found_error(self, scheduled_book):
         gb = GnuCashBook(str(scheduled_book))
         with pytest.raises(ValueError, match="not found"):
@@ -1037,7 +1089,8 @@ class TestScheduledCurrency:
         """A foreign template's bill-list amount carries its
         currency code — '25.00' from an EUR schedule must not read
         as a book-default amount."""
-        from datetime import date as _date, timedelta as _td
+        from datetime import date as _date
+        from datetime import timedelta as _td
 
         gc = GnuCashBook(str(multi_currency_book))
         self._eur_accounts(gc)
@@ -1062,7 +1115,8 @@ class TestScheduledCurrency:
         """Dashboard 7-day total: foreign templates convert at the
         latest market rate; with no rate on file they're counted
         but flagged unrated instead of silently mixed in."""
-        from datetime import date as _date, timedelta as _td
+        from datetime import date as _date
+        from datetime import timedelta as _td
 
         gc = GnuCashBook(str(multi_currency_book))
         self._eur_accounts(gc)
@@ -1139,6 +1193,7 @@ def _make_legacy(book_path, sx_name, *, refs="guid", description=True,
     write — so the guards that read it need tests that can still
     construct it."""
     import json
+
     from sqlalchemy import text
     gb = GnuCashBook(str(book_path))
     with gb.open(readonly=False) as book:
@@ -1475,8 +1530,8 @@ class TestTornWriteLate:
         delete-template-then-save, which commits the partial rows;
         it only looked clean because piecash's
         Account.scheduled_transaction cascade swept them out."""
-        from sqlalchemy import text
         from piecash.kvp import Slot
+        from sqlalchemy import text
         gb = GnuCashBook(str(scheduled_book))
         real_insert = Slot.__table__.insert
         calls = {"n": 0}

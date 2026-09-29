@@ -2136,6 +2136,13 @@ def _shape_upgrade_lines(after: dict) -> list[str]:
             f"{_INDENT}{n} invoice link{'s' if n != 1 else ''} renamed "
             f"to GnuCash's key (desktop-navigable, nothing posted)"
         )
+    n = after.get("due_dates_backfilled")
+    if n:
+        lines.append(
+            f"{_INDENT}{n} posted document{'s' if n != 1 else ''} given "
+            f"GnuCash's trans-date-due slot (terms over posting date; "
+            f"nothing posted)"
+        )
     if after.get("book_stamped"):
         lines.append(
             f'{_INDENT}book stamped: "{after["book_stamped"]}" '
@@ -2271,6 +2278,14 @@ def _fmt_scheduled_transaction_update(entry: dict) -> list[str]:
             lines.append(f"{_INDENT}enabled: {old} → {new}")
         else:
             lines.append(f"{_INDENT}enabled: {new}")
+    if "start_date" in params and params["start_date"] is not None:
+        old = before.get("start_date")
+        new = params["start_date"]
+        if old != new:
+            lines.append(
+                f"{_INDENT}start_date: {old or '(none)'} → {new} "
+                f"(recurrence rows moved with it)"
+            )
     if "end_date" in params and params["end_date"] is not None:
         old = before.get("end_date")
         new = params["end_date"] if params["end_date"] != "" else None

@@ -488,15 +488,16 @@ class TestIsVoidedConsistency:
     def test_reconciliation_backlog_counts_pre_latest_y_date(
         self, test_book: Path,
     ):
-        """HP-8: the dashboard's reconciliation backlog count must
-        include unreconciled splits that PREDATE the last
-        reconciled ('y') split — they're the ones most likely to
-        be problems (skipped during a partial reconciliation,
-        opening balances never stamped, edge cases that fell
-        through). Pre-fix the count was scoped to "splits after
-        latest_y_date" which silently dropped them, breaking the
-        invariant that the dashboard count equals
-        ``get_unreconciled_splits``'s count.
+        """HP-8: unreconciled splits that PREDATE the last
+        reconciled ('y') split must never vanish from the dashboard
+        — they're the ones most likely to be problems (skipped
+        during a partial reconciliation, opening balances never
+        stamped). Pre-fix the count was scoped to "splits after
+        latest_y_date" and silently dropped them. Since spec B2 the
+        dashboard carries them as OUTSTANDING ITEMS beside the
+        backlog, so the invariant is: backlog + outstanding equals
+        ``get_unreconciled_splits``'s count, and the pre-reconcile
+        splits land in the outstanding bucket, not nowhere.
         """
         from datetime import datetime as _dt
         gb = GnuCashBook(str(test_book))
@@ -544,15 +545,18 @@ class TestIsVoidedConsistency:
             r for r in results if r["account"] == "Assets:Checking"
         )
 
-        assert checking_entry["unreconciled_count"] == detail_count, (
-            f"dashboard ({checking_entry['unreconciled_count']}) "
-            f"disagrees with get_unreconciled_splits ({detail_count}) "
-            f"— bookkeeper's first instinct will be 'the book is "
-            f"wrong'"
+        dashboard_total = (
+            checking_entry["unreconciled_count"]
+            + checking_entry.get("outstanding_count", 0)
         )
-        # And confirm the pre-fix bug-shape: at least one
-        # unreconciled split predates ``latest_y_date``.
-        assert detail_count >= 1, (
+        assert dashboard_total == detail_count, (
+            f"dashboard ({dashboard_total}) disagrees with "
+            f"get_unreconciled_splits ({detail_count}) — bookkeeper's "
+            f"first instinct will be 'the book is wrong'"
+        )
+        # And confirm the pre-fix bug-shape: the splits predating
+        # ``latest_y_date`` are surfaced as outstanding items.
+        assert checking_entry.get("outstanding_count", 0) >= 1, (
             "fixture didn't produce the pre-latest_y_date "
             "unreconciled scenario this test is meant to lock"
         )

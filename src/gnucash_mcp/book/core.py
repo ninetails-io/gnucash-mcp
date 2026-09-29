@@ -63,10 +63,12 @@ def _describe_check_failure(check: str, exc: BaseException) -> str:
 from gnucash_mcp.book._base import (
     _rollback_if_aborted,
     _txn_sort_key,
+    _budget_period_bounds,
     _budget_targets,
     _account_to_compact_line,
     _account_to_dict,
     _commodity_quantum,
+    _future_statement_warning,
     _gnc_bool,
     _guid_prefix_map,
     _is_unreconciled,
@@ -214,6 +216,25 @@ class CoreMixin:
     # ~2-week grace period.
     _RECONCILE_WARN_DAYS = 45
 
+    # When desktop has recorded the account's statement cycle
+    # (``reconcile-info/last-interval``), the threshold is that
+    # interval plus this grace; a quarterly or annual statement no
+    # longer reads "behind" every month (spec B4, ruled 2026-09-28).
+    # One month plus grace equals the fixed default.
+    _RECONCILE_GRACE_DAYS = 15
+
+    # Unreconciled splits dated BEFORE an account's last reconcile
+    # are outstanding items (a cheque that never cleared), not
+    # backlog: they don't make the account "behind". They earn a
+    # note — no stronger — once the oldest is this many days older
+    # than the last reconcile date (spec B2, ruled 2026-09-28).
+    _RECONCILE_OUTSTANDING_NOTE_DAYS = 90
+
+    # A never-reconciled account with a zero balance and no activity
+    # this long is dormant — a card paid off years ago — not a
+    # standing ⚠ (spec B3, ruled 2026-09-28).
+    _RECONCILE_DORMANT_DAYS = 180
+
     # "Last transaction" staleness threshold for the book-summary
     # warning. Beyond this many days since the most recent
     # transaction post_date, the dashboard's "Last entry" line
@@ -224,7 +245,7 @@ class CoreMixin:
     _LAST_ENTRY_WARN_DAYS = 14
 
     # ── Honest failure for the dashboard collectors ────────────────
-    # Every ``except`` in _business_summary_counts,
+    # Every ``except`` in _open_documents, _business_summary_counts,
     # _overdue_scheduled_warnings, and _collect_warnings routes through
     # _check_failed (locked by TestDashboardHonestFailure in
     # test_contract_integrity.py). Spec:
@@ -260,8 +281,139 @@ class CoreMixin:
         n = len(lines)
         return f"{lines[0]} — {n} {noun}{'' if n == 1 else 's'} skipped"
 
+    def _open_documents(
+        self, book, failures: list[str] | None = None,
+    ) -> list[dict]:
+        """One pass over the book's posted documents, through
+        ``_document_settlement`` — the same seam ``get_document`` and
+        ``get_outstanding_documents`` read — so the dashboard's
+        Receivables/Payables counts and its overdue warnings agree
+        with the detail tools by construction (spec A1). Nothing in
+        core reads a lot balance directly.
+
+        Returns one dict per OPEN document (``balance != 0``)::
+
+            {
+              "inv": Invoice, "is_bill": bool, "is_credit_note": bool,
+              "amount_due": Decimal,   # signed, quantized; < 0 = overpaid
+              "due_date": date | None,
+              "overdue": bool, "days_overdue": int | None,
+            }
+
+        *Overdue* means open, ``amount_due > 0``, not a credit note,
+        and ``due_date < today`` — exactly the rows
+        ``get_outstanding_documents`` gives ``days_past_due > 0``.
+        An overpaid document is open but never overdue: the old
+        ``abs()`` over the raw lot balance rendered a customer's
+        overpayment as "Past due … USD 50" owed TO the business.
+
+        Empty when the business module isn't loaded. Item failures
+        are recorded through ``_check_failed`` and summarized into
+        ``failures``; the document is skipped, never guessed.
+        """
+        settle = getattr(self, "_document_settlement", None)
+        if settle is None:
+            return []
+        try:
+            from piecash.business.invoice import Invoice
+        except ImportError:
+            return []
+
+        today = date.today()
+        resolve_due = getattr(self, "_resolve_invoice_due_date", None)
+        get_is_cn = getattr(self, "_get_is_credit_note", None)
+        resolve_ot = getattr(self, "_resolve_owner_type_and_job", None)
+        is_bill_side = getattr(self, "_is_bill_side", None)
+
+        try:
+            posted = book.session.query(Invoice).filter(
+                Invoice.date_posted.isnot(None),
+            ).all()
+        except Exception as exc:
+            line = self._check_failed(book, "Business-count", exc)
+            if failures is not None:
+                failures.append(line)
+            return []
+
+        rows: list[dict] = []
+        item_failures: list[str] = []
+        due_failures: list[str] = []
+        for inv in posted:
+            try:
+                is_credit_note = (
+                    bool(get_is_cn(inv)) if get_is_cn is not None else False
+                )
+                # Polymorphic owner: a job-attached document's side
+                # comes from the job's owner (BusinessMixin
+                # chokepoints); a plain ``owner_type == 4`` drops it.
+                eff_ot = (
+                    resolve_ot(book, inv)[0]
+                    if resolve_ot is not None else inv.owner_type
+                )
+                is_bill = (
+                    is_bill_side(eff_ot)
+                    if is_bill_side is not None else eff_ot in (4, 5)
+                )
+                st = settle(
+                    book, inv, is_bill=is_bill,
+                    is_credit_note=is_credit_note,
+                )
+                if st is None or st["balance"] == 0:
+                    continue
+            except Exception as exc:
+                # Recorded, not swallowed — see _check_failed.
+                item_failures.append(
+                    self._check_failed(book, "Business-count", exc)
+                )
+                continue
+            try:
+                due_date = (
+                    resolve_due(book, inv)
+                    if resolve_due is not None else None
+                )
+            except Exception as exc:
+                # Due-date resolution can fail on corrupt term
+                # records; the document still counts as open, only
+                # its overdue-ness is unknowable.
+                due_failures.append(
+                    self._check_failed(book, "Overdue-document", exc)
+                )
+                due_date = None
+            try:
+                amount_due = st["amount_due"]
+                overdue = (
+                    not is_credit_note
+                    and amount_due > 0
+                    and due_date is not None
+                    and due_date < today
+                )
+                rows.append({
+                    "inv": inv,
+                    "is_bill": is_bill,
+                    "is_credit_note": is_credit_note,
+                    "amount_due": amount_due,
+                    "due_date": due_date,
+                    "overdue": overdue,
+                    "days_overdue": (
+                        (today - due_date).days if overdue else None
+                    ),
+                })
+            except Exception as exc:
+                # Recorded, not swallowed — see _check_failed.
+                item_failures.append(
+                    self._check_failed(book, "Business-count", exc)
+                )
+        if failures is not None:
+            for bucket in (item_failures, due_failures):
+                if bucket:
+                    failures.append(
+                        self._summarize_item_failures(bucket, "document")
+                    )
+        return rows
+
     def _business_summary_counts(
         self, book, failures: list[str] | None = None,
+        open_documents: list[dict] | None = None,
     ) -> dict:
         """Action-signal counts for the get_book_summary business
         lines: open/overdue invoices and bills, active jobs. Returns
@@ -270,6 +422,10 @@ class CoreMixin:
         The summary's principle: tell the LLM what needs attention,
         not what exists — these counts are actionable; account
         structure is shown elsewhere.
+
+        ``open_documents`` is the ``_open_documents`` pass
+        get_book_summary already ran (shared with the overdue
+        warnings); ``None`` runs it here for direct callers.
         """
         out = {
             "open_invoices": 0,
@@ -278,99 +434,29 @@ class CoreMixin:
             "overdue_bills": 0,
             "active_jobs": 0,
         }
-        calc_lot_balance = getattr(self, "_calculate_lot_balance", None)
-        if calc_lot_balance is None:
+        if getattr(self, "_document_settlement", None) is None:
             return out
         try:
-            from piecash.business.invoice import Invoice, Job
+            from piecash.business.invoice import Job
         except ImportError:
             return out
 
-        today = date.today()
-        resolve_due = getattr(self, "_resolve_invoice_due_date", None)
+        if open_documents is None:
+            open_documents = self._open_documents(book, failures=failures)
 
-        # Open = posted with non-zero lot balance, so partial
-        # payments and credit notes adjust the counts correctly.
-        #
-        # Pre-index accounts and lots once — per-invoice SQL lookups
-        # plus linear lot scans are an N+1 pattern on a surface that
-        # runs on every dashboard call.
-        accounts_by_guid = {
-            acct.guid: acct for acct in book.accounts
-        }
-        lots_by_guid: dict[str, object] = {}
-        for acct in book.accounts:
-            for lot in acct.lots:
-                lots_by_guid[lot.guid] = lot
-
-        item_failures: list[str] = []
-        for inv in book.session.query(Invoice).filter(
-            Invoice.date_posted.isnot(None),
-        ).all():
-            try:
-                post_acct = accounts_by_guid.get(inv.post_acc_guid)
-                if post_acct is None:
-                    continue
-                lot_obj = lots_by_guid.get(inv.post_lot_guid)
-                if lot_obj is None:
-                    continue
-                balance = calc_lot_balance(lot_obj)
-                if balance == 0:
-                    continue
-            except Exception as exc:
-                # Recorded, not swallowed — see _check_failed.
-                item_failures.append(
-                    self._check_failed(book, "Business-count", exc)
-                )
-                continue
-
-            # Credit notes stay in the OPEN counts but never age
-            # into overdue — they're money the business OWES.
-            # Matches get_outstanding_invoices.
-            is_credit_note = False
-            get_is_cn = getattr(self, "_get_is_credit_note", None)
-            if get_is_cn is not None:
-                try:
-                    is_credit_note = bool(get_is_cn(inv))
-                except Exception as exc:
-                    item_failures.append(
-                        self._check_failed(book, "Business-count", exc)
-                    )
-
-            is_overdue = False
-            if resolve_due is not None and not is_credit_note:
-                try:
-                    due_date, _ = resolve_due(book, inv)
-                    if due_date is not None and due_date < today:
-                        is_overdue = True
-                except Exception as exc:
-                    # Due-date resolution can fail on corrupt term
-                    # records; the document still counts as open.
-                    item_failures.append(
-                        self._check_failed(book, "Business-count", exc)
-                    )
-
-            if inv.owner_type == 4:  # vendor bill
+        # Credit notes stay in the OPEN counts but never age into
+        # overdue — they're money the business OWES (``overdue`` is
+        # already False for them; see _open_documents).
+        for row in open_documents:
+            if row["is_bill"]:
                 out["open_bills"] += 1
-                if is_overdue:
+                if row["overdue"]:
                     out["overdue_bills"] += 1
             else:
-                # owner_type 2/3/5 render as receivables unless the
-                # post account is PAYABLE (vouchers: company owes
-                # employees → folded into open_bills).
-                if post_acct.type == "PAYABLE":
-                    out["open_bills"] += 1
-                    if is_overdue:
-                        out["overdue_bills"] += 1
-                else:
-                    out["open_invoices"] += 1
-                    if is_overdue:
-                        out["overdue_invoices"] += 1
+                out["open_invoices"] += 1
+                if row["overdue"]:
+                    out["overdue_invoices"] += 1
 
-        if item_failures and failures is not None:
-            failures.append(
-                self._summarize_item_failures(item_failures, "document")
-            )
         try:
             out["active_jobs"] = book.session.query(Job).filter(
                 Job.active == 1,
@@ -411,6 +497,7 @@ class CoreMixin:
         """
         template_guids = self._template_account_guids(book)
         today = date.today()
+        reconcile_info = self._read_reconcile_info_all(book)
 
         results: list[dict] = []
         for account in accounts:
@@ -420,6 +507,16 @@ class CoreMixin:
                 continue
             if account.placeholder:
                 continue
+            # Per-account threshold from the statement cycle desktop
+            # (or reconcile_account) recorded; the fixed default
+            # otherwise. Months count as 30 days here — the lag
+            # display already rounds on a 30.44-day month.
+            info = reconcile_info.get(account.guid)
+            warn_days = self._RECONCILE_WARN_DAYS
+            if info and info["months"] is not None and info["days"] is not None:
+                cycle = info["months"] * 30 + info["days"]
+                if cycle > 0:
+                    warn_days = cycle + self._RECONCILE_GRACE_DAYS
 
             if account.type not in self._RECONCILABLE_TYPES \
                     and account.type != "ASSET":
@@ -441,6 +538,22 @@ class CoreMixin:
                     "excluded": True,
                 })
                 continue
+            # Desktop's way of closing an account is the ``hidden``
+            # flag. Hidden with a zero balance is closed: out of the
+            # dashboard, listed here as excluded. Hidden with money
+            # still in it stays visible — that is itself a finding
+            # (spec B3).
+            if account.hidden and self._own_splits_balance(
+                account, as_of=today,
+            ) == 0:
+                results.append({
+                    "account": account.fullname,
+                    "status": "excluded (hidden, zero balance)",
+                    "days_behind": None,
+                    "unreconciled_count": 0,
+                    "excluded": True,
+                })
+                continue
 
             # Single pass over splits derives latest_y_date, has_yc
             # (the ASSET gate), any_splits, unreconciled_count, and
@@ -452,10 +565,9 @@ class CoreMixin:
             latest_y_date = None
             has_yc = False
             any_splits = False
-            unreconciled_count = 0
-            unreconciled_value = Decimal("0")
-            oldest_unreconciled_date = None
             balance = Decimal("0")
+            last_activity_date = None
+            pending: list = []
             for s in account.splits:
                 # Voided splits are zombies, not reconcilable
                 # activity — they must not make an account
@@ -464,6 +576,11 @@ class CoreMixin:
                     continue
                 any_splits = True
                 balance += s.quantity
+                pd = s.transaction.post_date
+                if pd is not None and pd <= today and (
+                    last_activity_date is None or pd > last_activity_date
+                ):
+                    last_activity_date = pd
                 rstate = s.reconcile_state
                 if rstate in ("y", "c"):
                     has_yc = True
@@ -474,17 +591,60 @@ class CoreMixin:
                     ):
                         latest_y_date = pd
                 if _is_unreconciled(s):
-                    unreconciled_count += 1
-                    unreconciled_value += s.quantity
-                    pd = s.transaction.post_date
-                    # Null post_date (an old-book artifact) still
-                    # counts as backlog; it just can't anchor the
-                    # oldest-date lag display.
-                    if pd is not None and (
-                        oldest_unreconciled_date is None
-                        or pd < oldest_unreconciled_date
+                    pending.append(s)
+
+            # Two kinds of pending work (spec B2). Splits dated
+            # AFTER the last reconcile are backlog: they anchor
+            # "behind". Splits dated on or before it are
+            # OUTSTANDING ITEMS — a cheque that never cleared —
+            # which used to make a monthly-reconciled account read
+            # "6 years behind"; they get a note instead. With no
+            # reconcile on record everything is backlog. A null
+            # post_date (an old-book artifact) still counts as
+            # backlog; it just can't anchor a date.
+            unreconciled_count = 0
+            unreconciled_value = Decimal("0")
+            oldest_unreconciled_date = None
+            outstanding_count = 0
+            outstanding_value = Decimal("0")
+            outstanding_oldest_date = None
+            for s in pending:
+                pd = s.transaction.post_date
+                if (
+                    latest_y_date is not None
+                    and pd is not None
+                    and pd <= latest_y_date
+                ):
+                    outstanding_count += 1
+                    outstanding_value += s.quantity
+                    if (
+                        outstanding_oldest_date is None
+                        or pd < outstanding_oldest_date
                     ):
-                        oldest_unreconciled_date = pd
+                        outstanding_oldest_date = pd
+                    continue
+                unreconciled_count += 1
+                unreconciled_value += s.quantity
+                if pd is not None and (
+                    oldest_unreconciled_date is None
+                    or pd < oldest_unreconciled_date
+                ):
+                    oldest_unreconciled_date = pd
+            outstanding: dict = {}
+            if outstanding_count:
+                outstanding = {
+                    "outstanding_count": outstanding_count,
+                    "outstanding_value": str(outstanding_value),
+                    "outstanding_oldest_date":
+                        outstanding_oldest_date.isoformat(),
+                    "commodity": account.commodity.mnemonic,
+                    # The "worth a look" signal: an item older than
+                    # the reconcile by more than the grace window.
+                    "outstanding_note": (
+                        (latest_y_date - outstanding_oldest_date).days
+                        > self._RECONCILE_OUTSTANDING_NOTE_DAYS
+                    ),
+                }
 
             # ASSET passes only with reconcilable history (see
             # docstring).
@@ -501,13 +661,19 @@ class CoreMixin:
                     "status": "never reconciled",
                     "days_behind": None,
                     "unreconciled_count": unreconciled_count,
+                    "balance_zero": balance == 0,
+                    "days_idle": (
+                        (today - last_activity_date).days
+                        if last_activity_date is not None else None
+                    ),
                 })
             else:
-                # Lag anchors to the OLDEST unreconciled split when
-                # there's pending work — the honest scope-of-work
-                # signal ("6 years behind", not "4 months since the
-                # last reconcile"). Fully-caught-up accounts fall
-                # back to latest_y_date staleness.
+                # Lag anchors to the OLDEST backlog split (dated
+                # after the last reconcile) when there is backlog —
+                # the honest scope-of-work signal ("6 months
+                # behind", not "4 months since the last reconcile").
+                # Caught-up accounts fall back to latest_y_date
+                # staleness. Outstanding items never move the lag.
                 if unreconciled_count > 0 \
                         and oldest_unreconciled_date is not None:
                     days_behind = (today - oldest_unreconciled_date).days
@@ -521,6 +687,8 @@ class CoreMixin:
                         "latest_y_date": latest_y_date.isoformat(),
                         "oldest_unreconciled_date":
                             oldest_unreconciled_date.isoformat(),
+                        "warn_days": warn_days,
+                        **outstanding,
                     })
                 else:
                     days_behind = (today - latest_y_date).days
@@ -531,6 +699,8 @@ class CoreMixin:
                         "days_behind": days_behind,
                         "unreconciled_count": unreconciled_count,
                         "latest_y_date": latest_y_date.isoformat(),
+                        "warn_days": warn_days,
+                        **outstanding,
                     })
 
         results.sort(key=lambda r: r["account"])
@@ -671,13 +841,18 @@ class CoreMixin:
             for anchor_date, label in anchors
         ]
 
-    # Budget overspend threshold: variance over +10% (used% ahead of
-    # elapsed%) earns ⚠ — breathing room for lumpy household spending.
+    # Budget overspend threshold: spending more than 10% ahead of the
+    # budget's own expected-by-today earns ⚠ — breathing room for
+    # lumpy household spending (spec B5 kept the number).
     _BUDGET_WARN_VARIANCE_PCT = 10
 
     # Runway ⚠ threshold: under ~two months, a household should be
     # actively concerned about cash position, not just tracking it.
     _RUNWAY_WARN_DAYS = 60
+
+    # Low-cash trigger 2 looks this far ahead at scheduled cash out
+    # (spec B6, ruled 2026-09-28) — a week of bills.
+    _LOW_CASH_SCHEDULE_DAYS = 7
 
     # Burn-rate averaging window. 180 days smooths billing cycles
     # and seasonality without diluting recent changes; the iteration
@@ -736,6 +911,12 @@ class CoreMixin:
     # Stale-price threshold for the Warnings section — past a month,
     # quotes are likely skewing net-worth and runway numbers.
     _STALE_PRICE_DAYS = 30
+
+    # A non-default currency nobody holds is still checked for
+    # staleness while a transaction this recent used it (spec B1,
+    # ruled 2026-09-28). Beyond that, its history converts at
+    # monthly closes and a fresh rate would change nothing.
+    _STALE_CURRENCY_ACTIVITY_DAYS = 90
 
     def _overdue_scheduled_warnings(
         self, book: piecash.Book, today: date,
@@ -804,12 +985,15 @@ class CoreMixin:
         overdue_scheduled: list[dict] | None = None,
         last_entry_days_behind: int | None = None,
         check_failures: list[str] | None = None,
+        far_future: tuple[int, date] | None = None,
+        open_documents: list[dict] | None = None,
     ) -> list[str]:
         """Collect warnings for the consolidated Warnings section.
 
         Returns formatted warning strings ordered by category::
 
-            data integrity → backup health → critically low cash →
+            data integrity → far-future entries → backup health →
+            overdrawn accounts → critically low cash →
             overdue invoices/bills → overdue scheduled → stale prices
 
         Within each category, most-severe first. Operational urgency
@@ -825,7 +1009,12 @@ class CoreMixin:
 
         ``overdue_scheduled`` lets get_book_summary pass the list it
         already computed (shared with the Scheduled line); ``None``
-        computes it here for direct callers.
+        computes it here for direct callers. ``far_future`` is
+        ``_entry_dates``' ``(count, latest)`` of transactions dated
+        more than ``_FAR_FUTURE_DAYS`` ahead — a typo class, rendered
+        with the integrity lines. ``open_documents`` is the
+        ``_open_documents`` pass shared with the business counts;
+        ``None`` runs it here.
         """
         today = date.today()
         if check_failures is None:
@@ -880,6 +1069,121 @@ class CoreMixin:
         integrity.sort(key=lambda pair: pair[0], reverse=True)
         integrity = [msg for _, msg in integrity]
 
+        # ── 1b. Balance integrity ──
+        # A transaction whose non-voided split values don't sum to
+        # zero, or whose same-commodity split carries a value that
+        # disagrees with its quantity, was never entered through
+        # GnuCash (raw-SQL imports, other tools, corruption) — desktop
+        # parks a remainder in Imbalance instead, which the check
+        # above catches. One pass over the preloaded split graph;
+        # one line (spec A8).
+        try:
+            unbalanced = 0
+            oldest_unbalanced: date | None = None
+            for txn in transactions:
+                total = Decimal("0")
+                defect = False
+                txn_currency_guid = (
+                    txn.currency.guid if txn.currency is not None else None
+                )
+                for s in txn.splits:
+                    if _is_voided(s):
+                        continue
+                    value = Decimal(str(s.value))
+                    total += value
+                    if (
+                        s.account.commodity is not None
+                        and s.account.commodity.guid == txn_currency_guid
+                        and value != Decimal(str(s.quantity))
+                    ):
+                        defect = True
+                if total != 0:
+                    defect = True
+                if not defect:
+                    continue
+                unbalanced += 1
+                d = txn.post_date
+                if d is not None and (
+                    oldest_unbalanced is None or d < oldest_unbalanced
+                ):
+                    oldest_unbalanced = d
+            if unbalanced:
+                oldest = (
+                    f" (oldest {oldest_unbalanced.isoformat()})"
+                    if oldest_unbalanced is not None else ""
+                )
+                integrity.append(
+                    f"{unbalanced} unbalanced transaction"
+                    f"{'s' if unbalanced != 1 else ''}{oldest} — "
+                    f"get_transaction to inspect"
+                )
+        except Exception as exc:
+            check_failures.append(
+                self._check_failed(book, "Balance-integrity", exc)
+            )
+
+        # A transaction dated more than a year ahead is almost always
+        # a typo (2062 for 2026). It is excluded from "Last entry"
+        # (``_entry_dates``), and named here so it gets fixed rather
+        # than quietly stretching the data range forever.
+        if far_future is not None:
+            far_count, far_latest = far_future
+            integrity.append(
+                f"{far_count} transaction{'s' if far_count != 1 else ''} "
+                f"dated more than a year ahead (latest "
+                f"{far_latest.isoformat()}) — likely a typo; "
+                f"search_transactions to inspect"
+            )
+
+        # ── 2a. Overdrawn accounts ──
+        # A single BANK/CASH account below zero as of today. Low-cash
+        # skips non-positive balances and runway flags only when the
+        # WHOLE liquid pool is negative, so checking at -300 beside
+        # savings at 10,000 was flagged nowhere (spec A4). Each
+        # account renders in its own commodity (the overdraft is a
+        # fact in that currency; no rate needed); the cross-account
+        # sort converts where a rate exists, as the integrity sort
+        # does. Known false positive: a credit line typed BANK —
+        # the fix is the account's type, which is the user's call.
+        overdrawn: list[str] = []
+        try:
+            template_guids = self._template_account_guids(book)
+            overdrawn_entries: list[tuple[Decimal, str]] = []
+            for account in accounts:
+                if not self._is_cash_watch_account(
+                    account, book, template_guids,
+                ):
+                    continue
+                balance_qty = self._own_splits_balance(
+                    account, as_of=today,
+                )
+                if balance_qty >= 0:
+                    continue
+                if account.commodity == default_currency:
+                    sort_key = balance_qty
+                else:
+                    rate = rates_for_sort.get(account.commodity.guid)
+                    sort_key = (
+                        balance_qty * rate if rate is not None
+                        else balance_qty
+                    )
+                leaf = account.fullname.split(":")[-1]
+                amount = balance_qty.quantize(
+                    _commodity_quantum(account.commodity)
+                )
+                overdrawn_entries.append((
+                    sort_key,
+                    f"Overdrawn: {leaf} at "
+                    f"{account.commodity.mnemonic} {amount:,}",
+                ))
+            # Most negative first.
+            overdrawn_entries.sort(key=lambda e: e[0])
+            overdrawn = [msg for _, msg in overdrawn_entries]
+        except Exception as exc:
+            check_failures.append(
+                self._check_failed(book, "Overdraft", exc)
+            )
+
         # ── 2. Critically low cash ──
         # Threshold = 1 day of the ACCOUNT'S OWN outflow, not the
         # household's burn. Measured against total burn, a thin
@@ -892,29 +1196,29 @@ class CoreMixin:
         low_cash: list[str] = []
         try:
             own_out = self._account_daily_outflows(book, transactions)
-            if own_out:
+            # Second trigger (spec B6): the balance is below the
+            # account's scheduled cash out over the next
+            # _LOW_CASH_SCHEDULE_DAYS days — checking at 400 with a
+            # 2,100 mortgage due in 3 days is low whatever its
+            # average pace says. Same recipes and cash-leg rule as
+            # the Scheduled line (``_upcoming_cash_legs``).
+            sched_fn = getattr(self, "_scheduled_cash_out_by_account", None)
+            scheduled_out = (
+                sched_fn(book, days=self._LOW_CASH_SCHEDULE_DAYS)
+                if sched_fn is not None else {}
+            )
+            if own_out or scheduled_out:
                 template_guids = self._template_account_guids(book)
                 rates = self._rates_as_of(
                     book, today, default_currency,
                 )
                 low_cash_entries: list[tuple[Decimal, str]] = []
                 for account in accounts:
-                    if account.type not in ("BANK", "CASH"):
-                        continue
-                    if self._is_auto_balancing_account(
-                        account, book.root_account
+                    # Same account filter as the overdraft check
+                    # above — the two warnings watch one set.
+                    if not self._is_cash_watch_account(
+                        account, book, template_guids,
                     ):
-                        # A suspense/Imbalance balance isn't spendable
-                        # cash — it's surfaced by the integrity section
-                        # above. Counting it here fires a bogus
-                        # "critically low cash" on a few euros parked
-                        # for clarification.
-                        continue
-                    if account.placeholder:
-                        continue
-                    if account.guid in template_guids:
-                        continue
-                    if self._is_in_retirement_subtree(account):
                         continue
 
                     # "Now" warning: cap at today so a future-
@@ -924,9 +1228,8 @@ class CoreMixin:
                         account, as_of=today,
                     )
                     if balance_qty <= 0:
-                        # Zero = unused, not low. Negative = overdraft,
-                        # captured separately by runway's
-                        # negative_liquid path.
+                        # Zero = unused, not low. Negative = overdrawn,
+                        # its own line above.
                         continue
 
                     # Convert to default currency for the threshold
@@ -940,14 +1243,32 @@ class CoreMixin:
                             continue
                         balance_default = balance_qty * rate
 
-                    # Own-commodity comparison: balance and pace are
-                    # in the same units, no rate needed.
+                    leaf = account.fullname.split(":")[-1]
+                    # A warning that names an amount renders at the
+                    # currency's quantum, never rounded to a whole
+                    # unit (0.75 must not read as 0).
+                    quantum = _commodity_quantum(default_currency)
+                    amount_str = f"{balance_default.quantize(quantum):,}"
+
+                    # Trigger 2: scheduled bills this week exceed
+                    # the balance (both in the book default).
+                    sched = scheduled_out.get(account.guid)
+                    if sched is not None and balance_default < sched[0]:
+                        low_cash_entries.append((
+                            balance_default,
+                            f"Low cash: {leaf} at "
+                            f"{default_currency.mnemonic} {amount_str}, "
+                            f"{default_currency.mnemonic} "
+                            f"{sched[0].quantize(quantum):,} scheduled "
+                            f"out by {sched[1].isoformat()}",
+                        ))
+                        continue
+
+                    # Trigger 1: own-commodity comparison — balance
+                    # and pace are in the same units, no rate needed.
                     pace = own_out.get(account.guid, Decimal("0"))
                     if pace <= 0 or balance_qty >= pace:
                         continue
-
-                    leaf = account.fullname.split(":")[-1]
-                    amount_str = f"{int(balance_default):,}"
                     low_cash_entries.append((
                         balance_default,
                         f"Critically low cash: {leaf} at "
@@ -963,15 +1284,18 @@ class CoreMixin:
             )
 
         # ── 3. Overdue invoices and bills ──
-        # Posted, non-zero lot balance, due date past. Requires
-        # BusinessMixin's _calculate_lot_balance; gracefully skipped
-        # otherwise.
+        # Rendered from the ``_open_documents`` pass (settlement
+        # chokepoint), so the count here is the Receivables/Payables
+        # line's overdue count and get_outstanding_documents'
+        # ``days_past_due > 0`` rows. Amounts render at the lot
+        # commodity's quantum: 0.75 must not read as "USD 0".
         overdue_invoices: list[str] = []
-        calc_lot_balance = getattr(self, "_calculate_lot_balance", None)
-        if calc_lot_balance is not None:
+        if open_documents is None:
+            open_documents = self._open_documents(
+                book, failures=check_failures,
+            )
+        if open_documents:
             try:
-                from piecash.business.invoice import Invoice
-                from sqlalchemy import text
                 # Polymorphic owner + effective side (BusinessMixin
                 # chokepoints). The side-keyed finders rendered every
                 # overdue voucher and job-attached bill as "Past due
@@ -989,40 +1313,12 @@ class CoreMixin:
                 )
                 overdue_inv_entries: list[tuple[int, str]] = []
                 item_failures: list[str] = []
-                get_is_cn = getattr(
-                    self, "_get_is_credit_note", None,
-                )
-                for inv in book.session.query(Invoice).filter(
-                    Invoice.date_posted.isnot(None)
-                ).all():
+                for row in open_documents:
+                    if not row["overdue"]:
+                        continue
+                    inv = row["inv"]
                     try:
-                        # Credit notes never age into past-due —
-                        # their balance is money the business OWES.
-                        # get_outstanding_invoices exempts them too;
-                        # the two surfaces must agree.
-                        if get_is_cn is not None and get_is_cn(inv):
-                            continue
-
-                        # _resolve_invoice_due_date keeps this and
-                        # get_outstanding_invoices on identical math;
-                        # no_terms flags the 30-day-default branch.
-                        resolve_due = getattr(
-                            self, "_resolve_invoice_due_date", None,
-                        )
-                        if resolve_due is None:
-                            continue
-                        due_date, no_terms = resolve_due(book, inv)
-                        if due_date is None or due_date >= today:
-                            continue
-
-                        lot = inv.post_lot
-                        if lot is None:
-                            continue
-                        balance = calc_lot_balance(lot)
-                        if balance == 0:
-                            continue
-
-                        days_overdue = (today - due_date).days
+                        days_overdue = row["days_overdue"]
                         eff_ot = (
                             effective_owner_type(book, inv)
                             if effective_owner_type is not None
@@ -1046,24 +1342,12 @@ class CoreMixin:
                             if inv.currency
                             else default_currency.mnemonic
                         )
-                        amount_str = f"{int(abs(balance)):,}"
-                        # With no term set, anchor the count to the
-                        # assumption ("past 30-day default") rather
-                        # than "overdue", which reads as contractual
-                        # and contradicts "(no term set)".
-                        if no_terms:
-                            msg = (
-                                f"Past due {doc_type}: {owner_name} "
-                                f"{days_overdue} days past 30-day "
-                                f"default, {currency} {amount_str} "
-                                f"(no term set)"
-                            )
-                        else:
-                            msg = (
-                                f"Past due {doc_type}: {owner_name} "
-                                f"{days_overdue} days overdue, "
-                                f"{currency} {amount_str}"
-                            )
+                        amount_str = f"{row['amount_due']:,}"
+                        msg = (
+                            f"Past due {doc_type}: {owner_name} "
+                            f"{days_overdue} days overdue, "
+                            f"{currency} {amount_str}"
+                        )
                         overdue_inv_entries.append(
                             (days_overdue, msg),
                         )
@@ -1090,78 +1374,92 @@ class CoreMixin:
                 )
 
         # ── 4. Stale prices ──
+        # Staleness is the date of the rate VALUATION uses
+        # (``_rates_as_of_dated`` — the same map behind the asset
+        # lines and runway), never a commodity's own price rows: a
+        # EUR book storing "1 EUR = 1.08 USD" values its USD
+        # accounts off the inverse and used to read "USD no price
+        # on file" forever; a chain is as old as its oldest leg
+        # (spec A5). "No price on file" means exactly that the map
+        # has no entry and valuation fell back to cost basis.
         stale_prices: list[str] = []
         try:
             # Template accounts would mark GnuCash's ``template``
             # pseudo-commodity in-use and misfire a permanent
             # "no price on file" warning on desktop-created books.
             template_guids = self._template_account_guids(book)
-            in_use: set = set()
-            # Securities held in a nonzero quantity somewhere. A
-            # fund swapped out to zero keeps its account (history)
-            # and its commodity, but a quote for it values nothing —
-            # the warning nagged a live book to price an empty 401k
-            # fund (2026-09-24). Currencies are exempt: flow reports
-            # convert foreign transactions at their rate whether or
-            # not any account holds a balance.
+            # A commodity is checked only while its rate matters
+            # today: an account holds a nonzero balance in it (a
+            # fund swapped out to zero keeps its account and its
+            # commodity, but a quote for it values nothing — the
+            # warning nagged a live book to price an empty 401k
+            # fund, 2026-09-24), or, for a currency, a transaction
+            # in the last _STALE_CURRENCY_ACTIVITY_DAYS is
+            # denominated in it or touches an account in it. Old
+            # transactions convert at their own month's rate, which
+            # never goes stale, so a zero-balance EUR account from a
+            # 2019 trip no longer warns forever (spec B1).
+            in_use: dict[str, object] = {}
             held: set = set()
             for a in accounts:
-                if a.type != "ROOT" and a.guid not in template_guids:
-                    in_use.add(a.commodity.guid)
-                    if (
-                        a.commodity.namespace != "CURRENCY"
-                        and a.commodity.guid not in held
-                        and self._own_splits_balance(a, as_of=today) != 0
-                    ):
-                        held.add(a.commodity.guid)
+                if a.type == "ROOT" or a.guid in template_guids:
+                    continue
+                c = a.commodity
+                if c is None or c.guid == default_currency.guid:
+                    continue
+                balance = self._own_splits_balance(a, as_of=today)
+                # A hidden, zero-balance account is closed (spec
+                # B3): it doesn't put its commodity in use.
+                if a.hidden and balance == 0:
+                    continue
+                in_use[c.guid] = c
+                if c.guid not in held and balance != 0:
+                    held.add(c.guid)
+            recent_currencies: set = set()
+            activity_start = today - timedelta(
+                days=self._STALE_CURRENCY_ACTIVITY_DAYS,
+            )
+            for txn in transactions:
+                d = txn.post_date
+                if d is None or d < activity_start or d > today:
+                    continue
+                if txn.currency is not None:
+                    recent_currencies.add(txn.currency.guid)
+                for s in txn.splits:
+                    if s.account.commodity is not None:
+                        recent_currencies.add(s.account.commodity.guid)
 
-            # One pass over the price list builds both signals: in-use
-            # commodities and latest market-price date. ``market_only``
-            # is applied before ``in_use.add`` — marking first would
-            # tag commodities that only have piecash auto-placeholder
-            # prices as in-use and misfire the "no price on file"
-            # warning.
+            dated = self._rates_as_of_dated(book, today, default_currency)
             cutoff = today - timedelta(days=self._STALE_PRICE_DAYS)
-            by_commodity_latest: dict[str, date] = {}
-            for p in self._find_prices(book, market_only=True):
-                in_use.add(p.commodity.guid)
-                p_date = p.date
-                if hasattr(p_date, "date") and callable(p_date.date):
-                    p_date = p_date.date()
-                cguid = p.commodity.guid
-                if (
-                    cguid not in by_commodity_latest
-                    or p_date > by_commodity_latest[cguid]
-                ):
-                    by_commodity_latest[cguid] = p_date
 
             # (sort_key, message) — no-price entries sort to the
             # top as most stale.
             stale_entries: list[tuple[int, str, str]] = []
-            for commodity in book.commodities:
-                if commodity == default_currency:
-                    continue
-                if commodity.guid not in in_use:
-                    continue
-                if (
+            for cguid, commodity in in_use.items():
+                if cguid in held:
+                    pass
+                elif (
                     commodity.namespace != "CURRENCY"
-                    and commodity.guid not in held
+                    or cguid not in recent_currencies
                 ):
                     continue
-                latest = by_commodity_latest.get(commodity.guid)
-                if latest is None:
+                entry = dated.get(cguid)
+                if entry is None:
                     stale_entries.append((
                         10**9,  # arbitrary large sort key — top
                         commodity.mnemonic,
                         f"Stale price: {commodity.mnemonic} no price on file",
                     ))
-                elif latest < cutoff:
-                    days_old = (today - latest).days
+                    continue
+                _rate, rate_date, via = entry
+                if rate_date < cutoff:
+                    days_old = (today - rate_date).days
+                    via_note = f" ({via})" if via else ""
                     stale_entries.append((
                         days_old,
                         commodity.mnemonic,
                         f"Stale price: {commodity.mnemonic} "
-                        f"last updated {days_old} days ago",
+                        f"last updated {days_old} days ago{via_note}",
                     ))
             stale_entries.sort(key=lambda e: (-e[0], e[1]))
             stale_prices = self._rollup_warnings(
@@ -1296,6 +1594,7 @@ class CoreMixin:
             + check_failures
             + legacy_recipe
             + backup_health
+            + overdrawn
             + low_cash
             + overdue_invoices
             + overdue_sched_lines
@@ -1356,15 +1655,30 @@ class CoreMixin:
         to the latest start date. None (→ section omitted) when no
         budget covers today.
 
-        Returns ``{name, used_pct, elapsed_pct, variance_pct}``,
-        percentages quantized to whole numbers:
+        Returns ``{name, currency, spent, expected, used_pct,
+        variance_pct}``:
 
-        - ``used_pct`` = actuals in budgeted accounts ÷ targets × 100
-        - ``elapsed_pct`` = (today − start + 1) ÷ period length × 100
-        - ``variance_pct`` = used − elapsed (positive = ahead of pace)
+        - ``spent`` = actuals in budgeted EXPENSE accounts through
+          today, in the book default.
+        - ``expected`` = the budget's own targets for every fully
+          elapsed period, plus the current period's target × the
+          fraction of that period elapsed (spec B5). Pace used to
+          be linear in time over the whole span, so a January
+          insurance target read over pace all year and a heavy
+          December read under pace until December.
+        - ``used_pct`` = spent ÷ total targets × 100 (the whole-
+          budget consumption the report tools also show).
+        - ``variance_pct`` = (spent − expected) ÷ expected × 100;
+          ``None`` when nothing is expected yet.
 
-        Actuals come from EXPENSE/INCOME splits in budgeted accounts
-        AND their descendants — children roll up to a budgeted
+        Period boundaries come from ``_budget_period_bounds`` (the
+        Recurrence.cpp port), so every GnuCash period type paces.
+        A type the port can't handle returns
+        ``{name, unsupported_period_type}`` — rendered as a line
+        saying so, never omitted silently.
+
+        Actuals come from EXPENSE splits in budgeted accounts AND
+        their descendants — children roll up to a budgeted
         ancestor, but a separately-budgeted descendant stays on its
         own line so its actuals aren't double-counted (matches
         ``get_budget_report``).
@@ -1375,55 +1689,58 @@ class CoreMixin:
         if not budgets:
             return None
 
-        from dateutil.relativedelta import relativedelta
-
         today = date.today()
         candidate = None
+        unsupported = None
         for b in budgets:
+            bounds = _budget_period_bounds(b)
             rec = b.recurrence
             period_start = rec.recurrence_period_start
             if isinstance(period_start, datetime):
                 period_start = period_start.date()
-
-            period_type = rec.recurrence_period_type
-            mult = rec.recurrence_mult
-            num_periods = b.num_periods
-            if period_type == "month":
-                period_end = (
-                    period_start
-                    + relativedelta(months=mult * num_periods)
-                    - timedelta(days=1)
-                )
-            elif period_type == "week":
-                period_end = (
-                    period_start
-                    + timedelta(weeks=mult * num_periods)
-                    - timedelta(days=1)
-                )
-            else:
-                # Unknown recurrence type — skip.
+            if bounds is None:
+                # Can't tell whether it covers today; the best
+                # guess is by start date, and it is named, not
+                # dropped.
+                if period_start <= today and (
+                    unsupported is None
+                    or period_start > unsupported["start"]
+                ):
+                    unsupported = {
+                        "budget": b, "start": period_start,
+                        "period_type": rec.recurrence_period_type,
+                    }
                 continue
-
+            period_end = bounds[-1][1]
             if period_start <= today <= period_end:
                 if candidate is None or period_start > candidate["start"]:
                     candidate = {
                         "budget": b,
                         "start": period_start,
                         "end": period_end,
+                        "bounds": bounds,
                     }
 
         if candidate is None:
+            if unsupported is not None:
+                return {
+                    "name": unsupported["budget"].name,
+                    "unsupported_period_type": unsupported["period_type"],
+                }
             return None
 
         budget = candidate["budget"]
         period_start = candidate["start"]
         period_end = candidate["end"]
+        bounds = candidate["bounds"]
+        default_currency = self._require_default_currency(book)
 
         # Targets FX-convert at the period-end rate — raw sums would
         # be apples-to-oranges against default-currency actuals
         # (mirrors get_budget_report).
         factors = self._account_conversion_factors(book, period_end)
         total_budgeted = Decimal("0")
+        targets_by_period: dict[int, Decimal] = {}
         budgeted_accounts: list = []
         budgeted_account_guids: set[str] = set()
         for ba, ba_amount in _budget_targets(book, budget):
@@ -1436,8 +1753,13 @@ class CoreMixin:
             if factor is not None:
                 ba_amount = ba_amount * factor
             total_budgeted += ba_amount
-            budgeted_accounts.append(ba.account)
-            budgeted_account_guids.add(ba.account.guid)
+            targets_by_period[ba.period_num] = (
+                targets_by_period.get(ba.period_num, Decimal("0"))
+                + ba_amount
+            )
+            if ba.account.guid not in budgeted_account_guids:
+                budgeted_accounts.append(ba.account)
+                budgeted_account_guids.add(ba.account.guid)
 
         if total_budgeted <= 0:
             return None
@@ -1458,9 +1780,13 @@ class CoreMixin:
         # — raw quantities from a foreign-currency budgeted account
         # would wildly miscalibrate used_pct, and a historical
         # period must value at its own rates, not today's.
+        # Actuals stop at today, like every other "now" surface on
+        # the dashboard: a bill pre-entered for later in the period
+        # is not yet "used" (spec A7).
+        actuals_end = min(period_end, today)
         actuals = Decimal("0")
         for txn in transactions:
-            if txn.post_date < period_start or txn.post_date > period_end:
+            if txn.post_date < period_start or txn.post_date > actuals_end:
                 continue
             for s in txn.splits:
                 if s.account.guid not in rollup_guids:
@@ -1474,23 +1800,32 @@ class CoreMixin:
                     s, s.account, factors.get(s.account.guid),
                 )
 
-        # Period progression.
-        total_days = (period_end - period_start).days + 1
-        elapsed_days = (today - period_start).days + 1
-        elapsed_days = max(0, min(elapsed_days, total_days))
+        # Expected by today: elapsed periods in full, the current
+        # one pro-rated by days.
+        expected = Decimal("0")
+        for p, (p_start, p_end) in enumerate(bounds):
+            target = targets_by_period.get(p, Decimal("0"))
+            if p_end < today:
+                expected += target
+            elif p_start <= today <= p_end:
+                total_days = (p_end - p_start).days + 1
+                elapsed_days = (today - p_start).days + 1
+                expected += target * Decimal(elapsed_days) / Decimal(total_days)
 
-        elapsed_pct = (
-            Decimal(elapsed_days) / Decimal(total_days) * Decimal(100)
-        ).quantize(Decimal("1"))
         used_pct = (
             actuals / total_budgeted * Decimal(100)
         ).quantize(Decimal("1"))
-        variance_pct = used_pct - elapsed_pct
+        variance_pct = (
+            ((actuals - expected) / expected * Decimal(100)).quantize(Decimal("1"))
+            if expected > 0 else None
+        )
 
         return {
             "name": budget.name,
+            "currency": default_currency.mnemonic,
+            "spent": actuals.quantize(Decimal("1")),
+            "expected": expected.quantize(Decimal("1")),
             "used_pct": used_pct,
-            "elapsed_pct": elapsed_pct,
             "variance_pct": variance_pct,
         }
 
@@ -1546,6 +1881,29 @@ class CoreMixin:
             and not self._is_in_retirement_subtree(account)
         )
 
+    def _is_cash_watch_account(
+        self, account, book: piecash.Book, template_guids: set,
+    ) -> bool:
+        """True when ``account`` is money the household spends from
+        day to day, which the low-cash and overdraft warnings watch:
+        a BANK/CASH account that isn't a template, a placeholder, a
+        suspense/Imbalance account (a few euros parked for
+        clarification aren't spendable cash — the integrity section
+        surfaces those), or retirement money.
+
+        One filter for both warnings, so an account can't be
+        "critically low" under one and invisible to the other.
+        """
+        return (
+            account.type in ("BANK", "CASH")
+            and account.guid not in template_guids
+            and not account.placeholder
+            and not self._is_auto_balancing_account(
+                account, book.root_account,
+            )
+            and not self._is_in_retirement_subtree(account)
+        )
+
     def _daily_cash_burn(
         self,
         book: piecash.Book,
@@ -1555,11 +1913,24 @@ class CoreMixin:
         """Average daily cash leaving the liquid pool over the last
         ``days`` days.
 
-        Per transaction, the liquid legs (``_is_runway_liquid``) net
-        together; a negative net is cash out, a positive one (pay,
-        refunds) is ignored — runway asks how long the pool lasts
-        with nothing coming in. Netting keeps checking→savings and
-        checking→brokerage moves at zero. This is a transcribed
+        Per transaction, two nets: the liquid legs
+        (``_is_runway_liquid``) together, and just the BANK/CASH
+        legs among them. The burn is the SMALLER of the two
+        outflows — ``max(0, -max(pool_net, cash_net))`` — so cash
+        must have left the pool AND left a cash account (spec B7):
+
+        - selling shares into ASSET-typed brokerage cash: the pool
+          shrinks but no cash leg moved → 0 (it used to read as
+          money leaving, because the STOCK leg is liquid and the
+          ASSET cash leg is not);
+        - checking → brokerage: cash out, pool unchanged → 0;
+        - checking → rent, or a card payment: both fall → the amount.
+
+        (The spec wrote the rule as ``-min(pool_net, cash_net)``,
+        which is the larger outflow; its own examples fix the
+        intent.) A positive net (pay, refunds) is ignored — runway
+        asks how long the pool lasts with nothing coming in.
+        Netting keeps checking→savings at zero. This is a transcribed
         fact, not a spending model: payroll withholding never
         touches the pool and doesn't count, while card and loan
         payments do — at the pace actually paid, paydown included
@@ -1604,29 +1975,36 @@ class CoreMixin:
             legs = [s for s in txn.splits if liquid(s.account)]
             if not legs:
                 continue
-            net = sum(
-                (Decimal(str(s.value)) for s in legs), Decimal("0"),
-            )
-            if txn.currency != default_currency:
-                rate = rates.get(txn.currency.guid)
+
+            def leg_amounts(subset: list, currency=txn.currency) -> Decimal:
+                net = sum(
+                    (Decimal(str(s.value)) for s in subset), Decimal("0"),
+                )
+                if currency == default_currency:
+                    return net
+                rate = rates.get(currency.guid)
                 if rate is not None:
-                    net *= rate
-                else:
-                    if factors is None:
-                        factors = self._account_conversion_factors(
-                            book, today,
+                    return net * rate
+                nonlocal factors
+                if factors is None:
+                    factors = self._account_conversion_factors(book, today)
+                return sum(
+                    (
+                        self._split_in_default_currency(
+                            s, s.account, factors.get(s.account.guid),
                         )
-                    net = sum(
-                        (
-                            self._split_in_default_currency(
-                                s, s.account, factors.get(s.account.guid),
-                            )
-                            for s in legs
-                        ),
-                        Decimal("0"),
-                    )
-            if net < 0:
-                cash_out -= net
+                        for s in subset
+                    ),
+                    Decimal("0"),
+                )
+
+            pool_net = leg_amounts(legs)
+            cash_net = leg_amounts(
+                [s for s in legs if s.account.type in ("BANK", "CASH")]
+            )
+            burn = -max(pool_net, cash_net)
+            if burn > 0:
+                cash_out += burn
         return cash_out / Decimal(days)
 
     def _account_daily_outflows(
@@ -1643,9 +2021,19 @@ class CoreMixin:
         today = date.today()
         window_start = today - timedelta(days=days)
         out: dict[str, Decimal] = {}
+        # Each account's pace divides by ITS OWN age when that is
+        # shorter than the window (spec B6): a new account's outflow
+        # spread across 180 days made its warning nearly impossible
+        # to trigger.
+        first_split: dict[str, date] = {}
         for txn in transactions:
             if txn.post_date is None:  # old-book artifact
                 continue
+            for s in txn.splits:
+                if s.account.type in ("BANK", "CASH"):
+                    g = s.account.guid
+                    if g not in first_split or txn.post_date < first_split[g]:
+                        first_split[g] = txn.post_date
             if txn.post_date < window_start or txn.post_date > today:
                 continue
             net: dict[str, Decimal] = {}
@@ -1658,7 +2046,11 @@ class CoreMixin:
             for guid, amt in net.items():
                 if amt < 0:
                     out[guid] = out.get(guid, Decimal("0")) - amt
-        return {g: v / Decimal(days) for g, v in out.items()}
+        result: dict[str, Decimal] = {}
+        for g, v in out.items():
+            age = max(1, (today - first_split[g]).days)
+            result[g] = v / Decimal(min(days, age))
+        return result
 
     def _runway_metrics(
         self,
@@ -1721,12 +2113,34 @@ class CoreMixin:
         if daily_burn <= 0:
             return None
 
+        # Card balances already owed are shown beside runway, not
+        # subtracted from it (spec B7): whether the card is paid
+        # from savings or carried is the reader's call.
+        cards_owe = Decimal("0")
+        for account in accounts:
+            if (
+                account.type != "CREDIT"
+                or account.guid in template_guids
+                or account.placeholder
+            ):
+                continue
+            balance = self._own_splits_balance(account, as_of=today)
+            if balance == 0:
+                continue
+            converted, _ = self._market_value(
+                account, balance,
+                book=book, rates=rates,
+                default_currency=default_currency, today=today,
+            )
+            cards_owe += -converted
+
         if liquid < 0:
             return {
                 "negative_liquid": True,
                 "liquid": liquid.quantize(Decimal("1")),
                 "daily_burn": daily_burn.quantize(Decimal("1")),
                 "burn_window_days": burn_window,
+                "cards_owe": cards_owe.quantize(Decimal("1")),
             }
 
         runway_days = int(liquid / daily_burn)
@@ -1736,6 +2150,7 @@ class CoreMixin:
             "liquid": liquid.quantize(Decimal("1")),
             "daily_burn": daily_burn.quantize(Decimal("1")),
             "burn_window_days": burn_window,
+            "cards_owe": cards_owe.quantize(Decimal("1")),
         }
 
     def _monthly_net_income(
@@ -1758,16 +2173,19 @@ class CoreMixin:
         the prior month's net over the SAME day window (day 1
         through today's day-of-month, clamped to the prior
         month's length) — a partial month next to full months
-        misleads without a like-for-like anchor.
+        misleads without a like-for-like anchor. The MTD bucket
+        itself stops at today for the same reason (spec A7).
 
-        Each split converts to the book default at the most recent
-        market rate — raw ``split.value`` sums mix currencies.
+        Each split converts to the book default at its own MONTH's
+        closing rate (``_monthly_conversion_factors``) — the flow-
+        report quantum ``income_by_source`` and
+        ``spending_by_category`` use, so a month here equals
+        income minus spending there (locked by
+        ``TestModeAgreement``). Today's rate for every month made
+        the dashboard's March disagree with cash_flow's March on a
+        multi-currency book (spec A6).
         """
         today = date.today()
-        # One factors map applied uniformly — this summary surface
-        # deliberately uses today's rates for every month (per-month
-        # rates would need net_worth's per-boundary restructure).
-        factors = self._account_conversion_factors(book, today)
 
         # Calendar-month windows, oldest → newest. Plain (year,
         # month) arithmetic keeps core free of dateutil.
@@ -1798,8 +2216,15 @@ class CoreMixin:
 
         nets = [Decimal("0") for _ in month_starts]
         window_start = month_starts[0]
-        window_end = month_ends[-1]
+        # A "now" surface stops at today: the current month is a
+        # month-to-date figure, so a bill posted ahead to the 28th
+        # must not count on the 25th (it would also make the "vs
+        # prior month" same-day comparison unlike-for-like).
+        window_end = min(month_ends[-1], today)
         has_activity = False
+        monthly_factors = self._monthly_conversion_factors(
+            book, window_start, window_end,
+        )
 
         # Prior-month same-day-window accumulator for the MTD
         # comparable (clamped: Jul 30 compares against Jun 30, and
@@ -1832,7 +2257,8 @@ class CoreMixin:
                 if atype not in ("INCOME", "EXPENSE"):
                     continue
                 amt = self._split_in_default_currency(
-                    s, s.account, factors.get(s.account.guid),
+                    s, s.account,
+                    self._monthly_factor(monthly_factors, txn, s.account),
                 )
                 # INCOME is stored negative (credit-natural) and
                 # flips to a positive contribution; EXPENSE is
@@ -1906,19 +2332,30 @@ class CoreMixin:
         get_reconciliation_status, so the aggregate counts and the
         drill-down table agree by construction.
 
-        Buckets: ``excluded`` (no_reconcile opt-out), ``never``,
-        ``behind`` (stale with pending work OR a carried balance —
-        months of silence on a carried balance means missing
-        entries, since interest posts monthly), ``dormant`` (stale
-        but $0 and fully reconciled: nothing owed, nothing a
-        statement could reveal — the bookkeeper's stamped-dormant-
-        cards finding), ``current``.
+        Buckets: ``excluded`` (no_reconcile opt-out, or hidden with
+        a zero balance), ``never``, ``behind`` (stale with pending
+        work OR a carried balance — months of silence on a carried
+        balance means missing entries, since interest posts
+        monthly), ``dormant`` (stale but $0 and fully reconciled:
+        nothing owed, nothing a statement could reveal — the
+        bookkeeper's stamped-dormant-cards finding; or never
+        reconciled, $0, and idle past ``_RECONCILE_DORMANT_DAYS`` —
+        a card paid off years ago, spec B3), ``current``.
         """
         if entry.get("excluded"):
             return "excluded"
         if entry["status"] == "never reconciled":
+            idle = entry.get("days_idle")
+            if (
+                entry.get("balance_zero")
+                and idle is not None
+                and idle > self._RECONCILE_DORMANT_DAYS
+            ):
+                return "dormant"
             return "never"
-        if entry["days_behind"] > self._RECONCILE_WARN_DAYS:
+        if entry["days_behind"] > entry.get(
+            "warn_days", self._RECONCILE_WARN_DAYS,
+        ):
             if (
                 entry["unreconciled_count"] == 0
                 and entry.get("balance_zero")
@@ -1997,6 +2434,24 @@ class CoreMixin:
                 out.append(
                     f"  {leaf}: {entry['status']} {lag} ⚠"
                 )
+        # Outstanding items (spec B2): unreconciled splits older
+        # than the last reconcile, once the oldest is past the
+        # grace window. A note, never a ⚠ — the account isn't
+        # behind; a cheque that never cleared is worth a look.
+        for entry in reconciliation:
+            if not entry.get("outstanding_note"):
+                continue
+            if self._classify_reconciliation(entry) == "excluded":
+                continue
+            leaf = entry["account"].split(":")[-1]
+            n = entry["outstanding_count"]
+            amt = Decimal(entry["outstanding_value"])
+            out.append(
+                f"  {leaf}: {n} outstanding item{'s' if n != 1 else ''} "
+                f"older than last reconcile (oldest "
+                f"{entry['outstanding_oldest_date']}, "
+                f"{entry['commodity']} {_format_number(abs(amt))} net)"
+            )
         if current_count:
             plural = "s" if current_count != 1 else ""
             out.append(f"  {current_count} account{plural} current")
@@ -2004,7 +2459,7 @@ class CoreMixin:
             plural = "s" if dormant_count != 1 else ""
             out.append(
                 f"  {dormant_count} account{plural} dormant "
-                f"($0, fully reconciled)"
+                f"($0, idle)"
             )
         if never_count:
             plural = "s" if never_count != 1 else ""
@@ -2081,8 +2536,13 @@ class CoreMixin:
         """
         if runway is None:
             return []
+        cards = int(runway.get("cards_owe") or 0)
+        cards_part = f"; cards owe {currency} {cards:,}" if cards else ""
         if runway.get("negative_liquid"):
-            return ["Runway: 0 days — liquid position is negative ⚠"]
+            return [
+                f"Runway: 0 days — liquid position is negative ⚠"
+                f"{cards_part}"
+            ]
         days = runway["runway_days"]
         liquid = int(runway["liquid"])
         burn = int(runway["daily_burn"])
@@ -2092,7 +2552,7 @@ class CoreMixin:
             f"Runway: {days} days{warn} "
             f"({currency} {liquid:,} liquid / "
             f"{currency} {burn:,}/day cash out incl. debt paydown, "
-            f"{window}-day avg)"
+            f"{window}-day avg{cards_part})"
         ]
 
     # ── Summary collector / section renderers ────────────────────
@@ -2288,24 +2748,92 @@ class CoreMixin:
             )
         return lines
 
+    # A transaction dated further ahead than this is almost always a
+    # typo (2062 for 2026), not a posted-ahead bill. It earns its own
+    # warning line; see ``_entry_dates``.
+    _FAR_FUTURE_DAYS = 365
+
+    @classmethod
+    def _entry_dates(cls, transactions: list, today: date) -> dict:
+        """The dashboard's one reading of "when was the book last
+        touched", from the template-filtered transaction list::
+
+            {
+              "first": date | None,          # earliest post_date
+              "last": date | None,           # latest post_date <= today
+              "future_count": int,           # post_date > today
+              "future_latest": date | None,  # latest of those
+              "far_future": (count, latest) | None,
+                                             # > _FAR_FUTURE_DAYS ahead
+            }
+
+        ``last`` stops at today. It used to be ``max(post_date)``
+        over everything, so one entry dated ahead — a bill posted
+        ahead to next week, or a 2062 typo — switched off the
+        staleness ⚠ and the staleness note that frames the
+        time-based warnings (dashboard-accuracy spec, A3). Future
+        entries are counted and reported beside the line instead.
+        """
+        first: date | None = None
+        last: date | None = None
+        future_count = 0
+        future_latest: date | None = None
+        far_count = 0
+        far_latest: date | None = None
+        far_cutoff = today + timedelta(days=cls._FAR_FUTURE_DAYS)
+        for txn in transactions:
+            d = txn.post_date
+            if d is None:  # old-book artifact
+                continue
+            if first is None or d < first:
+                first = d
+            if d > today:
+                future_count += 1
+                if future_latest is None or d > future_latest:
+                    future_latest = d
+                if d > far_cutoff:
+                    far_count += 1
+                    if far_latest is None or d > far_latest:
+                        far_latest = d
+            elif last is None or d > last:
+                last = d
+        return {
+            "first": first,
+            "last": last,
+            "future_count": future_count,
+            "future_latest": future_latest,
+            "far_future": (
+                (far_count, far_latest) if far_count else None
+            ),
+        }
+
     def _render_book_metadata(
         self,
         currency: str,
         first_date: date | None,
         last_date: date | None,
+        *,
+        future_count: int = 0,
+        future_latest: date | None = None,
     ) -> list[str]:
         """Render Book / Currency / Data range / Last entry header.
 
         ``Last entry`` carries a staleness signal —
         the answer to "let's reconcile" vs "let's enter 200
-        transactions first" pivots on it. Four cases keyed on
-        ``(today - last_date).days``:
+        transactions first" pivots on it. ``last_date`` is the
+        latest post_date on or before today (``_entry_dates``), so
+        the cases key on ``(today - last_date).days``:
 
-        - ``< 0``  → future-dated (normal for scheduled-txn ahead-of-
-          today posting). ``(future-dated, N days ahead)``.
         - ``= 0``  → today.
         - ``= 1``  → yesterday.
         - ``> 1``  → N days behind. ⚠ past ``_LAST_ENTRY_WARN_DAYS``.
+
+        Future-dated entries never stand in for the last entry;
+        they are appended as ``(N future-dated, latest YYYY-MM-DD)``
+        so a posted-ahead bill is visible without hiding the gap.
+        A book whose only entries are ahead of today reads ``none
+        on or before today``. ``Data range`` stays the true span,
+        future entries included.
         """
         lines = [
             # ``source.display_name`` rather than ``book_path``: a
@@ -2314,26 +2842,29 @@ class CoreMixin:
             f"Book: {self.source.display_name}",
             f"Currency: {currency}",
         ]
-        if first_date and last_date:
+        range_end = future_latest if future_latest else last_date
+        if first_date and range_end:
             lines.append(
                 f"Data range: {first_date.isoformat()} "
-                f"to {last_date.isoformat()}"
+                f"to {range_end.isoformat()}"
             )
+        future_note = (
+            f" ({future_count} future-dated, "
+            f"latest {future_latest.isoformat()})"
+            if future_count and future_latest else ""
+        )
         if last_date is not None:
             today = date.today()
             days_behind = (today - last_date).days
-            if days_behind < 0:
-                lines.append(
-                    f"Last entry: {last_date.isoformat()} "
-                    f"(future-dated, {-days_behind} days ahead)"
-                )
-            elif days_behind == 0:
+            if days_behind == 0:
                 lines.append(
                     f"Last entry: {last_date.isoformat()} (today)"
+                    f"{future_note}"
                 )
             elif days_behind == 1:
                 lines.append(
                     f"Last entry: {last_date.isoformat()} (yesterday)"
+                    f"{future_note}"
                 )
             else:
                 warn = (
@@ -2343,8 +2874,12 @@ class CoreMixin:
                 )
                 lines.append(
                     f"Last entry: {last_date.isoformat()} "
-                    f"({days_behind} days behind){warn}"
+                    f"({days_behind} days behind){warn}{future_note}"
                 )
+        elif future_count:
+            lines.append(
+                f"Last entry: none on or before today{future_note}"
+            )
         return lines
 
     @staticmethod
@@ -2604,28 +3139,41 @@ class CoreMixin:
         """Render the Budget headline line.
 
         One line for the budget covering today. ``None`` = no
-        budget exists or none covers today → omit. Variance
-        over ``_BUDGET_WARN_VARIANCE_PCT`` earns ⚠ (spending
-        ahead of pace).
+        budget exists or none covers today → omit. Spent against
+        the budget's own expected-by-today; a variance over
+        ``_BUDGET_WARN_VARIANCE_PCT`` earns ⚠ (spending ahead of
+        the targets). A budget whose period type the server can't
+        pace says so.
         """
         if budget is None:
             return []
-        used = int(budget["used_pct"])
-        elapsed = int(budget["elapsed_pct"])
-        variance = int(budget["variance_pct"])
-        if variance > 0:
-            variance_str = f"(+{variance}% over pace)"
+        if "unsupported_period_type" in budget:
+            return [
+                f"Budget ({budget['name']}): period type "
+                f"'{budget['unsupported_period_type']}' is not one the "
+                f"server can pace — no headline computed"
+            ]
+        cur = budget["currency"]
+        spent = int(budget["spent"])
+        expected = int(budget["expected"])
+        variance = budget["variance_pct"]
+        warn = ""
+        if variance is None:
+            if spent > 0:
+                variance_str = "(ahead of targets)"
+                warn = " ⚠"
+            else:
+                variance_str = "(on pace)"
+        elif variance > 0:
+            variance_str = f"(+{int(variance)}%)"
+            warn = " ⚠" if variance > self._BUDGET_WARN_VARIANCE_PCT else ""
         elif variance < 0:
-            variance_str = f"({-variance}% under pace)"
+            variance_str = f"({int(variance)}%)"
         else:
             variance_str = "(on pace)"
-        warn = (
-            " ⚠" if variance > self._BUDGET_WARN_VARIANCE_PCT else ""
-        )
         return [
-            f"Budget ({budget['name']}): "
-            f"{used}% used / {elapsed}% elapsed "
-            f"{variance_str}{warn}"
+            f"Budget ({budget['name']}): {cur} {spent:,} spent / "
+            f"{cur} {expected:,} expected by today {variance_str}{warn}"
         ]
 
     def get_book_summary(self) -> str:
@@ -2695,16 +3243,9 @@ class CoreMixin:
                 if not self._is_template_transaction(t, template_guids)
             ]
             total_txns = len(transactions)
-            first_date: date | None = None
-            last_date: date | None = None
-            for txn in transactions:
-                d = txn.post_date
-                if d is None:  # old-book artifact
-                    continue
-                if first_date is None or d < first_date:
-                    first_date = d
-                if last_date is None or d > last_date:
-                    last_date = d
+            entry_dates = self._entry_dates(transactions, today)
+            first_date = entry_dates["first"]
+            last_date = entry_dates["last"]
 
             # Cross-mixin stats.
             all_sx = book.session.query(ScheduledTransaction).all()
@@ -2723,8 +3264,11 @@ class CoreMixin:
             # and rendered as warnings — a check that could not run is
             # never reported as "all clear".
             check_failures: list[str] = []
+            # One settlement pass feeds the Receivables/Payables
+            # counts AND the overdue warnings (spec A1).
+            open_docs = self._open_documents(book, failures=check_failures)
             biz_counts = self._business_summary_counts(
-                book, failures=check_failures,
+                book, failures=check_failures, open_documents=open_docs,
             )
 
             # Section renderers chain in output order — reorder by
@@ -2733,6 +3277,8 @@ class CoreMixin:
             lines.extend(
                 self._render_book_metadata(
                     currency, first_date, last_date,
+                    future_count=entry_dates["future_count"],
+                    future_latest=entry_dates["future_latest"],
                 )
             )
 
@@ -2753,6 +3299,8 @@ class CoreMixin:
                 overdue_scheduled=overdue_sched,
                 last_entry_days_behind=days_behind_for_warnings,
                 check_failures=check_failures,
+                far_future=entry_dates["far_future"],
+                open_documents=open_docs,
             )
             if warnings:
                 lines.append("Warnings:")
@@ -4644,6 +5192,12 @@ class CoreMixin:
                 reconciled_balance.quantize(quantum) - opening_book
             )
             warn_rows: list[tuple[str, str]] = []
+            # A statement dated after today is a typo; it goes
+            # through, and the warnings table says so in both
+            # modes (same sentence as reconcile_account).
+            future_msg = _future_statement_warning(statement_date)
+            if future_msg:
+                warn_rows.append(("*", future_msg))
             if opening_gap != 0:
                 gap_msg = (
                     f"account's reconciled balance "
@@ -5465,6 +6019,10 @@ class CoreMixin:
             piecash_splits[0].reconcile_state = "y"
             piecash_splits[0].reconcile_date = rec_dt
             built.append((ln, txn_obj, src))
+
+        # A statement commit is a reconcile: record it the way
+        # desktop's window does (spec B4).
+        self._write_reconcile_info(book, account, statement_date)
 
         book.save()
 

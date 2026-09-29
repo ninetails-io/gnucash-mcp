@@ -18,7 +18,8 @@ import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date, datetime
+from calendar import monthrange
+from datetime import date, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Generator, Iterable
@@ -109,6 +110,171 @@ _BUDGET_SCRUB_FLIP = {
     "CREDIT_ACC": frozenset({"LIABILITY", "EQUITY", "INCOME"}),
     "NONE": frozenset(),
 }
+
+
+# Lives here, not in scheduling.py, because budget period
+# boundaries read it too (spec B5) and the budgets module must
+# work without scheduling loaded.
+# ── GnuCash's recurrence engine, ported from Recurrence.cpp ──────
+# The occurrence anchor is the RECURRENCE row (period type, mult,
+# period start, weekend adjust), never the schedule's start_date and
+# never a frequency label: desktop lets "start 9 Sep, monthly on the
+# 15th" exist, and a schedule may carry several rows (monthly on the
+# 5th AND the 20th). recurrenceNextInstance is ported line for line,
+# including the weekend-adjust Friday special case; string tables
+# verbatim from period_type_strings / weekend_adj_strings.
+_PT_MONTHISH = frozenset(
+    {"year", "month", "end of month", "nth weekday", "last weekday"}
+)
+_PT_WEEKEND_ADJUSTED = frozenset({"year", "month", "end of month"})
+
+
+def _add_months(d: date, n: int) -> date:
+    """g_date_add_months: day clamped to the target month's length."""
+    total = d.month - 1 + n
+    y, m = d.year + total // 12, total % 12 + 1
+    return date(y, m, min(d.day, monthrange(y, m)[1]))
+
+
+def _is_last_of_month(d: date) -> bool:
+    return d.day == monthrange(d.year, d.month)[1]
+
+
+def _nth_weekday_compare(start: date, nxt: date, pt: str) -> int:
+    nd, sd = nxt.day, start.day
+    week = 3 if sd // 7 > 3 else sd // 7
+    if week > 0 and sd % 7 == 0 and sd != 28:
+        week -= 1
+    matchday = 7 * week + (
+        nd - nxt.isoweekday() + start.isoweekday() + 7
+    ) % 7
+    dim = monthrange(nxt.year, nxt.month)[1]
+    if (dim - matchday) >= 7 and pt == "last weekday":
+        matchday += 7
+    if pt == "nth weekday" and matchday % 7 == 0:
+        matchday += 7
+    return matchday - nd
+
+
+def _adjust_for_weekend(pt: str, wadj: str, d: date) -> date:
+    if pt in _PT_WEEKEND_ADJUSTED and d.isoweekday() in (6, 7):
+        sat = d.isoweekday() == 6
+        if wadj == "back":
+            return d - timedelta(days=1 if sat else 2)
+        if wadj == "forward":
+            return d + timedelta(days=2 if sat else 1)
+    return d
+
+
+def _recurrence_next(
+    pt: str, mult: int, start: date, wadj: str, ref: date,
+) -> date | None:
+    """First occurrence strictly after ``ref``; None when the
+    recurrence yields nothing (``once`` already past, unknown type)."""
+    mult = max(int(mult or 1), 1)
+    adjusted_start = _adjust_for_weekend(pt, wadj, start)
+    if ref < adjusted_start:
+        return adjusted_start
+    nxt = ref
+    if pt == "once":
+        return None
+    if pt in _PT_MONTHISH:
+        m = mult * 12 if pt == "year" else mult
+        # Step 1: forward one period, passing exactly one occurrence.
+        if (wadj == "back" and pt in _PT_WEEKEND_ADJUSTED
+                and nxt.isoweekday() in (6, 7)):
+            nxt -= timedelta(days=1 if nxt.isoweekday() == 6 else 2)
+        if (wadj == "back" and pt in _PT_WEEKEND_ADJUSTED
+                and nxt.isoweekday() == 5):
+            tmp_sat, tmp_sun = nxt + timedelta(days=1), nxt + timedelta(days=2)
+            if pt == "end of month":
+                if (_is_last_of_month(nxt) or _is_last_of_month(tmp_sat)
+                        or _is_last_of_month(tmp_sun)):
+                    nxt = _add_months(nxt, m)
+                else:
+                    nxt = _add_months(nxt, m - 1)
+            else:
+                if tmp_sat.day == start.day:
+                    nxt = _add_months(tmp_sat, m)
+                elif tmp_sun.day == start.day:
+                    nxt = _add_months(tmp_sun, m)
+                elif nxt.day >= start.day:
+                    nxt = _add_months(nxt, m)
+                elif _is_last_of_month(nxt):
+                    nxt = _add_months(nxt, m)
+                elif _is_last_of_month(tmp_sat):
+                    nxt = _add_months(tmp_sat, m)
+                elif _is_last_of_month(tmp_sun):
+                    nxt = _add_months(tmp_sun, m)
+                else:
+                    nxt = _add_months(nxt, m - 1)
+        elif (_is_last_of_month(nxt)
+              or (pt in ("month", "year") and nxt.day >= start.day)
+              or (pt in ("nth weekday", "last weekday")
+                  and _nth_weekday_compare(start, nxt, pt) <= 0)):
+            nxt = _add_months(nxt, m)
+        else:
+            nxt = _add_months(nxt, m - 1)
+        # Step 2: back up to the base phase, then align the day.
+        n_months = 12 * (nxt.year - start.year) + (nxt.month - start.month)
+        nxt = _add_months(nxt, -(n_months % m))
+        dim = monthrange(nxt.year, nxt.month)[1]
+        if pt in ("nth weekday", "last weekday"):
+            nxt += timedelta(days=_nth_weekday_compare(start, nxt, pt))
+        elif pt == "end of month" or start.day >= dim:
+            nxt = nxt.replace(day=dim)
+        else:
+            nxt = nxt.replace(day=start.day)
+        return _adjust_for_weekend(pt, wadj, nxt)
+    if pt in ("week", "day"):
+        step = mult * 7 if pt == "week" else mult
+        nxt = nxt + timedelta(days=step)
+        return nxt - timedelta(days=(nxt - start).days % step)
+    return None
+
+
+
+def _future_statement_warning(statement_date: date) -> str | None:
+    """A statement is not dated in the future; one that is, is a
+    typo. The reconcile goes through (desktop accepts the date too)
+    and the response says so — the one sentence ``reconcile_account``
+    and ``enter_statement`` both use (maintainer ruling, 2026-09-29).
+    ``None`` for today or earlier."""
+    today = date.today()
+    if statement_date <= today:
+        return None
+    return (
+        f"statement_date {statement_date.isoformat()} is after today "
+        f"({today.isoformat()}) — a statement is not dated in the "
+        f"future; check the transcription"
+    )
+
+
+def _budget_period_bounds(budget) -> "list[tuple[date, date]] | None":
+    """``[(start, end)]`` for every period of a budget, from its
+    recurrence row through ``_recurrence_next`` — the Recurrence.cpp
+    port — so every GnuCash period type (month, week, day, year,
+    end of month, nth/last weekday, with mult) paces the same way
+    desktop lays the columns out. ``None`` when the port yields
+    nothing for the type; callers say so rather than omit the
+    budget silently (spec B5).
+    """
+    rec = budget.recurrence
+    start = rec.recurrence_period_start
+    if isinstance(start, datetime):
+        start = start.date()
+    pt = rec.recurrence_period_type
+    mult = rec.recurrence_mult or 1
+    wadj = getattr(rec, "recurrence_weekend_adjust", None) or "none"
+    bounds = []
+    cursor = start
+    for _ in range(budget.num_periods):
+        nxt = _recurrence_next(pt, mult, start, wadj, cursor)
+        if nxt is None or nxt <= cursor:
+            return None
+        bounds.append((cursor, nxt - timedelta(days=1)))
+        cursor = nxt
+    return bounds
 
 
 def _budget_stored_sign(account) -> int:
@@ -2340,8 +2506,8 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
 
         Returns the non-zero counts / flags, keyed the way each
         module's response already reports them: ``templates_migrated``,
-        ``invoice_links_migrated``, ``book_stamped``,
-        ``book_scrubbed``.
+        ``invoice_links_migrated``, ``due_dates_backfilled``,
+        ``book_stamped``, ``book_scrubbed``.
         """
         out: dict = {}
         sweep = getattr(self, "_migrate_all_legacy", None)
@@ -2354,6 +2520,11 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
             n = rename(book)
             if n:
                 out["invoice_links_migrated"] = n
+        backfill = getattr(self, "_backfill_due_dates", None)
+        if backfill is not None:
+            n = backfill(book)
+            if n:
+                out["due_dates_backfilled"] = n
         stamp = getattr(self, "_ensure_budget_unreversed", None)
         if stamp is not None:
             from piecash.budget import Budget
@@ -2366,6 +2537,222 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
                 if st.get("scrubbed"):
                     out["book_scrubbed"] = True
         return out
+
+    # ── Desktop's reconcile-info frame ─────────────────────────────
+    # Key names verbatim from libgnucash/engine/Account.cpp (stable,
+    # read 2026-09-28): KEY_RECONCILE_INFO("reconcile-info");
+    # xaccAccountSetReconcileLastDate → {"reconcile-info","last-date"}
+    # (int64 time64); xaccAccountSetReconcileLastInterval →
+    # {"reconcile-info","last-interval","months"} and {...,"days"}
+    # (int64). Pinned by tests/test_reconcile_info.py. The SQL
+    # backend stores a frame as a FRAME slot on the owner whose
+    # guid_val names the frame, and each child on that frame guid
+    # under its full path name — the shape the desktop-gated
+    # sched-xaction and gncInvoice frames already follow.
+    _RECONCILE_INFO_FRAME = "reconcile-info"
+    _RECONCILE_LAST_DATE = "last-date"
+    _RECONCILE_LAST_INTERVAL = "last-interval"
+    _RECONCILE_INTERVAL_MONTHS = "months"
+    _RECONCILE_INTERVAL_DAYS = "days"
+
+    @staticmethod
+    def _reconcile_interval(
+        prev_statement_date: date, statement_date: date,
+        prev_interval: "tuple[int, int] | None",
+    ) -> "tuple[int, int] | None":
+        """``gnc_save_reconcile_interval`` (gnucash/gnome/
+        window-reconcile.cpp), ported verbatim: the ``(months,
+        days)`` desktop remembers after a reconcile, or ``None``
+        when it would remember nothing.
+
+        days = whole days between the two statement dates. Exactly
+        28 is ambiguous (four weeks or one month) and keeps the
+        previous answer's shape: months if the last interval was
+        one month (the default when none is stored), else 28 days.
+        More than 28 is counted in calendar months, days 0. A
+        negative result is not remembered.
+        """
+        days = (statement_date - prev_statement_date).days
+        months = 0
+        if days == 28:
+            prev_months = 1 if prev_interval is None else prev_interval[0]
+            if prev_months == 1:
+                months, days = 1, 0
+        elif days > 28:
+            months = (
+                (12 * statement_date.year + statement_date.month)
+                - (12 * prev_statement_date.year + prev_statement_date.month)
+            )
+            days = 0
+        if months >= 0 and days >= 0:
+            return months, days
+        return None
+
+    @staticmethod
+    def _read_reconcile_info_all(book) -> dict:
+        """``{account_guid: {"last_date": date | None, "months": int
+        | None, "days": int | None}}`` for every account carrying a
+        ``reconcile-info`` frame — three portable queries for the
+        whole book, never one per account. ``last-date`` is a
+        time64; it reads back as the local calendar day."""
+        from sqlalchemy import text
+
+        frames = {
+            r[1]: r[0] for r in book.session.execute(
+                text(
+                    "SELECT obj_guid, guid_val FROM slots "
+                    "WHERE name = :f AND slot_type = 9 "
+                    "AND guid_val IS NOT NULL"
+                ),
+                {"f": BaseGnuCashBook._RECONCILE_INFO_FRAME},
+            ).fetchall()
+        }
+        if not frames:
+            return {}
+        out = {
+            acct: {"last_date": None, "months": None, "days": None}
+            for acct in frames.values()
+        }
+        f = BaseGnuCashBook._RECONCILE_INFO_FRAME
+        for r in book.session.execute(
+            text(
+                "SELECT obj_guid, int64_val FROM slots "
+                "WHERE name = :n AND int64_val IS NOT NULL"
+            ),
+            {"n": f"{f}/{BaseGnuCashBook._RECONCILE_LAST_DATE}"},
+        ).fetchall():
+            acct = frames.get(r[0])
+            if acct is not None:
+                out[acct]["last_date"] = datetime.fromtimestamp(
+                    int(r[1])
+                ).date()
+        sub = f"{f}/{BaseGnuCashBook._RECONCILE_LAST_INTERVAL}"
+        subframes = {
+            r[1]: frames[r[0]] for r in book.session.execute(
+                text(
+                    "SELECT obj_guid, guid_val FROM slots "
+                    "WHERE name = :n AND slot_type = 9 "
+                    "AND guid_val IS NOT NULL"
+                ),
+                {"n": sub},
+            ).fetchall()
+            if r[0] in frames
+        }
+        if subframes:
+            for r in book.session.execute(
+                text(
+                    "SELECT obj_guid, name, int64_val FROM slots "
+                    "WHERE name IN (:m, :d) AND int64_val IS NOT NULL"
+                ),
+                {
+                    "m": f"{sub}/{BaseGnuCashBook._RECONCILE_INTERVAL_MONTHS}",
+                    "d": f"{sub}/{BaseGnuCashBook._RECONCILE_INTERVAL_DAYS}",
+                },
+            ).fetchall():
+                acct = subframes.get(r[0])
+                if acct is None:
+                    continue
+                key = "months" if r[1].endswith("/months") else "days"
+                out[acct][key] = int(r[2])
+        return out
+
+    def _write_reconcile_info(self, book, account, statement_date: date) -> None:
+        """Record a reconcile the way desktop's window does on
+        Finish: remember the interval since the previous statement
+        (``_reconcile_interval``; nothing when there was no previous
+        date), then set ``last-date`` to the statement date. Rows
+        take desktop's frame shape and are updated in place when the
+        frame already exists, so a book reconciled from both sides
+        keeps one frame. Every raw write is verified."""
+        import uuid
+
+        from piecash.kvp import KVP_Type, Slot
+        from sqlalchemy import text
+
+        info = self._read_reconcile_info_all(book).get(account.guid)
+        prev_date = info["last_date"] if info else None
+        prev_interval = (
+            (info["months"], info["days"])
+            if info and info["months"] is not None and info["days"] is not None
+            else None
+        )
+        label = f"reconcile-info for {account.fullname}"
+
+        def frame_guid(owner: str, name: str) -> str:
+            row = book.session.execute(
+                text(
+                    "SELECT guid_val FROM slots WHERE obj_guid = :o "
+                    "AND name = :n AND slot_type = 9"
+                ),
+                {"o": owner, "n": name},
+            ).first()
+            if row and row[0]:
+                return row[0]
+            guid = uuid.uuid4().hex
+            book.session.execute(
+                Slot.__table__.insert().values(
+                    obj_guid=owner, name=name,
+                    slot_type=KVP_Type.KVP_TYPE_FRAME, guid_val=guid,
+                )
+            )
+            _verify_composite_write(
+                book.session, Slot.__table__,
+                {"obj_guid": owner, "name": name}, label,
+            )
+            return guid
+
+        def put_int64(owner: str, name: str, value: int) -> None:
+            exists = book.session.execute(
+                text(
+                    "SELECT 1 FROM slots WHERE obj_guid = :o AND name = :n"
+                ),
+                {"o": owner, "n": name},
+            ).first()
+            if exists:
+                book.session.execute(
+                    Slot.__table__.update()
+                    .where(
+                        (Slot.__table__.c.obj_guid == owner)
+                        & (Slot.__table__.c.name == name)
+                    )
+                    .values(slot_type=KVP_Type.KVP_TYPE_GINT64, int64_val=value)
+                )
+            else:
+                book.session.execute(
+                    Slot.__table__.insert().values(
+                        obj_guid=owner, name=name,
+                        slot_type=KVP_Type.KVP_TYPE_GINT64, int64_val=value,
+                    )
+                )
+            _verify_composite_write(
+                book.session, Slot.__table__,
+                {"obj_guid": owner, "name": name, "int64_val": value}, label,
+            )
+
+        f = self._RECONCILE_INFO_FRAME
+        frame = frame_guid(account.guid, f)
+        if prev_date is not None:
+            interval = self._reconcile_interval(
+                prev_date, statement_date, prev_interval,
+            )
+            if interval is not None:
+                sub = f"{f}/{self._RECONCILE_LAST_INTERVAL}"
+                subframe = frame_guid(frame, sub)
+                put_int64(
+                    subframe, f"{sub}/{self._RECONCILE_INTERVAL_MONTHS}",
+                    interval[0],
+                )
+                put_int64(
+                    subframe, f"{sub}/{self._RECONCILE_INTERVAL_DAYS}",
+                    interval[1],
+                )
+        # Desktop stores the statement date as a day-end time64
+        # (gnc_time64_get_day_end_gdate); local time, as it does.
+        day_end = datetime.combine(statement_date, datetime.max.time())
+        put_int64(
+            frame, f"{f}/{self._RECONCILE_LAST_DATE}",
+            int(day_end.replace(microsecond=0).timestamp()),
+        )
 
     def _strip_guid_slots(
         self, book, obj_guids: list[str], label: str, objects=(),

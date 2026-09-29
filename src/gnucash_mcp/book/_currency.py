@@ -20,6 +20,7 @@ from decimal import Decimal
 
 import piecash
 
+from gnucash_mcp._format import _enumerate_periods, _period_label
 
 # ── FX staleness cap ───────────────────────────────────────────────
 #
@@ -363,13 +364,45 @@ class CurrencyMixin:
         default_currency: piecash.Commodity | None = None,
     ) -> dict[str, Decimal]:
         """Latest user-supplied rate per non-default-currency
-        commodity, as of a specific date.
-
-        Returns ``{commodity_guid: Decimal rate}`` — the most recent
-        market price of each commodity quoted in the default
-        currency, date-filtered per :meth:`_anchor_for_as_of`.
-        Commodities with no qualifying price are absent; callers
+        commodity, as of a specific date — the rate-only projection
+        of :meth:`_rates_as_of_dated`, which is where the lookup
+        lives. Returns ``{commodity_guid: Decimal rate}``;
+        commodities with no qualifying price are absent and callers
         fall back to cost basis.
+        """
+        return {
+            guid: rate
+            for guid, (rate, _d, _via) in self._rates_as_of_dated(
+                book, as_of, default_currency,
+            ).items()
+        }
+
+    def _rates_as_of_dated(
+        self,
+        book: piecash.Book,
+        as_of: date,
+        default_currency: piecash.Commodity | None = None,
+    ) -> dict[str, tuple[Decimal, date, str | None]]:
+        """Latest user-supplied rate per non-default-currency
+        commodity, as of a specific date, with the rate's date and
+        provenance.
+
+        Returns ``{commodity_guid: (rate, rate_date, via)}`` — the
+        most recent market price of each commodity quoted in the
+        default currency, date-filtered per :meth:`_anchor_for_as_of`.
+        ``rate_date`` is the date of that price; for a rate chained
+        through a pivot it is the OLDEST leg's date, and ``via`` is
+        the ``_format_via`` note (``None`` for a direct or inverse
+        price). Commodities with no qualifying price are absent;
+        callers fall back to cost basis.
+
+        This is the one answer to "which rate, from when" — the
+        dashboard's asset lines and runway take the rate, and its
+        stale-price warning takes the date, so the warning describes
+        the rate actually used. Keying staleness on a commodity's
+        own price rows instead flagged a EUR book's USD accounts
+        as "no price on file" forever while they valued correctly
+        off the inverse ``1 EUR = 1.08 USD`` row (spec A5).
 
         Commodities with no *direct* default-currency price chain
         through intermediates via
@@ -385,7 +418,7 @@ class CurrencyMixin:
         anchor = self._anchor_for_as_of(as_of)
         if default_currency is None:
             default_currency = self._require_default_currency(book)
-        latest: dict[str, tuple[date, Decimal]] = {}
+        latest: dict[str, tuple[date, tuple, Decimal]] = {}
         for p in self._find_prices(
             book, currency_guid=default_currency.guid, market_only=True,
         ):
@@ -398,8 +431,9 @@ class CurrencyMixin:
             if existing is None or cand > (existing[0], existing[1]):
                 latest[key] = (p_date, _price_tie_rank(p),
                                Decimal(str(p.value)))
-        result = {
-            guid: rate for guid, (_d, _rank, rate) in latest.items()
+        result: dict[str, tuple[Decimal, date, str | None]] = {
+            guid: (rate, p_date, None)
+            for guid, (p_date, _rank, rate) in latest.items()
         }
 
         # Chain pass for commodities the direct pass couldn't rate
@@ -417,12 +451,15 @@ class CurrencyMixin:
             # chain on the same forecast convention as the direct
             # pass; the legs run cap-free, so date.max selects the
             # latest rate rather than excluding everything as stale.
-            chained = self._market_rate_to_default(
+            chained = self._market_rate_to_default_with_path(
                 book, commodity, default_currency, anchor,
                 allow_after=allow_after,
             )
             if chained is not None:
-                result[commodity.guid] = chained
+                rate, intermediates, rate_date = chained
+                result[commodity.guid] = (
+                    rate, rate_date, self._format_via(intermediates),
+                )
         return result
 
     @staticmethod
@@ -477,14 +514,17 @@ class CurrencyMixin:
         to_commodity: piecash.Commodity,
         as_of: date,
         allow_after: bool = True,
-    ) -> tuple[Decimal, list[str]] | None:
+    ) -> tuple[Decimal, list[str], date] | None:
         """Rate from ``from_commodity`` to ``to_commodity`` with the
         intermediate path: direct, inverse, or single-pivot.
 
         ``1 unit of from_commodity == rate units of to_commodity``.
-        Returns ``(rate, intermediates)`` — ``[]`` for direct/inverse,
-        ``[P.mnemonic]`` for a pivot — feeding the ``(via …)``
-        provenance note.
+        Returns ``(rate, intermediates, rate_date)`` — intermediates
+        ``[]`` for direct/inverse, ``[P.mnemonic]`` for a pivot —
+        feeding the ``(via …)`` provenance note. ``rate_date`` is
+        the date of the price used, or the OLDEST leg's date for a
+        pivot: a chain is only as fresh as its stalest leg, and
+        the stale-price warning reads this date (spec A5).
 
         Candidate pivots are scored by **freshest worst leg** (ties
         by mnemonic) so the choice is deterministic. Single pivot
@@ -497,7 +537,7 @@ class CurrencyMixin:
         cross.
         """
         if from_commodity == to_commodity:
-            return (Decimal("1"), [])
+            return (Decimal("1"), [], as_of)
         # Valuation chain: legs ignore the FX staleness cap so a
         # holding values at its latest available rate (matching the
         # cap-free direct path), regardless of age.
@@ -510,9 +550,9 @@ class CurrencyMixin:
             allow_after=allow_after,
         )
         if direct is not None:
-            return (direct[0], [])
+            return (direct[0], [], _to_date(direct[2]))
         best_key: tuple[int, str] | None = None
-        best: tuple[Decimal, list[str]] | None = None
+        best: tuple[Decimal, list[str], date] | None = None
         for pivot in self._pivot_currencies(book):
             if pivot == from_commodity or pivot == to_commodity:
                 continue
@@ -535,7 +575,11 @@ class CurrencyMixin:
             key = (max(leg1[1], leg2[1]), pivot.mnemonic or "")
             if best_key is None or key < best_key:
                 best_key = key
-                best = (leg1[0] * leg2[0], [pivot.mnemonic or ""])
+                best = (
+                    leg1[0] * leg2[0],
+                    [pivot.mnemonic or ""],
+                    min(_to_date(leg1[2]), _to_date(leg2[2])),
+                )
         return best
 
     def _cross_rate(
@@ -560,10 +604,12 @@ class CurrencyMixin:
         default_currency: piecash.Commodity,
         as_of: date,
         allow_after: bool = True,
-    ) -> tuple[Decimal, list[str]] | None:
+    ) -> tuple[Decimal, list[str], date] | None:
         """Market rate converting one unit of ``commodity`` to the
-        book default, with the intermediate path, chaining when
-        there is no direct price.
+        book default, with the intermediate path and the rate's
+        date (oldest leg for a chain — see
+        :meth:`_cross_rate_with_path`), chaining when there is no
+        direct price.
 
         Resolution: (1) :meth:`_cross_rate_with_path` ``commodity →
         default`` (direct/inverse, pivot triangulation, security
@@ -572,11 +618,12 @@ class CurrencyMixin:
         ``X`` × rate(X → default), the 3-hop case (fund priced in
         GBP, GBP only reachable via USD).
 
-        Returns ``(rate, intermediates)`` or ``None`` (caller keeps
-        cost basis); ``[]`` only for a direct default-currency price.
+        Returns ``(rate, intermediates, rate_date)`` or ``None``
+        (caller keeps cost basis); ``[]`` only for a direct
+        default-currency price.
         """
         if commodity == default_currency:
-            return (Decimal("1"), [])
+            return (Decimal("1"), [], as_of)
         res = self._cross_rate_with_path(
             book, commodity, default_currency, as_of,
             allow_after=allow_after,
@@ -602,6 +649,7 @@ class CurrencyMixin:
                 return (
                     Decimal(str(p.value)) * leg[0],
                     [quote.mnemonic or ""] + leg[1],
+                    min(_to_date(p.date), leg[2]),
                 )
         return None
 
@@ -701,6 +749,57 @@ class CurrencyMixin:
             else:
                 factors[acct.guid] = rates.get(acct.commodity.guid)
         return factors
+
+    def _monthly_conversion_factors(
+        self,
+        book: piecash.Book,
+        start_date: date,
+        end_date: date,
+    ) -> dict[str, dict[str, Decimal | None]]:
+        """``{YYYY-MM: {account_guid: factor}}`` covering the range —
+        the FLOW-report valuation quantum (GB-1 ruling, 2026-07-07).
+
+        Flow reports (spending / income / cash_flow) value every
+        split at its own MONTH's closing rate, in single-period and
+        group_by modes alike. Month is the quantum because it makes
+        totals granularity-invariant (quarter/year/single are sums of
+        month-valued splits), matches the ``group_by="month"``
+        numbers users had already seen before unification, and is a
+        recognizable accounting convention (monthly close). Anchors
+        clamp to ``end_date`` via ``_enumerate_periods``, so a
+        partial final month values at the range end and the
+        forecast-price convention (``_anchor_for_as_of``) applies
+        through ``_account_conversion_factors`` as everywhere else.
+
+        STOCK reports (balance_sheet, net_worth) are deliberately
+        different: they value holdings as of their report date, not
+        per flow month.
+        """
+        # Lives on the always-composed CurrencyMixin (not the
+        # optional ReportingMixin) because the dashboard's monthly
+        # net uses it too (spec A6): one quantum for every flow.
+        return {
+            pl: self._account_conversion_factors(book, anchor)
+            for pl, anchor in _enumerate_periods(
+                start_date, end_date, "month",
+            )
+        }
+
+    @staticmethod
+    def _monthly_factor(
+        monthly_factors: dict[str, dict[str, Decimal | None]],
+        txn,
+        account,
+    ) -> Decimal | None:
+        """The conversion factor for one split under the monthly
+        quantum: its transaction's month, its account. ``None`` (no
+        rate on file that month, or a month outside the built range)
+        falls back to ``split.value`` in
+        ``_split_in_default_currency`` — the same degradation as
+        every other missing-rate path.
+        """
+        month = _period_label(txn.post_date, "month")
+        return monthly_factors.get(month, {}).get(account.guid)
 
     @staticmethod
     def _split_in_default_currency(

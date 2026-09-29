@@ -47,9 +47,9 @@ sample books — a complete financial dashboard in a single call:
 Book: samples/alex-chen-morales.gnucash
 Currency: USD
 Data range: 2025-01-01 to 2026-05-31
-Last entry: 2026-05-31 (future-dated, 31 days ahead)
+Last entry: 2026-04-30 (today) (1 future-dated, latest 2026-05-31)
 Warnings:
-  ⚠ Past due invoice: Berlin Digital GmbH 58 days past 30-day default, EUR 4,200 (no term set)
+  ⚠ Past due invoice: Berlin Digital GmbH 58 days overdue, EUR 4,200.00
   ⚠ Stale price: GBP last updated 150 days ago
 Accounts: 108 total
 Assets: 12 accounts, USD 602680.49
@@ -84,7 +84,7 @@ Monthly net (last 6 months):
   Dec 2025: +4,853
   Nov 2025: -1,494
 Runway: 121 days (USD 84,579 liquid / USD 694/day burn)
-Budget (2026 Annual Budget): 41% used / 33% elapsed (+8% over pace)
+Budget (2026 Annual Budget): USD 24,600 spent / USD 22,800 expected by today (+8%)
 Transactions: 2473
 Scheduled: 13 recurring, none due in next 7 days
 Business: 4 customers, 2 vendors, 1 employee

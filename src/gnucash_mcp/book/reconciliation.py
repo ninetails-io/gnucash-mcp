@@ -15,6 +15,7 @@ from decimal import Decimal
 
 from gnucash_mcp.book._base import (
     _commodity_quantum,
+    _future_statement_warning,
     _is_unreconciled,
     _is_voided,
     _set_split_amounts,
@@ -138,7 +139,8 @@ class ReconciliationMixin:
         One row per reconcilable account with activity, bucketed by
         the same classification the dashboard uses (agree-by-
         construction): ``behind`` (most-behind first), ``never``,
-        ``current``, ``dormant`` ($0, fully reconciled, idle), and
+        ``current``, ``dormant`` ($0 and idle: fully reconciled, or never
+        reconciled with no activity in 180 days), and
         ``excluded`` (the account's ``no_reconcile`` slot — set via
         set_account_slot — opts it out of dashboard warnings;
         loans and escrow payables with no statement to reconcile).
@@ -181,6 +183,15 @@ class ReconciliationMixin:
                                 f"{r['oldest_unreconciled_date']})"
                             )
                         cells.append(cell)
+                    # Same split the dashboard makes (spec B2):
+                    # items older than the last reconcile are not
+                    # backlog and never make the account behind.
+                    m = r.get("outstanding_count")
+                    if m:
+                        cells.append(
+                            f"{m} outstanding older than last reconcile "
+                            f"(oldest: {r['outstanding_oldest_date']})"
+                        )
                     lines.append("\t".join(cells))
                 return "\n".join(lines)
             return {
@@ -493,16 +504,25 @@ class ReconciliationMixin:
                 split.reconcile_state = "y"
                 split.reconcile_date = reconcile_datetime
 
+            # What desktop's reconcile window records on Finish:
+            # the statement cycle the dashboard's threshold reads
+            # (spec B4).
+            self._write_reconcile_info(book, account, statement_date)
+
             book.save()
 
             # Computed info only — the audit log reads the statement
             # inputs from tool params and the reconciled-split list
             # from the staged before-state above.
-            return {
+            result = {
                 "splits_reconciled": len(splits_to_reconcile),
                 "new_reconciled_balance": str(new_balance),
                 "status": "reconciled",
             }
+            warning = _future_statement_warning(statement_date)
+            if warning:
+                result["warning"] = warning
+            return result
 
     def void_transaction(self, guid: str, reason: str) -> dict:
         """Void a transaction (proper accounting void, not delete).

@@ -181,6 +181,7 @@ def register(mcp, get_book) -> None:
         enabled: bool | None = None,
         end_date: str | None = None,
         notes: str | None = None,
+        start_date: str | None = None,
     ) -> str:
         """Update a scheduled transaction.
 
@@ -193,6 +194,12 @@ def register(mcp, get_book) -> None:
         Args:
             guid: Scheduled transaction GUID (or 8+ char prefix).
             enabled: Enable or disable.
+            start_date: ``"YYYY-MM-DD"`` to move the schedule's start
+                — what desktop's Scheduled Transaction Editor does.
+                The start is the recurrence's phase anchor, so a
+                monthly schedule moved from the 15th to the 3rd
+                falls on the 3rd from then on; transactions already
+                created are untouched. Omit to leave unchanged.
             end_date: Three-state field for the schedule's end date.
 
                 - Omit (or pass ``null``): leave unchanged.
@@ -217,6 +224,7 @@ def register(mcp, get_book) -> None:
             enabled=enabled,
             end_date=end_date,
             notes=notes,
+            start_date=start_date,
         )
         return _json(result)
 
