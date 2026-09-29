@@ -247,3 +247,46 @@ unit-tested and desktop-settable only); proximo terms cannot be
 created by `create_billterm` (unit-tested against gncBillTerm.c; to
 exercise one live, set `type = 'GNC_TERM_TYPE_PROXIMO'` and `cutoff`
 on a term row with sqlite, then post against it).
+
+## Addendum — round 2 (after the round-1 report, branch at `24f2ea2`)
+
+Five changes since the report. Start from a FRESH copy of Alex
+(`cp samples/alex-chen-morales.gnucash /tmp/alex-r2.gnucash`), not
+the round-1 loop copy, so step 1 has old-shape rows to convert.
+
+1. **The due-date rows convert on the first business write (C2's
+   fix).** On the fresh copy, post one invoice with `due_date`
+   (any date) — that is a business write. Expected: the response
+   carries `due_dates_backfilled: N` for the sample's already-posted
+   documents, and:
+
+        sqlite3 /tmp/alex-r2.gnucash "SELECT slot_type, COUNT(*) FROM slots WHERE name = 'trans-date-due' GROUP BY slot_type;"
+
+   shows one row, `6|<N+1>` — every due date is a timespec, no
+   `10` left. A second business write reports no
+   `due_dates_backfilled` (nothing left to convert).
+2. **A future statement date warns, both tools.** `reconcile_account`
+   on Savings Account with `statement_date` seven days ahead and the
+   balance `get_balance` reports: succeeds, and the response carries
+   `warning: statement_date <date> is after today (<today>) — a
+   statement is not dated in the future; check the transcription`.
+   `enter_statement` dry run with the same future date: the same
+   sentence appears as a `*` row in `warnings`. A past date carries
+   no such text in either.
+3. **`closing_balance` on `reconcile_account`.** Reconcile with
+   `closing_balance` instead of `statement_balance`: works. Pass
+   both with different values: refused, naming both. Pass neither:
+   refused, `closing_balance is required`.
+4. **`start_date` moves a schedule's phase.** On a monthly schedule
+   starting the 15th, `update_scheduled_transaction` with
+   `start_date` on the 3rd of the same month. Expected: the response
+   `start_date` is the 3rd; `get_upcoming_transactions` (wide
+   window) lists the next occurrence on a 3rd, and the audit log
+   line reads `start_date: …-15 → …-03 (recurrence rows moved with
+   it)`. Transactions already created from the schedule are
+   untouched.
+5. **Count-only.** `get_unreconciled_splits` with `limit=0` returns
+   the `Showing 0 of N` indicator and the totals footer, nothing
+   else (this existed; round 1 missed it).
+
+Routed around: name every workaround, as before.
