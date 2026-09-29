@@ -7021,10 +7021,12 @@ class TestPostInvoice:
             assert child is not None, "missing gncInvoice/invoice-guid child slot"
             assert child[1] == 5, "child slot should be GUID type (5)"
 
-            # Due date slot
+            # Due date slot — a timespec (6), as xaccTransSetDateDue
+            # stores a Time64; the GDate row (10) this asserted
+            # before was the shape desktop could not read.
             assert "trans-date-due" in slot_dict, "missing trans-date-due slot"
-            assert slot_dict["trans-date-due"][1] == 10, (
-                "trans-date-due should be GDATE type (10)"
+            assert slot_dict["trans-date-due"][1] == 6, (
+                "trans-date-due should be TIMESPEC type (6), GnuCash's Time64"
             )
 
             # gncInvoice frame slot on lot
