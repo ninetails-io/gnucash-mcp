@@ -147,3 +147,26 @@ specimen), and re-run the backfill on affected books. A
 desktop-posted Net-30 specimen is being captured on the looped copy
 for byte-level comparison. Steps C3–C6 deferred until the format fix
 lands; re-run the whole gate then.
+
+### The specimen table (2026-09-28 evening, C3 exchange)
+
+| writer        | slot_type | column       | value                  |
+|---------------|-----------|--------------|------------------------|
+| server (A2)   | 10        | gdate_val    | 20260918               |
+| GnuCash desktop | 6       | timespec_val | 2026-10-28 10:59:00    |
+
+- Desktop, posting a Net-30 invoice unaided, computed due 10/28/2026
+  and wrote the row above (C3, desktop half: PASS).
+- The server read desktop's slot straight back: `due_date 2026-10-28`,
+  `days_past_due: -30` (C3, server half: PASS — the READ path is
+  bilingual; only the WRITE path speaks the wrong dialect).
+- Verdict sharpened: fix is write-only — A2's writer and its backfill
+  emit `slot_type 6` timespec rows at GnuCash's neutral clock time
+  (the same 10:59:00 convention as `transactions.post_date`); the
+  reader needs nothing. Re-run the backfill on touched books.
+- Etiquette pass observed in passing: with desktop holding the book,
+  the server refused cleanly (`lock_error`, "Close GnuCash and try
+  again") rather than fighting for the lock. After the desktop
+  session, the summary answers normally.
+- C4/C5/C6 (reconcile proposal, desktop reconcile read-back,
+  edit-save-reopen) deferred to the post-fix re-run of the full gate.
