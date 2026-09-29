@@ -189,9 +189,11 @@ GDate rows in place (59 timespec rows after; desktop's own untouched).
   (desktop reading the native recipes); cancelled, nothing posted.
 - **C3 — PASS** (unchanged from the first run: desktop's Net-30
   specimen reads back as 2026-10-28).
-- **C4 proposal — PASS.** Actions → Reconcile on Savings proposed
-  2026-10-31: the server-written last date plus its recorded 3-month
-  interval, last day of month kept.
+- **C4 proposal — NOT YET CONFIRMED.** Expected: Actions → Reconcile
+  on Savings proposes 2026-10-31 (the server-written last date plus
+  its recorded 3-month interval, last day of month kept). The
+  maintainer reconciled on that date (C5 below), but has not yet
+  reported what the dialog proposed unaided.
 - **C5 desktop reconcile read back — PASS, strict.** After Finish on
   2026-10-31 the slots hold ONE `reconcile-info` frame:
   `last-date` 1793516399 (2026-10-31 23:59:59 local, desktop's
@@ -199,7 +201,8 @@ GDate rows in place (59 timespec rows after; desktop's own untouched).
   `last-interval/months` 3, `days` 0, plus desktop's own
   `include-children` 0. Desktop wrote into the server's frame, not
   beside it.
-- **C6 edit-save-reopen — PASS.** Clean reopen; reminders fire again.
+- **C6 edit-save-reopen — NOT YET CONFIRMED.** Expected: clean reopen,
+  reminders fire again.
 
 Route-around: the maintainer drove C4–C6 at the screen. Claude's
 desktop control could open the copy and read every dialog, but a
