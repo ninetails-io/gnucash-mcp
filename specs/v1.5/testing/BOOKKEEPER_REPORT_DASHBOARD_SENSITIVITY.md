@@ -209,6 +209,17 @@ GDate rows in place (59 timespec rows after; desktop's own untouched).
   `last-interval/months` 3, `days` 0, plus desktop's own
   `include-children` 0. Desktop wrote into the server's frame, not
   beside it.
+- **C5 on Gate Test (past-dated re-check) — PASS, strict.** The
+  server created `Assets:Current Assets:Gate Test`, deposited 100 on
+  2026-05-15 and 2026-06-15, and reconciled 05/31 then 06/30 (frame:
+  `last-date` 2026-06-30, `months` 1). After desktop's Finish on
+  2026-07-31 the slots hold ONE `reconcile-info` frame for the
+  account: `last-date` 1785567599 (2026-07-31 23:59:59 local),
+  `last-interval/months` 1, `days` 0, plus desktop's
+  `include-children` 0.
+- **C4 on Gate Test — NOT YET CONFIRMED.** Expected: before any edit,
+  the Reconcile dialog proposes 2026-07-31 (2026-06-30 + 1 month,
+  last day of month kept, not clamped since it is before today).
 - **C6 edit-save-reopen — NOT YET CONFIRMED.** Expected: clean reopen,
   reminders fire again.
 
