@@ -139,3 +139,16 @@ difference. The desktop dump is now a fixture
 the frozen sample and expects it verbatim, with the one
 machine-dependent line (the entry date at the desktop's local noon)
 rendered for the zone the test runs in.
+
+## Plain-transaction twin — 2026-09-29 afternoon
+
+One transaction each side ("Twin probe", 100 from Checking Account
+to Bank Charges; the maintainer's landed in `parity-server`, the
+book GnuCash had reopened). Every column and slot matched — `num`,
+the neutral post time, empty memo and action, state `n`,
+denominators, the `date-posted` slot, no split slots — except
+`splits.reconcile_date`: desktop `1970-01-01 00:00:00` (time64 0),
+server NULL. Fixed at `_new_split` with a converter
+(`split_reconcile_dates_filled`). Open candidate from the same
+look: the time of day the server stores on a *reconciled* split
+(local midnight) against desktop's, not yet sampled.

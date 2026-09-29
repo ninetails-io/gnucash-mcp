@@ -190,3 +190,31 @@ def test_mixed_sign_unposted_credit_note_is_reported_not_guessed(business_book):
         book.save()
     assert out.get("credit_note_entries_unresolved") == 1
     assert "credit_note_entries_migrated" not in out
+
+
+def test_new_splits_carry_the_epoch_reconcile_date_and_nulls_convert(test_book):
+    """The plain-transaction twin (2026-09-29, "Twin probe"): desktop
+    stores an unreconciled split's reconcile_date as time64 0; the
+    server left it NULL. New splits carry the epoch; a converting
+    write fills every NULL and reports the count."""
+    gc = GnuCashBook(str(test_book))
+    p = str(test_book)
+    nulls_before = _rows(p, "SELECT COUNT(*) FROM splits WHERE reconcile_date IS NULL")[0][0]
+    assert nulls_before > 0  # the fixture predates the convention
+    gc.create_transaction(
+        description="Twin probe",
+        splits=[{"account": "Expenses:Groceries", "amount": "100"},
+                {"account": "Assets:Checking", "amount": "-100"}],
+        trans_date=date(2026, 9, 29),
+    )
+    assert {r for r, in _rows(
+        p, "SELECT quote(reconcile_date) FROM splits WHERE tx_guid = "
+           "(SELECT guid FROM transactions WHERE description = 'Twin probe')"
+    )} == {"'1970-01-01 00:00:00'"}
+    with gc.open(readonly=False) as book:
+        out = gc._upgrade_book_shapes(book)
+        book.save()
+    assert out["split_reconcile_dates_filled"] == nulls_before
+    assert _rows(p, "SELECT COUNT(*) FROM splits WHERE reconcile_date IS NULL")[0][0] == 0
+    with gc.open(readonly=False) as book:
+        assert "split_reconcile_dates_filled" not in gc._upgrade_book_shapes(book)

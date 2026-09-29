@@ -396,12 +396,20 @@ def _split_amounts(value, quantity, currency, account) -> tuple:
     )
 
 
+# GnuCash stores an unreconciled split's reconcile_date as time64 0.
+_EPOCH = datetime(1970, 1, 1, tzinfo=__import__("datetime").timezone.utc)
+
+
 def _new_split(account, value, quantity, currency, **fields):
     """The one constructor of a ``piecash.Split``: amounts through
     ``_split_amounts`` first. ``currency`` is the transaction's, which
     may not exist yet when the split is built. Locked by
     ``test_amount_precision.py``: no ``piecash.Split(`` elsewhere."""
     value, quantity = _split_amounts(value, quantity, currency, account)
+    # An unreconciled split's reconcile_date is the epoch on desktop
+    # (time64 0), never NULL — the one column a plain transaction
+    # twin found different (2026-09-29).
+    fields.setdefault("reconcile_date", _EPOCH)
     return piecash.Split(
         account=account, value=value, quantity=quantity, **fields,
     )
@@ -666,6 +674,13 @@ def _verify_composite_write(
             f"Write verification failed: {label} not found "
             f"after INSERT (count={count})"
         )
+
+
+def _verify_none_remaining(left: int, label: str) -> None:
+    """Verification for a bulk UPDATE: the count of rows still in the
+    old state must be zero afterwards."""
+    if left:
+        raise RuntimeError(f"{label}: {left} row(s) still in the old state")
 
 
 def _verify_delete(
@@ -2544,6 +2559,9 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         biz = getattr(self, "_migrate_business_shapes", None)
         if biz is not None:
             out.update(biz(book))
+        n = self._migrate_split_reconcile_dates(book)
+        if n:
+            out["split_reconcile_dates_filled"] = n
         stamp = getattr(self, "_ensure_budget_unreversed", None)
         if stamp is not None:
             from piecash.budget import Budget
@@ -2772,6 +2790,31 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
             frame, f"{f}/{self._RECONCILE_LAST_DATE}",
             int(day_end.replace(microsecond=0).timestamp()),
         )
+
+    @staticmethod
+    def _migrate_split_reconcile_dates(book) -> int:
+        """Write path only: every split the server wrote before
+        2026-09-29 has a NULL reconcile_date; desktop stores the
+        epoch (time64 0) until the split is reconciled. One portable
+        UPDATE, verified by re-count."""
+        from piecash.core.transaction import Split
+        from sqlalchemy import text
+
+        n = book.session.execute(
+            text("SELECT COUNT(*) FROM splits WHERE reconcile_date IS NULL")
+        ).scalar()
+        if not n:
+            return 0
+        book.session.execute(
+            Split.__table__.update()
+            .where(Split.__table__.c.reconcile_date.is_(None))
+            .values(reconcile_date=_EPOCH)
+        )
+        left = book.session.execute(
+            text("SELECT COUNT(*) FROM splits WHERE reconcile_date IS NULL")
+        ).scalar()
+        _verify_none_remaining(left, f"split reconcile_date fill ({n} rows)")
+        return int(n)
 
     def _strip_guid_slots(
         self, book, obj_guids: list[str], label: str, objects=(),

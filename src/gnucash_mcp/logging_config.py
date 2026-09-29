@@ -2169,6 +2169,12 @@ def _shape_upgrade_lines(after: dict) -> list[str]:
             f"{_INDENT}business rows brought to desktop's shape: "
             + ", ".join(biz_parts) + " (nothing posted)"
         )
+    n = after.get("split_reconcile_dates_filled")
+    if n:
+        lines.append(
+            f"{_INDENT}{n} split{'s' if n != 1 else ''} given desktop's epoch "
+            f"reconcile_date (was NULL; nothing posted)"
+        )
     n = after.get("credit_note_entries_unresolved")
     if n:
         lines.append(
