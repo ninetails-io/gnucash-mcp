@@ -394,18 +394,23 @@ class InvestmentsMixin:
         wrote before 2026-09-29 to desktop's shape — a source string
         GnuCash recognizes (``user:market_data`` and its hyphenated
         twin become ``Finance::Quote``, any other unknown string
-        ``user:price``) and the date at the neutral time. Amounts
-        untouched. Runs through ``_upgrade_book_shapes``."""
-        from datetime import time
+        ``user:price``), the date at the neutral time, and the value
+        reduced (``gnc_numeric_reduce``: desktop stores 178.70 as
+        1787/10; piecash keeps the typed denominator, 17870/100).
+        Only a row at the server's local-midnight shape has its date
+        moved; a row desktop stamped at some other time is desktop's
+        business. Runs through ``_upgrade_book_shapes``."""
+        from fractions import Fraction
         from sqlalchemy import text
 
         out: dict = {}
         sources = 0
         dates = 0
+        values = 0
         rows = book.session.execute(
-            text("SELECT guid, source, date FROM prices")
+            text("SELECT guid, source, date, value_num, value_denom FROM prices")
         ).fetchall()
-        for guid, src, raw in rows:
+        for guid, src, raw, num, denom in rows:
             src = src or ""
             if src not in self._GNC_PRICE_SOURCES:
                 new_src = self._PRICE_SOURCE_ALIASES.get(src, "user:price")
@@ -420,41 +425,74 @@ class InvestmentsMixin:
                 _verify_none_remaining(left, f"price {guid[:8]} source → {new_src}")
                 sources += 1
             as_utc = _price_row_utc(raw)
-            if as_utc is not None and as_utc.time() != time(10, 59):
-                # The server bound local midnight; the intended day is
-                # that instant's local date (what piecash reads back).
-                self._stamp_price_date(book, guid, as_utc.astimezone().date())
-                dates += 1
+            local = as_utc.astimezone() if as_utc is not None else None
+            move_date = local is not None and local.time() == datetime.min.time()
+            reduce_value = (
+                denom and Fraction(int(num), int(denom)).denominator != int(denom)
+            )
+            if move_date or reduce_value:
+                self._stamp_price_row(
+                    book, guid,
+                    price_date=local.date() if move_date else None,
+                    value=Fraction(int(num), int(denom)) if reduce_value else None,
+                )
+                dates += int(move_date)
+                values += int(bool(reduce_value))
         if sources:
             out["price_sources_normalized"] = sources
         if dates:
             out["price_dates_normalized"] = dates
-        if sources or dates:
+        if values:
+            out["price_values_reduced"] = values
+        if sources or dates or values:
             book.session.expire_all()
             self._invalidate_price_caches(book)
         return out
 
     @staticmethod
-    def _stamp_price_date(book, guid: str, price_date: date) -> None:
-        """Set one price row's ``date`` to the neutral time (10:59:00
-        UTC), the way desktop's price editor stores it. piecash's
-        ``Price.date`` column accepts only a bare date and binds it
-        at LOCAL midnight, so the ORM can't write this shape; one
-        portable UPDATE, verified by read-back. Bound as the
-        ``YYYY-MM-DD HH:MM:SS`` string GnuCash stores in SQLite and
-        PostgreSQL/MySQL cast to a timestamp."""
+    def _stamp_price_row(book, guid: str, price_date=None, value=None) -> None:
+        """Bring one price row to the price editor's shape: ``date``
+        at the neutral time (10:59:00 UTC) and ``value_num`` /
+        ``value_denom`` reduced, as ``gnc_numeric_reduce`` leaves
+        them. piecash's ``Price.date`` column accepts only a bare
+        date and binds it at LOCAL midnight, and its value hybrid
+        keeps the typed denominator, so the ORM can't write either;
+        one portable UPDATE, verified by read-back. The date is
+        bound as the ``YYYY-MM-DD HH:MM:SS`` string GnuCash stores in
+        SQLite and PostgreSQL/MySQL cast to a timestamp. ``value`` is
+        anything ``Fraction`` accepts (a Decimal, a string, a
+        Fraction)."""
+        from fractions import Fraction
         from sqlalchemy import text
 
-        stamp = _neutral_time(price_date).strftime("%Y-%m-%d %H:%M:%S")
+        sets = []
+        params: dict = {"g": guid}
+        if price_date is not None:
+            params["d"] = _neutral_time(price_date).strftime("%Y-%m-%d %H:%M:%S")
+            sets.append("date = :d")
+        if value is not None:
+            frac = Fraction(value)
+            params["n"] = frac.numerator
+            params["dn"] = frac.denominator
+            sets.append("value_num = :n")
+            sets.append("value_denom = :dn")
+        if not sets:
+            return
         book.session.execute(
-            text("UPDATE prices SET date = :d WHERE guid = :g"),
-            {"d": stamp, "g": guid},
+            text(f"UPDATE prices SET {', '.join(sets)} WHERE guid = :g"),
+            params,
         )
         left = book.session.execute(
-            text("SELECT COUNT(*) FROM prices WHERE guid = :g AND date <> :d"),
-            {"d": stamp, "g": guid},
+            text(
+                "SELECT COUNT(*) FROM prices WHERE guid = :g AND NOT ("
+                + " AND ".join(sets) + ")"
+            ),
+            params,
         ).scalar()
-        _verify_none_remaining(left, f"price {guid[:8]} date → {stamp}")
+        _verify_none_remaining(left, f"price {guid[:8]} → editor shape")
+        stale = book.session.get(Price, guid)
+        if stale is not None:
+            book.session.expire(stale)
 
     @staticmethod
     def _upsert_price(
@@ -485,13 +523,18 @@ class InvestmentsMixin:
                 existing = p
                 break
 
-        if existing:
-            existing.value = _to_decimal(value)
-            existing.type = price_type
-            return "updated"
         # Desktop stores a price's date at the neutral time (10:59:00
-        # UTC); piecash binds a bare date at local midnight (price
-        # twin, 2026-09-29), so the row is flushed and re-stamped.
+        # UTC) and its value reduced; piecash binds a bare date at
+        # local midnight and keeps the typed denominator (price twin,
+        # 2026-09-29), so the row is flushed and re-stamped.
+        if existing:
+            existing.type = price_type
+            book.flush()
+            InvestmentsMixin._stamp_price_row(
+                book, existing.guid, price_date=price_date,
+                value=_to_decimal(value),
+            )
+            return "updated"
         created = piecash.Price(
             commodity=comm,
             currency=resolved_currency,
@@ -501,7 +544,9 @@ class InvestmentsMixin:
             source=source,
         )
         book.flush()
-        InvestmentsMixin._stamp_price_date(book, created.guid, price_date)
+        InvestmentsMixin._stamp_price_row(
+            book, created.guid, price_date=price_date, value=_to_decimal(value),
+        )
         return "created"
 
     @staticmethod

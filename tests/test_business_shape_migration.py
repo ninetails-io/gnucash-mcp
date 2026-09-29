@@ -261,21 +261,39 @@ def test_prices_carry_gnucash_source_and_neutral_time(test_book):
     gc.create_commodity(mnemonic="AAPL", fullname="Apple", namespace="NASDAQ")
     gc.create_price(commodity="AAPL", namespace="NASDAQ", value="200",
                     price_date=date(2026, 9, 29))
-    gc.create_price(commodity="AAPL", namespace="NASDAQ", value="201",
+    gc.create_price(commodity="AAPL", namespace="NASDAQ", value="178.70",
                     price_date=date(2026, 9, 28), source="user:market_data")
-    rows = _rows(p, "SELECT source, type, date FROM prices ORDER BY date")
-    assert rows == [("Finance::Quote", "nav", "2026-09-28 10:59:00"),
-                    ("user:price", "nav", "2026-09-29 10:59:00")]
+    rows = _rows(p, "SELECT source, type, date, value_num, value_denom "
+                    "FROM prices ORDER BY date")
+    # 178.70 is stored reduced, 1787/10, as the editor wrote it.
+    assert rows == [("Finance::Quote", "nav", "2026-09-28 10:59:00", 1787, 10),
+                    ("user:price", "nav", "2026-09-29 10:59:00", 200, 1)]
+    # Update in place keeps the shape.
+    gc.create_price(commodity="AAPL", namespace="NASDAQ", value="199.50",
+                    price_date=date(2026, 9, 29))
+    assert _rows(p, "SELECT value_num, value_denom, date FROM prices "
+                    "WHERE source = 'user:price'") == [(399, 2, "2026-09-29 10:59:00")]
     with pytest.raises(ValueError, match="Invalid in the price editor"):
         gc.create_price(commodity="AAPL", namespace="NASDAQ", value="1",
                         price_date=date(2026, 9, 27), source="user:whatever")
     with pytest.raises(ValueError, match="not one GnuCash recognizes"):
         gc.create_price(commodity="AAPL", namespace="NASDAQ", value="1",
                         price_date=date(2026, 9, 27), price_type="close")
-    # Old shapes: an unknown source and a midnight date.
+    # Old shapes: an unknown source, the server's local-midnight
+    # date, an unreduced value — plus a row desktop stamped at some
+    # other time, which the converter must leave alone.
+    from datetime import datetime, timezone
+    midnight = datetime(2026, 9, 29).astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     with gc.open(readonly=False) as book:
         book.session.execute(text(
-            "UPDATE prices SET source = 'user:market-data', date = '2026-09-29 07:00:00'"
+            "UPDATE prices SET source = 'user:market-data', date = :m, "
+            "value_num = 17870, value_denom = 100"
+        ), {"m": midnight})
+        book.session.execute(text(
+            "INSERT INTO prices (guid, commodity_guid, currency_guid, date, "
+            "source, type, value_num, value_denom) SELECT 'f' || substr(guid, 2), "
+            "commodity_guid, currency_guid, '2026-09-29 20:44:14', "
+            "'user:price-editor', 'last', 0, 1 FROM prices LIMIT 1"
         ))
         book.save()
     with gc.open(readonly=False) as book:
@@ -283,5 +301,9 @@ def test_prices_carry_gnucash_source_and_neutral_time(test_book):
         book.save()
     assert out["price_sources_normalized"] == 2
     assert out["price_dates_normalized"] == 2
-    assert {s for s, in _rows(p, "SELECT source FROM prices")} == {"Finance::Quote"}
-    assert {d[11:] for d, in _rows(p, "SELECT date FROM prices")} == {"10:59:00"}
+    assert out["price_values_reduced"] == 2
+    assert sorted(_rows(p, "SELECT source, date, value_num, value_denom FROM prices")) == [
+        ("Finance::Quote", "2026-09-29 10:59:00", 1787, 10),
+        ("Finance::Quote", "2026-09-29 10:59:00", 1787, 10),
+        ("user:price-editor", "2026-09-29 20:44:14", 0, 1),
+    ]

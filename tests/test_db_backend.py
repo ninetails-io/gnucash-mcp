@@ -979,6 +979,39 @@ class _RealDatabaseTests:
         else:
             assert "check failed" not in result
 
+    def test_price_row_lands_in_editor_shape(self, db_book):
+        """The price twin's shape on a real driver: ``_stamp_price_row``
+        binds the neutral-time date as a string and the reduced
+        numerator/denominator by raw SQL, and the converter's date
+        rule reads the driver's datetime back. SQLite stores the
+        string verbatim; here the column is a real timestamp."""
+        from datetime import date
+
+        from sqlalchemy import text
+
+        db_book.create_commodity(
+            mnemonic="AAPL", fullname="Apple", namespace="NASDAQ",
+        )
+        db_book.create_price(
+            commodity="AAPL", namespace="NASDAQ", value="178.70",
+            price_date=date(2026, 9, 28),
+        )
+        with db_book.open(readonly=True) as book:
+            row = book.session.execute(text(
+                "SELECT date, value_num, value_denom, source FROM prices"
+            )).one()
+        assert (row[1], row[2], row[3]) == (1787, 10, "user:price")
+        assert str(row[0])[:19] == "2026-09-28 10:59:00"
+        # A second write on the same day updates in place — the
+        # converter runs first and must leave the row alone.
+        result = db_book.create_price(
+            commodity="AAPL", namespace="NASDAQ", value="180",
+            price_date=date(2026, 9, 28),
+        )
+        assert result["status"] == "updated"
+        assert "price_dates_normalized" not in result
+        assert "price_values_reduced" not in result
+
     def test_rollback_if_aborted(self, db_book):
         """The real-driver half of ``TestRollbackIfAborted``: after a
         swallowed bad statement, the helper clears PostgreSQL's

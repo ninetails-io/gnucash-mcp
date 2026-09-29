@@ -2182,6 +2182,8 @@ def _shape_upgrade_lines(after: dict) -> list[str]:
         parts.append(f"{after['price_sources_normalized']} price source(s) set to a string GnuCash recognizes")
     if after.get("price_dates_normalized"):
         parts.append(f"{after['price_dates_normalized']} price date(s) moved to the neutral time")
+    if after.get("price_values_reduced"):
+        parts.append(f"{after['price_values_reduced']} price value(s) reduced")
     if after.get("reconcile_dates_normalized"):
         parts.append(f"{after['reconcile_dates_normalized']} statement date(s) moved to day end")
     if after.get("reconcile_frames_completed"):

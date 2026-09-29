@@ -199,6 +199,21 @@ only bind a date at local midnight. The same column is why piecash's
 save-time `Price.validate` re-queries the row at midnight and raises
 `NoResultFound` on any desktop-written price the server touches;
 `book/investments.py` replaces it with a by-day comparison. Every
-price write runs the converter. Unprobed: whether desktop reduces a
-fractional price's `value_num/value_denom` (the one specimen was a
-whole number).
+price write runs the converter.
+
+Second round, same evening: the maintainer added AAPL at 178.70 dated
+the day before. Desktop stored `1787/10` — `gnc_numeric_reduce` —
+where piecash keeps the typed denominator (`17870/100`; the
+generators' `1787000/10000`). The writer now reduces by raw SQL in
+the same UPDATE as the date stamp, and the converter reduces
+existing rows (`price_values_reduced`). The converter's date rule
+was tightened at the same time: only a row at the server's
+local-midnight shape moves; a third row desktop left in the book at
+`20:44:14` UTC (value 0/1, `user:price-editor`, a wall-clock stamp
+the editor's own Add produced) stays as desktop wrote it. The
+editor's Type default is `last`, offered alongside Bid, Ask,
+Unknown, and Net Asset Value; the server's default is `nav`, an open
+question for the maintainer. The real-driver gate
+(`_RealDatabaseTests::test_price_row_lands_in_editor_shape`) writes
+one price on PostgreSQL and MariaDB, where `prices.date` is a true
+timestamp rather than SQLite's text.
