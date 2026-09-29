@@ -217,9 +217,9 @@ GDate rows in place (59 timespec rows after; desktop's own untouched).
   account: `last-date` 1785567599 (2026-07-31 23:59:59 local),
   `last-interval/months` 1, `days` 0, plus desktop's
   `include-children` 0.
-- **C4 on Gate Test — NOT YET CONFIRMED.** Expected: before any edit,
-  the Reconcile dialog proposes 2026-07-31 (2026-06-30 + 1 month,
-  last day of month kept, not clamped since it is before today).
+- **C4 on Gate Test — PASS.** Unaided, the Reconcile dialog proposed
+  07/31/2026: 2026-06-30 plus the server-recorded 1-month interval,
+  last day of month kept, before today so no clamp.
 - **C6 edit-save-reopen — NOT YET CONFIRMED.** Expected: clean reopen,
   reminders fire again.
 
