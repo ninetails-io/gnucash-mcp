@@ -43,7 +43,10 @@ def dump(path: str) -> str:
     txns.sort(key=lambda t: (names[t[0]], t[2]))
     for g, num, pd, desc, cur in txns:
         out.append(f"TXN {names[g]} num={num!r} post_date={pd!r} desc={desc!r} ccy={N(cur)}")
-        for s in q("select account_guid, memo, action, reconcile_state, value_num, value_denom, quantity_num, quantity_denom, lot_guid from splits where tx_guid=? order by account_guid, value_num", g):
+        # Splits ordered by the account's NAME, not its GUID: GUIDs
+        # differ between two books built the same way.
+        rows = q("select account_guid, memo, action, reconcile_state, value_num, value_denom, quantity_num, quantity_denom, lot_guid from splits where tx_guid=?", g)
+        for s in sorted(rows, key=lambda r: (N(r[0]), r[4])):
             lot = s[8]
             if lot:
                 title = q("select string_val from slots where obj_guid=? and name='title'", lot)

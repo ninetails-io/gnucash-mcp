@@ -5,9 +5,10 @@ Analytics, apply it to invoice 000018, pay the 3,000 remainder — ran
 on two byte-identical books, one in GnuCash desktop and one through
 the server, and the row-by-row dumps were diffed until nothing was
 left (``specs/v1.5/testing/PARITY_CREDIT_NOTE.md``). The desktop
-dump is the fixture here; the server side is reproduced from the
-frozen Alex sample plus ``_upgrade_book_shapes`` (the base both
-twins started from) and must dump to the same text.
+dump is the fixture here. The server side is reproduced on a book
+built from nothing (the dump reads only the rows the flow touches:
+the customer, invoice 000018 and its lot, the three accounts), and
+must dump to the same text.
 
 One line is machine-dependent by desktop's own convention: the entry
 date is stored at LOCAL noon (the entry ledger's date cell), so the
@@ -17,17 +18,15 @@ expected value for the zone it runs in.
 
 from __future__ import annotations
 
-import shutil
 import sys
 from datetime import date, datetime, time, timezone
 from pathlib import Path
 
-import pytest
+import piecash
 
 from gnucash_mcp.book import GnuCashBook
 
 _HERE = Path(__file__).resolve().parent
-_SAMPLE = _HERE.parent / "samples" / "alex-chen-morales.gnucash"
 _FIXTURE = _HERE / "fixtures" / "parity_credit_note_desktop.txt"
 sys.path.insert(0, str(_HERE / "fixtures"))
 from parity_dump import dump  # noqa: E402
@@ -39,15 +38,43 @@ def _local_noon_utc(d: date) -> str:
     )
 
 
-def test_server_writes_what_desktop_wrote(tmp_path):
-    if not _SAMPLE.exists():
-        pytest.skip("Alex sample not present")
-    path = tmp_path / "twin.gnucash"
-    shutil.copy(_SAMPLE, path)
+def _base_book(path: Path) -> GnuCashBook:
+    """The slice of the twin's base the flow touches, built from
+    nothing: the accounts by their names, Emerald Analytics as
+    customer 000001, invoice 000018 posted 2026-06-01 for 3,500 to
+    Income:LLC Revenue."""
+    book = piecash.create_book(str(path), currency="USD", overwrite=True)
+    root = book.root_account
+    usd = book.default_currency
+    assets = piecash.Account(name="Assets", type="ASSET", parent=root,
+                             commodity=usd, placeholder=True)
+    current = piecash.Account(name="Current Assets", type="ASSET", parent=assets,
+                              commodity=usd, placeholder=True)
+    piecash.Account(name="Checking Account", type="BANK", parent=current, commodity=usd)
+    piecash.Account(name="Accounts Receivable", type="RECEIVABLE", parent=assets,
+                    commodity=usd)
+    income = piecash.Account(name="Income", type="INCOME", parent=root,
+                             commodity=usd, placeholder=True)
+    piecash.Account(name="LLC Revenue", type="INCOME", parent=income, commodity=usd)
+    book.save()
+    book.close()
     gc = GnuCashBook(str(path))
-    with gc.open(readonly=False) as book:
-        gc._upgrade_book_shapes(book)
-        book.save()
+    gc.create_customer(name="Emerald Analytics", currency="USD")
+    gc.create_invoice(customer_id="000001", date_opened="2026-06-01", invoice_id="000018")
+    gc.add_invoice_entry(
+        invoice_id="000018", account="Income:LLC Revenue",
+        description="June 2026 consulting retainer", quantity="1", price="3500",
+    )
+    gc.post_invoice(
+        invoice_id="000018", post_account="Assets:Accounts Receivable",
+        post_date="2026-06-01", due_date="2026-07-01",
+    )
+    return gc
+
+
+def test_server_writes_what_desktop_wrote(tmp_path):
+    gc = _base_book(tmp_path / "twin.gnucash")
+    path = tmp_path / "twin.gnucash"
 
     gc.create_credit_note(
         owner_id="000001", owner_type="customer",
