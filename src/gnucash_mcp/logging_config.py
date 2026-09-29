@@ -2160,6 +2160,8 @@ def _shape_upgrade_lines(after: dict) -> list[str]:
         ("payment_memos_completed", "payment memos on both legs"),
         ("payment_slots_pruned", "payment date-posted slots removed"),
         ("lot_notes_pruned", "empty lot notes removed"),
+        ("billterm_refcounts_recomputed", "billterm refcounts recounted"),
+        ("credit_note_flags_completed", "credit-note flags written"),
     ):
         n = after.get(key)
         if n:

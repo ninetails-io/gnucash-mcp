@@ -218,3 +218,32 @@ def test_new_splits_carry_the_epoch_reconcile_date_and_nulls_convert(test_book):
     assert _rows(p, "SELECT COUNT(*) FROM splits WHERE reconcile_date IS NULL")[0][0] == 0
     with gc.open(readonly=False) as book:
         assert "split_reconcile_dates_filled" not in gc._upgrade_book_shapes(book)
+
+
+def test_terms_refcount_and_credit_note_flag_follow_desktop(business_book):
+    """Billterm twin (2026-09-29): desktop's refcount on a term is the
+    number of documents (and customers, vendors) referencing it, and
+    every plain document carries credit-note 0."""
+    gc = GnuCashBook(str(business_book))
+    p = str(business_book)
+    gc.create_billterm(name="Net 30", due_days=30)
+    gc.create_customer(name="Acme")
+    gc.create_invoice(customer_id="000001", term="Net 30")
+    gc.create_invoice(customer_id="000001", term="Net 30")
+    assert _rows(p, "SELECT refcount FROM billterms WHERE name = 'Net 30'")[0][0] == 2
+    assert _rows(p, "SELECT int64_val FROM slots WHERE name = 'credit-note' AND obj_guid = "
+                    "(SELECT guid FROM invoices WHERE id = '000001')")[0][0] == 0
+    gc.delete_invoice("000002")
+    assert _rows(p, "SELECT refcount FROM billterms WHERE name = 'Net 30'")[0][0] == 1
+    # Old shapes: refcount 0 and no flag; the converter recounts and completes.
+    with gc.open(readonly=False) as book:
+        book.session.execute(text("UPDATE billterms SET refcount = 0"))
+        book.session.execute(text("DELETE FROM slots WHERE name = 'credit-note'"))
+        book.save()
+    with gc.open(readonly=False) as book:
+        out = gc._upgrade_book_shapes(book)
+        book.save()
+    assert out["billterm_refcounts_recomputed"] == 1
+    assert out["credit_note_flags_completed"] == 1
+    assert _rows(p, "SELECT refcount FROM billterms WHERE name = 'Net 30'")[0][0] == 1
+    assert _rows(p, "SELECT COUNT(*) FROM slots WHERE name = 'credit-note' AND int64_val = 0")[0][0] == 1

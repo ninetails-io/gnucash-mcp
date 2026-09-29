@@ -2741,6 +2741,35 @@ class BusinessMixin:
         if pruned:
             out["payment_slots_pruned"] = pruned
 
+        # ── billterm refcounts: documents + customers + vendors ──
+        from piecash.business.invoice import Billterm
+        recounted = 0
+        for bt in book.session.query(Billterm).all():
+            refs = book.session.execute(
+                text(
+                    "SELECT (SELECT COUNT(*) FROM invoices WHERE terms = :g) + "
+                    "(SELECT COUNT(*) FROM customers WHERE terms = :g) + "
+                    "(SELECT COUNT(*) FROM vendors WHERE terms = :g)"
+                ),
+                {"g": bt.guid},
+            ).scalar()
+            if int(bt.refcount or 0) != int(refs):
+                bt.refcount = int(refs)
+                recounted += 1
+        if recounted:
+            out["billterm_refcounts_recomputed"] = recounted
+
+        # ── credit-note 0 on every document that isn't one ──
+        flagged = 0
+        for inv in book.session.query(Invoice).all():
+            try:
+                inv[self._CREDIT_NOTE_SLOT_KEY]
+            except KeyError:
+                self._set_is_credit_note(inv, False)
+                flagged += 1
+        if flagged:
+            out["credit_note_flags_completed"] = flagged
+
         # ── no empty notes slot on a document lot ──
         empty_notes = [
             r[0] for r in book.session.execute(
@@ -4696,17 +4725,13 @@ class BusinessMixin:
     def _set_is_credit_note(invoice, value: bool = True) -> None:
         """Set or clear the GnuCash ``credit-note`` slot.
 
-        Stores integer ``1`` for credit notes (GnuCash convention);
-        clearing removes the slot entirely so the absence-means-False
-        invariant holds for both desktop and MCP readers.
+        Stores integer ``1`` for credit notes and ``0`` otherwise, as
+        gncInvoiceSetIsCreditNote does; the reader treats an absent
+        slot as 0 too.
         """
-        if value:
-            invoice[BusinessMixin._CREDIT_NOTE_SLOT_KEY] = 1
-        else:
-            try:
-                del invoice[BusinessMixin._CREDIT_NOTE_SLOT_KEY]
-            except KeyError:
-                pass
+        # Desktop stores 1 or 0 (g_value_set_int64 (&v, credit_note ?
+        # 1 : 0)); the reader treats absence as 0.
+        invoice[BusinessMixin._CREDIT_NOTE_SLOT_KEY] = 1 if value else 0
 
     @staticmethod
     def _get_applies_to_invoice_guid(invoice) -> str | None:
@@ -4940,15 +4965,30 @@ class BusinessMixin:
                 f"{config['doc_label']} '{doc_id}'",
             )
 
+            # Desktop's gncInvoiceSetTerms increments the term's
+            # refcount; the column is the number of documents (and
+            # customers, vendors) referencing it (billterm twin,
+            # 2026-09-29).
+            if term_guid:
+                from piecash.business.invoice import Billterm
+                bt = book.session.query(Billterm).filter_by(guid=term_guid).first()
+                if bt is not None:
+                    bt.refcount = (bt.refcount or 0) + 1
+
             # Apply caller-supplied slots BEFORE save so slot writes
             # and the row insert land in one transaction — preserves
             # the "one book open per write" invariant.
+            new_inv = book.session.query(Invoice).filter_by(
+                guid=inv_guid,
+            ).first()
             if extra_slots:
-                new_inv = book.session.query(Invoice).filter_by(
-                    guid=inv_guid,
-                ).first()
                 for key, value in extra_slots.items():
                     new_inv[key] = value
+            # Desktop writes credit-note 0 on every document that is
+            # not a credit note (gncInvoiceSetIsCreditNote(FALSE)
+            # stores int64 0); absence is the server's old shape.
+            if not self._get_is_credit_note(new_inv):
+                self._set_is_credit_note(new_inv, False)
 
             book.save()
 
@@ -7979,6 +8019,17 @@ class BusinessMixin:
                     f"Entries for {type_label.lower()} '{doc_id}'",
                 )
 
+            # gncInvoiceDestroy → gncBillTermDecRef on the document's term.
+            from sqlalchemy import text as _sql_text
+            term_guid = book.session.execute(
+                _sql_text("SELECT terms FROM invoices WHERE guid = :g"),
+                {"g": inv_guid},
+            ).scalar()
+            if term_guid:
+                from piecash.business.invoice import Billterm
+                bt = book.session.query(Billterm).filter_by(guid=term_guid).first()
+                if bt is not None and (bt.refcount or 0) > 0:
+                    bt.refcount = bt.refcount - 1
             book.session.execute(
                 Invoice.__table__.delete().where(
                     Invoice.__table__.c.guid == inv_guid

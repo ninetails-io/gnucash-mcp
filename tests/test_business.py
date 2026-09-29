@@ -4645,32 +4645,20 @@ class TestCreditNoteSlotHelpers:
             inv = book.session.query(Invoice).filter_by(id="000001").first()
             assert BusinessMixin._get_is_credit_note(inv) is True
 
-    def test_set_false_clears_slot(self, business_book):
-        """``_set_is_credit_note(False)`` removes the slot entirely
-        (not stores ``0``). Important: the "absent-means-False"
-        convention is what GnuCash desktop reads — storing 0 would
-        be a non-standard state."""
-        from gnucash_mcp.book.business import BusinessMixin
+    def test_set_false_stores_zero(self, business_book):
+        """gncInvoiceSetIsCreditNote(FALSE) stores int64 0, as desktop
+        does on every plain document (billterm twin, 2026-09-29);
+        the reader treats 0 and absence alike."""
         gb = GnuCashBook(str(business_book))
-        self._new_invoice(gb)
+        gb.create_customer(name="Acme")
+        cn = gb.create_credit_note(owner_id="000001", owner_type="customer")
         with gb.open(readonly=False) as book:
-            from piecash.business.invoice import Invoice
-            inv = book.session.query(Invoice).filter_by(id="000001").first()
-            BusinessMixin._set_is_credit_note(inv, True)
+            inv = gb._find_invoice(book, cn["id"], owner_type=2)
+            assert gb._get_is_credit_note(inv) is True
+            gb._set_is_credit_note(inv, False)
+            assert gb._get_is_credit_note(inv) is False
+            assert int(str(inv["credit-note"].value)) == 0
             book.save()
-        with gb.open(readonly=False) as book:
-            from piecash.business.invoice import Invoice
-            inv = book.session.query(Invoice).filter_by(id="000001").first()
-            BusinessMixin._set_is_credit_note(inv, False)
-            book.save()
-        # Slot should be gone — re-read returns False AND the
-        # underlying access raises KeyError on direct lookup.
-        with gb.open(readonly=True) as book:
-            from piecash.business.invoice import Invoice
-            inv = book.session.query(Invoice).filter_by(id="000001").first()
-            assert BusinessMixin._get_is_credit_note(inv) is False
-            with pytest.raises(KeyError):
-                inv[BusinessMixin._CREDIT_NOTE_SLOT_KEY]
 
     def test_set_false_on_unflagged_is_idempotent(self, business_book):
         """Clearing a slot that was never set must not raise.

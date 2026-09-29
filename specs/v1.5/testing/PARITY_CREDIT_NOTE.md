@@ -163,3 +163,17 @@ wrote local midnight. Desktop's Finish also wrote
 `reconcile-info/include-children` 0, which the server's frame
 lacked. Both fixed on the write side with a converter
 (`reconcile_dates_normalized`, `reconcile_frames_completed`).
+
+## Billterm twin — 2026-09-29 afternoon
+
+The maintainer created (not posted) an invoice for Emerald Analytics
+with `Net 30`, letting desktop pick the ID. Desktop chose `000047`,
+continuing the six-digit counter past the hand-named `Parity01`;
+the server's `max(counter, highest numeric id) + 1` gives the same.
+No child copy of the billterm: the invoice's `terms` points at the
+parent row, as the server's does. Two differences, both fixed with
+converters (`billterm_refcounts_recomputed`,
+`credit_note_flags_completed`): desktop maintains `refcount` (55 =
+every referencing document; the base held 0), and it writes
+`credit-note` 0 on a plain document where the server wrote nothing.
+Every other column matched.
