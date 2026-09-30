@@ -104,15 +104,18 @@ document as overpaid by 100.)
 
 **B4. The posting-rate carve-out.** `pay_document` for `000048`
 from `Assets:Current Assets:Checking Account`, amount `900`, today,
-`dry_run`. Expect a refusal or a stale-rate block naming the last
-ENTERED EUR quote: the recent implied rates must not count here.
+`dry_run`. Expect a stale-rate refusal naming the last ENTERED EUR
+quote (July). The book holds recent EUR rows that are not quotes —
+implied rates from the twins' transfers and payment, and two
+`temporary` rows desktop leaked on its invoice posts — and none of
+them may satisfy the guard.
 
 **B5. Pay across a rate change.** `create_price` EUR at `1.18`
 USD dated today. Dry-run the same payment. Expect:
 
 | Proposed split | value | quantity |
 |---|---|---|
-| Accounts Receivable EUR | -1000.00 | -900.00 |
+| Accounts Receivable EUR | -1000.00 | -900 |
 | Checking Account | 1062.00 | 1062.00 |
 | Foreign Exchange Gain/Loss | -62.00 | -62.00 |
 
@@ -121,16 +124,18 @@ and `fx_realized` 62.00 USD, gain. Then run it for real.
 `get_transaction` on the payment: currency USD, three splits,
 values summing to zero.
 
-**B6.** `get_prices` for EUR. Today has ONE row: the `user:price`
-quote at 1.18. The payment added nothing (a preferred same-day
-source stays).
+**B6.** `get_prices` for EUR. Today still has exactly two rows:
+the `user:price` quote you entered and the `user:xfer-dialog` row
+desktop's payment of `000049` left for the day. The payment added
+no third row. (Which of the two the payment's rate landed on is
+GnuCash's same-day rule plus a GUID draw: both may read 1.18, or
+the dialog row may still read 1.1111.)
 
-**B7. Partial payments at two rates.** Create a EUR 500 invoice for
-Berlin Digital, post it to the EUR receivable dated today. Pay
-`200` today. `create_price` EUR `1.25` dated tomorrow is not
-possible, so instead: `get_document` shows `amount_due 300.00`;
-pay `300`; `amount_due 0.00`, two `payments` rows of 200.00 and
-300.00. Try to pay `1` more: refused, in EUR.
+**B7. Partial payments.** Create a EUR 500 invoice for Berlin
+Digital and post it to the EUR receivable dated today. Pay `200`
+from Checking: `get_document` shows `amount_due 300.00`. Pay `300`:
+`amount_due 0.00`, two `payments` rows of 200.00 and 300.00. Try to
+pay `1` more: refused, with the balance stated in EUR.
 
 **B8. Price writes.** `create_price` AAPL `178.70` with no type:
 the response says `last`. `create_price` with

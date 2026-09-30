@@ -228,7 +228,15 @@ def _is_market_price(price) -> bool:
     re-derives the rate over quotes alone to NAME a stale rate's
     provenance, and the business module picks the rate for a NEW
     cross-currency posting or payment from quotes alone, so a
-    posting never prices itself off the last posting's echo."""
+    posting never prices itself off the last posting's echo.
+
+    A ``temporary`` row is not a quote either: desktop leaks one on
+    every cross-currency invoice post (``gnc_price_invert`` builds a
+    reversed copy with ``PRICE_SOURCE_TEMP`` and the SQL backend
+    saves it), typed ``last``. Counted as a quote, the echo of a
+    posting would satisfy the staleness guard for the next one."""
+    if getattr(price, "source", None) == "temporary":
+        return False
     return getattr(price, "type", None) != "transaction"
 
 

@@ -442,3 +442,36 @@ def test_customer_credit_note_refund_sends_the_pay_currency(business_book):
     assert _prices_on(business_book, "2026-09-30") == [
         ("EUR", "USD", "user:xfer-dialog", "transaction", 10, 9),
     ]
+
+
+def test_posting_rate_ignores_implied_and_temporary_rows(business_book):
+    """The rate the server chooses for a new payment comes from
+    quotes somebody entered or fetched. Neither a transaction's
+    implied rate nor the ``temporary`` row desktop leaks on a
+    cross-currency post (twin: ``USD/EUR 9/10 temporary last``, the
+    same instant as the real price) is one: with only those on file
+    near the pay date the guard sees the real quote's age."""
+    from gnucash_mcp.book import StaleFXRateError
+
+    gb = _book(business_book, quotes={date(2026, 9, 1): "1.111111"})
+    inv = _invoice(gb, post_date="2026-09-02")
+    with gb.open(readonly=False) as book:
+        usd = book.default_currency.guid
+        eur = next(c.guid for c in book.commodities if c.mnemonic == "EUR")
+        for guid, comm, curr, source, ptype, num, den in (
+            ("a" * 32, eur, usd, "user:xfer-dialog", "transaction", 10, 9),
+            ("b" * 32, usd, eur, "temporary", "last", 9, 10),
+        ):
+            book.session.execute(text(
+                "INSERT INTO prices (guid, commodity_guid, currency_guid, "
+                "date, source, type, value_num, value_denom) VALUES "
+                "(:g, :c, :u, '2026-09-29 10:59:00', :s, :t, :n, :d)"
+            ), {"g": guid, "c": comm, "u": curr, "s": source, "t": ptype,
+                "n": num, "d": den})
+        book.save()
+    with pytest.raises(StaleFXRateError) as exc:
+        gb.pay_invoice(
+            invoice_id=inv, payment_account="Assets:Checking", amount="900",
+            payment_date="2026-09-30",
+        )
+    assert "2026-09-01" in str(exc.value)
