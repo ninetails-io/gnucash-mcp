@@ -6485,7 +6485,6 @@ class BusinessMixin:
                 _qty_for_split(post_acct, ar_ap_value), inv.currency,
                 memo="",
                 action=doc_action,
-                reconcile_date=datetime(1970, 1, 1),
             )
             piecash_splits.append(ar_ap_split)
 

@@ -2957,28 +2957,63 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
 
     @staticmethod
     def _migrate_split_reconcile_dates(book) -> int:
-        """Write path only: every split the server wrote before
-        2026-09-29 has a NULL reconcile_date; desktop stores the
-        epoch (time64 0) until the split is reconciled. One portable
-        UPDATE, verified by re-count."""
+        """Write path only: an unreconciled split's reconcile_date is
+        the epoch (time64 0) on desktop. Two shapes the server left:
+
+        * NULL — every split written before 2026-09-29.
+        * The epoch at LOCAL midnight — the receivable/payable split
+          of every posted document until 2026-09-30, from a naive
+          ``datetime(1970, 1, 1)`` that piecash localized
+          (``1970-01-01 08:00:00`` on a Pacific machine; the
+          cross-currency invoice twin's one differing column).
+
+        Portable UPDATEs, verified by re-count."""
         from piecash.core.transaction import Split
         from sqlalchemy import text
 
-        n = book.session.execute(
-            text("SELECT COUNT(*) FROM splits WHERE reconcile_date IS NULL")
-        ).scalar()
-        if not n:
-            return 0
-        book.session.execute(
-            Split.__table__.update()
-            .where(Split.__table__.c.reconcile_date.is_(None))
-            .values(reconcile_date=_EPOCH)
+        # Within a day of the epoch but not the epoch, on a split
+        # that is not reconciled: no real reconcile date lives there.
+        near = (
+            "SELECT COUNT(*) FROM splits WHERE reconcile_state <> 'y' "
+            "AND reconcile_date > :lo AND reconcile_date < :hi "
+            "AND reconcile_date <> :epoch"
         )
-        left = book.session.execute(
+        bounds = {
+            "lo": "1969-12-31 00:00:00", "hi": "1970-01-02 00:00:00",
+            "epoch": "1970-01-01 00:00:00",
+        }
+        nulls = book.session.execute(
             text("SELECT COUNT(*) FROM splits WHERE reconcile_date IS NULL")
         ).scalar()
-        _verify_none_remaining(left, f"split reconcile_date fill ({n} rows)")
-        return int(n)
+        shifted = book.session.execute(text(near), bounds).scalar()
+        if not nulls and not shifted:
+            return 0
+        if nulls:
+            book.session.execute(
+                Split.__table__.update()
+                .where(Split.__table__.c.reconcile_date.is_(None))
+                .values(reconcile_date=_EPOCH)
+            )
+            left = book.session.execute(
+                text("SELECT COUNT(*) FROM splits WHERE reconcile_date IS NULL")
+            ).scalar()
+            _verify_none_remaining(
+                left, f"split reconcile_date fill ({nulls} rows)",
+            )
+        if shifted:
+            book.session.execute(
+                text(
+                    "UPDATE splits SET reconcile_date = :epoch WHERE "
+                    "reconcile_state <> 'y' AND reconcile_date > :lo "
+                    "AND reconcile_date < :hi AND reconcile_date <> :epoch"
+                ),
+                bounds,
+            )
+            left = book.session.execute(text(near), bounds).scalar()
+            _verify_none_remaining(
+                left, f"split reconcile_date epoch ({shifted} rows)",
+            )
+        return int(nulls) + int(shifted)
 
     def _strip_guid_slots(
         self, book, obj_guids: list[str], label: str, objects=(),

@@ -417,3 +417,38 @@ receivable is `Assets:Receivables:Accounts Receivable EUR`.
 
 Report back: the invoice ID desktop chose, and anything the dialogs
 asked that is not listed here.
+
+### Result — 2026-09-30
+
+Desktop chose `000048`, as predicted, and raised the exchange dialog;
+the maintainer typed USD 1,000.00 as the to-amount. The same invoice
+was run through the server on a copy (a day later, behind an entered
+EUR/USD quote, since the server picks its posting rate from quotes).
+
+Every column of the invoice row, the entry row, the posting
+transaction, both splits, the transaction's six slots, the lot and
+its slots, and the invoice's `credit-note` slot matched — filler
+columns included — except one: the receivable split's
+`reconcile_date`, `1970-01-01 00:00:00` in desktop and
+`1970-01-01 08:00:00` from the server. The posting path passed a
+naive `datetime(1970, 1, 1)`, which piecash localized; every other
+split went through `_new_split`'s tz-aware epoch. 55 such rows in
+the twin, one per posted document. Fixed at the writer; the
+reconcile-date converter now also moves a near-epoch date on an
+unreconciled split to the epoch. `parity_dump.py` had not printed
+`reconcile_date` at all; it does now, and the credit-note fixture
+was regenerated from the desktop twin.
+
+Prices: desktop wrote `EUR/USD 10/9 user:xfer-dialog transaction`,
+which is the server's row. It also left a second row,
+`USD/EUR 9/10 temporary last`, at the same instant:
+`gnc_price_invert` (gnc-pricedb.h: "The source is set to
+PRICE_SOURCE_TEMP") builds a reversed copy for the posting code's
+conversion, and the SQL backend commits any instance it is handed —
+the same leak that left the zero-value AAPL row. The server does
+not write it. Open question for the maintainer.
+
+The Post dialog's Due Date stayed at the day the dialog opened
+(09/29) when the Post Date was changed to 09/22 on a customer with
+no terms; the server's default for that case is the posting date.
+Both are the user's choice at post time.

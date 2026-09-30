@@ -45,13 +45,16 @@ def dump(path: str) -> str:
         out.append(f"TXN {names[g]} num={num!r} post_date={pd!r} desc={desc!r} ccy={N(cur)}")
         # Splits ordered by the account's NAME, not its GUID: GUIDs
         # differ between two books built the same way.
-        rows = q("select account_guid, memo, action, reconcile_state, value_num, value_denom, quantity_num, quantity_denom, lot_guid from splits where tx_guid=?", g)
+        rows = q("select account_guid, memo, action, reconcile_state, value_num, value_denom, quantity_num, quantity_denom, lot_guid, reconcile_date from splits where tx_guid=?", g)
         for s in sorted(rows, key=lambda r: (N(r[0]), r[4])):
             lot = s[8]
             if lot:
                 title = q("select string_val from slots where obj_guid=? and name='title'", lot)
                 role(lot, f"lot:{title[0][0] if title else '?'}")
-            out.append(f"  SPLIT acct={N(s[0])} memo={s[1]!r} action={s[2]!r} rec={s[3]} value={s[4]}/{s[5]} qty={s[6]}/{s[7]} lot={N(lot)}")
+            # rec_date: the epoch on an unreconciled split. Left out of
+            # the first dump, which hid a local-midnight epoch on every
+            # posted document's receivable split (2026-09-30).
+            out.append(f"  SPLIT acct={N(s[0])} memo={s[1]!r} action={s[2]!r} rec={s[3]} rec_date={s[9]} value={s[4]}/{s[5]} qty={s[6]}/{s[7]} lot={N(lot)}")
     # lots touched
     for lot in sorted({r for r in names if names[r].startswith("lot:")}, key=lambda r: names[r]):
         l = q("select is_closed, account_guid from lots where guid=?", lot)[0]

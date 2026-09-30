@@ -2175,7 +2175,8 @@ def _shape_upgrade_lines(after: dict) -> list[str]:
     if n:
         lines.append(
             f"{_INDENT}{n} split{'s' if n != 1 else ''} given desktop's epoch "
-            f"reconcile_date (was NULL; nothing posted)"
+            f"reconcile_date (was NULL or the epoch at local midnight; "
+            f"nothing posted)"
         )
     n = after.get("slot_fillers_normalized")
     if n:

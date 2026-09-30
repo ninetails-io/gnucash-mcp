@@ -404,3 +404,113 @@ def test_new_account_carries_the_balance_limit_frame(fx_book):
         assert book.session.execute(
             text("SELECT COUNT(*) FROM slots WHERE obj_guid = :g"), {"g": frame},
         ).scalar() == 0
+
+
+def _eur_invoice(business_book, *, quote_day, rate):
+    """USD book, EUR customer, a EUR receivable, and one entered
+    EUR/USD quote — the server picks a posting rate from quotes."""
+    gb = GnuCashBook(str(business_book))
+    with gb.open(readonly=False) as bk:
+        eur = piecash.Commodity(
+            namespace="CURRENCY", mnemonic="EUR", fullname="Euro", fraction=100,
+        )
+        bk.session.add(eur)
+        bk.flush()
+        assets = next(a for a in bk.accounts if a.fullname == "Assets")
+        bk.session.add(piecash.Account(
+            name="AR EUR", type="RECEIVABLE", parent=assets, commodity=eur,
+        ))
+        bk.save()
+    gb.create_price("EUR", "CURRENCY", rate, price_date=quote_day)
+    gb.create_customer(name="Berlin Digital GmbH", currency="EUR")
+    inv = gb.create_invoice(customer_id="000001", date_opened="2026-09-22")
+    gb.add_invoice_entry(
+        invoice_id=inv["id"], account="Income:Sales",
+        description="Twin invoice", quantity="1", price="900",
+    )
+    return gb, inv["id"]
+
+
+def test_cross_currency_invoice_post_matches_the_desktop_specimen(business_book):
+    """Invoice twin, 2026-09-30: a EUR 900 invoice for a EUR customer
+    in a USD book, posted in desktop with USD 1,000.00 typed for the
+    income side. Desktop's posting transaction: currency EUR; the
+    receivable split 900/900 and the income split value -900.00 EUR,
+    quantity -1,000.00 USD, both action ``Invoice``, both
+    ``reconcile_date`` at the epoch; and one implied price,
+    ``EUR/USD 10/9 user:xfer-dialog transaction``, at the neutral
+    time. The server's rows for the same invoice matched in every
+    column but one: the receivable split's reconcile_date sat at the
+    epoch's LOCAL midnight."""
+    gb, inv_id = _eur_invoice(
+        business_book, quote_day=date(2026, 9, 21), rate="1.111111",
+    )
+    gb.post_invoice(
+        invoice_id=inv_id, post_account="Assets:AR EUR",
+        post_date="2026-09-22", due_date="2026-09-29",
+    )
+    with gb.open(readonly=True) as book:
+        txn = book.session.execute(text(
+            "SELECT c.mnemonic, t.num, t.post_date, t.description "
+            "FROM transactions t JOIN commodities c ON c.guid = t.currency_guid "
+            "JOIN invoices i ON i.post_txn = t.guid"
+        )).one()
+        splits = book.session.execute(text(
+            "SELECT a.name, s.memo, s.action, s.reconcile_state, "
+            "s.reconcile_date, s.value_num, s.value_denom, s.quantity_num, "
+            "s.quantity_denom FROM splits s JOIN accounts a ON a.guid = "
+            "s.account_guid JOIN invoices i ON i.post_txn = s.tx_guid "
+            "ORDER BY a.name"
+        )).fetchall()
+    assert (txn[0], txn[1], str(txn[2])[:19], txn[3]) == (
+        "EUR", inv_id, "2026-09-22 10:59:00", "Berlin Digital GmbH",
+    )
+    assert [tuple(str(v)[:19] if i == 4 else v for i, v in enumerate(r))
+            for r in splits] == [
+        ("AR EUR", "", "Invoice", "n", "1970-01-01 00:00:00",
+         90000, 100, 90000, 100),
+        ("Sales", "", "Invoice", "n", "1970-01-01 00:00:00",
+         -90000, 100, -100000, 100),
+    ]
+    assert _prices(business_book)[-1] == (
+        "EUR", "USD", "2026-09-22 10:59:00", "user:xfer-dialog",
+        "transaction", 10, 9,
+    )
+
+
+def test_converter_moves_a_local_midnight_epoch_to_the_epoch(business_book):
+    """Every document posted before 2026-09-30 left its receivable
+    split's reconcile_date at a naive ``datetime(1970, 1, 1)``, which
+    piecash localized (``1970-01-01 08:00:00`` on a Pacific
+    machine). Engineered, then converted; a reconciled split's real
+    date is never touched."""
+    gb, inv_id = _eur_invoice(
+        business_book, quote_day=date(2026, 9, 21), rate="1.111111",
+    )
+    gb.post_invoice(
+        invoice_id=inv_id, post_account="Assets:AR EUR",
+        post_date="2026-09-22", due_date="2026-09-29",
+    )
+    with gb.open(readonly=False) as book:
+        book.session.execute(text(
+            "UPDATE splits SET reconcile_date = '1970-01-01 08:00:00' "
+            "WHERE account_guid IN (SELECT guid FROM accounts WHERE name = 'AR EUR')"
+        ))
+        book.session.execute(text(
+            "UPDATE splits SET reconcile_state = 'y', "
+            "reconcile_date = '1970-01-01 09:00:00' "
+            "WHERE account_guid IN (SELECT guid FROM accounts WHERE name = 'Sales')"
+        ))
+        book.save()
+    with gb.open(readonly=False) as book:
+        out = gb._upgrade_book_shapes(book)
+        book.save()
+    assert out["split_reconcile_dates_filled"] == 1
+    with gb.open(readonly=True) as book:
+        rows = dict(book.session.execute(text(
+            "SELECT a.name, s.reconcile_date FROM splits s "
+            "JOIN accounts a ON a.guid = s.account_guid "
+            "JOIN invoices i ON i.post_txn = s.tx_guid"
+        )).fetchall())
+    assert str(rows["AR EUR"])[:19] == "1970-01-01 00:00:00"
+    assert str(rows["Sales"])[:19] == "1970-01-01 09:00:00"
