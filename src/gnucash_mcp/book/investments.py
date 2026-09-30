@@ -109,15 +109,6 @@ class InvestmentsMixin:
                 latest_market.setdefault(
                     p.commodity.guid, (_to_date(p.date), p),
                 )
-            # Staleness is measured on quotes somebody entered or
-            # fetched; a transaction's implied rate values the
-            # holding but is not a quote that can go stale.
-            latest_quote: dict[str, tuple[date, "Price"]] = {}
-            with self._market_prices_only(book):
-                for p in self._find_prices(book):
-                    latest_quote.setdefault(
-                        p.commodity.guid, (_to_date(p.date), p),
-                    )
 
             today = date.today()
             default_commodity = self._require_default_currency(book)
@@ -147,7 +138,7 @@ class InvestmentsMixin:
                 if stale_days is not None:
                     if commodity == default_commodity:
                         continue
-                    latest = latest_quote.get(commodity.guid)
+                    latest = latest_market.get(commodity.guid)
                     if latest is None:
                         no_price = True
                     else:

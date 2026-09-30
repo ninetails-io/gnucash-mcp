@@ -242,12 +242,15 @@ Second ruling, same evening: "The server should NOT skip
 `type='transaction'` rows because desktop doesn't. The ruling made
 before is overturned." `_find_prices` now returns every row;
 valuation, posting FX, chains, `get_latest_price`,
-`calculate_lot_gain` all count a transaction's implied rate. The
-maintainer kept one exemption: the stale-price warning and
-`list_commodities`' staleness markers measure entered or fetched
-quotes only (`_market_prices_only`); a holding priced by its
-transactions alone reads "no quote on file; valued at the rate of
-its last transaction". 25 tests migrated by subject; the ones about
+`calculate_lot_gain` all count a transaction's implied rate. A
+first cut exempted transaction rows from the stale-price warning;
+the test migration showed that hiding a sixty-day-old direct rate
+behind a fresh chain of quotes, and the bookkeeper ruled it out
+(`BOOKKEEPER_REPORT_DASHBOARD_SENSITIVITY.md`, 2026-09-29 evening):
+staleness keys on the date of the rate valuation actually used,
+one window for all sources, provenance named — "valued at the rate
+of its last transaction, 45 days ago". 33 tests migrated by
+subject; the ones about
 the unpriced state delete the transaction rows
 (`drop_transaction_prices`), since a book with a holding and no
 price row at all is a state desktop's Price Editor can produce.

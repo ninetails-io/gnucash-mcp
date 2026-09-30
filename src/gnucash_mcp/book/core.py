@@ -1430,15 +1430,18 @@ class CoreMixin:
                     if s.account.commodity is not None:
                         recent_currencies.add(s.account.commodity.guid)
 
-            # Two views of the same map. ``dated`` is the rate
-            # valuation uses — a cross-currency transaction's
-            # implied rate included, as desktop counts it (ruling
-            # 2026-09-29). ``quoted`` is the same derivation over
-            # quotes somebody entered or fetched: that is what can
-            # go stale, and its absence is what "no quote on file"
-            # means. A holding valued only by its transactions is
-            # named as such, so the operator knows what backs the
-            # number without being nagged about a rate nobody set.
+            # ``dated`` is the rate valuation uses — a cross-currency
+            # transaction's implied rate included, as desktop counts
+            # it (ruling 2026-09-29). ``quoted`` is the same
+            # derivation over quotes somebody entered or fetched; it
+            # is consulted only to NAME the provenance of a stale
+            # rate. Staleness itself keys on the date of the rate
+            # valuation actually used, whatever its source, against
+            # one window (bookkeeper ruling, 2026-09-29 evening: the
+            # warning must describe the number displayed, never
+            # another subsystem's view). A fresh implied rate warns
+            # of nothing; an old one says what it is, and the
+            # phrasing carries the cure.
             dated = self._rates_as_of_dated(book, today, default_currency)
             with self._market_prices_only(book):
                 quoted = self._rates_as_of_dated(
@@ -1457,35 +1460,32 @@ class CoreMixin:
                     or cguid not in recent_currencies
                 ):
                     continue
-                entry = quoted.get(cguid)
+                entry = dated.get(cguid)
                 if entry is None:
-                    implied = dated.get(cguid)
-                    if implied is None:
-                        stale_entries.append((
-                            10**9,  # arbitrary large sort key — top
-                            commodity.mnemonic,
-                            f"Stale price: {commodity.mnemonic} no price on file",
-                        ))
-                    else:
-                        _r, implied_date, _v = implied
-                        stale_entries.append((
-                            10**9,
-                            commodity.mnemonic,
-                            f"Stale price: {commodity.mnemonic} no quote "
-                            f"on file; valued at the rate of its last "
-                            f"transaction ({implied_date.isoformat()})",
-                        ))
+                    stale_entries.append((
+                        10**9,  # arbitrary large sort key — top
+                        commodity.mnemonic,
+                        f"Stale price: {commodity.mnemonic} no price on file",
+                    ))
                     continue
-                _rate, rate_date, via = entry
+                rate, rate_date, via = entry
                 if rate_date < cutoff:
                     days_old = (today - rate_date).days
                     via_note = f" ({via})" if via else ""
-                    stale_entries.append((
-                        days_old,
-                        commodity.mnemonic,
-                        f"Stale price: {commodity.mnemonic} "
-                        f"last updated {days_old} days ago{via_note}",
-                    ))
+                    q = quoted.get(cguid)
+                    implied = q is None or (q[0], q[1]) != (rate, rate_date)
+                    if implied:
+                        text_ = (
+                            f"Stale price: {commodity.mnemonic} valued at "
+                            f"the rate of its last transaction, "
+                            f"{days_old} days ago{via_note}"
+                        )
+                    else:
+                        text_ = (
+                            f"Stale price: {commodity.mnemonic} "
+                            f"last updated {days_old} days ago{via_note}"
+                        )
+                    stale_entries.append((days_old, commodity.mnemonic, text_))
             stale_entries.sort(key=lambda e: (-e[0], e[1]))
             stale_prices = self._rollup_warnings(
                 [m for _, _, m in stale_entries],

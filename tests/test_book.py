@@ -2588,8 +2588,14 @@ class TestGetBookSummaryWarnings:
         line. The investment_book fixture has VTSAX with a
         single price on 2026-01-15, which is now well past the
         30-day cutoff."""
+        from tests.conftest import drop_transaction_prices
+
         gc = GnuCashBook(str(investment_book))
         self._hold_shares(gc, "Assets:Investments:VTSAX")
+        # The buy's implied-rate row is fresh and would value VTSAX
+        # (ruling 2026-09-29); the subject is the stale QUOTE, so
+        # the row goes, as desktop's Price Editor can make it go.
+        assert drop_transaction_prices(investment_book) == 1
         result = gc.get_book_summary()
         assert "Warnings:" in result
         warnings_block = result.split("Warnings:")[1].split(
@@ -2606,9 +2612,15 @@ class TestGetBookSummaryWarnings:
         commodity, but a quote for it values nothing — no warning
         (live book, 2026-09-24: an emptied 401k fund nagged for a
         price). Holding any shares brings the warning back."""
+        from tests.conftest import drop_transaction_prices
+
         gc = GnuCashBook(str(investment_book))
         assert "Stale price" not in gc.get_book_summary()
         self._hold_shares(gc, "Assets:Investments:VTSAX")
+        # The buy's implied-rate row is fresh and would value VTSAX
+        # (ruling 2026-09-29); the subject is the stale QUOTE, so
+        # the row goes, as desktop's Price Editor can make it go.
+        assert drop_transaction_prices(investment_book) == 1
         assert "Stale price: VTSAX" in gc.get_book_summary()
 
     def test_unpriced_commodity_in_use_warns_no_price_on_file(
@@ -2618,9 +2630,9 @@ class TestGetBookSummaryWarnings:
         record at all → 'no price on file' warning.
 
         Since the 2026-09-29 ruling the purchase's implied-rate row
-        values WILD as desktop does, so the warning first names that
-        rate ('no quote on file'); deleting the row — a real state,
-        e.g. after desktop's Price Editor — brings the old text back."""
+        values WILD as desktop does, and a fresh rate warns of
+        nothing; deleting the row — a real state, e.g. after
+        desktop's Price Editor — brings the warning."""
         from tests.conftest import drop_transaction_prices
 
         gc = GnuCashBook(str(test_book))
@@ -2642,17 +2654,11 @@ class TestGetBookSummaryWarnings:
             )
             book.save()
         self._hold_shares(gc, "Assets:WILD")
-        bought = (date.today() - timedelta(days=5)).isoformat()
+        # The buy's implied rate is 5 days old: valuation uses it,
+        # nothing is stale, and silence is earned by freshness
+        # (bookkeeper ruling, 2026-09-29 evening).
         result = gc.get_book_summary()
-        assert "Warnings:" in result
-        warnings_block = result.split("Warnings:")[1].split(
-            "Accounts:"
-        )[0]
-        assert (
-            "Stale price: WILD no quote on file; valued at the rate "
-            f"of its last transaction ({bought})"
-        ) in warnings_block
-        assert "WILD no price on file" not in warnings_block
+        assert "Stale price: WILD" not in result
 
         assert drop_transaction_prices(test_book) > 0
         result = gc.get_book_summary()
@@ -2660,9 +2666,7 @@ class TestGetBookSummaryWarnings:
         warnings_block = result.split("Warnings:")[1].split(
             "Accounts:"
         )[0]
-        assert "WILD" in warnings_block
-        assert "no price on file" in warnings_block
-        assert "no quote on file" not in warnings_block
+        assert "Stale price: WILD no price on file" in warnings_block
 
     def test_iso_currency_in_use_with_stale_rate_warns(
         self, tmp_path: Path,
@@ -3334,8 +3338,14 @@ class TestGetBookSummaryWarnings:
     ):
         """When emitted, Warnings appears above Accounts — that's
         the scan-first ordering the spec calls for."""
+        from tests.conftest import drop_transaction_prices
+
         gc = GnuCashBook(str(investment_book))
         self._hold_shares(gc, "Assets:Investments:VTSAX")
+        # The buy's implied-rate row is fresh and would value VTSAX
+        # (ruling 2026-09-29); the subject is the stale QUOTE, so
+        # the row goes, as desktop's Price Editor can make it go.
+        assert drop_transaction_prices(investment_book) == 1
         result = gc.get_book_summary()
         assert "Warnings:" in result
         warnings_idx = result.index("Warnings:")
@@ -3417,6 +3427,8 @@ class TestStalePriceReadsValuationRate:
         assert "USD Account: 1080 USD @ 0.925" in result and "(EUR 1000.00)" in result, result
 
     def test_inverse_only_rate_goes_stale_by_its_own_date(self, tmp_path):
+        from tests.conftest import drop_transaction_prices
+
         book, cur = self._book(tmp_path / "eur2.gnucash", "EUR", [("USD", "1080")])
         book.session.add(piecash.Price(
             commodity=cur["EUR"], currency=cur["USD"],
@@ -3424,9 +3436,49 @@ class TestStalePriceReadsValuationRate:
         ))
         book.save()
         book.close()
+        # The opening's fresh implied row would value USD (ruling
+        # 2026-09-29); the subject is the inverse QUOTE's age.
+        assert drop_transaction_prices(tmp_path / "eur2.gnucash") == 1
         result = GnuCashBook(str(tmp_path / "eur2.gnucash")).get_book_summary()
         assert self._stale_lines(result) == [
             "⚠ Stale price: USD last updated 45 days ago"
+        ], result
+
+    def test_old_implied_rate_warns_and_names_its_source(self, tmp_path):
+        """Bookkeeper ruling (2026-09-29 evening): staleness keys on
+        the date of the rate valuation actually used, whatever its
+        source, one window for all. A 45-day-old transaction-implied
+        rate warns and says what it is; a quote of the same age
+        reads as before."""
+        from sqlalchemy import text
+
+        book, cur = self._book(
+            tmp_path / "old.gnucash", "USD", [("GBP", "500", "630")],
+        )
+        book.close()
+        old = date.today() - timedelta(days=45)
+        gc = GnuCashBook(str(tmp_path / "old.gnucash"))
+        with gc.open(readonly=False) as b:
+            b.session.execute(
+                text("UPDATE prices SET date = :d WHERE type = 'transaction'"),
+                {"d": old.strftime("%Y-%m-%d 10:59:00")},
+            )
+            b.save()
+        result = gc.get_book_summary()
+        assert self._stale_lines(result) == [
+            "⚠ Stale price: GBP valued at the rate of its last "
+            "transaction, 45 days ago"
+        ], result
+        assert "(USD 630.00)" in next(
+            ln for ln in result.splitlines() if "GBP Account" in ln
+        )
+        # A quote newer than the implied rate takes over, and is
+        # measured the same way.
+        gc.create_price("GBP", "CURRENCY", "1.30",
+                        price_date=date.today() - timedelta(days=40))
+        result = gc.get_book_summary()
+        assert self._stale_lines(result) == [
+            "⚠ Stale price: GBP last updated 40 days ago"
         ], result
 
     def test_chained_rate_is_as_old_as_its_oldest_leg(self, tmp_path):
@@ -3507,21 +3559,18 @@ class TestStalePriceReadsValuationRate:
 
     def test_no_price_on_file_means_cost_basis_fallback(self, tmp_path):
         """Since the 2026-09-29 ruling the opening's implied rate
-        values GBP as desktop does, and the warning names it ('no
-        quote on file'). Deleting that row — a book with no price of
-        any type is still real — brings back 'no price on file'."""
+        values GBP as desktop does, and a rate 10 days old warns of
+        nothing. Deleting that row — a book with no price of any
+        type is still real — brings 'no price on file' and the
+        cost-basis fallback."""
         from tests.conftest import drop_transaction_prices
 
         book, cur = self._book(
             tmp_path / "np.gnucash", "USD", [("GBP", "500", "630")],
         )
         book.close()
-        opened = (date.today() - timedelta(days=10)).isoformat()
         result = GnuCashBook(str(tmp_path / "np.gnucash")).get_book_summary()
-        assert self._stale_lines(result) == [
-            "⚠ Stale price: GBP no quote on file; valued at the rate "
-            f"of its last transaction ({opened})"
-        ], result
+        assert self._stale_lines(result) == [], result
         assert "(USD 630.00)" in next(
             ln for ln in result.splitlines() if "GBP Account" in ln
         )
@@ -14194,6 +14243,12 @@ class TestPricesTsvParser:
 
 class TestListCommoditiesStaleFilter:
     def test_work_list_filters_and_markers(self, multi_currency_book):
+        from tests.conftest import drop_transaction_prices
+
+        # The fixture's EUR transfer left an implied EUR/USD row that
+        # would price EUR (ruling 2026-09-29); the subject is the
+        # unquoted state.
+        assert drop_transaction_prices(multi_currency_book) >= 1
         from datetime import timedelta
 
         gc = GnuCashBook(str(multi_currency_book))

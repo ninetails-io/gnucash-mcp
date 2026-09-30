@@ -217,12 +217,13 @@ def _is_market_price(price) -> bool:
     """True iff ``price`` is a quote somebody entered or fetched, not
     the ``type='transaction'`` row a cross-currency transaction
     leaves behind. Valuation counts BOTH, as desktop does (ruling
-    2026-09-29); this predicate serves the operator-facing "which
-    quotes need refreshing" layer only — the dashboard's stale-price
-    warning and ``list_commodities``' staleness markers — through
-    :meth:`CurrencyMixin._market_prices_only`. A transaction's
-    implied rate never goes stale in the sense that warning means
-    (nobody entered it), so it is not what the warning measures."""
+    2026-09-29), and so does every staleness measure — one window
+    for all sources (bookkeeper ruling, same evening). This
+    predicate serves one purpose: through
+    :meth:`CurrencyMixin._market_prices_only` the dashboard's
+    stale-price warning re-derives the rate over quotes alone to
+    NAME a stale rate's provenance — "valued at the rate of its
+    last transaction" when the quote view disagrees with valuation."""
     return getattr(price, "type", None) != "transaction"
 
 
@@ -305,8 +306,8 @@ class CurrencyMixin:
         somebody entered or fetched (``_is_market_price``), so every
         rate derived inside — direct, inverse, chained — answers
         "when did the operator last quote this?" rather than "what
-        is it worth?". The dashboard's stale-price warning and
-        ``list_commodities``' staleness markers are the only users;
+        is it worth?". The dashboard's stale-price warning is the
+        only user, and only to name a stale rate's provenance;
         valuation never runs inside it. The memo is untouched — the
         filter is applied per call, so nothing cached inside leaks
         out."""

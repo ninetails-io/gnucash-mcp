@@ -278,8 +278,10 @@ class TestMarketPriceFilter:
         ``nav`` quote IS ``latest_price``. GnuCash's lookups never
         filter on price type; maintainer ruling 2026-09-29 overturned
         the issue #94 skip so the server agrees with desktop on the
-        current price. Staleness (``stale_days``) still reads quotes
-        only: the nav's age, and ``no_price`` once no quote is left."""
+        current price. Staleness (``stale_days``) keys on that same
+        latest row — one window for all sources (bookkeeper ruling,
+        2026-09-29 evening); ``no_price`` only when no row of any
+        type is left."""
         from sqlalchemy import text
 
         book_path, _ = book_with_vtsax_lot
@@ -305,18 +307,18 @@ class TestMarketPriceFilter:
 
         entry = vtsax_entry(gb, stale_days=1)
         assert entry["latest_price"]["date"] == "2026-06-01"
-        assert entry["days_stale"] == (date.today() - date(2026, 1, 15)).days
+        assert entry["days_stale"] == (date.today() - date(2026, 6, 1)).days
         assert "no_price" not in entry
 
-        # Delete the only quote: the transaction rows still value
-        # VTSAX, but nothing anyone quoted is on file.
+        # Delete the only quote: the transaction row still values
+        # VTSAX and still dates its staleness.
         with gb.open(readonly=False) as book:
             book.session.execute(text("DELETE FROM prices WHERE type = 'nav'"))
             book.save()
         entry = vtsax_entry(gb, stale_days=1)
         assert entry["latest_price"]["date"] == "2026-06-01"
-        assert entry["no_price"] is True
-        assert "days_stale" not in entry
+        assert entry["days_stale"] == (date.today() - date(2026, 6, 1)).days
+        assert "no_price" not in entry
 
     def test_calculate_lot_gain_counts_transaction_prices_like_desktop(
         self, book_with_vtsax_lot,
