@@ -134,6 +134,16 @@ module contributes zero tools to the MCP surface.
   rebuilds the object the way `create` does — never patches the old
   container in place. (Added 2026-09-10 by ruling, after the
   native-templates loop.)
+
+  Why the gate exists at all: it is a promise to users, not a
+  workflow. For most of the audience this server is a *complement*
+  to GnuCash desktop — they keep entering, reviewing, and reporting
+  there, and the server is the assistant that fills the book in
+  between. The maintainer's own use is closer to a replacement (the
+  LLM's review table stands in for the register), and that must
+  never be grounds for relaxing the gate. The invariant is written
+  for the audience, not for whoever is currently maintaining it.
+  (Stated 2026-09-21.)
 - **piecash objects never cross the MCP boundary.** Book methods
   return dicts or primitives. Tool wrappers stringify for transport.
 - **One book open per write.** `@audit_log` stages before-state on
@@ -148,10 +158,14 @@ module contributes zero tools to the MCP surface.
   GUIDs accept 8+ char prefixes via `_resolve_guid`. Account refs
   also accept `%xxxxxxx` short-GUID shorthand alongside path and
   full-GUID forms.
-- **Cross-currency exchange rates** come from `book.prices`.
-  `type='transaction'` auto-defaults created by piecash on
-  cross-currency transactions are skipped — they'd shadow user-
-  supplied market prices.
+- **Cross-currency exchange rates** come from `book.prices`, every
+  row included. The `type='transaction'` row piecash (and desktop)
+  writes on a cross-currency transaction is a price GnuCash values
+  by — its lookups never filter on type — so the server counts it
+  too (maintainer ruling 2026-09-29, overturning the issue #94
+  skip). Staleness keys on the rate valuation used, one window for
+  all sources; `_market_prices_only` exists only so the dashboard
+  warning can name a stale implied rate's provenance.
 - **Every raw-SQL write is verified.** Two-tier contract:
   - **ORM writes** (`book.session.add(obj)`, attribute mutation,
     `book.session.delete(obj)`) rely on SQLAlchemy's commit-side
@@ -284,7 +298,12 @@ with a test that fails when a new site skips the helper.
 Established chokepoints and the rule each one owns:
 
 - `_find_prices` — price-history access (market-price filter,
-  same-date tie-break, and since #126 the per-pair memo).
+  the per-pair memo since #126, and the raw stored time on every
+  row it returns). `_price_tie_rank` is which price is current:
+  GnuCash's `compare_prices_by_date` — later stored time, then
+  smaller GUID — so every same-day tie lands where desktop's
+  Accounts tab lands (price twin, 2026-09-29; the source-rank
+  tie-break it replaced was bookkeeper F3).
 - `_rates_as_of` / `_monthly_conversion_factors` /
   `_account_conversion_factors` — which FX rate a report may use
   (as-of is mandatory; flow vs. stock semantics pick the factory).
@@ -359,8 +378,77 @@ Established chokepoints and the rule each one owns:
   `specs/v1.5/DASHBOARD_HONEST_FAILURE_SPEC.md`. Its first catch was
   `get_backup_health` raising on every database book's dashboard
   call, unseen for three weeks.
-- `_parse_owner_type`, `_commodity_quantum`, `_is_market_price`,
-  `_effective_owner_type` — same story, smaller surface.
+- `_rates_as_of_dated` — which rate valuation uses AND from when:
+  `{guid: (rate, rate_date, via)}`, a chain dated by its oldest
+  leg; `_rates_as_of` is its projection, and the dashboard's
+  stale-price warning reads the date, so the warning describes the
+  rate actually used (spec A5).
+- `_open_documents` — the dashboard's one pass over posted
+  documents, through `_document_settlement`; the business counts
+  and the overdue warnings both consume it, and nothing in core
+  reads a lot balance directly (grep-locked, spec A1).
+- `_billterm_due_date` / `_write_due_date_slot` — GnuCash's
+  `compute_time` ported verbatim, and the one writer of
+  `trans-date-due` (a slot_type 6 timespec at 10:59:00 UTC, the
+  desktop-posted specimen pinned by test; the GDate row the server
+  wrote from 1.2 through the first cut of 1.5 was one desktop could
+  not read — the desktop gate's catch, 2026-09-28).
+- `_budget_period_bounds` — every budget period boundary, from the
+  Recurrence.cpp port; the dashboard headline and
+  `get_budget_report` share it (spec B5). `_recurrence_next` and
+  its helpers live in `_base.py` for that reason.
+- `_write_reconcile_info` / `_read_reconcile_info_all` — desktop's
+  `reconcile-info` frame (key names pinned from Account.cpp), with
+  `gnc_save_reconcile_interval` ported verbatim; `reconcile_account`
+  and `enter_statement` write it, the dashboard threshold reads it
+  (spec B4; desktop-gated).
+- `_upcoming_cash_legs` — one pass over the schedules due this week;
+  the Scheduled line and the low-cash trigger both read it (spec B6).
+- `_future_statement_warning` — the one sentence both reconcile
+  writers attach to a statement dated after today.
+- **The parity twin** (`specs/v1.5/testing/PARITY_CREDIT_NOTE.md`) —
+  the instrument for everything the slot registry can't see: the
+  same flow on two identical books, one in desktop, diffed row by
+  row with `tests/fixtures/parity_dump.py`. "Parity" means the diff
+  is empty (maintainer ruling, 2026-09-29), not that desktop copes.
+  `tests/test_parity_credit_note.py` keeps the credit-note twin's
+  desktop dump as the expected text; a new business write path gets
+  its own twin and fixture the same way. Conventions it fixed, all
+  in `_migrate_business_shapes` for old rows: credit-note entry
+  quantities stored negated (`gncEntrySetDocQuantity`), the
+  application as `gncOwnerCreateLotLink`'s `L` transaction, document
+  dates at the neutral 10:59 UTC and entry dates at local noon,
+  `gncEntryCreate`'s column defaults, document lot flags left at -1,
+  payment memos on both legs, no `date-posted` slot on `P`/`L`
+  transactions, no empty notes slot on a lot.
+- `_write_void_slots` / `_migrate_void_shapes` — `xaccTransVoid` and
+  `xaccSplitVoid` key for key (numeric originals, GnuCash's
+  void-time form, read-only); the converter rewrites the string-
+  typed voids the server made before 2026-09-29. **The lock for the
+  whole class is `tests/test_slot_shapes.py`**: a registry of every
+  slot key the server writes, typed from the GnuCash source line
+  that defines it, checked against every write site, the sample
+  books on disk, and a fresh void. A new slot key goes in the
+  registry first, with its citation — that is what stops the next
+  "desktop can't read it" from shipping.
+- `_lot_split_amount` — what one split in a document's lot settles,
+  in the DOCUMENT's currency: its quantity when the account is in
+  that currency and the transaction is not (a payment booked in the
+  transfer account's currency — desktop's rule,
+  `gncOwnerCreatePaymentLotSecs`, and the server's since
+  2026-09-30), else its value. `_calculate_lot_balance` and the
+  `payments` list both read through it; summing values alone read a
+  desktop-settled EUR invoice as overpaid. `pay_invoice` writes the
+  payment in the pay account's currency, relieves the receivable at
+  its carrying amount when realized FX is booked beside it, and
+  records the day's price itself (`_record_payment_price`) — its
+  splits carry `SKIP_IMPLIED_PRICE_ATTR` so none implies the
+  posting rate as today's.
+- `_parse_owner_type`, `_commodity_quantum`, `_effective_owner_type`
+  — same story, smaller surface. `_is_market_price` /
+  `_market_prices_only` — the quotes-only re-derivation the
+  dashboard warning compares against valuation to name a stale
+  implied rate; nothing values inside it.
 
 Working rules:
 
@@ -437,10 +525,35 @@ existed.
   `value == quantity`. Cross-currency: value on all splits must sum
   to zero (the transaction balances in its own currency); quantities
   don't need to balance across commodities.
-- **Cross-currency prices**: piecash auto-creates `type='transaction'`
-  price records as effective-rate placeholders on any cross-currency
-  transaction. Helpers that walk `book.prices` for market valuation
-  must skip these or they'll shadow real user-supplied rates.
+- **Cross-currency prices**: a cross-commodity split leaves a
+  `type='transaction'` price row, written by
+  `_piecash_shapes._record_implied_price` the way desktop writes it
+  (piecash's own version is replaced). Valuation counts it like any
+  other row; a test whose subject is "no price at all" must delete
+  those rows (`tests/conftest.py::drop_transaction_prices`). The
+  rate the business module picks for a NEW posting is the one
+  exception: quotes only, inside `_market_prices_only`.
+- **piecash's `Price.date` binds at local midnight and validates
+  against its own shape.** The column is `_DateAsDateTime(
+  neutral_time=False)`: it accepts only a bare `date`, stores it at
+  local midnight in UTC, and the save-time `Price.validate` re-queries
+  the row with that same bind — so a price stored at GnuCash's
+  neutral time (every desktop-written price, and ours since the
+  price twin of 2026-09-29) raises `NoResultFound` on any save that
+  touches it. `book/_piecash_shapes.py` replaces `Price.validate`
+  with a by-day comparison; `_stamp_price_row` stamps the date and
+  the reduced value by raw SQL. Don't write a price date through
+  the ORM.
+- **`book/_piecash_shapes.py` is where piecash's shapes are
+  corrected**, imported unconditionally from `_base.py`: slot
+  filler-column defaults (GnuCash leaves `double_val` NULL and
+  `timespec_val` at the epoch; piecash wrote 0.0 and NULL on every
+  slot), and `Split.validate` replaced so a cross-commodity split
+  writes GnuCash's implied price (`record_price` for STOCK/MUTUAL
+  accounts, the exchange dialog's `create_price` otherwise) and
+  stamps no `Buy`/`Sell` action. A new piecash behavior that
+  diverges from desktop's rows gets fixed there, once, not per
+  write path.
 - **piecash `Address` is a composite, not a relationship.** It views
   the parent row's `addr_addr1`, `addr_addr2`, etc. columns directly.
   Mutating through the composite (`entity.address.addr1 = "..."`)
@@ -557,15 +670,14 @@ accounts of different commodities:
   (each split at its month's close); as-of valuations use
   `_account_conversion_factors(book, as_of)`. Pick by report kind,
   not convenience — see the flow-vs-stock invariant above.
-- Skip `type='transaction'` prices (auto-defaults).
+- Count `type='transaction'` prices; desktop does (ruling 2026-09-29).
 - A commodity priced only through a pivot currency values via a
-  one-hop chain (provenance notes the path, e.g. `via USD`) — and
-  the chain legs obey the same market-price filter as direct
-  lookups; a `type='transaction'` rate inside the chain leaks
-  fee-laden implied rates into valuations. Both halves of this
-  rule come from Abdulla Alhosani's
+  one-hop chain (provenance notes the path, e.g. `via USD`). The
+  chain came from Abdulla Alhosani's
   ([@alhosani-abdulla](https://github.com/alhosani-abdulla))
-  report in issue #94.
+  report in issue #94; its second half — skipping
+  `type='transaction'` legs as fee-laden — was overturned on
+  2026-09-29 for parity with desktop, which chains through them.
 - Fall back to `split.value` when no market rate is on file —
   that's the transaction-currency amount, which equals cost basis
   for default-currency-denominated investment purchases and degrades
