@@ -221,6 +221,16 @@ _BATCH_SPLIT_TOKENS = {
 _BATCH_LEGACY_GROUP = ("amount", "account")
 
 
+# The whole batch-TSV contract in one sentence, printed by EVERY
+# refusal on the way in (bookkeeper friction, 2026-09-30: four
+# rounds to the first success when only the last error showed it).
+_BATCH_CONTRACT = (
+    "columns are ref, date, description, notes, cur, then amt, acct, "
+    "memo, qty split groups (amt1, acct1, memo1, qty1, amt2, …); "
+    "tab-separated, one header row, one transaction per row"
+)
+
+
 def _batch_tsv_layout(header_line: str) -> dict:
     """Column layout of a batch-entry TSV, derived from its header.
 
@@ -259,7 +269,8 @@ def _batch_tsv_layout(header_line: str) -> dict:
             or tokens[2] not in ("description", "desc"):
         raise ValueError(
             "batch header must start with ref, date, description "
-            f"— got {', '.join(raw_tokens[:3]) or '(empty header)'}"
+            f"— got {', '.join(raw_tokens[:3]) or '(empty header)'}. "
+            + _BATCH_CONTRACT
         )
     # Optional per-transaction fixed columns after description, in
     # either order: ``notes`` and ``cur`` (row's transaction
@@ -298,8 +309,7 @@ def _batch_tsv_layout(header_line: str) -> dict:
         if name is None:
             raise ValueError(
                 f"unrecognized column {raw!r} in batch header — "
-                f"columns are ref, date, description, notes, cur, "
-                f"then amt, acct, memo, qty split groups"
+                + _BATCH_CONTRACT
             )
         canonical.append(name)
 

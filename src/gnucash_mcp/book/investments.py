@@ -133,7 +133,16 @@ class InvestmentsMixin:
                     "fraction": commodity.fraction,
                 }
 
-                if commodity.guid in latest_market:
+                if commodity == default_commodity:
+                    # The book's default currency has no price OF its
+                    # own: every other line is priced IN it, and a row
+                    # stored the other way round (USD/EUR, from an
+                    # older writer) restates a EUR rate backwards.
+                    # ``get_latest_price`` answers null here too
+                    # (bookkeeper ruling B10, 2026-09-30).
+                    entry["latest_price"] = None
+                    entry["default_currency"] = True
+                elif commodity.guid in latest_market:
                     _, price = latest_market[commodity.guid]
                     entry["latest_price"] = {
                         "value": str(price.value),

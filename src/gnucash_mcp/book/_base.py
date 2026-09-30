@@ -1176,7 +1176,9 @@ def _commodity_to_compact_line(namespace: str, entry: dict) -> str:
     name = entry.get("fullname", "")
     parts = [prefix, name]
     lp = entry.get("latest_price")
-    if lp:
+    if entry.get("default_currency"):
+        parts.append("— (default currency)")
+    elif lp:
         parts.append(f"{lp['value']} {lp['currency']} ({lp['date']})")
     # Work-list markers, present only under the stale_days filter.
     if entry.get("no_price"):
@@ -1398,7 +1400,10 @@ def _upcoming_to_compact_line(
     # "2000" from an HKD schedule reads as the book currency.
     if entry.get("currency"):
         amount = f"{amount} {entry['currency']}"
-    due = f"{-days} days overdue" if days < 0 else f"{days} days"
+    due = (
+        f"{-days} day{'s' if days != -1 else ''} overdue" if days < 0
+        else f"{days} day{'s' if days != 1 else ''}"
+    )
     return f"{short}\t{name}\t{occ_date}\t{due}\t{amount}"
 
 

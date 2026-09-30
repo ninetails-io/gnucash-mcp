@@ -225,7 +225,7 @@ def _format_outstanding_invoices_compact(rows: list[dict]) -> str:
         if days is None:
             days_str = ""
         elif days > 0:
-            days_str = f"  {days} days past due"
+            days_str = f"  {days} day{'s' if days != 1 else ''} past due"
         elif days == 0:
             days_str = "  due today"
         else:
@@ -6365,8 +6365,9 @@ class BusinessMixin:
                     f"rate is locked at {context} time and cannot be "
                     f"updated retroactively. Either run create_price("
                     f"commodity='{invoice_currency.mnemonic}', "
-                    f"value='...') to add a rate near {as_of}, or pass "
-                    f"force=true to proceed with the stale rate.",
+                    f"namespace='CURRENCY', value='...', "
+                    f"date='{as_of}') to add a rate near {as_of}, or "
+                    f"pass force=true to proceed with the stale rate.",
                     {
                         "currency": invoice_currency.mnemonic,
                         "rate": str(rate),

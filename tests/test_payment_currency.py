@@ -475,3 +475,35 @@ def test_posting_rate_ignores_implied_and_temporary_rows(business_book):
             payment_date="2026-09-30",
         )
     assert "2026-09-01" in str(exc.value)
+
+
+def test_default_currency_has_no_latest_price_of_its_own(business_book):
+    """Bookkeeper ruling B10 (2026-09-30): a price row stored the
+    other way round (USD/EUR, the way an older writer or desktop's
+    leaked ``temporary`` row stores it) must not read as "the latest
+    price of USD" in a USD book. ``list_commodities`` prints the
+    default-currency cell as such, and ``get_latest_price`` answers
+    null, as it always did."""
+    gb = _book(business_book, quotes={date(2026, 9, 21): "1.111111"})
+    with gb.open(readonly=False) as book:
+        usd = book.default_currency.guid
+        eur = next(c.guid for c in book.commodities if c.mnemonic == "EUR")
+        book.session.execute(text(
+            "INSERT INTO prices (guid, commodity_guid, currency_guid, date, "
+            "source, type, value_num, value_denom) VALUES "
+            "('c' || substr('0123456789abcdef0123456789abcdef', 2), :u, :e, "
+            "'2026-09-23 10:59:00', 'temporary', 'last', 9, 10)"
+        ), {"u": usd, "e": eur})
+        book.save()
+    lines = gb.list_commodities().splitlines()
+    usd_line = next(ln for ln in lines if ln.startswith("CURRENCY:USD"))
+    assert usd_line.split("\t")[2:] == ["— (default currency)"]
+    eur_line = next(ln for ln in lines if ln.startswith("CURRENCY:EUR"))
+    assert "1.111111 USD (2026-09-21)" in eur_line
+    verbose = gb.list_commodities(compact=False)
+    usd_entry = next(
+        e for e in verbose["commodities"]["CURRENCY"] if e["mnemonic"] == "USD"
+    )
+    assert usd_entry["latest_price"] is None
+    assert usd_entry["default_currency"] is True
+    assert gb.get_latest_price("USD", "CURRENCY") is None

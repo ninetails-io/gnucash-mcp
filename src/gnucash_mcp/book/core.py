@@ -1346,7 +1346,8 @@ class CoreMixin:
                         amount_str = f"{row['amount_due']:,}"
                         msg = (
                             f"Past due {doc_type}: {owner_name} "
-                            f"{days_overdue} days overdue, "
+                            f"{days_overdue} day"
+                            f"{'s' if days_overdue != 1 else ''} overdue, "
                             f"{currency} {amount_str}"
                         )
                         overdue_inv_entries.append(
