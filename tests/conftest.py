@@ -24,6 +24,30 @@ def _quiet_restart_guards():
     yield
 
 
+def drop_transaction_prices(book_path) -> int:
+    """Delete every ``type='transaction'`` price row from the book at
+    ``book_path`` and return how many went.
+
+    Since the 2026-09-29 ruling those rows (piecash's, and desktop's,
+    implied rate on every cross-currency transaction) value holdings
+    as desktop does. A book with a holding and NO price row of any
+    type is still real — prices deleted in desktop's Price Editor,
+    or books older than the rows — so tests whose subject is that
+    state build it with the fixture's transactions, then this.
+    """
+    from sqlalchemy import text
+
+    with piecash.open_book(
+        str(book_path), readonly=False, open_if_lock=True,
+        do_backup=False,
+    ) as book:
+        n = book.session.execute(
+            text("DELETE FROM prices WHERE type = 'transaction'")
+        ).rowcount
+        book.save()
+    return n
+
+
 @pytest.fixture
 def test_book(tmp_path: Path) -> Path:
     """Create a temporary GnuCash book with sample data.
@@ -1356,6 +1380,11 @@ def pathological_book(tmp_path: Path) -> PathologicalBook:
                 piecash.Split(account=chk, value=Decimal("300")),
             ],
         )
+        # The stored flag is desktop's -1; piecash's guard reads -1 as
+        # closed, so cache the computed answer first, as every server
+        # write path does.
+        from gnucash_mcp.book._base import _lot_cache_flag
+        _lot_cache_flag(lot_obj)
         ar_split.lot = lot_obj
         b.save()
 

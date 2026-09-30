@@ -14,7 +14,9 @@ from datetime import date, datetime
 from decimal import Decimal
 
 from gnucash_mcp.book._base import (
+    _account_unit,
     _commodity_quantum,
+    _day_end,
     _future_statement_warning,
     _is_unreconciled,
     _is_voided,
@@ -104,9 +106,7 @@ class ReconciliationMixin:
 
             if state == "y":
                 if reconcile_date:
-                    split.reconcile_date = datetime.combine(
-                        reconcile_date, datetime.min.time()
-                    )
+                    split.reconcile_date = _day_end(reconcile_date)
                 else:
                     split.reconcile_date = datetime.now()
             elif state == "n":
@@ -499,7 +499,9 @@ class ReconciliationMixin:
                 {"splits": [_split_state_dict(s) for s in splits_to_reconcile]}
             )
 
-            reconcile_datetime = datetime.combine(statement_date, datetime.min.time())
+            # Desktop dates a reconciled split at the statement's local
+            # day end (gnc_time64_get_day_end), not midnight.
+            reconcile_datetime = _day_end(statement_date)
             for split in splits_to_reconcile:
                 split.reconcile_state = "y"
                 split.reconcile_date = reconcile_datetime
@@ -577,21 +579,21 @@ class ReconciliationMixin:
             # description (date)" plus the original splits from it.
             self._stage_audit_before(_transaction_to_dict(transaction))
 
-            # tz-aware local time (audit-log convention) — a naive
-            # datetime.now() means different absolute times across
-            # DST shifts and zone changes.
-            transaction["void-reason"] = reason
-            transaction["void-time"] = (
-                datetime.now().astimezone().isoformat()
-            )
+            # Every pre-fix void in the book converts on this write
+            # (nothing else changes) — see _migrate_void_shapes.
+            shapes = self._upgrade_book_shapes(book)
 
-            for split in transaction.splits:
-                split["void-former-value"] = str(split.value)
-                split["void-former-quantity"] = str(split.quantity)
-
-                _set_split_amounts(split, Decimal("0"), Decimal("0"))
-
-                split.reconcile_state = "v"
+            # xaccTransVoid, key for key (Transaction.cpp): the notes
+            # move to void-former-notes and read "Voided transaction";
+            # void-reason and void-time are strings, the time in
+            # GnuCash's own ISO 8601 (format_iso8601: UTC,
+            # "YYYY-MM-DD HH:MM:SS" — a space, no zone; the 'T' form
+            # Python emits fails gnc-datetime's parser, and desktop
+            # then does not see the transaction as voided at all);
+            # the transaction becomes read-only. Each split keeps its
+            # originals as NUMERIC void-former-amount / -value
+            # (xaccSplitVoid), which is what desktop's Unvoid restores.
+            self._write_void_slots(transaction, reason)
 
             book.save()
 
@@ -604,6 +606,7 @@ class ReconciliationMixin:
                 "void_reason": reason,
                 "status": "voided",
             }
+            result.update(shapes)
             if reconciled_accounts:
                 result["warning"] = (
                     f"Voided transaction contained "
@@ -613,6 +616,108 @@ class ReconciliationMixin:
                     f"longer matches the cleared statement."
                 )
             return result
+
+    @staticmethod
+    def _gnc_void_time(now: datetime | None = None) -> str:
+        """``gnc_time64_to_iso8601_buff``: UTC, ``YYYY-MM-DD HH:MM:SS``
+        (GncDateTimeImpl::format_iso8601 — to_iso_extended_string of
+        the UTC time with the 'T' replaced by a space, 19 chars)."""
+        from datetime import timezone
+
+        now = now or datetime.now(timezone.utc)
+        return now.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+    def _write_void_slots(self, transaction, reason: str) -> None:
+        """Void one transaction the way ``xaccTransVoid`` and
+        ``xaccSplitVoid`` do, key for key and type for type. piecash
+        types a bracket-assigned Decimal as a NUMERIC slot and a str
+        as a STRING slot (kvp.py ``slot()``), which is what makes the
+        shapes line up with GnuCash's."""
+        former_notes = transaction.notes
+        if former_notes:
+            transaction["void-former-notes"] = former_notes
+        transaction.notes = "Voided transaction"
+        transaction["void-reason"] = reason
+        transaction["void-time"] = self._gnc_void_time()
+        # gnc_numeric carries the split's own denominators — the
+        # account's unit for the amount, the currency's fraction for
+        # the value — not the Decimal's exponent.
+        value_q = _commodity_quantum(transaction.currency)
+        for split in transaction.splits:
+            split["void-former-amount"] = Decimal(str(split.quantity)).quantize(
+                _account_unit(split.account)
+            )
+            split["void-former-value"] = Decimal(str(split.value)).quantize(value_q)
+            _set_split_amounts(split, Decimal("0"), Decimal("0"))
+            split.reconcile_state = "v"
+        transaction["trans-read-only"] = "Transaction Voided"
+
+    def _migrate_void_shapes(self, book) -> int:
+        """Write path only: rewrite every void the server made before
+        the fix into GnuCash's shape, and say how many.
+
+        The server voided with ``void-former-value`` and an invented
+        ``void-former-quantity``, both STRING slots, and a
+        ``void-time`` in Python's ISO form. ``xaccSplitUnvoid`` reads
+        NUMERIC ``void-former-value`` / ``void-former-amount`` and
+        ``xaccTransGetVoidStatus`` parses ``void-time`` with
+        gnc-datetime's regex, so desktop saw none of it: the
+        transaction was not "voided" to desktop, and Unvoid, had it
+        run, would have restored zeros. Each such transaction gets
+        the numeric pair, the legacy key removed, the time
+        reformatted, and the read-only marker; the amounts it holds
+        are kept exactly. Nothing posts. Every void, unvoid,
+        schedule, budget, and business write calls this through
+        ``_upgrade_book_shapes``. Returns the number of transactions
+        converted.
+        """
+        from piecash.core.transaction import Split
+        from sqlalchemy import text
+
+        split_guids = [
+            r[0] for r in book.session.execute(
+                text(
+                    "SELECT DISTINCT obj_guid FROM slots "
+                    "WHERE name = 'void-former-quantity'"
+                ),
+            ).fetchall()
+        ]
+        if not split_guids:
+            return 0
+        transactions = {}
+        for sg in split_guids:
+            split = book.session.query(Split).filter_by(guid=sg).first()
+            if split is None:
+                continue
+            former_value = split.get("void-former-value")
+            former_quantity = split.get("void-former-quantity")
+            # Replace, never assign over: piecash keeps a slot's
+            # class, and the old row is a SlotString.
+            for key in ("void-former-value", "void-former-quantity"):
+                if split.get(key) is not None:
+                    del split[key]
+            book.flush()
+            if former_value is not None:
+                split["void-former-value"] = Decimal(str(former_value)).quantize(
+                    _commodity_quantum(split.transaction.currency)
+                )
+            if former_quantity is not None:
+                split["void-former-amount"] = Decimal(str(former_quantity)).quantize(
+                    _account_unit(split.account)
+                )
+            transactions[split.transaction.guid] = split.transaction
+        for txn in transactions.values():
+            vt = txn.get("void-time")
+            if vt is not None and "T" in str(vt):
+                try:
+                    parsed = datetime.fromisoformat(str(vt))
+                    txn["void-time"] = self._gnc_void_time(parsed)
+                except ValueError:
+                    pass
+            if "trans-read-only" not in txn:
+                txn["trans-read-only"] = "Transaction Voided"
+        book.flush()
+        return len(transactions)
 
     def unvoid_transaction(self, guid: str) -> dict:
         """Restore a voided transaction.
@@ -636,6 +741,11 @@ class ReconciliationMixin:
             if not any(s.reconcile_state == "v" for s in transaction.splits):
                 raise ValueError(f"Transaction {guid} is not voided")
 
+            # Every pre-fix void converts first, so the read below
+            # sees GnuCash's keys; the legacy pair is still accepted
+            # in case a conversion is refused mid-way.
+            shapes = self._upgrade_book_shapes(book)
+
             # Validate up-front that EVERY voided split has its
             # void-former slots — otherwise partial corruption
             # produces a partial unvoid (one split restored, its
@@ -645,11 +755,14 @@ class ReconciliationMixin:
                 if split.reconcile_state != "v":
                     continue
                 has_value = split.get("void-former-value") is not None
-                has_qty = split.get("void-former-quantity") is not None
+                has_qty = (
+                    split.get("void-former-amount") is not None
+                    or split.get("void-former-quantity") is not None
+                )
                 if not (has_value and has_qty):
                     missing_slots.append(
                         f"{split.account.fullname} (value={has_value}, "
-                        f"quantity={has_qty})"
+                        f"amount={has_qty})"
                     )
             if missing_slots:
                 raise ValueError(
@@ -661,29 +774,39 @@ class ReconciliationMixin:
                     f"before retrying."
                 )
 
+            # xaccTransUnvoid / xaccSplitUnvoid, key for key.
             for split in transaction.splits:
                 former_value = split.get("void-former-value")
-                former_quantity = split.get("void-former-quantity")
+                former_amount = split.get("void-former-amount")
+                if former_amount is None:
+                    former_amount = split.get("void-former-quantity")
 
-                if former_value is not None or former_quantity is not None:
+                if former_value is not None or former_amount is not None:
                     _set_split_amounts(
                         split,
-                        Decimal(former_value) if former_value is not None
+                        Decimal(str(former_value)) if former_value is not None
                         else split.value,
-                        Decimal(former_quantity)
-                        if former_quantity is not None else split.quantity,
+                        Decimal(str(former_amount))
+                        if former_amount is not None else split.quantity,
                     )
-                if former_value is not None:
-                    del split["void-former-value"]
-                if former_quantity is not None:
-                    del split["void-former-quantity"]
+                for key in (
+                    "void-former-value", "void-former-amount",
+                    "void-former-quantity",
+                ):
+                    if split.get(key) is not None:
+                        del split[key]
 
                 split.reconcile_state = "n"
 
-            if "void-reason" in transaction:
-                del transaction["void-reason"]
-            if "void-time" in transaction:
-                del transaction["void-time"]
+            former_notes = transaction.get("void-former-notes")
+            if former_notes is not None:
+                transaction.notes = str(former_notes)
+                del transaction["void-former-notes"]
+            elif (transaction.notes or "") == "Voided transaction":
+                transaction.notes = None
+            for key in ("void-reason", "void-time", "trans-read-only"):
+                if key in transaction:
+                    del transaction[key]
 
             book.save()
 
@@ -696,6 +819,7 @@ class ReconciliationMixin:
                 "guid": short_guid,
                 "date": transaction.post_date.isoformat(),
                 "description": transaction.description,
+                **shapes,
                 "splits": [
                     _split_to_compact_dict(s) for s in transaction.splits
                 ],

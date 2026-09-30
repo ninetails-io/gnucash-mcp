@@ -9,6 +9,7 @@ way (pure lazy-load orchestration, no hardcoded imports).
 from datetime import date
 
 from gnucash_mcp._format import (
+    _BATCH_CONTRACT,
     _batch_row_splits,
     _batch_tsv_layout,
     _parse_statement_tsv,
@@ -44,7 +45,8 @@ def _parse_transactions_tsv(tsv: str) -> list[dict]:
     lines = _tsv_lines(tsv, "the transactions TSV")
     if len(lines) < 2:
         raise ValueError(
-            "transactions TSV needs a header row and at least one data row"
+            "transactions TSV needs a header row and at least one data row; "
+            + _BATCH_CONTRACT
         )
     layout = _batch_tsv_layout(lines[0])
     group = layout["group"]

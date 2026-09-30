@@ -160,10 +160,12 @@ class TestResolveAccountTemplateFilter:
 
 
 class TestMarketPriceFilter:
-    """SB-11: ``list_commodities`` and ``calculate_lot_gain`` must
-    skip piecash's ``type='transaction'`` auto-placeholder prices,
-    and ``calculate_lot_gain`` must filter to the book's default
-    currency.
+    """SB-11: ``list_commodities`` and ``calculate_lot_gain`` pick
+    the current price through ``_find_prices``, and
+    ``calculate_lot_gain`` must filter to the book's default
+    currency. (Since the 2026-09-29 ruling ``type='transaction'``
+    rows count as prices, as in desktop; only the staleness markers
+    read quotes alone.)
 
     Pre-fix both methods walked ``book.prices`` raw. A placeholder
     newer than the user's last ``nav`` quote shadowed it as the
@@ -173,10 +175,10 @@ class TestMarketPriceFilter:
     ``specs/branch_1_captures/pre/*/50_list_commodities.json`` and
     ``…/51_calculate_lot_gain.json``.
 
-    Post-fix both routes through ``CurrencyMixin._find_prices`` with
-    ``market_only=True`` (and currency filter where applicable),
-    making the chokepoint the single source of truth for "give me
-    the right prices for this commodity."
+    Post-fix both route through ``CurrencyMixin._find_prices`` (with
+    a currency filter where applicable), making the chokepoint the
+    single source of truth for "give me the right prices for this
+    commodity."
     """
 
     @pytest.fixture
@@ -269,52 +271,73 @@ class TestMarketPriceFilter:
             )
             book.save()
 
-    def test_list_commodities_skips_transaction_placeholders(
+    def test_list_commodities_counts_transaction_prices_like_desktop(
         self, book_with_vtsax_lot,
     ):
-        """A ``type='transaction'`` placeholder newer than the user's
-        last ``nav`` quote must NOT appear as ``latest_price`` on the
-        commodity. Pre-fix it did — the iteration over ``book.prices``
-        picked whatever was newest regardless of type."""
+        """A ``type='transaction'`` row newer than the user's last
+        ``nav`` quote IS ``latest_price``. GnuCash's lookups never
+        filter on price type; maintainer ruling 2026-09-29 overturned
+        the issue #94 skip so the server agrees with desktop on the
+        current price. Staleness (``stale_days``) keys on that same
+        latest row — one window for all sources (bookkeeper ruling,
+        2026-09-29 evening); ``no_price`` only when no row of any
+        type is left."""
+        from sqlalchemy import text
+
         book_path, _ = book_with_vtsax_lot
-        # Placeholder dated 2026-06-01, ~5 months past the 2026-01-15
-        # nav of $125. Pre-fix the placeholder would win.
+        # A later buy's implied rate, dated 2026-06-01 — ~5 months
+        # past the 2026-01-15 nav of $125.
         self._add_vtsax_price(
-            book_path, value="0.99", p_date=date(2026, 6, 1),
+            book_path, value="131.40", p_date=date(2026, 6, 1),
             p_type="transaction",
         )
 
-        gb = GnuCashBook(str(book_path))
-        result = gb.list_commodities(compact=False)
-        vtsax_entry = next(
-            e for entries in result["commodities"].values()
-            for e in entries if e["mnemonic"] == "VTSAX"
-        )
-        assert vtsax_entry["latest_price"]["date"] == "2026-01-15", (
-            f"placeholder shadowed real nav quote: "
-            f"{vtsax_entry['latest_price']}"
-        )
+        def vtsax_entry(gb, **kw):
+            result = gb.list_commodities(compact=False, **kw)
+            return next(
+                e for entries in result["commodities"].values()
+                for e in entries if e["mnemonic"] == "VTSAX"
+            )
 
-    def test_calculate_lot_gain_skips_transaction_placeholders(
+        gb = GnuCashBook(str(book_path))
+        entry = vtsax_entry(gb)
+        assert entry["latest_price"] == {
+            "value": "131.4", "currency": "USD", "date": "2026-06-01",
+        }, entry
+
+        entry = vtsax_entry(gb, stale_days=1)
+        assert entry["latest_price"]["date"] == "2026-06-01"
+        assert entry["days_stale"] == (date.today() - date(2026, 6, 1)).days
+        assert "no_price" not in entry
+
+        # Delete the only quote: the transaction row still values
+        # VTSAX and still dates its staleness.
+        with gb.open(readonly=False) as book:
+            book.session.execute(text("DELETE FROM prices WHERE type = 'nav'"))
+            book.save()
+        entry = vtsax_entry(gb, stale_days=1)
+        assert entry["latest_price"]["date"] == "2026-06-01"
+        assert entry["days_stale"] == (date.today() - date(2026, 6, 1)).days
+        assert "no_price" not in entry
+
+    def test_calculate_lot_gain_counts_transaction_prices_like_desktop(
         self, book_with_vtsax_lot,
     ):
-        """``calculate_lot_gain`` must skip placeholders when picking
-        the default sale price. Pre-fix a $0.99 placeholder would
-        produce nonsense proceeds; post-fix the $125 nav wins."""
+        """``calculate_lot_gain``'s default sale price is the most
+        current row, a ``type='transaction'`` row newer than the nav
+        quote included. GnuCash's lookups never filter on price type;
+        maintainer ruling 2026-09-29 overturned the issue #94 skip so
+        the server agrees with desktop on the current price."""
         book_path, lot_guid = book_with_vtsax_lot
         self._add_vtsax_price(
-            book_path, value="0.99", p_date=date(2026, 6, 1),
+            book_path, value="131.40", p_date=date(2026, 6, 1),
             p_type="transaction",
         )
 
         gb = GnuCashBook(str(book_path))
         result = gb.calculate_lot_gain(lot_guid=lot_guid)
-        # Expected proceeds: 10 shares × $125 = $1250.
-        # Placeholder-shadowed: 10 × $0.99 = $9.90.
-        proceeds = Decimal(result["sale_proceeds"])
-        assert proceeds > Decimal("1000"), (
-            f"placeholder was used for proceeds: {result}"
-        )
+        # 10 shares × $131.40 (the transaction row), not × $125 (nav).
+        assert Decimal(result["sale_proceeds"]) == Decimal("1314.00"), result
 
     def test_calculate_lot_gain_filters_to_default_currency(
         self, book_with_vtsax_lot,
@@ -1286,6 +1309,16 @@ class TestHistoricalAnchorChainRates:
             commodity=eur, currency=usd, date=date(2025, 9, 1),
             value="1.10", source="user:test", type="nav"))
         book.save()
+        # The USD buy left a direct GFUND/USD implied-rate row, which
+        # values the fund ahead of any chain since the 2026-09-29
+        # ruling (desktop counts it). The subject is the chain's
+        # anchor, so delete it: a book with no direct row is real.
+        from sqlalchemy import text
+
+        assert book.session.execute(
+            text("DELETE FROM prices WHERE type = 'transaction'")
+        ).rowcount == 1
+        book.save()
         return bp
 
     def test_past_anchor_never_uses_future_chain_rate(
@@ -1385,9 +1418,10 @@ class TestPriceWalkChokepoint:
         assert not offenders, offenders
 
     def test_latest_price_surfaces_agree_on_same_date_tie(self, tmp_path):
-        """Two market quotes on one day: the manual quote outranks
-        the feed everywhere, and the tool that shows the operator
-        'the rate on file' shows the rate the reports use."""
+        """Two market quotes on one day at the same stored time: the
+        smaller GUID wins everywhere (GnuCash's own tie order, since
+        the price twin of 2026-09-29), and the tool that shows the
+        operator 'the rate on file' shows the rate the reports use."""
         path = tmp_path / "tie.gnucash"
         book = piecash.create_book(str(path), currency="USD", overwrite=True)
         usd = book.default_currency
@@ -1409,22 +1443,25 @@ class TestPriceWalkChokepoint:
         piecash.Account(name="ZZZ", type="STOCK", commodity=zzz, parent=assets)
         # Feed row written first, manual quote second: storage order
         # and rank order disagree, which is the case that matters.
-        book.session.add(piecash.Price(
+        feed = piecash.Price(
             commodity=aaa, currency=usd, date=date(2026, 1, 15),
-            value=Decimal("50"), source="user:market-data", type="last",
-        ))
-        book.session.add(piecash.Price(
+            value=Decimal("50"), source="Finance::Quote", type="last",
+        )
+        manual = piecash.Price(
             commodity=aaa, currency=usd, date=date(2026, 1, 15),
             value=Decimal("80"), source="user:price", type="last",
-        ))
+        )
+        book.session.add(feed)
+        book.session.add(manual)
         book.save()
         aaa_guid = aaa.guid
+        expected = Decimal("50") if feed.guid < manual.guid else Decimal("80")
         book.close()
 
         gb = GnuCashBook(str(path))
         with gb.open(readonly=True) as b:
             report_rate = gb._rates_as_of(b, date(2026, 9, 1))[aaa_guid]
-        assert report_rate == Decimal("80")
+        assert report_rate == expected
         assert Decimal(
             gb.get_latest_price("AAA", "NASDAQ")["value"]
         ) == report_rate

@@ -1133,9 +1133,12 @@ class TestScheduledCurrency:
             start_date=(_date.today() + _td(days=2)).isoformat(),
             frequency="monthly", currency="EUR",
         )
-        # The fixture's only EUR price is piecash's auto
-        # type='transaction' placeholder, which the market-rate
-        # chokepoint skips → unrated.
+        # The fixture's only EUR price is its transfer's implied-rate
+        # row, which rates EUR since the 2026-09-29 ruling (desktop
+        # counts it); delete it to reach "no rate on file" → unrated.
+        from tests.conftest import drop_transaction_prices
+
+        assert drop_transaction_prices(multi_currency_book) == 1
         with gc.open(readonly=True) as book:
             stats = gc._upcoming_within_days(book, days=7)
         assert stats["count"] == 1

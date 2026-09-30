@@ -2143,6 +2143,71 @@ def _shape_upgrade_lines(after: dict) -> list[str]:
             f"GnuCash's trans-date-due slot (terms over posting date; "
             f"nothing posted)"
         )
+    n = after.get("voids_migrated")
+    if n:
+        lines.append(
+            f"{_INDENT}{n} voided transaction{'s' if n != 1 else ''} "
+            f"rewritten in GnuCash's void shape (numeric originals, "
+            f"read-only; nothing posted)"
+        )
+    biz_parts = []
+    for key, label in (
+        ("credit_note_entries_migrated", "credit-note entry signs"),
+        ("credit_applications_migrated", "credit applications as lot links"),
+        ("document_dates_normalized", "document dates at the neutral time"),
+        ("entries_normalized", "entry defaults"),
+        ("lot_flags_reset", "lot flags left to GnuCash"),
+        ("payment_memos_completed", "payment memos on both legs"),
+        ("payment_slots_pruned", "payment date-posted slots removed"),
+        ("lot_notes_pruned", "empty lot notes removed"),
+        ("billterm_refcounts_recomputed", "billterm refcounts recounted"),
+        ("credit_note_flags_completed", "credit-note flags written"),
+    ):
+        n = after.get(key)
+        if n:
+            biz_parts.append(f"{n} {label}")
+    if biz_parts:
+        lines.append(
+            f"{_INDENT}business rows brought to desktop's shape: "
+            + ", ".join(biz_parts) + " (nothing posted)"
+        )
+    n = after.get("split_reconcile_dates_filled")
+    if n:
+        lines.append(
+            f"{_INDENT}{n} split{'s' if n != 1 else ''} given desktop's epoch "
+            f"reconcile_date (was NULL or the epoch at local midnight; "
+            f"nothing posted)"
+        )
+    n = after.get("slot_fillers_normalized")
+    if n:
+        lines.append(
+            f"{_INDENT}{n} slot row{'s' if n != 1 else ''} given desktop's "
+            f"unused-column values (values untouched)"
+        )
+    parts = []
+    if after.get("price_sources_normalized"):
+        parts.append(f"{after['price_sources_normalized']} price source(s) set to a string GnuCash recognizes")
+    if after.get("price_dates_normalized"):
+        parts.append(f"{after['price_dates_normalized']} price date(s) moved to the neutral time")
+    if after.get("price_values_reduced"):
+        parts.append(f"{after['price_values_reduced']} price value(s) reduced")
+    if after.get("implied_prices_restated"):
+        parts.append(
+            f"{after['implied_prices_restated']} transaction-implied price(s) "
+            f"restated as desktop's exchange dialog stores them"
+        )
+    if after.get("reconcile_dates_normalized"):
+        parts.append(f"{after['reconcile_dates_normalized']} statement date(s) moved to day end")
+    if after.get("reconcile_frames_completed"):
+        parts.append(f"{after['reconcile_frames_completed']} reconcile-info frame(s) given include-children")
+    if parts:
+        lines.append(f"{_INDENT}price and reconcile rows brought to desktop's shape: " + ", ".join(parts))
+    n = after.get("credit_note_entries_unresolved")
+    if n:
+        lines.append(
+            f"{_INDENT}{n} unposted credit note{'s' if n != 1 else ''} with "
+            f"mixed-sign lines left as is — review before posting"
+        )
     if after.get("book_stamped"):
         lines.append(
             f'{_INDENT}book stamped: "{after["book_stamped"]}" '

@@ -272,7 +272,14 @@ class TestGetBookSummary:
 
         In the fixture the cross-currency transfer booked value=1100 USD
         on the EUR side, so the fallback cost basis is $1,100.
+
+        The transfer's implied-rate price row values EUR since the
+        2026-09-29 ruling (desktop counts it); a book with no price
+        row of any type is still real, so drop it to reach that state.
         """
+        from tests.conftest import drop_transaction_prices
+
+        assert drop_transaction_prices(multi_currency_book) > 0
         gc_book = GnuCashBook(str(multi_currency_book))
         result = gc_book.get_book_summary()
         assert "1000 EUR — no price data" in result
@@ -2581,8 +2588,14 @@ class TestGetBookSummaryWarnings:
         line. The investment_book fixture has VTSAX with a
         single price on 2026-01-15, which is now well past the
         30-day cutoff."""
+        from tests.conftest import drop_transaction_prices
+
         gc = GnuCashBook(str(investment_book))
         self._hold_shares(gc, "Assets:Investments:VTSAX")
+        # The buy's implied-rate row is fresh and would value VTSAX
+        # (ruling 2026-09-29); the subject is the stale QUOTE, so
+        # the row goes, as desktop's Price Editor can make it go.
+        assert drop_transaction_prices(investment_book) == 1
         result = gc.get_book_summary()
         assert "Warnings:" in result
         warnings_block = result.split("Warnings:")[1].split(
@@ -2599,16 +2612,29 @@ class TestGetBookSummaryWarnings:
         commodity, but a quote for it values nothing — no warning
         (live book, 2026-09-24: an emptied 401k fund nagged for a
         price). Holding any shares brings the warning back."""
+        from tests.conftest import drop_transaction_prices
+
         gc = GnuCashBook(str(investment_book))
         assert "Stale price" not in gc.get_book_summary()
         self._hold_shares(gc, "Assets:Investments:VTSAX")
+        # The buy's implied-rate row is fresh and would value VTSAX
+        # (ruling 2026-09-29); the subject is the stale QUOTE, so
+        # the row goes, as desktop's Price Editor can make it go.
+        assert drop_transaction_prices(investment_book) == 1
         assert "Stale price: VTSAX" in gc.get_book_summary()
 
     def test_unpriced_commodity_in_use_warns_no_price_on_file(
         self, test_book: Path,
     ):
         """A commodity referenced by an account but with no price
-        record at all → 'no price on file' warning."""
+        record at all → 'no price on file' warning.
+
+        Since the 2026-09-29 ruling the purchase's implied-rate row
+        values WILD as desktop does, and a fresh rate warns of
+        nothing; deleting the row — a real state, e.g. after
+        desktop's Price Editor — brings the warning."""
+        from tests.conftest import drop_transaction_prices
+
         gc = GnuCashBook(str(test_book))
         with gc.open(readonly=False) as book:
             from piecash import Commodity
@@ -2628,13 +2654,19 @@ class TestGetBookSummaryWarnings:
             )
             book.save()
         self._hold_shares(gc, "Assets:WILD")
+        # The buy's implied rate is 5 days old: valuation uses it,
+        # nothing is stale, and silence is earned by freshness
+        # (bookkeeper ruling, 2026-09-29 evening).
+        result = gc.get_book_summary()
+        assert "Stale price: WILD" not in result
+
+        assert drop_transaction_prices(test_book) > 0
         result = gc.get_book_summary()
         assert "Warnings:" in result
         warnings_block = result.split("Warnings:")[1].split(
             "Accounts:"
         )[0]
-        assert "WILD" in warnings_block
-        assert "no price on file" in warnings_block
+        assert "Stale price: WILD no price on file" in warnings_block
 
     def test_iso_currency_in_use_with_stale_rate_warns(
         self, tmp_path: Path,
@@ -3306,8 +3338,14 @@ class TestGetBookSummaryWarnings:
     ):
         """When emitted, Warnings appears above Accounts — that's
         the scan-first ordering the spec calls for."""
+        from tests.conftest import drop_transaction_prices
+
         gc = GnuCashBook(str(investment_book))
         self._hold_shares(gc, "Assets:Investments:VTSAX")
+        # The buy's implied-rate row is fresh and would value VTSAX
+        # (ruling 2026-09-29); the subject is the stale QUOTE, so
+        # the row goes, as desktop's Price Editor can make it go.
+        assert drop_transaction_prices(investment_book) == 1
         result = gc.get_book_summary()
         assert "Warnings:" in result
         warnings_idx = result.index("Warnings:")
@@ -3329,9 +3367,15 @@ class TestStalePriceReadsValuationRate:
         ]
 
     @staticmethod
-    def _book(path, default: str, held: list[tuple[str, str]]):
+    def _book(path, default: str, held: list[tuple]):
         """``default``-currency book with one BANK account per
-        ``(currency, balance)`` in ``held``, opened from equity."""
+        ``(currency, balance)`` in ``held``, opened from equity.
+
+        An optional third element is the opening's cost in
+        ``default``: the equity leg's quantity, so the implied-rate
+        price row the transaction leaves (which values the holding
+        since the 2026-09-29 ruling) carries a realistic rate. Without
+        it the leg's quantity equals its value — an implied rate of 1."""
         book = piecash.create_book(str(path), currency=default, overwrite=True)
         root = book.root_account
         base = book.default_currency
@@ -3343,7 +3387,7 @@ class TestStalePriceReadsValuationRate:
         equity = piecash.Account(
             name="Opening", type="EQUITY", parent=root, commodity=base,
         )
-        for code, balance in held:
+        for code, balance, *cost in held:
             if code not in currencies:
                 currencies[code] = factories.create_currency_from_ISO(code)
                 book.session.add(currencies[code])
@@ -3352,12 +3396,14 @@ class TestStalePriceReadsValuationRate:
                 commodity=currencies[code],
             )
             amt = Decimal(balance)
+            base_amt = Decimal(cost[0]) if cost else amt
             book.session.add(piecash.Transaction(
                 currency=currencies[code], description="open",
                 post_date=date.today() - timedelta(days=10),
                 splits=[
                     piecash.Split(account=acct, value=amt, quantity=amt),
-                    piecash.Split(account=equity, value=-amt, quantity=-amt),
+                    piecash.Split(account=equity, value=-amt,
+                                  quantity=-base_amt),
                 ],
             ))
         book.save()
@@ -3381,6 +3427,8 @@ class TestStalePriceReadsValuationRate:
         assert "USD Account: 1080 USD @ 0.925" in result and "(EUR 1000.00)" in result, result
 
     def test_inverse_only_rate_goes_stale_by_its_own_date(self, tmp_path):
+        from tests.conftest import drop_transaction_prices
+
         book, cur = self._book(tmp_path / "eur2.gnucash", "EUR", [("USD", "1080")])
         book.session.add(piecash.Price(
             commodity=cur["EUR"], currency=cur["USD"],
@@ -3388,15 +3436,61 @@ class TestStalePriceReadsValuationRate:
         ))
         book.save()
         book.close()
+        # The opening's fresh implied row would value USD (ruling
+        # 2026-09-29); the subject is the inverse QUOTE's age.
+        assert drop_transaction_prices(tmp_path / "eur2.gnucash") == 1
         result = GnuCashBook(str(tmp_path / "eur2.gnucash")).get_book_summary()
         assert self._stale_lines(result) == [
             "⚠ Stale price: USD last updated 45 days ago"
         ], result
 
+    def test_old_implied_rate_warns_and_names_its_source(self, tmp_path):
+        """Bookkeeper ruling (2026-09-29 evening): staleness keys on
+        the date of the rate valuation actually used, whatever its
+        source, one window for all. A 45-day-old transaction-implied
+        rate warns and says what it is; a quote of the same age
+        reads as before."""
+        from sqlalchemy import text
+
+        book, cur = self._book(
+            tmp_path / "old.gnucash", "USD", [("GBP", "500", "630")],
+        )
+        book.close()
+        old = date.today() - timedelta(days=45)
+        gc = GnuCashBook(str(tmp_path / "old.gnucash"))
+        with gc.open(readonly=False) as b:
+            b.session.execute(
+                text("UPDATE prices SET date = :d WHERE type = 'transaction'"),
+                {"d": old.strftime("%Y-%m-%d 10:59:00")},
+            )
+            b.save()
+        result = gc.get_book_summary()
+        assert self._stale_lines(result) == [
+            "⚠ Stale price: GBP valued at the rate of its last "
+            "transaction, 45 days ago"
+        ], result
+        assert "(USD 630.00)" in next(
+            ln for ln in result.splitlines() if "GBP Account" in ln
+        )
+        # A quote newer than the implied rate takes over, and is
+        # measured the same way.
+        gc.create_price("GBP", "CURRENCY", "1.30",
+                        price_date=date.today() - timedelta(days=40))
+        result = gc.get_book_summary()
+        assert self._stale_lines(result) == [
+            "⚠ Stale price: GBP last updated 40 days ago"
+        ], result
+
     def test_chained_rate_is_as_old_as_its_oldest_leg(self, tmp_path):
         """USD book holding GBP; GBP is priced only in EUR (today)
         and EUR in USD (40 days ago). The valuation chains GBP→EUR→
-        USD, so GBP is stale at 40 days, named with its path."""
+        USD, so GBP is stale at 40 days, named with its path.
+
+        The subject is the chain, so the opening's implied GBP/USD row
+        (a direct rate, which desktop and the server value by since
+        the 2026-09-29 ruling) is deleted: no direct pair on file."""
+        from tests.conftest import drop_transaction_prices
+
         book, cur = self._book(tmp_path / "usd.gnucash", "USD", [("GBP", "500")])
         eur = factories.create_currency_from_ISO("EUR")
         book.session.add(eur)
@@ -3410,6 +3504,7 @@ class TestStalePriceReadsValuationRate:
         ))
         book.save()
         book.close()
+        assert drop_transaction_prices(tmp_path / "usd.gnucash") == 1
         result = GnuCashBook(str(tmp_path / "usd.gnucash")).get_book_summary()
         assert self._stale_lines(result) == [
             "⚠ Stale price: GBP last updated 40 days ago (via EUR)"
@@ -3458,13 +3553,38 @@ class TestStalePriceReadsValuationRate:
             ],
             trans_date=with_dates[0], check_duplicates=False,
         )
+        # That transaction is itself cross-currency, so it leaves a
+        # fresh implied EUR rate — the cure the warning names — and
+        # nothing is stale.
+        assert self._stale_lines(gc.get_book_summary()) == []
+        # With that row gone (the state a same-currency EUR purchase
+        # leaves: activity, no new rate) the stale quote is back.
+        from tests.conftest import drop_transaction_prices
+        # Three implied rows: the 2019 opening and spend, and coffee.
+        assert drop_transaction_prices(path) == 3
         lines = self._stale_lines(gc.get_book_summary())
         assert len(lines) == 1 and lines[0].startswith("⚠ Stale price: EUR last updated")
         # ... as does holding a balance, whatever the activity.
 
     def test_no_price_on_file_means_cost_basis_fallback(self, tmp_path):
-        book, cur = self._book(tmp_path / "np.gnucash", "USD", [("GBP", "500")])
+        """Since the 2026-09-29 ruling the opening's implied rate
+        values GBP as desktop does, and a rate 10 days old warns of
+        nothing. Deleting that row — a book with no price of any
+        type is still real — brings 'no price on file' and the
+        cost-basis fallback."""
+        from tests.conftest import drop_transaction_prices
+
+        book, cur = self._book(
+            tmp_path / "np.gnucash", "USD", [("GBP", "500", "630")],
+        )
         book.close()
+        result = GnuCashBook(str(tmp_path / "np.gnucash")).get_book_summary()
+        assert self._stale_lines(result) == [], result
+        assert "(USD 630.00)" in next(
+            ln for ln in result.splitlines() if "GBP Account" in ln
+        )
+
+        assert drop_transaction_prices(tmp_path / "np.gnucash") == 1
         result = GnuCashBook(str(tmp_path / "np.gnucash")).get_book_summary()
         assert self._stale_lines(result) == [
             "⚠ Stale price: GBP no price on file"
@@ -9742,42 +9862,155 @@ class TestReconcileAccount:
 class TestVoidTransaction:
     """Tests for void_transaction method."""
 
-    def test_void_time_slot_is_timezone_aware(self, test_book: Path):
-        """The ``void-time`` slot must store a tz-aware ISO string
-        so a later reader can reconstruct the absolute void instant
-        across DST transitions and timezone changes. Pre-fix this
-        was naive ``datetime.now().isoformat()`` whose
-        interpretation depended on the host's current zone."""
-        from datetime import datetime as _dt
-        gc_book = GnuCashBook(str(test_book))
-        transactions = gc_book.list_transactions(compact=False)["transactions"]
-        guid = transactions[0]["guid"]
-
-        gc_book.void_transaction(guid=guid, reason="test")
-
-        # Read the raw value out of the slots table — the
-        # SlotString wrapper's repr contains the value but isn't
-        # itself directly parseable. Going through SQL gives us
-        # the stored ISO string verbatim.
+    @staticmethod
+    def _slot_rows(gc_book, guids):
         from sqlalchemy import text
         with gc_book.open(readonly=True) as book:
-            txn = next(
-                t for t in book.transactions if t.guid.startswith(guid[:8])
-            )
-            row = book.session.execute(
+            q = ",".join(f":g{i}" for i in range(len(guids)))
+            return book.session.execute(
                 text(
-                    "SELECT string_val FROM slots "
-                    "WHERE obj_guid = :guid AND name = :name"
+                    "SELECT obj_guid, name, slot_type, string_val, "
+                    "numeric_val_num, numeric_val_denom FROM slots "
+                    f"WHERE obj_guid IN ({q}) ORDER BY obj_guid, name"
                 ),
-                {"guid": txn.guid, "name": "void-time"},
-            ).first()
-        void_time_str = row[0]
-        parsed = _dt.fromisoformat(void_time_str)
-        # Pre-fix the slot stored a NAIVE ``datetime.now()`` whose
-        # absolute meaning depended on the host's current zone.
-        assert parsed.tzinfo is not None, (
-            f"void-time must be tz-aware, got naive: {void_time_str!r}"
+                {f"g{i}": g for i, g in enumerate(guids)},
+            ).fetchall()
+
+    def test_void_writes_gnucash_shape(self, test_book: Path):
+        """xaccTransVoid / xaccSplitVoid, key for key: void-reason
+        and void-time as strings, the time in GnuCash's own ISO
+        8601 (UTC, ``YYYY-MM-DD HH:MM:SS``, a space — Python's 'T'
+        form fails gnc-datetime's parser and desktop then does not
+        see the void at all), notes stashed in void-former-notes and
+        set to "Voided transaction", the transaction read-only, and
+        each split's originals as NUMERIC void-former-amount /
+        void-former-value. Pre-fix the server wrote STRING slots
+        under void-former-value and an invented void-former-quantity."""
+        import re
+        gc_book = GnuCashBook(str(test_book))
+        created = gc_book.create_transaction(
+            description="Will void", notes="keep me",
+            splits=[
+                {"account": "Assets:Checking", "amount": "-42.50"},
+                {"account": "Expenses:Groceries", "amount": "42.50"},
+            ],
+            trans_date=date.today() - timedelta(days=1),
         )
+        gc_book.void_transaction(guid=created["guid"], reason="test")
+        with gc_book.open(readonly=True) as book:
+            txn = gc_book._find_transaction(book, created["guid"])
+            txn_guid = txn.guid
+            split_guids = [s.guid for s in txn.splits]
+            assert txn.notes == "Voided transaction"
+        rows = self._slot_rows(gc_book, [txn_guid] + split_guids)
+        by = {(r[0], r[1]): r for r in rows}
+        assert by[(txn_guid, "void-reason")][2:4] == (4, "test")
+        assert by[(txn_guid, "void-former-notes")][2:4] == (4, "keep me")
+        assert by[(txn_guid, "trans-read-only")][2:4] == (4, "Transaction Voided")
+        void_time = by[(txn_guid, "void-time")][3]
+        assert re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", void_time), void_time
+        for sg in split_guids:
+            amount = by[(sg, "void-former-amount")]
+            value = by[(sg, "void-former-value")]
+            assert amount[2] == 3 and value[2] == 3  # KVP_TYPE_NUMERIC
+            assert abs(amount[4]) == 4250 and amount[5] == 100
+            assert abs(value[4]) == 4250 and value[5] == 100
+            assert (sg, "void-former-quantity") not in by
+
+    def test_unvoid_restores_from_gnucash_shape(self, test_book: Path):
+        """A void desktop made (numeric former amounts, no legacy
+        keys) unvoids here to the original amounts and notes, and
+        clears every void key including read-only."""
+        gc_book = GnuCashBook(str(test_book))
+        created = gc_book.create_transaction(
+            description="Desktop void", notes="original",
+            splits=[
+                {"account": "Assets:Checking", "amount": "-10"},
+                {"account": "Expenses:Groceries", "amount": "10"},
+            ],
+            trans_date=date.today() - timedelta(days=1),
+        )
+        # Engineer desktop's shape directly.
+        with gc_book.open(readonly=False) as book:
+            txn = gc_book._find_transaction(book, created["guid"])
+            txn["void-former-notes"] = "original"
+            txn.notes = "Voided transaction"
+            txn["void-reason"] = "desktop"
+            txn["void-time"] = "2026-09-29 17:00:00"
+            txn["trans-read-only"] = "Transaction Voided"
+            for s in txn.splits:
+                s["void-former-amount"] = Decimal(str(s.quantity))
+                s["void-former-value"] = Decimal(str(s.value))
+                s.value = Decimal("0")
+                s.quantity = Decimal("0")
+                s.reconcile_state = "v"
+            book.save()
+        gc_book.unvoid_transaction(created["guid"])
+        with gc_book.open(readonly=True) as book:
+            txn = gc_book._find_transaction(book, created["guid"])
+            assert txn.notes == "original"
+            assert sorted(abs(s.value) for s in txn.splits) == [Decimal("10")] * 2
+            assert all(s.reconcile_state == "n" for s in txn.splits)
+            guids = [txn.guid] + [s.guid for s in txn.splits]
+        names = {r[1] for r in self._slot_rows(gc_book, guids)}
+        assert not names & {
+            "void-reason", "void-time", "void-former-notes", "trans-read-only",
+            "void-former-amount", "void-former-value",
+        }
+
+    def test_legacy_void_converts_on_the_next_write(self, test_book: Path):
+        """A pre-fix void (STRING void-former-value, invented
+        void-former-quantity, 'T' void-time, no read-only) is
+        rewritten into GnuCash's shape by the next converting write,
+        keeping the amounts it held, and reported as voids_migrated."""
+        gc_book = GnuCashBook(str(test_book))
+        created = gc_book.create_transaction(
+            description="Old void",
+            splits=[
+                {"account": "Assets:Checking", "amount": "-7.25"},
+                {"account": "Expenses:Groceries", "amount": "7.25"},
+            ],
+            trans_date=date.today() - timedelta(days=1),
+        )
+        with gc_book.open(readonly=False) as book:
+            txn = gc_book._find_transaction(book, created["guid"])
+            txn["void-reason"] = "old"
+            txn["void-time"] = "2026-03-01T09:00:00-08:00"
+            for s in txn.splits:
+                s["void-former-value"] = str(s.value)
+                s["void-former-quantity"] = str(s.quantity)
+                s.value = Decimal("0")
+                s.quantity = Decimal("0")
+                s.reconcile_state = "v"
+            book.save()
+        # Any converting write: void a second transaction.
+        other = gc_book.create_transaction(
+            description="Another",
+            splits=[
+                {"account": "Assets:Checking", "amount": "-1"},
+                {"account": "Expenses:Groceries", "amount": "1"},
+            ],
+            trans_date=date.today() - timedelta(days=1),
+        )
+        result = gc_book.void_transaction(other["guid"], reason="x")
+        assert result["voids_migrated"] == 1
+        with gc_book.open(readonly=True) as book:
+            txn = gc_book._find_transaction(book, created["guid"])
+            guids = [txn.guid] + [s.guid for s in txn.splits]
+            txn_guid = txn.guid
+        by = {(r[0], r[1]): r for r in self._slot_rows(gc_book, guids)}
+        assert by[(txn_guid, "void-time")][3] == "2026-03-01 17:00:00"
+        assert (txn_guid, "trans-read-only") in by
+        for (obj, name), row in by.items():
+            if obj == txn_guid:
+                continue
+            assert name in ("void-former-amount", "void-former-value"), name
+            assert row[2] == 3 and abs(row[4]) == 725 and row[5] == 100
+        # ... and it unvoids to what it held.
+        gc_book.unvoid_transaction(created["guid"])
+        with gc_book.open(readonly=True) as book:
+            txn = gc_book._find_transaction(book, created["guid"])
+            assert sorted(abs(s.value) for s in txn.splits) == [Decimal("7.25")] * 2
 
     def test_void_transaction_success(self, test_book: Path):
         """Should void a transaction."""
@@ -11934,7 +12167,14 @@ class TestMultiCurrencyBalances:
         ``usd_value`` alongside the human-readable triplet ``balance``.
         ``usd_value`` is dropped for currency rows where it would just
         repeat ``balance``.
+
+        The transfer's implied-rate price row values EUR since the
+        2026-09-29 ruling (desktop counts it); a book with no price
+        row of any type is still real, so drop it to reach that state.
         """
+        from tests.conftest import drop_transaction_prices
+
+        assert drop_transaction_prices(multi_currency_book) > 0
         gc_book = GnuCashBook(str(multi_currency_book))
         result = gc_book.balance_sheet(as_of_date=date(2024, 12, 31))
         accounts = {a["account"]: a for a in result["assets"]["accounts"]}
@@ -12754,18 +12994,18 @@ class TestPrices:
         assert Decimal(result["value"]) == Decimal("42.50")
         assert result["currency"] == "EUR"
 
-    def test_get_latest_price_skips_transaction_placeholder_prices(
+    def test_get_latest_price_counts_transaction_prices_like_desktop(
         self, test_book: Path,
     ):
-        """``get_latest_price`` must skip piecash's auto-created
-        ``type='transaction'`` placeholder rows so its answer agrees
-        with ``get_book_summary``, ``_find_exchange_rate``, and
-        every other valuation path.
+        """``get_latest_price`` answers with the most current row by
+        (stored time, smaller GUID), a ``type='transaction'`` row
+        included. GnuCash's lookups never filter on price type;
+        maintainer ruling 2026-09-29 overturned the issue #94 skip so
+        the server agrees with desktop on the current price.
 
-        On the bookkeeper's CNY book this surfaced as Moutai
-        returning a ``user:split-register`` rate of 33.333333 CNY
-        (the effective rate of a cross-currency transaction)
-        instead of the user's nav quote of 1810 CNY/share.
+        The shape is the bookkeeper's CNY-book one: a
+        ``user:split-register`` rate newer than the user's nav quote.
+        A quote dated after it wins back on timestamp.
         """
         import piecash
         gc_book = GnuCashBook(str(test_book))
@@ -12773,14 +13013,13 @@ class TestPrices:
             mnemonic="ZZZP", fullname="Test Stock",
             namespace="EXCHANGE",
         )
-        # User-quoted nav price (the "real" answer).
         gc_book.create_price(
             commodity="ZZZP", namespace="EXCHANGE",
             value="100.00", price_date=date(2026, 2, 1),
             price_type="nav",
         )
-        # Auto-created placeholder rows (newer date — would win on
-        # any "latest by date" sort if not filtered out).
+        # A cross-currency transaction's implied-rate row, newer than
+        # the nav quote — the current price, as desktop reads it.
         with gc_book.open(readonly=False) as book:
             usd = book.default_currency
             zzzp = next(
@@ -12797,10 +13036,19 @@ class TestPrices:
         result = gc_book.get_latest_price(
             commodity="ZZZP", namespace="EXCHANGE",
         )
-        # Must surface the user's nav quote, NOT the newer auto-
-        # created transaction artifact.
         assert result is not None
-        assert Decimal(result["value"]) == Decimal("100.00")
+        assert Decimal(result["value"]) == Decimal("33.333333")
+        assert result["type"] == "transaction"
+
+        gc_book.create_price(
+            commodity="ZZZP", namespace="EXCHANGE",
+            value="101.00", price_date=date(2026, 3, 20),
+            price_type="nav",
+        )
+        result = gc_book.get_latest_price(
+            commodity="ZZZP", namespace="EXCHANGE",
+        )
+        assert Decimal(result["value"]) == Decimal("101.00")
         assert result["type"] == "nav"
 
     def test_get_latest_price_no_prices(self, test_book: Path):
@@ -13001,7 +13249,7 @@ class TestDeletePrice:
         gc_book.create_price(
             commodity="VTSAX", namespace="FUND", value="127.99",
             currency="USD", price_date=date(2026, 2, 7),
-            source="user:yfinance",
+            source="Finance::Quote",
         )
 
         with pytest.raises(ValueError) as exc_info:
@@ -13015,7 +13263,7 @@ class TestDeletePrice:
         # trailing zeros from stored values; check the integer
         # part to stay implementation-agnostic.
         assert "user:price" in msg
-        assert "user:yfinance" in msg
+        assert "Finance::Quote" in msg
         assert "127.5" in msg
         assert "127.99" in msg
         assert "source=" in msg
@@ -13033,12 +13281,12 @@ class TestDeletePrice:
         gc_book.create_price(
             commodity="VTSAX", namespace="FUND", value="127.99",
             currency="USD", price_date=date(2026, 2, 7),
-            source="user:yfinance",
+            source="Finance::Quote",
         )
 
         result = gc_book.delete_price(
             commodity="VTSAX", namespace="FUND",
-            price_date=date(2026, 2, 7), source="user:yfinance",
+            price_date=date(2026, 2, 7), source="Finance::Quote",
         )
 
         assert Decimal(result["value"]) == Decimal("127.99")
@@ -13387,13 +13635,19 @@ class TestIssue94IntermediateCurrencyChain:
       B. foreign ccy → pivot → default          (GBP via USD)
       C. security → foreign ccy → pivot → default (fund priced GBP)
 
-    plus a direct-priced control and an unreachable control, and the
-    ``type='transaction'`` trap (the cross-currency GBP funding stamps
-    a non-market GBP/AED rate of 5.0 that the chain must ignore in
-    favour of the GBP→USD→AED market legs = 4.664075).
+    plus a direct-priced control and an unreachable control.
+
+    Every purchase here is AED-funded, so each leaves a direct
+    fund/AED (and GBP/AED) ``type='transaction'`` row, and since the
+    2026-09-29 ruling those value holdings as desktop does — direct
+    pair before any chain, as ``get_nearest_price`` orders it. The
+    chain-mechanics tests are about books with no direct row, so
+    ``_build`` deletes them unless asked to keep them (case B).
     """
 
-    def _build(self, tmp_path) -> GnuCashBook:
+    def _build(
+        self, tmp_path, keep_transaction_prices: bool = False,
+    ) -> GnuCashBook:
         from datetime import date as d
         path = tmp_path / "issue94.gnucash"
         book = piecash.create_book(
@@ -13518,6 +13772,11 @@ class TestIssue94IntermediateCurrencyChain:
         price(ofund, jpy, "1000")    # E unreachable
         book.save()
         book.close()
+        if not keep_transaction_prices:
+            from tests.conftest import drop_transaction_prices
+
+            # One row per cross-currency transaction: four buys + GBP.
+            assert drop_transaction_prices(path) == 5
         return GnuCashBook(str(path))
 
     def _holdings(self, gb: GnuCashBook) -> dict:
@@ -13534,9 +13793,23 @@ class TestIssue94IntermediateCurrencyChain:
         # Provenance: derived through USD, flagged for the reader.
         assert "via USD" in h["balance"]
 
-    def test_case_b_triangulation_ignores_transaction_price(self, tmp_path):
+    def test_case_b_transaction_price_beats_chain_like_desktop(
+        self, tmp_path,
+    ):
+        """The GBP funding's implied GBP/AED 5.0 is a direct rate, and
+        a direct rate answers before any chain, stale or not. GnuCash's
+        lookups never filter on price type; maintainer ruling
+        2026-09-29 overturned the issue #94 skip so the server agrees
+        with desktop on the current price. Without the row, the
+        GBP→USD→AED triangulation values the cash."""
+        h = self._holdings(
+            self._build(tmp_path, keep_transaction_prices=True)
+        )["GBP Cash"]
+        assert h["default_currency_value"] == "4000.00"  # 800 × 5.0
+        assert "via" not in h["balance"]
+
         h = self._holdings(self._build(tmp_path))["GBP Cash"]
-        # 800 × 1.27 × 3.6725 = 3731.26 — NOT 4000 (the 5.0 txn rate).
+        # 800 × 1.27 × 3.6725 = 3731.26.
         assert h["default_currency_value"] == "3731.26"
         assert "via USD" in h["balance"]
 
@@ -13979,6 +14252,12 @@ class TestPricesTsvParser:
 
 class TestListCommoditiesStaleFilter:
     def test_work_list_filters_and_markers(self, multi_currency_book):
+        from tests.conftest import drop_transaction_prices
+
+        # The fixture's EUR transfer left an implied EUR/USD row that
+        # would price EUR (ruling 2026-09-29); the subject is the
+        # unquoted state.
+        assert drop_transaction_prices(multi_currency_book) >= 1
         from datetime import timedelta
 
         gc = GnuCashBook(str(multi_currency_book))

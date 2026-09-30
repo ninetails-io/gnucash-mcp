@@ -9,18 +9,23 @@ split valuation (``_split_in_default_currency``), account valuation
 with cost-basis fallback (``_market_value``), and pairwise exchange
 rates (``_find_exchange_rate``).
 
-All helpers skip piecash's auto-created ``type='transaction'`` price
-placeholders via :func:`_is_market_price` (re-exported through
-``book._base``) — those would shadow real user-supplied quotes.
+Every price row counts, ``type='transaction'`` included — GnuCash's
+own lookups never filter on type (maintainer ruling, 2026-09-29,
+overturning the issue #94 skip).
 """
 
 import os
+from contextlib import contextmanager
 from datetime import date, datetime
 from decimal import Decimal
 
 import piecash
 
-from gnucash_mcp._format import _enumerate_periods, _period_label
+from gnucash_mcp._format import (
+    _enumerate_periods,
+    _format_rate,
+    _period_label,
+)
 
 # ── FX staleness cap ───────────────────────────────────────────────
 #
@@ -131,57 +136,107 @@ def _to_date(dt: date | datetime) -> date:
     return dt
 
 
-# The two sources a deliberate manual quote arrives under:
-# ``user:price`` from create_price, ``user:price-editor`` from
-# GnuCash's editor. An EXPLICIT allowlist — ``user:market-data`` is
-# deliberately feed-ranked despite the prefix, so it needs its own
-# explicit demotion below the generic ``user:*`` tier.
-_MANUAL_PRICE_SOURCES = frozenset({"user:price", "user:price-editor"})
-_FEED_PRICE_SOURCES = frozenset({"user:market-data"})
+class _SmallerWins:
+    """Ordering wrapper: in a "higher tuple wins" key, the SMALLER
+    wrapped value ranks higher. GnuCash breaks a price-time tie by
+    ``guid_compare`` ascending (``compare_prices_by_date``,
+    gnc-pricedb.cpp), so the lower GUID is the current price."""
+
+    __slots__ = ("v",)
+
+    def __init__(self, v):
+        self.v = v
+
+    def __lt__(self, other):
+        return self.v > other.v
+
+    def __gt__(self, other):
+        return self.v < other.v
+
+    def __eq__(self, other):
+        return self.v == other.v
+
+    def __le__(self, other):
+        return self.v >= other.v
+
+    def __ge__(self, other):
+        return self.v <= other.v
+
+    def __repr__(self):
+        return f"_SmallerWins({self.v!r})"
 
 
-def _price_source_rank(source: str | None) -> int:
-    """Three-tier source rank for same-date ties: 2 = known manual
-    quote, 1 = other ``user:*`` (an explicit operator act, but one
-    that shouldn't silently override a deliberate manual edit),
-    0 = feeds and everything else — including ``user:market-data``,
-    which is feed-ranked by name despite the prefix."""
-    source = source or ""
-    if source in _MANUAL_PRICE_SOURCES:
-        return 2
-    if source in _FEED_PRICE_SOURCES:
-        return 0
-    if source.startswith("user:"):
-        return 1
-    return 0
+_STORED_TIME_ATTR = "_gnc_mcp_stored_time"
+
+
+def _price_row_utc(raw) -> "datetime | None":
+    """UTC-aware datetime of a raw ``prices.date`` value: the
+    ``YYYY-MM-DD HH:MM:SS`` string SQLite stores, or the naive/aware
+    datetime a database driver returns."""
+    from datetime import timezone
+
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        digits = "".join(ch for ch in raw if ch.isdigit()).ljust(14, "0")
+        raw = datetime(
+            int(digits[0:4]), int(digits[4:6]), int(digits[6:8]),
+            int(digits[8:10]), int(digits[10:12]), int(digits[12:14]),
+        )
+    if isinstance(raw, datetime):
+        return raw.astimezone(timezone.utc) if raw.tzinfo else raw.replace(tzinfo=timezone.utc)
+    return None
 
 
 def _price_tie_rank(price) -> tuple:
-    """Deterministic tie-break key for prices sharing a date
-    (bookkeeper finding F3 — the winner used to be an accident of
-    query/iteration order, so posting math and month-close valuation
-    could flip between runs on books carrying same-date duplicates).
+    """Which of two prices on a pair is the more current — GnuCash's
+    ``compare_prices_by_date`` (gnc-pricedb.cpp): the later stored
+    time first, and for equal times the smaller GUID. Higher tuple
+    wins.
 
-    Higher tuple wins. Rank via ``_price_source_rank`` (manual
-    quote > other user:* > feed); the guid breaks residual ties —
-    arbitrary but STABLE, which is the property that matters.
-    ``create_price``/``create_prices`` report when a written row
-    loses this tie, so any rank order stays visible to the operator.
+    The stored time is the full timestamp, not the calendar day:
+    piecash's ``Price.date`` strips the time, so ``_find_prices``
+    attaches the raw column value to each row it returns. Every
+    same-day tie the server resolves — month-close valuation,
+    posting FX, the latest quote — therefore lands on the row
+    desktop's Accounts tab and reports use. Until 2026-09-29 the
+    tie went to a source rank (bookkeeper finding F3: manual quote
+    over other user sources over feeds); the price twin showed
+    desktop valuing a holding by a wall-clock-stamped row the
+    server ranked below the day's neutral-time quote, and the
+    maintainer ruled that parity means agreeing on the price.
     """
-    source = getattr(price, "source", None) or ""
-    return (_price_source_rank(source), price.guid or "")
+    stored = getattr(price, _STORED_TIME_ATTR, None)
+    if stored is None:
+        # A row that did not come through _find_prices: piecash
+        # reads the day back at local midnight; rank it at the
+        # neutral time the server and desktop both store.
+        from gnucash_mcp.book._base import _neutral_time
+
+        stored = _neutral_time(_to_date(price.date))
+    return (stored, _SmallerWins(price.guid or ""))
 
 
 def _is_market_price(price) -> bool:
-    """True iff ``price`` is a real market quote, not a piecash
-    auto-placeholder.
+    """True iff ``price`` is a quote somebody entered or fetched, not
+    the ``type='transaction'`` row a cross-currency transaction
+    leaves behind. Valuation counts BOTH, as desktop does (ruling
+    2026-09-29), and so does every staleness measure — one window
+    for all sources (bookkeeper ruling, same evening). This
+    predicate serves :meth:`CurrencyMixin._market_prices_only`,
+    which has two users: the dashboard's stale-price warning
+    re-derives the rate over quotes alone to NAME a stale rate's
+    provenance, and the business module picks the rate for a NEW
+    cross-currency posting or payment from quotes alone, so a
+    posting never prices itself off the last posting's echo.
 
-    piecash auto-creates a ``type='transaction'`` Price row on every
-    cross-currency transaction — a bookkeeping artifact, not a user
-    quote. Every helper that walks ``book.prices`` must skip these
-    or they shadow real quotes. Centralized so all call sites answer
-    the same way; a future placeholder type needs one change.
-    """
+    A ``temporary`` row is not a quote either: desktop leaks one on
+    every cross-currency invoice post (``gnc_price_invert`` builds a
+    reversed copy with ``PRICE_SOURCE_TEMP`` and the SQL backend
+    saves it), typed ``last``. Counted as a quote, the echo of a
+    posting would satisfy the staleness guard for the next one."""
+    if getattr(price, "source", None) == "temporary":
+        return False
     return getattr(price, "type", None) != "transaction"
 
 
@@ -255,16 +310,39 @@ class CurrencyMixin:
     # paths that mutate prices mid-call.
     _PRICE_LOOKUPS_ATTR = "_gnucash_mcp_price_lookups"
     _PRICE_COMMODITIES_ATTR = "_gnucash_mcp_price_commodities"
+    _MARKET_ONLY_ATTR = "_gnucash_mcp_market_prices_only"
+
+    @staticmethod
+    @contextmanager
+    def _market_prices_only(book: piecash.Book):
+        """Within the block, ``_find_prices`` returns only quotes
+        somebody entered or fetched (``_is_market_price``), so every
+        rate derived inside — direct, inverse, chained — answers
+        "when did the operator last quote this?" rather than "what
+        is it worth?". Two users: the dashboard's stale-price
+        warning (to name a stale rate's provenance) and the
+        business module's posting-rate lookup (the rate the server
+        chooses for a write); valuation never runs inside it. The
+        memo is untouched — the
+        filter is applied per call, so nothing cached inside leaks
+        out."""
+        setattr(book, CurrencyMixin._MARKET_ONLY_ATTR, True)
+        try:
+            yield
+        finally:
+            setattr(book, CurrencyMixin._MARKET_ONLY_ATTR, False)
 
     @staticmethod
     def _invalidate_price_caches(book: piecash.Book) -> None:
         """Drop the memoized price lookups. Every path that adds or
         removes a Price row must call this after its save so a later
         lookup in the same call sees the change — today that is
-        create_price, create_prices, and delete_price. (piecash's
-        auto-created ``type='transaction'`` placeholders on
-        cross-currency saves skip this deliberately: every consumer
-        filters them out via ``market_only``.)"""
+        create_price, create_prices, and delete_price. piecash's
+        auto-created ``type='transaction'`` row on a cross-currency
+        save counts as a price too (since 2026-09-29) but is not
+        invalidated for: a lookup later in the same call would miss
+        a rate equal to the transaction it just wrote, and the next
+        call reads it."""
         for attr in (
             CurrencyMixin._PRICE_LOOKUPS_ATTR,
             CurrencyMixin._PRICE_COMMODITIES_ATTR,
@@ -278,20 +356,22 @@ class CurrencyMixin:
         *,
         commodity_guid: str | None = None,
         currency_guid: str | None = None,
-        market_only: bool = True,
     ) -> list:
-        """Indexed lookup over ``book.prices``, newest first.
+        """Indexed lookup over ``book.prices``, most current first.
 
         Replaces the linear ``for p in book.prices`` walks.
         ``commodity_guid`` filters the held instrument,
-        ``currency_guid`` the quote side; ``market_only`` (default)
-        skips ``type='transaction'`` auto-placeholders.
+        ``currency_guid`` the quote side. Every row counts,
+        ``type='transaction'`` included: GnuCash's own lookups
+        (``gnc_pricedb_lookup_latest``, ``lookup_nearest_in_time``)
+        never filter on type, so a cross-currency transaction's
+        implied rate IS a price desktop values by. The server
+        skipped them from issue #94 until 2026-09-29, when the
+        maintainer overturned that for parity with desktop.
 
         Memoized per ``(commodity_guid, currency_guid)`` on the open
         book: the first request for a pair runs one indexed query,
-        and every repeat is served from memory (``market_only``
-        re-filters the memoized list per call — cheap, since a
-        pair's list is small). The pivot search requests the
+        and every repeat is served from memory. The pivot search requests the
         same handful of pairs once per candidate leg per commodity,
         so without the memo a whole-book report re-runs identical
         queries thousands of times; with it the query count is
@@ -309,31 +389,45 @@ class CurrencyMixin:
         key = (commodity_guid, currency_guid)
         prices = lookups.get(key)
         if prices is None:
-            from piecash.core.commodity import Price
-
-            q = book.session.query(Price)
-            if commodity_guid is not None:
-                q = q.filter(Price.commodity_guid == commodity_guid)
-            if currency_guid is not None:
-                q = q.filter(Price.currency_guid == currency_guid)
-            prices = list(q)
-            # Newest first, with same-date ties resolved by
-            # _price_tie_rank rather than row order (see its
-            # docstring for the rule), and full-key ties by guid so
-            # the ordering never falls through to arbitrary DB row
-            # order. Sorted once, at memoization time, so every
-            # consumer sees the same ordering.
-            prices.sort(
-                key=lambda p: (
-                    _to_date(p.date), _price_tie_rank(p), p.guid,
-                ),
-                reverse=True,
+            prices = CurrencyMixin._query_prices_with_time(
+                book, commodity_guid, currency_guid,
             )
+            # Most current first — the full stored time, then the
+            # smaller GUID (_price_tie_rank: GnuCash's own order) —
+            # never DB row order. Sorted once, at memoization time,
+            # so every consumer sees the same ordering.
+            prices.sort(key=_price_tie_rank, reverse=True)
             lookups[key] = prices
 
-        if market_only:
+        if getattr(book, CurrencyMixin._MARKET_ONLY_ATTR, False):
             return [p for p in prices if _is_market_price(p)]
         return list(prices)
+
+    @staticmethod
+    def _query_prices_with_time(
+        book: piecash.Book, commodity_guid: str | None,
+        currency_guid: str | None,
+    ) -> list:
+        """One indexed query for a pair's Price rows, each carrying
+        its raw stored ``date`` (UTC-aware) on ``_STORED_TIME_ATTR``.
+        piecash's column type reads the timestamp back as a bare
+        day, and desktop orders prices by the full time, so the raw
+        column rides along in the same SELECT. The only reader of
+        that column; ``_find_prices`` memoizes the result and the
+        outranker check reads it fresh."""
+        from piecash.core.commodity import Price
+        from sqlalchemy import literal_column
+
+        q = book.session.query(Price, literal_column("prices.date"))
+        if commodity_guid is not None:
+            q = q.filter(Price.commodity_guid == commodity_guid)
+        if currency_guid is not None:
+            q = q.filter(Price.currency_guid == currency_guid)
+        prices = []
+        for p, raw in q:
+            setattr(p, _STORED_TIME_ATTR, _price_row_utc(raw))
+            prices.append(p)
+        return prices
 
     @staticmethod
     def _anchor_for_as_of(as_of: date) -> date:
@@ -419,18 +513,32 @@ class CurrencyMixin:
         if default_currency is None:
             default_currency = self._require_default_currency(book)
         latest: dict[str, tuple[date, tuple, Decimal]] = {}
-        for p in self._find_prices(
-            book, currency_guid=default_currency.guid, market_only=True,
-        ):
+
+        def _offer(key: str, p, rate: Decimal) -> None:
             p_date = _to_date(p.date)
             if p_date > anchor:
-                continue
-            key = p.commodity.guid
+                return
             existing = latest.get(key)
             cand = (p_date, _price_tie_rank(p))
             if existing is None or cand > (existing[0], existing[1]):
-                latest[key] = (p_date, _price_tie_rank(p),
-                               Decimal(str(p.value)))
+                latest[key] = (p_date, cand[1], rate)
+
+        # A pair's prices are ONE list whichever way each row is
+        # stored: GnuCash merges the forward and reverse lists
+        # (``pricedb_get_prices_internal``) and takes the most
+        # current. Desktop stores a rate against the default
+        # currency but older rows, other tools and the pre-1.5
+        # server stored either way, so both directions compete.
+        for p in self._find_prices(
+            book, currency_guid=default_currency.guid,
+        ):
+            _offer(p.commodity.guid, p, Decimal(str(p.value)))
+        for p in self._find_prices(
+            book, commodity_guid=default_currency.guid,
+        ):
+            inverse = Decimal(str(p.value))
+            if inverse > 0:
+                _offer(p.currency.guid, p, Decimal("1") / inverse)
         result: dict[str, tuple[Decimal, date, str | None]] = {
             guid: (rate, p_date, None)
             for guid, (p_date, _rank, rate) in latest.items()
@@ -466,8 +574,8 @@ class CurrencyMixin:
     def _commodities_with_market_prices(
         book: piecash.Book,
     ) -> list[piecash.Commodity]:
-        """Distinct commodities that appear on either side of a market
-        price (``type='transaction'`` rows excluded).
+        """Distinct commodities that appear on either side of a price
+        (inside ``_market_prices_only``, of a quote).
 
         Both sides matter: a held currency may appear only as the
         *quote* side of a pair (``USD/GBP`` rather than ``GBP/USD``),
@@ -478,8 +586,18 @@ class CurrencyMixin:
         if cached is not None:
             return cached
 
+        # Enumerated over EVERY row whatever the market-only flag
+        # says: the set is memoized once per book, and a superset
+        # only costs the market-only pass a chain attempt that finds
+        # no quote.
+        flag = getattr(book, CurrencyMixin._MARKET_ONLY_ATTR, False)
+        setattr(book, CurrencyMixin._MARKET_ONLY_ATTR, False)
+        try:
+            rows = CurrencyMixin._find_prices(book)
+        finally:
+            setattr(book, CurrencyMixin._MARKET_ONLY_ATTR, flag)
         seen: dict[str, piecash.Commodity] = {}
-        for p in CurrencyMixin._find_prices(book, market_only=True):
+        for p in rows:
             for c in (p.commodity, p.currency):
                 seen.setdefault(c.guid, c)
         result = sorted(
@@ -631,7 +749,7 @@ class CurrencyMixin:
         if res is not None:
             return res
         for p in self._find_prices(
-            book, commodity_guid=commodity.guid, market_only=True,
+            book, commodity_guid=commodity.guid,
         ):
             # Newest-first list with no date bound; the outer hop
             # honors the same anchor convention as the legs —
@@ -937,7 +1055,7 @@ class CurrencyMixin:
         sym = account.commodity.mnemonic
         rate = rates.get(account.commodity.guid)
         if rate is not None:
-            note = f"{quantity} {sym} @ {rate}"
+            note = f"{quantity} {sym} @ {_format_rate(rate)}"
             via = (provenance or {}).get(account.commodity.guid)
             if via:
                 note += f" ({via})"
@@ -1123,7 +1241,6 @@ class CurrencyMixin:
             book,
             commodity_guid=from_commodity.guid,
             currency_guid=to_commodity.guid,
-            market_only=True,  # load-bearing: skips FX placeholders
         ):
             p_date = _to_date(p.date)
             days = (as_of - p_date).days
@@ -1146,7 +1263,6 @@ class CurrencyMixin:
             book,
             commodity_guid=to_commodity.guid,
             currency_guid=from_commodity.guid,
-            market_only=True,  # load-bearing: skips FX placeholders
         ):
             p_date = _to_date(p.date)
             days = (as_of - p_date).days
@@ -1165,12 +1281,19 @@ class CurrencyMixin:
                 if _better(-days, rank, best_after_inverse):
                     best_after_inverse = (-days, rank, rate, p_date)
 
-        for candidate in (
-            best_before_direct,
-            best_before_inverse,
-            best_after_direct,
-            best_after_inverse,
+        # Direct and inverse rows are one list to GnuCash
+        # (``pricedb_get_prices_internal`` merges them); the nearer,
+        # then the more current, wins whichever way it is stored.
+        # Before-anchor candidates still precede after-anchor ones.
+        for direct, inverse in (
+            (best_before_direct, best_before_inverse),
+            (best_after_direct, best_after_inverse),
         ):
+            candidate = direct
+            if inverse is not None and _better(
+                inverse[0], inverse[1], direct,
+            ):
+                candidate = inverse
             if candidate is not None:
                 age_days, _rank, rate, p_date = candidate
                 return (rate, age_days, p_date)

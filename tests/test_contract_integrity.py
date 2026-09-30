@@ -551,7 +551,7 @@ class TestWriteVerificationCoverage:
     def test_every_raw_sql_dml_site_has_paired_verify(self):
         import re
         verify_pattern = re.compile(
-            r"_verify_(write|composite_write|delete)\b"
+            r"_verify_(write|composite_write|delete|none_remaining)\b"
         )
         missing: list[str] = []
         for path, line_no, table, op in self._scan_dml_sites():

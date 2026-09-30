@@ -35,9 +35,12 @@ from sqlalchemy import exc as sa_exc
 # churn across the codebase.
 from gnucash_mcp.book._currency import (  # noqa: F401
     CurrencyMixin,
-    _is_market_price,
     _to_date,
 )
+# Imported for its side effect: replaces piecash's Price and Split
+# validators with ones that write GnuCash desktop's shapes. Must
+# hold whichever modules are enabled, hence here.
+from gnucash_mcp.book import _piecash_shapes  # noqa: F401,E402
 from gnucash_mcp.book._query import QueryMixin
 from gnucash_mcp._format import _book_display_name, _parse_book_url
 
@@ -234,6 +237,24 @@ def _recurrence_next(
 
 
 
+def _day_end(d: date) -> datetime:
+    """``gnc_time64_get_day_end``: 23:59:59 local on the date, what
+    desktop stores for a reconciled split's reconcile_date and the
+    account's reconcile-info last-date (twin, 2026-09-29)."""
+    return datetime.combine(d, datetime.max.time()).replace(microsecond=0).astimezone()
+
+
+def _neutral_time(d: date) -> datetime:
+    """GnuCash's neutral time of day for a date-valued timestamp:
+    10:59:00 UTC (``gnc_time64_get_day_neutral``), the convention
+    behind ``transactions.post_date`` and, on desktop, a document's
+    ``date_opened`` / ``date_posted``. Timezone-aware so piecash's
+    local→UTC conversion is a no-op."""
+    from datetime import timezone
+
+    return datetime(d.year, d.month, d.day, 10, 59, 0, tzinfo=timezone.utc)
+
+
 def _future_statement_warning(statement_date: date) -> str | None:
     """A statement is not dated in the future; one that is, is a
     typo. The reconcile goes through (desktop accepts the date too)
@@ -385,12 +406,20 @@ def _split_amounts(value, quantity, currency, account) -> tuple:
     )
 
 
+# GnuCash stores an unreconciled split's reconcile_date as time64 0.
+_EPOCH = datetime(1970, 1, 1, tzinfo=__import__("datetime").timezone.utc)
+
+
 def _new_split(account, value, quantity, currency, **fields):
     """The one constructor of a ``piecash.Split``: amounts through
     ``_split_amounts`` first. ``currency`` is the transaction's, which
     may not exist yet when the split is built. Locked by
     ``test_amount_precision.py``: no ``piecash.Split(`` elsewhere."""
     value, quantity = _split_amounts(value, quantity, currency, account)
+    # An unreconciled split's reconcile_date is the epoch on desktop
+    # (time64 0), never NULL — the one column a plain transaction
+    # twin found different (2026-09-29).
+    fields.setdefault("reconcile_date", _EPOCH)
     return piecash.Split(
         account=account, value=value, quantity=quantity, **fields,
     )
@@ -655,6 +684,13 @@ def _verify_composite_write(
             f"Write verification failed: {label} not found "
             f"after INSERT (count={count})"
         )
+
+
+def _verify_none_remaining(left: int, label: str) -> None:
+    """Verification for a bulk UPDATE: the count of rows still in the
+    old state must be zero afterwards."""
+    if left:
+        raise RuntimeError(f"{label}: {left} row(s) still in the old state")
 
 
 def _verify_delete(
@@ -1140,7 +1176,9 @@ def _commodity_to_compact_line(namespace: str, entry: dict) -> str:
     name = entry.get("fullname", "")
     parts = [prefix, name]
     lp = entry.get("latest_price")
-    if lp:
+    if entry.get("default_currency"):
+        parts.append("— (default currency)")
+    elif lp:
         parts.append(f"{lp['value']} {lp['currency']} ({lp['date']})")
     # Work-list markers, present only under the stale_days filter.
     if entry.get("no_price"):
@@ -1362,7 +1400,10 @@ def _upcoming_to_compact_line(
     # "2000" from an HKD schedule reads as the book currency.
     if entry.get("currency"):
         amount = f"{amount} {entry['currency']}"
-    due = f"{-days} days overdue" if days < 0 else f"{days} days"
+    due = (
+        f"{-days} day{'s' if days != -1 else ''} overdue" if days < 0
+        else f"{days} day{'s' if days != 1 else ''}"
+    )
     return f"{short}\t{name}\t{occ_date}\t{due}\t{amount}"
 
 
@@ -2507,7 +2548,7 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         Returns the non-zero counts / flags, keyed the way each
         module's response already reports them: ``templates_migrated``,
         ``invoice_links_migrated``, ``due_dates_backfilled``,
-        ``book_stamped``, ``book_scrubbed``.
+        ``voids_migrated``, ``book_stamped``, ``book_scrubbed``.
         """
         out: dict = {}
         sweep = getattr(self, "_migrate_all_legacy", None)
@@ -2525,6 +2566,24 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
             n = backfill(book)
             if n:
                 out["due_dates_backfilled"] = n
+        voids = getattr(self, "_migrate_void_shapes", None)
+        if voids is not None:
+            n = voids(book)
+            if n:
+                out["voids_migrated"] = n
+        biz = getattr(self, "_migrate_business_shapes", None)
+        if biz is not None:
+            out.update(biz(book))
+        n = self._migrate_split_reconcile_dates(book)
+        if n:
+            out["split_reconcile_dates_filled"] = n
+        out.update(self._migrate_reconcile_conventions(book))
+        n = self._migrate_slot_fillers(book)
+        if n:
+            out["slot_fillers_normalized"] = n
+        prices = getattr(self, "_migrate_price_shapes", None)
+        if prices is not None:
+            out.update(prices(book))
         stamp = getattr(self, "_ensure_budget_unreversed", None)
         if stamp is not None:
             from piecash.budget import Budget
@@ -2656,6 +2715,67 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
                 out[acct][key] = int(r[2])
         return out
 
+    @staticmethod
+    def _migrate_slot_fillers(book) -> int:
+        """Write path only: every slot the ORM wrote before
+        2026-09-30 carries piecash's filler columns (``double_val``
+        0.0, ``timespec_val`` NULL); GnuCash's SQL backend writes
+        NULL and the epoch (``_piecash_shapes`` has the story). Two
+        portable UPDATEs over the columns a slot's type does not
+        use, verified by re-count. Returns the rows brought along."""
+        from sqlalchemy import text
+
+        # KVP_TYPE_DOUBLE = 2 and KVP_TYPE_TIMESPEC = 6 own those
+        # columns; their values are data, not filler.
+        stale = (
+            "SELECT COUNT(*) FROM slots WHERE "
+            "(double_val = 0 AND slot_type <> 2) OR "
+            "(timespec_val IS NULL AND slot_type <> 6)"
+        )
+        n = book.session.execute(text(stale)).scalar()
+        if not n:
+            return 0
+        book.session.execute(text(
+            "UPDATE slots SET double_val = NULL "
+            "WHERE double_val = 0 AND slot_type <> 2"
+        ))
+        book.session.execute(
+            text(
+                "UPDATE slots SET timespec_val = :epoch "
+                "WHERE timespec_val IS NULL AND slot_type <> 6"
+            ),
+            {"epoch": "1970-01-01 00:00:00"},
+        )
+        left = book.session.execute(text(stale)).scalar()
+        _verify_none_remaining(left, f"slot filler columns ({n} rows)")
+        book.session.expire_all()
+        return int(n)
+
+    @staticmethod
+    def _write_balance_limit_frame(book, account_guid: str) -> None:
+        """The empty ``balance-limit`` frame desktop's account dialog
+        leaves on every account it saves: ``gnc_ui_to_account``
+        (dialog-account.c) always calls
+        ``xaccAccountSetIncludeSubAccountBalances``, which creates
+        the frame, and with no limits set nothing goes in it
+        (cross-currency twin, 2026-09-30). The account row must be
+        flushed first."""
+        import uuid
+
+        from piecash.kvp import KVP_Type, Slot
+
+        book.session.execute(
+            Slot.__table__.insert().values(
+                obj_guid=account_guid, name="balance-limit",
+                slot_type=KVP_Type.KVP_TYPE_FRAME, guid_val=uuid.uuid4().hex,
+            )
+        )
+        _verify_composite_write(
+            book.session, Slot.__table__,
+            {"obj_guid": account_guid, "name": "balance-limit"},
+            "balance-limit frame",
+        )
+
     def _write_reconcile_info(self, book, account, statement_date: date) -> None:
         """Record a reconcile the way desktop's window does on
         Finish: remember the interval since the previous statement
@@ -2748,11 +2868,157 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
                 )
         # Desktop stores the statement date as a day-end time64
         # (gnc_time64_get_day_end_gdate); local time, as it does.
-        day_end = datetime.combine(statement_date, datetime.max.time())
         put_int64(
             frame, f"{f}/{self._RECONCILE_LAST_DATE}",
-            int(day_end.replace(microsecond=0).timestamp()),
+            int(_day_end(statement_date).timestamp()),
         )
+        # Finish also records the include-children status (0 unless
+        # the dialog's box was ticked); never overwrite a user's 1.
+        children_key = f"{f}/include-children"
+        if not book.session.execute(
+            text("SELECT 1 FROM slots WHERE obj_guid = :o AND name = :n"),
+            {"o": frame, "n": children_key},
+        ).first():
+            put_int64(frame, children_key, 0)
+
+    @staticmethod
+    def _migrate_reconcile_conventions(book) -> dict:
+        """Write path only: reconciled splits the server dated at local
+        midnight move to the statement date's local day-end (desktop's
+        reconcile_date), and reconcile-info frames the server wrote
+        without ``include-children`` get desktop's 0. Server-dated
+        rows are recognized by their time of day; one UPDATE per
+        distinct old value, verified by re-count."""
+        from datetime import timezone
+
+        from piecash.core.transaction import Split
+        from piecash.kvp import KVP_Type, Slot
+        from sqlalchemy import text
+
+        out: dict = {}
+        olds = [
+            r[0] for r in book.session.execute(
+                text(
+                    "SELECT DISTINCT reconcile_date FROM splits "
+                    "WHERE reconcile_state = 'y' AND reconcile_date IS NOT NULL"
+                ),
+            ).fetchall()
+        ]
+        moved = 0
+        for old in olds:
+            if isinstance(old, str):
+                old_dt = datetime.fromisoformat(old)
+            elif isinstance(old, datetime):
+                old_dt = old
+            else:
+                continue
+            as_utc = old_dt if old_dt.tzinfo else old_dt.replace(tzinfo=timezone.utc)
+            local = as_utc.astimezone()
+            if local.time() != datetime.min.time():
+                continue  # not the server's midnight shape
+            new = _day_end(local.date())
+            book.session.execute(
+                Split.__table__.update()
+                .where(Split.__table__.c.reconcile_state == "y")
+                .where(Split.__table__.c.reconcile_date == as_utc)  # tz-aware: no local shift
+                .values(reconcile_date=new)
+            )
+            left = book.session.execute(
+                text(
+                    "SELECT COUNT(*) FROM splits WHERE reconcile_state = 'y' "
+                    "AND reconcile_date = :old"
+                ),
+                {"old": old},
+            ).scalar()
+            _verify_none_remaining(left, f"reconcile_date {old} → day end")
+            moved += 1
+        if moved:
+            out["reconcile_dates_normalized"] = moved
+
+        frames = [
+            r[0] for r in book.session.execute(
+                text(
+                    "SELECT guid_val FROM slots WHERE name = 'reconcile-info' "
+                    "AND slot_type = 9 AND guid_val NOT IN ("
+                    "SELECT obj_guid FROM slots WHERE name = 'reconcile-info/include-children')"
+                ),
+            ).fetchall()
+        ]
+        for frame in frames:
+            book.session.execute(
+                Slot.__table__.insert().values(
+                    obj_guid=frame, name="reconcile-info/include-children",
+                    slot_type=KVP_Type.KVP_TYPE_GINT64, int64_val=0,
+                )
+            )
+            _verify_composite_write(
+                book.session, Slot.__table__,
+                {"obj_guid": frame, "name": "reconcile-info/include-children"},
+                "include-children on a reconcile-info frame",
+            )
+        if frames:
+            out["reconcile_frames_completed"] = len(frames)
+        return out
+
+    @staticmethod
+    def _migrate_split_reconcile_dates(book) -> int:
+        """Write path only: an unreconciled split's reconcile_date is
+        the epoch (time64 0) on desktop. Two shapes the server left:
+
+        * NULL — every split written before 2026-09-29.
+        * The epoch at LOCAL midnight — the receivable/payable split
+          of every posted document until 2026-09-30, from a naive
+          ``datetime(1970, 1, 1)`` that piecash localized
+          (``1970-01-01 08:00:00`` on a Pacific machine; the
+          cross-currency invoice twin's one differing column).
+
+        Portable UPDATEs, verified by re-count."""
+        from piecash.core.transaction import Split
+        from sqlalchemy import text
+
+        # Within a day of the epoch but not the epoch, on a split
+        # that is not reconciled: no real reconcile date lives there.
+        near = (
+            "SELECT COUNT(*) FROM splits WHERE reconcile_state <> 'y' "
+            "AND reconcile_date > :lo AND reconcile_date < :hi "
+            "AND reconcile_date <> :epoch"
+        )
+        bounds = {
+            "lo": "1969-12-31 00:00:00", "hi": "1970-01-02 00:00:00",
+            "epoch": "1970-01-01 00:00:00",
+        }
+        nulls = book.session.execute(
+            text("SELECT COUNT(*) FROM splits WHERE reconcile_date IS NULL")
+        ).scalar()
+        shifted = book.session.execute(text(near), bounds).scalar()
+        if not nulls and not shifted:
+            return 0
+        if nulls:
+            book.session.execute(
+                Split.__table__.update()
+                .where(Split.__table__.c.reconcile_date.is_(None))
+                .values(reconcile_date=_EPOCH)
+            )
+            left = book.session.execute(
+                text("SELECT COUNT(*) FROM splits WHERE reconcile_date IS NULL")
+            ).scalar()
+            _verify_none_remaining(
+                left, f"split reconcile_date fill ({nulls} rows)",
+            )
+        if shifted:
+            book.session.execute(
+                text(
+                    "UPDATE splits SET reconcile_date = :epoch WHERE "
+                    "reconcile_state <> 'y' AND reconcile_date > :lo "
+                    "AND reconcile_date < :hi AND reconcile_date <> :epoch"
+                ),
+                bounds,
+            )
+            left = book.session.execute(text(near), bounds).scalar()
+            _verify_none_remaining(
+                left, f"split reconcile_date epoch ({shifted} rows)",
+            )
+        return int(nulls) + int(shifted)
 
     def _strip_guid_slots(
         self, book, obj_guids: list[str], label: str, objects=(),

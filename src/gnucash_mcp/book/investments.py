@@ -12,13 +12,14 @@ Depends on shared helpers from BaseGnuCashBook:
     (module-level in _base)
 """
 
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 
 import piecash
 from piecash.core.commodity import Price
 from piecash.core.transaction import Lot
 
+from gnucash_mcp.book._currency import _price_row_utc, _price_tie_rank
 from gnucash_mcp.book._base import (
     _lot_cache_flag,
     _LOT_CLOSED,
@@ -26,9 +27,10 @@ from gnucash_mcp.book._base import (
     _lot_is_closed,
     _commodity_to_compact_line,
     _guid_prefix_map,
-    _is_market_price,
     _is_voided,
     _lot_to_compact_line,
+    _neutral_time,
+    _verify_none_remaining,
     _to_date,
     _to_decimal,
     _unique_prefix,
@@ -79,11 +81,10 @@ class InvestmentsMixin:
             # Latest market quote per commodity. ``_find_prices`` is
             # newest-first with the same-date tie-break every
             # valuation path uses, so the first row per commodity is
-            # the one the reports price by; ``market_only`` keeps a
-            # newer type='transaction' placeholder from shadowing the
-            # user's last nav quote.
+            # the one the reports price by — a transaction's implied
+            # rate included, as desktop counts it.
             latest_market: dict[str, tuple[date, "Price"]] = {}
-            for p in self._find_prices(book, market_only=True):
+            for p in self._find_prices(book):
                 latest_market.setdefault(
                     p.commodity.guid, (_to_date(p.date), p),
                 )
@@ -132,7 +133,16 @@ class InvestmentsMixin:
                     "fraction": commodity.fraction,
                 }
 
-                if commodity.guid in latest_market:
+                if commodity == default_commodity:
+                    # The book's default currency has no price OF its
+                    # own: every other line is priced IN it, and a row
+                    # stored the other way round (USD/EUR, from an
+                    # older writer) restates a EUR rate backwards.
+                    # ``get_latest_price`` answers null here too
+                    # (bookkeeper ruling B10, 2026-09-30).
+                    entry["latest_price"] = None
+                    entry["default_currency"] = True
+                elif commodity.guid in latest_market:
                     _, price = latest_market[commodity.guid]
                     entry["latest_price"] = {
                         "value": str(price.value),
@@ -305,6 +315,205 @@ class InvestmentsMixin:
                 "status": "created",
             }
 
+    # gnc-pricedb.h, verbatim: the only source strings GnuCash's
+    # price editor recognizes. Anything else renders as "Invalid"
+    # (gnc_price_source_string_to_enum), which is how every price the
+    # sample generators wrote as ``user:market_data`` looked in
+    # desktop (2026-09-29). Spellings the server's own history used
+    # map to the string GnuCash uses for a quote feed.
+    _GNC_PRICE_SOURCES = frozenset({
+        "user:price-editor", "Finance::Quote", "user:price",
+        "user:xfer-dialog", "user:split-register", "user:split-import",
+        "user:stock-split", "user:stock-transaction", "user:invoice-post",
+        "temporary", "invalid",
+    })
+    _PRICE_SOURCE_ALIASES = {
+        "user:market_data": "Finance::Quote",
+        "user:market-data": "Finance::Quote",
+    }
+    # gnc-pricedb.h PRICE_TYPE_*: "bid", "ask", "last", "nav",
+    # "transaction", "unknown".
+    _GNC_PRICE_TYPES = frozenset({"bid", "ask", "last", "nav", "transaction", "unknown"})
+
+    @staticmethod
+    def _gnc_price_source(source: str) -> str:
+        source = InvestmentsMixin._PRICE_SOURCE_ALIASES.get(source, source)
+        if source not in InvestmentsMixin._GNC_PRICE_SOURCES:
+            raise ValueError(
+                f"Price source {source!r} is not one GnuCash recognizes "
+                f"(it would show as Invalid in the price editor). Use one "
+                f"of: {', '.join(sorted(InvestmentsMixin._GNC_PRICE_SOURCES))}. "
+                f"A quote feed is 'Finance::Quote'; a price you typed is "
+                f"'user:price'."
+            )
+        return source
+
+    @staticmethod
+    def _gnc_price_type(price_type: str) -> str:
+        if price_type not in InvestmentsMixin._GNC_PRICE_TYPES:
+            raise ValueError(
+                f"Price type {price_type!r} is not one GnuCash recognizes. "
+                f"Use one of: {', '.join(sorted(InvestmentsMixin._GNC_PRICE_TYPES))}."
+            )
+        return price_type
+
+    def _migrate_price_shapes(self, book) -> dict:
+        """Write path only: price rows the server (or its generators)
+        wrote before 2026-09-29 to desktop's shape.
+
+        * A source string GnuCash recognizes (``user:market_data``
+          and its hyphenated twin become ``Finance::Quote``, any
+          other unknown string ``user:price``).
+        * The date at the neutral time. Only a row at the server's
+          local-midnight shape moves; a row desktop stamped at some
+          other time is desktop's business.
+        * A quote's value reduced (``gnc_numeric_reduce``: desktop's
+          editor stores 178.70 as 1787/10; piecash keeps the typed
+          denominator, 17870/100). A ``type='transaction'`` row is
+          NOT reduced — ``record_price`` stores those at a fixed
+          ``scu × 10000`` denominator.
+        * An implied price piecash wrote for a currency account
+          (``user:split-register``, six decimals, the split's own
+          direction) restated as the exchange dialog's row — exact
+          ratio, stored against the default currency,
+          ``user:xfer-dialog`` — when the split it came from can be
+          identified. Done only in the pass that moves the row off
+          local midnight, so it runs once per row.
+
+        Runs through ``_upgrade_book_shapes``."""
+        from fractions import Fraction
+        from sqlalchemy import text
+
+        from gnucash_mcp.book._piecash_shapes import (
+            _cross_commodity_split_index,
+            _restate_price,
+            _restated_piecash_price,
+        )
+
+        out: dict = {}
+        sources = 0
+        dates = 0
+        values = 0
+        restated = 0
+        split_index = None
+        commodities = None
+        rows = book.session.execute(
+            text(
+                "SELECT guid, source, date, value_num, value_denom, type, "
+                "commodity_guid, currency_guid FROM prices"
+            )
+        ).fetchall()
+        for guid, src, raw, num, denom, ptype, comm_guid, curr_guid in rows:
+            src = src or ""
+            if src not in self._GNC_PRICE_SOURCES:
+                new_src = self._PRICE_SOURCE_ALIASES.get(src, "user:price")
+                book.session.execute(
+                    text("UPDATE prices SET source = :s WHERE guid = :g"),
+                    {"s": new_src, "g": guid},
+                )
+                left = book.session.execute(
+                    text("SELECT COUNT(*) FROM prices WHERE guid = :g AND source <> :s"),
+                    {"s": new_src, "g": guid},
+                ).scalar()
+                _verify_none_remaining(left, f"price {guid[:8]} source → {new_src}")
+                sources += 1
+            as_utc = _price_row_utc(raw)
+            local = as_utc.astimezone() if as_utc is not None else None
+            move_date = local is not None and local.time() == datetime.min.time()
+            implied = ptype == "transaction"
+            stored = Fraction(int(num), int(denom)) if denom else None
+            reduce_value = (
+                not implied and stored is not None
+                and stored.denominator != int(denom)
+            )
+            if move_date or reduce_value:
+                self._stamp_price_row(
+                    book, guid,
+                    price_date=local.date() if move_date else None,
+                    value=stored if reduce_value else None,
+                )
+                dates += int(move_date)
+                values += int(bool(reduce_value))
+            if (
+                implied and move_date and stored is not None
+                and src == "user:split-register"
+            ):
+                if split_index is None:
+                    split_index = _cross_commodity_split_index(book.session)
+                    commodities = {c.guid: c for c in book.commodities}
+                    try:
+                        default = self._require_default_currency(book)
+                    except Exception:
+                        default = None
+                comm = commodities.get(comm_guid)
+                curr = commodities.get(curr_guid)
+                shape = None
+                if comm is not None and curr is not None:
+                    shape = _restated_piecash_price(
+                        split_index.get((comm_guid, curr_guid, local.date()), []),
+                        stored, comm, curr, default,
+                    )
+                if shape is not None:
+                    _restate_price(book.session, guid, *shape)
+                    restated += 1
+        if sources:
+            out["price_sources_normalized"] = sources
+        if dates:
+            out["price_dates_normalized"] = dates
+        if values:
+            out["price_values_reduced"] = values
+        if restated:
+            out["implied_prices_restated"] = restated
+        if sources or dates or values or restated:
+            book.session.expire_all()
+            self._invalidate_price_caches(book)
+        return out
+
+    @staticmethod
+    def _stamp_price_row(book, guid: str, price_date=None, value=None) -> None:
+        """Bring one price row to the price editor's shape: ``date``
+        at the neutral time (10:59:00 UTC) and ``value_num`` /
+        ``value_denom`` reduced, as ``gnc_numeric_reduce`` leaves
+        them. piecash's ``Price.date`` column accepts only a bare
+        date and binds it at LOCAL midnight, and its value hybrid
+        keeps the typed denominator, so the ORM can't write either;
+        one portable UPDATE, verified by read-back. The date is
+        bound as the ``YYYY-MM-DD HH:MM:SS`` string GnuCash stores in
+        SQLite and PostgreSQL/MySQL cast to a timestamp. ``value`` is
+        anything ``Fraction`` accepts (a Decimal, a string, a
+        Fraction)."""
+        from fractions import Fraction
+        from sqlalchemy import text
+
+        sets = []
+        params: dict = {"g": guid}
+        if price_date is not None:
+            params["d"] = _neutral_time(price_date).strftime("%Y-%m-%d %H:%M:%S")
+            sets.append("date = :d")
+        if value is not None:
+            frac = Fraction(value)
+            params["n"] = frac.numerator
+            params["dn"] = frac.denominator
+            sets.append("value_num = :n")
+            sets.append("value_denom = :dn")
+        if not sets:
+            return
+        book.session.execute(
+            text(f"UPDATE prices SET {', '.join(sets)} WHERE guid = :g"),
+            params,
+        )
+        left = book.session.execute(
+            text(
+                "SELECT COUNT(*) FROM prices WHERE guid = :g AND NOT ("
+                + " AND ".join(sets) + ")"
+            ),
+            params,
+        ).scalar()
+        _verify_none_remaining(left, f"price {guid[:8]} → editor shape")
+        stale = book.session.get(Price, guid)
+        if stale is not None:
+            book.session.expire(stale)
+
     @staticmethod
     def _upsert_price(
         book, comm, resolved_currency, price_date,
@@ -320,6 +529,8 @@ class InvestmentsMixin:
 
         Returns ``"updated"`` or ``"created"``.
         """
+        source = InvestmentsMixin._gnc_price_source(source)
+        price_type = InvestmentsMixin._gnc_price_type(price_type)
         # Indexed query, not a full book.prices walk.
         candidates = book.session.query(Price).filter_by(
             commodity_guid=comm.guid,
@@ -332,12 +543,19 @@ class InvestmentsMixin:
                 existing = p
                 break
 
+        # Desktop stores a price's date at the neutral time (10:59:00
+        # UTC) and its value reduced; piecash binds a bare date at
+        # local midnight and keeps the typed denominator (price twin,
+        # 2026-09-29), so the row is flushed and re-stamped.
         if existing:
-            existing.value = _to_decimal(value)
             existing.type = price_type
+            book.flush()
+            InvestmentsMixin._stamp_price_row(
+                book, existing.guid, price_date=price_date,
+                value=_to_decimal(value),
+            )
             return "updated"
-        # piecash expects datetime.date, not datetime.datetime
-        piecash.Price(
+        created = piecash.Price(
             commodity=comm,
             currency=resolved_currency,
             date=price_date,
@@ -345,41 +563,47 @@ class InvestmentsMixin:
             type=price_type,
             source=source,
         )
+        book.flush()
+        InvestmentsMixin._stamp_price_row(
+            book, created.guid, price_date=price_date, value=_to_decimal(value),
+        )
         return "created"
 
     @staticmethod
     def _same_date_outranker(
         book, comm, resolved_currency, price_date, source,
     ) -> str | None:
-        """Source of a same-date row that beats ``source`` in the
-        tie-break (``_price_source_rank`` — the bookkeeper's ruling: manual
-        quote > other user:* > feed), or None when the written row
-        is the effective rate for its date.
+        """Source of a same-day row desktop will use instead of the
+        one just written under ``source``, or None when the written
+        row is the day's current price.
 
-        An operator who just wrote a price and can't see it winning
-        has been misled by silence — both ``create_price`` and
-        ``create_prices`` surface this so single and batch entry
-        can't diverge on it. Only a strictly higher rank reports;
-        an equal-rank guid tie is arbitrary-but-stable and naming a
-        "winner" there would imply an ordering that isn't semantic.
+        The rule is ``_price_tie_rank`` — GnuCash's own: the later
+        stored time, then the smaller GUID. An operator who just
+        wrote a price and can't see it winning has been misled by
+        silence — both ``create_price`` and ``create_prices``
+        surface this so single and batch entry can't diverge on it.
+        Reads the rows fresh (not the memo) so a batch sees its own
+        earlier writes.
         """
-        from gnucash_mcp.book._currency import _price_source_rank
-        own_rank = _price_source_rank(source)
-        best = None
-        for p in book.session.query(Price).filter_by(
-            commodity_guid=comm.guid,
-            currency_guid=resolved_currency.guid,
-        ).all():
-            if _to_date(p.date) != price_date or p.source == source:
+        from gnucash_mcp.book._currency import CurrencyMixin
+
+        own = None
+        others = []
+        for p in CurrencyMixin._query_prices_with_time(
+            book, comm.guid, resolved_currency.guid,
+        ):
+            if _to_date(p.date) != price_date:
                 continue
-            if not _is_market_price(p):
-                continue
-            rank = _price_source_rank(p.source)
-            if rank > own_rank and (
-                best is None or rank > _price_source_rank(best)
-            ):
-                best = p.source
-        return best
+            if p.source == source:
+                own = p
+            else:
+                others.append(p)
+        if own is None or not others:
+            return None
+        best = max(others, key=_price_tie_rank)
+        if _price_tie_rank(best) > _price_tie_rank(own):
+            return best.source
+        return None
 
     def _resolve_price_commodity(self, book, mnemonic: str,
                                  namespace: str | None):
@@ -424,7 +648,7 @@ class InvestmentsMixin:
         Each entry: ``{ref, commodity, date (date), value,
         namespace (optional), currency (optional — quote currency,
         defaults to the book default), source (optional, default
-        "user:price"), price_type (optional, default "nav")}``.
+        "user:price"), price_type (optional, default "last")}``.
 
         Per-row semantics are ``create_price``'s exactly (shared
         upsert chokepoint): same (commodity, currency, date,
@@ -485,7 +709,7 @@ class InvestmentsMixin:
                         "currency": resolved_currency,
                         "date": p["date"],
                         "value": str(value),
-                        "type": p.get("price_type") or "nav",
+                        "type": p.get("price_type") or "last",
                         "source": p.get("source") or "user:price",
                     })
                 except (ValueError, KeyError) as e:
@@ -571,13 +795,15 @@ class InvestmentsMixin:
                 if outranked_by:
                     by_ref[row["ref"]]["reason"] = (
                         f"outranked by {outranked_by!r} for this "
-                        f"date (manual sources win same-date ties)"
+                        f"date (desktop's order: later stamp, then smaller GUID)"
                     )
 
+            shapes: dict = {}
             if wrote:
+                shapes = self._upgrade_book_shapes(book)
                 book.save()
                 self._invalidate_price_caches(book)
-            return self._prices_envelope(prices, by_ref)
+            return {**self._prices_envelope(prices, by_ref), **shapes}
 
     @staticmethod
     def _prices_envelope(prices: list[dict], by_ref: dict) -> dict:
@@ -600,7 +826,7 @@ class InvestmentsMixin:
         value: str,
         currency: str | None = None,
         price_date: date | None = None,
-        price_type: str = "nav",
+        price_type: str = "last",
         source: str = "user:price",
     ) -> dict:
         """Record a price for a commodity (stock price, NAV, exchange rate).
@@ -614,7 +840,7 @@ class InvestmentsMixin:
                 means 1 USD = 7.30 CNY). Pass explicitly for pairs
                 that don't involve the book default.
             price_date: Defaults to today.
-            price_type: "nav" (default), "last", "bid", "ask",
+            price_type: "last" (default, as desktop's price editor), "nav", "bid", "ask",
                 "unknown".
             source: Source identifier. Default "user:price".
 
@@ -649,6 +875,11 @@ class InvestmentsMixin:
                     book, currency,
                 )
 
+            # A price write converts the book's pre-1.5 shapes first
+            # (generator sources desktop shows as Invalid, midnight
+            # dates) so this row and the existing ones share one
+            # convention.
+            shapes = self._upgrade_book_shapes(book)
             status = self._upsert_price(
                 book, comm, resolved_currency, price_date,
                 value, price_type, source,
@@ -667,6 +898,7 @@ class InvestmentsMixin:
                 "value": value,
                 "type": price_type,
                 "status": "updated" if existing else "created",
+                **shapes,
             }
             outranked_by = self._same_date_outranker(
                 book, comm, resolved_currency, price_date, source,
@@ -675,7 +907,7 @@ class InvestmentsMixin:
                 result["note"] = (
                     f"recorded, but a {outranked_by!r} price for "
                     f"this date outranks it as the effective rate "
-                    f"(manual sources win same-date ties)"
+                    f"(desktop's order: later stamp, then smaller GUID)"
                 )
 
             return result
@@ -900,13 +1132,12 @@ class InvestmentsMixin:
             # The chokepoint's list is newest-first with the same-date
             # tie-break every valuation path uses, so the first row in
             # the requested quote currency IS the rate the reports
-            # price by; ``market_only`` keeps a type='transaction'
-            # placeholder from answering where the user expects their
-            # nav quote.
+            # price by, a transaction's implied rate included, as
+            # desktop counts it.
             latest = next(
                 (
                     p for p in self._find_prices(
-                        book, commodity_guid=comm.guid, market_only=True,
+                        book, commodity_guid=comm.guid,
                     )
                     if p.currency.mnemonic == currency
                 ),

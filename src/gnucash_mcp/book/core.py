@@ -68,6 +68,7 @@ from gnucash_mcp.book._base import (
     _account_to_compact_line,
     _account_to_dict,
     _commodity_quantum,
+    _day_end,
     _future_statement_warning,
     _gnc_bool,
     _guid_prefix_map,
@@ -1345,7 +1346,8 @@ class CoreMixin:
                         amount_str = f"{row['amount_due']:,}"
                         msg = (
                             f"Past due {doc_type}: {owner_name} "
-                            f"{days_overdue} days overdue, "
+                            f"{days_overdue} day"
+                            f"{'s' if days_overdue != 1 else ''} overdue, "
                             f"{currency} {amount_str}"
                         )
                         overdue_inv_entries.append(
@@ -1429,7 +1431,23 @@ class CoreMixin:
                     if s.account.commodity is not None:
                         recent_currencies.add(s.account.commodity.guid)
 
+            # ``dated`` is the rate valuation uses — a cross-currency
+            # transaction's implied rate included, as desktop counts
+            # it (ruling 2026-09-29). ``quoted`` is the same
+            # derivation over quotes somebody entered or fetched; it
+            # is consulted only to NAME the provenance of a stale
+            # rate. Staleness itself keys on the date of the rate
+            # valuation actually used, whatever its source, against
+            # one window (bookkeeper ruling, 2026-09-29 evening: the
+            # warning must describe the number displayed, never
+            # another subsystem's view). A fresh implied rate warns
+            # of nothing; an old one says what it is, and the
+            # phrasing carries the cure.
             dated = self._rates_as_of_dated(book, today, default_currency)
+            with self._market_prices_only(book):
+                quoted = self._rates_as_of_dated(
+                    book, today, default_currency,
+                )
             cutoff = today - timedelta(days=self._STALE_PRICE_DAYS)
 
             # (sort_key, message) — no-price entries sort to the
@@ -1451,16 +1469,24 @@ class CoreMixin:
                         f"Stale price: {commodity.mnemonic} no price on file",
                     ))
                     continue
-                _rate, rate_date, via = entry
+                rate, rate_date, via = entry
                 if rate_date < cutoff:
                     days_old = (today - rate_date).days
                     via_note = f" ({via})" if via else ""
-                    stale_entries.append((
-                        days_old,
-                        commodity.mnemonic,
-                        f"Stale price: {commodity.mnemonic} "
-                        f"last updated {days_old} days ago{via_note}",
-                    ))
+                    q = quoted.get(cguid)
+                    implied = q is None or (q[0], q[1]) != (rate, rate_date)
+                    if implied:
+                        text_ = (
+                            f"Stale price: {commodity.mnemonic} valued at "
+                            f"the rate of its last transaction, "
+                            f"{days_old} days ago{via_note}"
+                        )
+                    else:
+                        text_ = (
+                            f"Stale price: {commodity.mnemonic} "
+                            f"last updated {days_old} days ago{via_note}"
+                        )
+                    stale_entries.append((days_old, commodity.mnemonic, text_))
             stale_entries.sort(key=lambda e: (-e[0], e[1]))
             stale_prices = self._rollup_warnings(
                 [m for _, _, m in stale_entries],
@@ -5984,9 +6010,8 @@ class CoreMixin:
         })
 
         # Mutate: claims first (annotations + state), then builds.
-        rec_dt = datetime.combine(
-            statement_date, datetime.min.time()
-        )
+        # Desktop's reconcile_date: the statement's local day end.
+        rec_dt = _day_end(statement_date)
         for ln, s in claims:
             if ln.get("raw"):
                 s.memo = ln["raw"]
@@ -6383,6 +6408,8 @@ class CoreMixin:
             if notes:
                 new_account["notes"] = notes
 
+            book.flush()
+            self._write_balance_limit_frame(book, new_account.guid)
             book.save()
 
             short_guid = _unique_prefix(
