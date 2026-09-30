@@ -364,3 +364,22 @@ no such column. piecash stamped every cross-commodity split; the
 first fix stamped none. The server now stamps a split in a priced
 account (STOCK, MUTUAL, CURRENCY type) and nothing else, on entry
 or amount change only.
+
+The maintainer then re-dated both entries to 2026-09-20 in place.
+
+- **Stock side confirmed.** Committing the re-dated `AAPL 3` ran
+  `xaccTransRecordPrice` for the new day and desktop wrote
+  `AAPL/USD | 2026-09-20 10:59:00 | user:split-register |
+  transaction | 333333333/1000000` — the row
+  `test_stock_purchase_is_record_price` asserts for the same
+  purchase, denominator unreduced.
+- **Currency side: no row.** Re-dating `Euro test 3` wrote no price
+  for 2026-09-20. The register's `record_price` skips an account
+  that is not priced, and a date edit does not reopen the exchange
+  dialog, which is the only writer for a currency account. That is
+  the port's behavior too (a split whose amounts did not change
+  records nothing), but the dialog's to-amount row for a NEW
+  transfer on a free day is still without a desktop specimen.
+- Desktop also saved a blank transaction on 2026-09-20: empty
+  description, one zero-value Checking split. A stray register row,
+  not part of the probe.
