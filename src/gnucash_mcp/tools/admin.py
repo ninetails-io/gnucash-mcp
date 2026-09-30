@@ -71,7 +71,7 @@ def register(mcp, get_book) -> None:
 
         Args:
             account: Account ref: full path (e.g., "Liabilities:Credit Cards:Capital One"), %short GUID, or full 32-char GUID.
-            key: Slot key (e.g., "apr", "credit_limit").
+            key: Slot key (e.g., "apr", "credit_limit"). GnuCash's own keys (reconcile-info, lot-mgmt, ofx, import-map, placeholder, hidden, …) are refused; use update_account for placeholder.
             value: Slot value (always stored as string).
         """
         book = get_book()
@@ -94,9 +94,11 @@ def register(mcp, get_book) -> None:
         Permanent, and surgical: only the named key is deleted —
         other slots, the account, and its transactions are untouched.
         Errors, changing nothing, if the account ref or key doesn't
-        exist, or if the key contains '/' (reserved for internal
-        hierarchical slots; user slots are flat). get_account_slots
-        lists the removable keys; set_account_slot re-creates one.
+        exist, if the key contains '/' (reserved for internal
+        hierarchical slots; user slots are flat), or if the key is
+        GnuCash's own data rather than a custom string (reconcile-info,
+        ofx, import-map, placeholder, …). set_account_slot re-creates
+        a removed key.
 
         Args:
             account: Account ref: full path (e.g., "Liabilities:Credit Cards:Capital One"), %short GUID, or full 32-char GUID.

@@ -6836,19 +6836,41 @@ class BusinessMixin:
             inv.post_account = None
             book.flush()
 
-            # Read the credit-note flag AND the applies-to link
-            # BEFORE deleting: slot reads can flake ("Multiple rows
-            # returned with uselist=False") while lots/transactions
-            # are being deleted in the same session, and the delete
-            # sweeps both slots (see below).
+            # Read what the response needs BEFORE deleting: slot reads
+            # can flake ("Multiple rows returned with uselist=False")
+            # while lots/transactions are being deleted in the same
+            # session.
             is_credit_note = self._get_is_credit_note(inv)
-            applies_to_guid = (
-                self._get_applies_to_invoice_guid(inv)
-                if is_credit_note else None
-            )
             inv_id_snapshot = inv.id
             owner_type_snapshot = inv.owner_type
-            inv_guid_snapshot = inv.guid
+
+            # Strip GUID-valued slots and frames off the posting
+            # transaction, its splits, and the lot by raw SQL FIRST.
+            # Each carries a ``gncInvoice/invoice-guid`` GUID slot
+            # pointing at the invoice, and piecash's SlotGUID cascade
+            # treats every slot on the referenced invoice as that
+            # slot's children: an unstripped delete swept the
+            # invoice's OWN slots — desktop's document link
+            # (``assoc_uri``), the ``credit-note`` flag, the
+            # applies-to link. gncInvoiceUnpost never touches them.
+            # This site used to let the sweep happen and re-insert
+            # two of the slots by hand, for credit notes only
+            # (adversarial review 2026-09-30, C5).
+            owners = []
+            objects = []
+            if txn is not None:
+                txn_splits = list(txn.splits)
+                owners += [txn.guid] + [s.guid for s in txn_splits]
+                objects += [txn, *txn_splits]
+            if lot is not None:
+                owners.append(lot.guid)
+                objects.append(lot)
+            if owners:
+                self._strip_guid_slots(
+                    book, owners,
+                    f"unpost of {doc_label} {inv_id_snapshot}",
+                    objects=objects,
+                )
 
             # The transaction delete cascades its splits; the lot is
             # empty now that the posted-state pointers are cleared.
@@ -6856,48 +6878,6 @@ class BusinessMixin:
                 book.session.delete(txn)
             if lot is not None:
                 book.session.delete(lot)
-
-            if is_credit_note:
-                # Deleting the posting transaction sweeps the
-                # invoice's OWN slots along with the txn's: the
-                # txn carries a ``gncInvoice`` GUID slot, and
-                # piecash's overlapping slot-hierarchy relationship
-                # treats every slot on the referenced invoice as
-                # that slot's child frame, cascading them away.
-                # Restore the identity flag or this document comes
-                # back from unpost as a plain invoice.
-                # Core-table insert + the _verify_* chokepoint —
-                # the same idiom as the applies-to slot writes
-                # above. This site once used text() DML with a
-                # hand-rolled COUNT check, which the
-                # TestWriteVerificationCoverage scanner could not
-                # see (release-review finding 10).
-                from piecash.kvp import KVP_Type, Slot
-                book.flush()
-                book.session.execute(
-                    Slot.__table__.insert().values(
-                        obj_guid=inv_guid_snapshot,
-                        name="credit-note",
-                        slot_type=KVP_Type.KVP_TYPE_GINT64,
-                        int64_val=1,
-                    )
-                )
-                _verify_composite_write(
-                    book.session, Slot.__table__,
-                    {"obj_guid": inv_guid_snapshot,
-                     "name": "credit-note"},
-                    "credit-note flag restore",
-                )
-                # The applies-to link rides the same sweep. It is
-                # stored as a FRAME row on the invoice (``gnc-mcp``)
-                # with the value hung off the frame's guid, so the
-                # restore rebuilds both rows — the identity flag alone
-                # came back and the link silently vanished on every
-                # unpost (whole-tree review, 2026-09-04, class 3).
-                if applies_to_guid:
-                    self._write_applies_to_slot(
-                        book, inv_guid_snapshot, applies_to_guid,
-                    )
 
             book.save()
 
@@ -8258,8 +8238,15 @@ class BusinessMixin:
             # Slots (credit-note flag, applies-to link, date slots)
             # have no ON DELETE CASCADE on obj_guid — clean up
             # explicitly, same as _delete_business_person.
+            # Frames first (the ``gnc-mcp`` applies-to frame, any
+            # frame desktop hung on the document): deleting only the
+            # document's own rows orphaned their children.
             from piecash.kvp import Slot
 
+            self._strip_guid_slots(
+                book, [inv_guid],
+                f"delete of {type_label.lower()} '{doc_id}'",
+            )
             book.session.execute(
                 Slot.__table__.delete().where(
                     Slot.__table__.c.obj_guid == inv_guid
@@ -8325,6 +8312,16 @@ class BusinessMixin:
             if dependency_check is not None:
                 dependency_check(book, entity_guid)
 
+            # Frames first, the way gnc_sql_slots_delete walks them:
+            # desktop hangs ``payment/last_acct`` (a GUID) off a
+            # ``payment`` frame on customers and vendors, and deleting
+            # only the owner's own rows left the frame's children
+            # behind as orphans.
+            self._strip_guid_slots(
+                book, [entity_guid],
+                f"delete of {entity_label.lower()} '{entity_id}'",
+                objects=[entity],
+            )
             book.session.execute(
                 Slot.__table__.delete().where(
                     Slot.__table__.c.obj_guid == entity_guid

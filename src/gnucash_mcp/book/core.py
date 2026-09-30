@@ -6653,6 +6653,18 @@ class CoreMixin:
                 "status": "deleted",
             }
 
+            # Strip the account's GUID-valued slots and frames by raw
+            # SQL first. Desktop stores account links as GUID slots
+            # (``ofx/associated-income-account``,
+            # ``associated-account/<tag>``, ``lot-mgmt/gains-acct/…``,
+            # ``import-map/…``), and piecash's SlotGUID cascade would
+            # delete every slot of the account each one points at.
+            # Adversarial review 2026-09-30, C7.
+            self._strip_guid_slots(
+                book, [account.guid],
+                f"delete of account {account.guid[:8]}",
+                objects=[account],
+            )
             book.session.delete(account)
             book.save()
 
@@ -7552,8 +7564,21 @@ class CoreMixin:
                 for split in in_lots:
                     _lot_forget_flag(split.lot)
 
-            # 6. Delete existing splits
-            for split in list(transaction.splits):
+            # 6. Delete existing splits. Strip their GUID-valued
+            # slots and frames by raw SQL first, as delete_transaction
+            # does: a split's ``gains-split`` / ``gains-source`` slot
+            # points at a split in ANOTHER transaction, and piecash's
+            # SlotGUID cascade would delete every slot of that split
+            # (or raise CircularDependencyError on desktop's two-way
+            # pair). Adversarial review 2026-09-30, C4b.
+            old_splits = list(transaction.splits)
+            self._strip_guid_slots(
+                book,
+                [s.guid for s in old_splits],
+                f"replace_splits of {transaction.guid[:8]}",
+                objects=old_splits,
+            )
+            for split in old_splits:
                 book.delete(split)
 
             # 7. Create new splits

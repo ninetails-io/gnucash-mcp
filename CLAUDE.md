@@ -342,13 +342,33 @@ Established chokepoints and the rule each one owns:
   the storage boundary in exactly two places: GnuCash's natural
   sign on disk (credit-normal types negative, book stamped), the
   surface's magnitudes everywhere else.
-- `_strip_guid_slots` — called before every ORM delete of a
-  transaction or template row. piecash's `SlotGUID` inherits a
-  delete-orphan cascade joined on the referenced GUID, so deleting a
-  row that carries one sweeps every slot of the entity it points at
-  (the target account's for a template split, the schedule's for a
-  stamped instance, the invoice's for a posting transaction — the
-  credit-note incident). Strip GUID and frame rows by raw SQL first.
+- `_strip_guid_slots` — called before every ORM delete of a row
+  that can carry a GUID slot or a frame: transactions, splits, lots,
+  accounts, template rows, parties, documents. piecash's `SlotGUID`
+  inherits a delete-orphan cascade joined on the referenced GUID, so
+  deleting a row that carries one sweeps every slot of the entity it
+  points at (the target account's for a template split, the
+  schedule's for a stamped instance, the invoice's for a posting
+  transaction — the credit-note incident). Strip GUID and frame rows
+  by raw SQL first. The rule was a convention until the 1.5
+  adversarial review found four sites that skipped it (unpost wiped
+  the invoice's document link; `replace_splits`, `delete_account`,
+  and `delete_account_slot` each reached another entity's slots).
+  **Locked by `tests/test_guid_slot_cascade.py::
+  TestOrmDeleteSitesStripFirst`** — grep-the-source: every
+  `book.session.delete(` / `book.delete(` / slot-accessor `del` in
+  `book/*.py` strips within 40 lines or is listed with the reason
+  the row cannot carry one.
+- `_check_user_slot_key` / `_check_user_slot_row` (`book/admin.py`)
+  — the one gate on the user-slot tools. By NAME: GnuCash's own
+  account frames (`reconcile-info`, `lot-mgmt`, `ofx`, `import-map`,
+  `balance-limit`, `tax-US`, …, pinned from Account.cpp), the two
+  flags desktop reads from the slot while the server reads the
+  column (`placeholder`, `hidden`), and the server's own `gnc-mcp`
+  frame. By SHAPE: a slot that is not a plain string row is someone
+  else's structured data, so a GnuCash key nobody listed is still
+  refused. Strings desktop stores the way a user slot would
+  (`notes`, `color`, `tax-related`) stay writable.
 - `_upgrade_book_shapes` — the one caller of every conversion from
   a pre-1.5 private shape to GnuCash's own (schedule recipes,
   invoice link key, budget signs). Every schedule, budget, and
