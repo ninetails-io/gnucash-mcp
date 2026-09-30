@@ -383,3 +383,37 @@ The maintainer then re-dated both entries to 2026-09-20 in place.
 - Desktop also saved a blank transaction on 2026-09-20: empty
   description, one zero-value Checking split. A stray register row,
   not part of the probe.
+
+**Currency side confirmed.** A new transfer entered with the date set
+first (`Euro test 4`, 2026-09-21, USD 70 → EUR 60 typed as a
+to-amount) made desktop write `EUR/USD | 2026-09-21 10:59:00 |
+user:xfer-dialog | transaction | 7/6` — the dialog port's row,
+source string included
+(`test_to_amount_transfer_matches_the_second_desktop_specimen`).
+Both ports now have a desktop specimen for a new row and for the
+same-day rule. The blank transaction was deleted in desktop.
+
+## Cross-currency invoice twin — click path
+
+Book: `~/Projects/abe-bench/parity-server.gnucash`. Customer
+`Berlin Digital GmbH` (000003) is a EUR customer in a USD book; its
+receivable is `Assets:Receivables:Accounts Receivable EUR`.
+
+1. Business → Customer → New Invoice…
+   - Customer: `Berlin Digital GmbH`. Leave Invoice ID blank (desktop
+     picks it; expect `000048`). Date Opened: 09/22/2026. OK.
+2. In the invoice window, one entry line:
+   - Date 09/22/2026, Description `Twin invoice`, Income Account
+     `Income:LLC Revenue`, Quantity `1`, Unit Price `900`.
+   - Tab off the line so it is saved.
+3. Click Post (toolbar).
+   - Post Date 09/22/2026, Due Date as offered, Post To
+     `Assets:Receivables:Accounts Receivable EUR`, leave
+     "Accumulate Splits" as it is. OK.
+   - When the exchange-rate dialog appears (the income account is
+     USD, the invoice EUR), choose **To Amount** and type `1000.00`
+     (so EUR 900 = USD 1000, rate 10/9). OK.
+4. File → Save if enabled, then quit.
+
+Report back: the invoice ID desktop chose, and anything the dialogs
+asked that is not listed here.

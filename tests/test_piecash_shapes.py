@@ -87,6 +87,20 @@ def test_currency_transfer_matches_the_desktop_specimen(fx_book):
     assert actions == {""}, "desktop stamps no Buy/Sell on a transfer"
 
 
+def test_to_amount_transfer_matches_the_second_desktop_specimen(fx_book):
+    """Desktop, 2026-09-30, a NEW transfer on a day with no price,
+    typed as a to-amount (USD 70 → EUR 60): ``EUR/USD | 2026-09-21
+    10:59:00 | user:xfer-dialog | transaction | 7/6``. This is the
+    path the server's two-amount API corresponds to, source string
+    included."""
+    gc = GnuCashBook(str(fx_book))
+    _transfer(gc, "Assets:EUR Savings", "70", "60", date(2026, 9, 21))
+    assert _prices(fx_book) == [
+        ("EUR", "USD", "2026-09-21 10:59:00", "user:xfer-dialog",
+         "transaction", 7, 6),
+    ]
+
+
 def test_money_leaving_the_foreign_account_stores_the_same_direction(fx_book):
     """EUR 90 → USD 100: ``from`` is EUR, ``to`` is the default; the
     dialog stores commodity EUR, currency USD without a swap."""
