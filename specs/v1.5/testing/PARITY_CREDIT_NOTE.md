@@ -344,3 +344,23 @@ not confirm the shape of a NEW row, which the server writes as
 `AAPL/USD 400000000/1000000 user:split-register` and
 `EUR/USD 10/9 user:xfer-dialog`; that needs the same two entries on
 a day with no price for the pair.
+
+### Third round — 2026-09-30, the stock register
+
+The maintainer entered `AAPL 3` (3 shares for 1,000.00) in the AAPL
+register and `Euro test 3` (USD 70 → EUR 60 as a to-amount) in the
+Checking register. Both were saved dated 2026-09-29 again — the
+register's default date — so the day's preferred prices stood and
+the new-row shape is still unprobed.
+
+The AAPL register entry did show something the bank-side entry had
+not: its AAPL split came back with action `Buy`. The earlier
+purchase, entered from the Checking register, had an empty action.
+`gnc_split_register_check_stock_shares`
+(split-register-control.cpp) sets an empty Action to Buy or Sell
+when a share count is entered in a register that has a Shares
+column (stock, portfolio, currency registers); a bank register has
+no such column. piecash stamped every cross-commodity split; the
+first fix stamped none. The server now stamps a split in a priced
+account (STOCK, MUTUAL, CURRENCY type) and nothing else, on entry
+or amount change only.

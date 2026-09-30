@@ -25,11 +25,12 @@ Slot filler columns
     it writes a ``type='transaction'`` price for ANY cross-commodity
     split (six-decimal half-even value, local-midnight date, source
     ``user:split-register``, never updated once a row exists that
-    day), and it stamps ``Buy``/``Sell`` into an empty ``action``.
-    Desktop does neither that way (cross-currency twin, 2026-09-30:
-    a USD→EUR transfer left action empty and a price of exactly
-    ``10/9`` from ``user:price``). The implied price is now written
-    by ports of GnuCash's own two writers:
+    day), and it stamps ``Buy``/``Sell`` into an empty ``action``
+    on all of them. Desktop does neither that way (cross-currency
+    twin, 2026-09-30: a USD→EUR transfer left action empty and a
+    price of exactly ``10/9`` from ``user:price``; only a split
+    entered in a stock register came back ``Buy``). The implied
+    price is now written by ports of GnuCash's own two writers:
 
     * ``record_price`` (``Transaction.cpp``, called by the register
       as ``xaccTransRecordPrice(trans, PRICE_SOURCE_SPLIT_REG)``) —
@@ -437,11 +438,12 @@ def _record_implied_price(split) -> None:
 def _split_validate(self) -> None:
     """Replacement for piecash's ``Split.validate``: the same checks
     and precision normalisation; the implied price through
-    ``_record_implied_price``; no ``Buy``/``Sell`` stamped into an
-    empty action (desktop leaves it empty). The price is recorded
-    only when the split is new or its value or quantity changed —
-    piecash wrote one on ANY change to the split, so reconciling an
-    old cross-currency split could mint a price for its day."""
+    ``_record_implied_price``; ``Buy``/``Sell`` stamped into an
+    empty action only where desktop's register stamps it
+    (``_stamp_stock_action``). Both happen only when the split is
+    new or its value or quantity changed — piecash acted on ANY
+    change to the split, so reconciling an old cross-currency split
+    could mint a price for its day."""
     old = self.get_all_changes()
 
     if old["STATE_CHANGES"][-1] == "deleted":
@@ -480,6 +482,26 @@ def _split_validate(self) -> None:
     )
     if amounts_changed:
         _record_implied_price(self)
+        _stamp_stock_action(self)
+
+
+def _stamp_stock_action(split) -> None:
+    """``gnc_split_register_check_stock_shares``
+    (split-register-control.cpp): in a register with a Shares column
+    — the register of a STOCK, MUTUAL or CURRENCY-type account —
+    entering a nonzero share count sets an empty Action to ``Buy``
+    (positive) or ``Sell`` (negative). A bank or asset register has
+    no such column, so a currency transfer's splits stay empty.
+
+    Twin specimens, 2026-09-30: 3 AAPL entered in the AAPL register
+    came back ``Buy``; USD → EUR transfers came back empty. piecash
+    stamped both kinds."""
+    account = split.account
+    if account is None or account.type not in _PRICED_ACCOUNT_TYPES:
+        return
+    if split.action or not split.quantity:
+        return
+    split.action = "Sell" if split.quantity < 0 else "Buy"
 
 
 def _price_validate(self) -> None:

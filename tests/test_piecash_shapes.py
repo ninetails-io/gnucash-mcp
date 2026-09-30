@@ -123,6 +123,46 @@ def test_stock_purchase_is_record_price(fx_book):
     assert _prices(fx_book)[-1][5:] == (666666667, 1000000)
 
 
+def test_stock_register_action_is_buy_or_sell(fx_book):
+    """Desktop's stock register sets an empty Action to Buy or Sell
+    when shares are entered (``gnc_split_register_check_stock_shares``;
+    the twin's ``AAPL 3`` row came back ``Buy``). Only the split in
+    the priced account gets it, a caller's own action is kept, and a
+    later reconcile does not stamp a split desktop left blank."""
+    gc = GnuCashBook(str(fx_book))
+    _transfer(gc, "Assets:AAPL", "1000", "3", date(2026, 9, 29))
+    gc.create_transaction(
+        "sell",
+        splits=[
+            {"account": "Assets:AAPL", "amount": "-400", "quantity": "-1"},
+            {"account": "Assets:Checking", "amount": "400"},
+        ],
+        trans_date=date(2026, 9, 30), check_duplicates=False,
+    )
+    with gc.open(readonly=False) as book:
+        rows = book.session.execute(text(
+            "SELECT a.name, s.quantity_num, s.action FROM splits s "
+            "JOIN accounts a ON a.guid = s.account_guid ORDER BY s.quantity_num"
+        )).fetchall()
+        assert [(n, act) for n, _q, act in rows if n == "AAPL"] == [
+            ("AAPL", "Sell"), ("AAPL", "Buy"),
+        ]
+        assert {act for n, _q, act in rows if n == "Checking"} == {""}
+        # A split desktop left blank (entered from the bank side).
+        book.session.execute(text(
+            "UPDATE splits SET action = '' WHERE action = 'Buy'"
+        ))
+        book.save()
+    gc.reconcile_account(
+        "Assets:AAPL", statement_date=date(2026, 9, 30),
+        statement_balance="2", reconcile_all=True,
+    )
+    with gc.open(readonly=True) as book:
+        assert book.session.execute(text(
+            "SELECT COUNT(*) FROM splits WHERE action = 'Buy'"
+        )).scalar() == 0
+
+
 def test_same_day_preferred_source_is_left_alone(fx_book):
     """A quote from the price editor outranks the register: the
     implied price does not supersede it (``oldsource < source``)."""
