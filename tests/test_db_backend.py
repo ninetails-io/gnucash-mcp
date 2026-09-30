@@ -1057,8 +1057,13 @@ class _RealDatabaseTests:
             )
             assert str(row[2])[:19] == "2026-09-29 10:59:00"
             assert book.session.execute(text(stale)).scalar() == 0
+            # This account's frame, not the book's: the fixture is
+            # class-scoped and another test may have created accounts
+            # first (the count was 2 on one CI run, 1 on the re-run).
             assert book.session.execute(text(
-                "SELECT COUNT(*) FROM slots WHERE name = 'balance-limit'"
+                "SELECT COUNT(*) FROM slots s JOIN accounts a "
+                "ON a.guid = s.obj_guid WHERE s.name = 'balance-limit' "
+                "AND a.name = 'EUR Savings'"
             )).scalar() == 1
         # piecash's old fillers, then the converter's two UPDATEs.
         with db_book.open(readonly=False) as book:
