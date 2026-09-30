@@ -452,3 +452,49 @@ The Post dialog's Due Date stayed at the day the dialog opened
 (09/29) when the Post Date was changed to 09/22 on a customer with
 no terms; the server's default for that case is the posting date.
 Both are the user's choice at post time.
+
+## Payment, second invoice, and Since Last Run — 2026-09-30
+
+The maintainer's next session in the server twin produced four
+specimens.
+
+**Second invoice (`000049`, posted 2026-09-23).** Same shape as
+`000048` in every row, including the second `USD/EUR 9/10 temporary`
+price. The leak is deterministic: one per cross-currency post.
+
+**Cross-currency payment of `000049`** (dated 2026-09-30, USD
+1,000.00 from Checking for EUR 900.00). Compared with the server
+paying an identical invoice on a copy:
+
+| | Desktop | Server |
+|---|---|---|
+| Transaction currency | USD (the transfer account's) | EUR (the invoice's) |
+| Receivable split | value -1000.00, quantity -900.00 | value -900.00, quantity -900.00 |
+| Checking split | value 1000.00, quantity 1000.00 | value 900.00, quantity 1000.00 |
+
+Actions (`Payment` on both), empty memos, the lone
+`trans-txn-type = P` slot, the lot flag (-1), and the implied price
+(`EUR/USD 10/9 user:xfer-dialog`) all match. The currency is
+`gncOwnerCreatePaymentLotSecs` (gncOwner.c): a new payment
+transaction gets `xaccTransSetCurrency(txn, xfer_comm)`, and the
+transaction value is the amount × rate whenever the post account's
+commodity is not the transaction's. NOT fixed: the server's realized
+FX split is a zero-value, nonzero-quantity split that only works in
+an invoice-currency transaction, so matching desktop means
+re-expressing that split as a real balanced value in the transfer
+currency. A math-path change; waiting on the maintainer. The
+payment was typed at the posting rate, so how desktop treats a rate
+difference is still unprobed (its code books nothing for it).
+
+**Since Last Run.** Desktop instantiated 33 scheduled transactions
+from server-written templates. The server instantiated `Internet`
+(twice) and `Robin's Paycheck` (twice) on the pre-session copy; a
+diff of the transactions, all splits (seven on the paycheck), both
+slots with their filler columns, and the schedule rows
+(`last_occur`, `instance_count`) is empty apart from the paycheck
+schedule's counters, where desktop ran five instances to the
+server's two. The scheduled-transaction twin is clean.
+
+**Transfer on a day with a price** (`Twin Euro Parity Test`,
+2026-09-21, same USD 70 → EUR 60): no new row and no change, as the
+dialog's equal-rounded-value rule says.
