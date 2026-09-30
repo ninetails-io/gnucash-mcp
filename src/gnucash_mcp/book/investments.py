@@ -19,6 +19,7 @@ import piecash
 from piecash.core.commodity import Price
 from piecash.core.transaction import Lot
 
+from gnucash_mcp.book._currency import _price_row_utc, _price_tie_rank
 from gnucash_mcp.book._base import (
     _lot_cache_flag,
     _LOT_CLOSED,
@@ -57,25 +58,6 @@ def _price_validate(self) -> None:
 
 
 Price.validate = _price_validate
-
-
-def _price_row_utc(raw) -> "datetime | None":
-    """UTC-aware datetime of a raw ``prices.date`` value: the
-    ``YYYY-MM-DD HH:MM:SS`` string SQLite stores, or the naive/aware
-    datetime a database driver returns."""
-    from datetime import timezone
-
-    if raw is None:
-        return None
-    if isinstance(raw, str):
-        digits = "".join(ch for ch in raw if ch.isdigit()).ljust(14, "0")
-        raw = datetime(
-            int(digits[0:4]), int(digits[4:6]), int(digits[6:8]),
-            int(digits[8:10]), int(digits[10:12]), int(digits[12:14]),
-        )
-    if isinstance(raw, datetime):
-        return raw.astimezone(timezone.utc) if raw.tzinfo else raw.replace(tzinfo=timezone.utc)
-    return None
 
 
 class InvestmentsMixin:
@@ -553,35 +535,37 @@ class InvestmentsMixin:
     def _same_date_outranker(
         book, comm, resolved_currency, price_date, source,
     ) -> str | None:
-        """Source of a same-date row that beats ``source`` in the
-        tie-break (``_price_source_rank`` — the bookkeeper's ruling: manual
-        quote > other user:* > feed), or None when the written row
-        is the effective rate for its date.
+        """Source of a same-day row desktop will use instead of the
+        one just written under ``source``, or None when the written
+        row is the day's current price.
 
-        An operator who just wrote a price and can't see it winning
-        has been misled by silence — both ``create_price`` and
-        ``create_prices`` surface this so single and batch entry
-        can't diverge on it. Only a strictly higher rank reports;
-        an equal-rank guid tie is arbitrary-but-stable and naming a
-        "winner" there would imply an ordering that isn't semantic.
+        The rule is ``_price_tie_rank`` — GnuCash's own: the later
+        stored time, then the smaller GUID. An operator who just
+        wrote a price and can't see it winning has been misled by
+        silence — both ``create_price`` and ``create_prices``
+        surface this so single and batch entry can't diverge on it.
+        Reads the rows fresh (not the memo) so a batch sees its own
+        earlier writes.
         """
-        from gnucash_mcp.book._currency import _price_source_rank
-        own_rank = _price_source_rank(source)
-        best = None
-        for p in book.session.query(Price).filter_by(
-            commodity_guid=comm.guid,
-            currency_guid=resolved_currency.guid,
-        ).all():
-            if _to_date(p.date) != price_date or p.source == source:
+        from gnucash_mcp.book._currency import CurrencyMixin
+
+        own = None
+        others = []
+        for p in CurrencyMixin._query_prices_with_time(
+            book, comm.guid, resolved_currency.guid,
+        ):
+            if _to_date(p.date) != price_date or not _is_market_price(p):
                 continue
-            if not _is_market_price(p):
-                continue
-            rank = _price_source_rank(p.source)
-            if rank > own_rank and (
-                best is None or rank > _price_source_rank(best)
-            ):
-                best = p.source
-        return best
+            if p.source == source:
+                own = p
+            else:
+                others.append(p)
+        if own is None or not others:
+            return None
+        best = max(others, key=_price_tie_rank)
+        if _price_tie_rank(best) > _price_tie_rank(own):
+            return best.source
+        return None
 
     def _resolve_price_commodity(self, book, mnemonic: str,
                                  namespace: str | None):
@@ -773,7 +757,7 @@ class InvestmentsMixin:
                 if outranked_by:
                     by_ref[row["ref"]]["reason"] = (
                         f"outranked by {outranked_by!r} for this "
-                        f"date (manual sources win same-date ties)"
+                        f"date (desktop's order: later stamp, then smaller GUID)"
                     )
 
             shapes: dict = {}
@@ -885,7 +869,7 @@ class InvestmentsMixin:
                 result["note"] = (
                     f"recorded, but a {outranked_by!r} price for "
                     f"this date outranks it as the effective rate "
-                    f"(manual sources win same-date ties)"
+                    f"(desktop's order: later stamp, then smaller GUID)"
                 )
 
             return result

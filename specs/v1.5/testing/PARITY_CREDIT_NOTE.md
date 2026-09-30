@@ -217,3 +217,26 @@ question for the maintainer. The real-driver gate
 (`_RealDatabaseTests::test_price_row_lands_in_editor_shape`) writes
 one price on PostgreSQL and MariaDB, where `prices.date` is a true
 timestamp rather than SQLite's text.
+
+### Reading parity — the current price
+
+With the zero row in the book, desktop's Accounts tab valued the
+31 AAPL shares at 0.00; the server's `get_latest_price` said 200.
+GnuCash's `compare_prices_by_date` (gnc-pricedb.cpp, stable) orders
+a pair's prices by the full stored time, then by `guid_compare`
+ascending, and `gnc_pricedb_lookup_latest` takes the head of that
+list; the zero row's 20:44:14 stamp beats the 200's 10:59:00. The
+server ordered by calendar day and broke same-day ties by source
+rank (bookkeeper F3). Maintainer ruling: "parity means agreeing on
+the price." `_price_tie_rank` is now GnuCash's order; `_find_prices`
+carries the raw stored time on each row it returns (piecash's
+column type strips it), and the outranker note names the row
+desktop will use. The zero row itself came from the editor's Add
+path: `dialog-price-editor.c` clones the selected price with source
+`user:price-editor`, time `gnc_time(NULL)` and value zero before
+the dialog opens, which is the only path in the editor that stamps
+a wall-clock time; a saved price goes through the date widget and
+lands at the neutral time.
+
+Not adopted (open, issue #94 ruling stands): desktop's lookup does
+not skip `type='transaction'` rows; the server does.

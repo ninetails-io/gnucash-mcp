@@ -682,95 +682,101 @@ class TestUnpricedCostBasis:
 
 
 class TestSameDatePriceTieBreak:
-    """Bookkeeper finding F3: two prices on the same
-    commodity/currency/date used to resolve by an accident of query
-    order — posting math and month-close valuation could flip between
-    runs. The rule is now deliberate: a manual quote (user:price /
-    user:price-editor) outranks feed sources; guid breaks residual
-    ties (arbitrary but stable)."""
+    """Two prices on the same commodity/currency/day resolve the way
+    GnuCash's ``compare_prices_by_date`` resolves them: the later
+    stored time, then the smaller GUID. Bookkeeper finding F3 first
+    made the tie deliberate (a source rank); the price twin of
+    2026-09-29 showed desktop valuing a holding by a
+    wall-clock-stamped zero row the server ranked below the day's
+    neutral-time quote, and the maintainer ruled that parity means
+    agreeing on the price. Every surface — posting FX, as-of
+    valuation, the latest quote — reads one rule."""
 
-    def test_manual_quote_beats_feed_on_same_date(
+    @staticmethod
+    def _guids(gc, *, source_by_value):
+        from sqlalchemy import text
+        with gc.open(readonly=True) as book:
+            rows = book.session.execute(text(
+                "SELECT guid, value_num, value_denom FROM prices"
+            )).fetchall()
+        return {
+            Decimal(n) / Decimal(d): g for g, n, d in rows
+        }
+
+    def test_equal_times_go_to_the_smaller_guid(
         self, multi_currency_book,
     ):
         from datetime import date
         gc = GnuCashBook(str(multi_currency_book))
         d = date(2026, 3, 31)
-        # Insert feed first, manual second AND manual first, feed
-        # second on a different date — order must not matter.
         gc.create_price("EUR", "CURRENCY", "1.30", price_date=d,
-                        source="user:market-data")
+                        source="Finance::Quote")
         gc.create_price("EUR", "CURRENCY", "1.10", price_date=d,
                         source="user:price")
+        by_value = self._guids(gc, source_by_value=None)
+        winner = min(by_value, key=lambda v: by_value[v])
         with gc.open(readonly=True) as book:
             eur = book.commodities(mnemonic="EUR")
             usd = book.default_currency
-            rate = gc._find_exchange_rate(book, eur, usd, d)
-            assert rate == Decimal("1.10"), (
-                f"manual quote must win the same-date tie, got {rate}"
-            )
-            rates = gc._rates_as_of(book, d)
-            assert rates[eur.guid] == Decimal("1.10")
+            assert gc._find_exchange_rate(book, eur, usd, d) == winner
+            assert gc._rates_as_of(book, d)[eur.guid] == winner
+            assert Decimal(str(gc._find_prices(
+                book, commodity_guid=eur.guid, currency_guid=usd.guid,
+            )[0].value)) == winner
 
-    def test_unknown_user_source_ranks_between_manual_and_feed(
+    def test_later_stored_time_beats_the_smaller_guid(
         self, multi_currency_book,
     ):
-        """The bookkeeper's three-tier ruling: an unrecognized ``user:*``
-        source (an explicit operator act) outranks feeds but does
-        NOT silently override a deliberate manual quote.
-
-        Since the price twin (2026-09-29) the writer refuses a source
-        desktop's editor would show as Invalid, and every price write
-        converts such rows — so the middle tier is engineered the way
-        real books carry it: rows some earlier writer left, flipped
-        by raw SQL after the last write. Reads never convert, so the
-        ranking still has to hold for them."""
+        """The twin's shape: desktop's editor left a row stamped at
+        wall-clock time, later than the day's neutral-time quote.
+        Desktop uses it; so does the server, whatever its GUID."""
         from datetime import date
         from sqlalchemy import text
         gc = GnuCashBook(str(multi_currency_book))
-        d1 = date(2026, 3, 31)   # custom vs feed
-        d2 = date(2026, 4, 30)   # custom vs manual
-        for d in (d1, d2):
-            gc.create_price("EUR", "CURRENCY", "1.30", price_date=d,
-                            source="Finance::Quote")
-            gc.create_price("EUR", "CURRENCY", "1.20", price_date=d,
-                            source="user:price-editor")
-        gc.create_price("EUR", "CURRENCY", "1.10", price_date=d2,
-                        source="user:price")
+        d = date(2026, 3, 31)
+        gc.create_price("EUR", "CURRENCY", "1.30", price_date=d,
+                        source="Finance::Quote")
+        gc.create_price("EUR", "CURRENCY", "1.10", price_date=d,
+                        source="user:price-editor")
         with gc.open(readonly=False) as book:
             book.session.execute(text(
-                "UPDATE prices SET source = 'user:test-fx' "
+                "UPDATE prices SET date = '2026-03-31 20:44:14' "
                 "WHERE source = 'user:price-editor'"
             ))
             book.save()
         with gc.open(readonly=True) as book:
             eur = book.commodities(mnemonic="EUR")
             usd = book.default_currency
-            assert gc._find_exchange_rate(book, eur, usd, d1) == \
-                Decimal("1.20")
-            # A known-manual quote still beats the custom user source.
-            assert gc._find_exchange_rate(book, eur, usd, d2) == \
-                Decimal("1.10")
+            assert gc._find_exchange_rate(book, eur, usd, d) == Decimal("1.10")
+            assert gc._rates_as_of(book, d)[eur.guid] == Decimal("1.10")
 
     def test_create_price_notes_when_outranked(
         self, multi_currency_book,
     ):
         """An operator who just wrote a price and can't see it
         winning has been misled by silence — the losing write says
-        so; the winning write carries no note."""
+        so and names the row desktop will use; the winning write
+        carries no note. Which of two neutral-time rows wins is
+        the GUID draw, so the assertion follows the draw."""
         from datetime import date
         gc = GnuCashBook(str(multi_currency_book))
         d = date(2026, 3, 31)
-        winner = gc.create_price(
+        first = gc.create_price(
             "EUR", "CURRENCY", "1.10", price_date=d,
             source="user:price",
         )
-        assert "note" not in winner
-        loser = gc.create_price(
+        assert "note" not in first
+        second = gc.create_price(
             "EUR", "CURRENCY", "1.30", price_date=d,
-            source="user:market-data",
+            source="Finance::Quote",
         )
-        assert "outranks it as the effective rate" in loser["note"]
-        assert "user:price" in loser["note"]
+        by_value = self._guids(gc, source_by_value=None)
+        first_wins = by_value[Decimal("1.10")] < by_value[Decimal("1.30")]
+        if first_wins:
+            assert "outranks it as the effective rate" in second["note"]
+            assert "user:price" in second["note"]
+        else:
+            assert "note" not in second
 
     def test_create_prices_batch_notes_outranked_in_reason(
         self, multi_currency_book,
@@ -784,11 +790,13 @@ class TestSameDatePriceTieBreak:
                         source="user:price")
         out = gc.create_prices([{
             "ref": "1", "commodity": "EUR", "date": d,
-            "value": "1.30", "source": "user:market-data",
+            "value": "1.30", "source": "Finance::Quote",
         }])["results"]
         row = out.splitlines()[1]
         assert "created" in row
-        assert "outranked by 'user:price'" in row
+        by_value = self._guids(gc, source_by_value=None)
+        first_wins = by_value[Decimal("1.10")] < by_value[Decimal("1.30")]
+        assert ("outranked by 'user:price'" in row) is first_wins
 
 
 class TestPriceLookupMemo:
@@ -806,7 +814,7 @@ class TestPriceLookupMemo:
         gc = GnuCashBook(str(multi_currency_book))
         d = date(2026, 3, 31)
         gc.create_price("EUR", "CURRENCY", "1.30", price_date=d,
-                        source="user:market-data")
+                        source="Finance::Quote")
         gc.create_price("EUR", "CURRENCY", "1.10", price_date=d,
                         source="user:price")
 
@@ -826,9 +834,9 @@ class TestPriceLookupMemo:
                 "memoized lookups must return the same prices "
                 "in the same order as the first query"
             )
-            # The manual quote wins the same-date tie on both.
-            assert first[0].value == Decimal("1.10")
-            assert repeat[0].value == Decimal("1.10")
+            # The smaller GUID wins the same-time tie on both.
+            assert first[0].guid == min(p.guid for p in first)
+            assert repeat[0].guid == first[0].guid
 
     def test_price_written_mid_call_is_visible_after_invalidation(
         self, multi_currency_book,

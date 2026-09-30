@@ -131,51 +131,85 @@ def _to_date(dt: date | datetime) -> date:
     return dt
 
 
-# The two sources a deliberate manual quote arrives under:
-# ``user:price`` from create_price, ``user:price-editor`` from
-# GnuCash's editor. An EXPLICIT allowlist — ``user:market-data`` is
-# deliberately feed-ranked despite the prefix, so it needs its own
-# explicit demotion below the generic ``user:*`` tier.
-_MANUAL_PRICE_SOURCES = frozenset({"user:price", "user:price-editor"})
-# A quote feed is "Finance::Quote" — GnuCash's own string. The
-# server's earlier "user:market-data" (and the generators'
-# underscored twin) was never one desktop knew; reads never write,
-# so an unconverted book still ranks those rows as feeds.
-_FEED_PRICE_SOURCES = frozenset({
-    "Finance::Quote", "user:market-data", "user:market_data",
-})
+class _SmallerWins:
+    """Ordering wrapper: in a "higher tuple wins" key, the SMALLER
+    wrapped value ranks higher. GnuCash breaks a price-time tie by
+    ``guid_compare`` ascending (``compare_prices_by_date``,
+    gnc-pricedb.cpp), so the lower GUID is the current price."""
+
+    __slots__ = ("v",)
+
+    def __init__(self, v):
+        self.v = v
+
+    def __lt__(self, other):
+        return self.v > other.v
+
+    def __gt__(self, other):
+        return self.v < other.v
+
+    def __eq__(self, other):
+        return self.v == other.v
+
+    def __le__(self, other):
+        return self.v >= other.v
+
+    def __ge__(self, other):
+        return self.v <= other.v
+
+    def __repr__(self):
+        return f"_SmallerWins({self.v!r})"
 
 
-def _price_source_rank(source: str | None) -> int:
-    """Three-tier source rank for same-date ties: 2 = known manual
-    quote, 1 = other ``user:*`` (an explicit operator act, but one
-    that shouldn't silently override a deliberate manual edit),
-    0 = feeds and everything else — including ``user:market-data``,
-    which is feed-ranked by name despite the prefix."""
-    source = source or ""
-    if source in _MANUAL_PRICE_SOURCES:
-        return 2
-    if source in _FEED_PRICE_SOURCES:
-        return 0
-    if source.startswith("user:"):
-        return 1
-    return 0
+_STORED_TIME_ATTR = "_gnc_mcp_stored_time"
+
+
+def _price_row_utc(raw) -> "datetime | None":
+    """UTC-aware datetime of a raw ``prices.date`` value: the
+    ``YYYY-MM-DD HH:MM:SS`` string SQLite stores, or the naive/aware
+    datetime a database driver returns."""
+    from datetime import timezone
+
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        digits = "".join(ch for ch in raw if ch.isdigit()).ljust(14, "0")
+        raw = datetime(
+            int(digits[0:4]), int(digits[4:6]), int(digits[6:8]),
+            int(digits[8:10]), int(digits[10:12]), int(digits[12:14]),
+        )
+    if isinstance(raw, datetime):
+        return raw.astimezone(timezone.utc) if raw.tzinfo else raw.replace(tzinfo=timezone.utc)
+    return None
 
 
 def _price_tie_rank(price) -> tuple:
-    """Deterministic tie-break key for prices sharing a date
-    (bookkeeper finding F3 — the winner used to be an accident of
-    query/iteration order, so posting math and month-close valuation
-    could flip between runs on books carrying same-date duplicates).
+    """Which of two prices on a pair is the more current — GnuCash's
+    ``compare_prices_by_date`` (gnc-pricedb.cpp): the later stored
+    time first, and for equal times the smaller GUID. Higher tuple
+    wins.
 
-    Higher tuple wins. Rank via ``_price_source_rank`` (manual
-    quote > other user:* > feed); the guid breaks residual ties —
-    arbitrary but STABLE, which is the property that matters.
-    ``create_price``/``create_prices`` report when a written row
-    loses this tie, so any rank order stays visible to the operator.
+    The stored time is the full timestamp, not the calendar day:
+    piecash's ``Price.date`` strips the time, so ``_find_prices``
+    attaches the raw column value to each row it returns. Every
+    same-day tie the server resolves — month-close valuation,
+    posting FX, the latest quote — therefore lands on the row
+    desktop's Accounts tab and reports use. Until 2026-09-29 the
+    tie went to a source rank (bookkeeper finding F3: manual quote
+    over other user sources over feeds); the price twin showed
+    desktop valuing a holding by a wall-clock-stamped row the
+    server ranked below the day's neutral-time quote, and the
+    maintainer ruled that parity means agreeing on the price.
     """
-    source = getattr(price, "source", None) or ""
-    return (_price_source_rank(source), price.guid or "")
+    stored = getattr(price, _STORED_TIME_ATTR, None)
+    if stored is None:
+        # A row that did not come through _find_prices: piecash
+        # reads the day back at local midnight; rank it at the
+        # neutral time the server and desktop both store.
+        from gnucash_mcp.book._base import _neutral_time
+
+        stored = _neutral_time(_to_date(price.date))
+    return (stored, _SmallerWins(price.guid or ""))
 
 
 def _is_market_price(price) -> bool:
@@ -315,31 +349,45 @@ class CurrencyMixin:
         key = (commodity_guid, currency_guid)
         prices = lookups.get(key)
         if prices is None:
-            from piecash.core.commodity import Price
-
-            q = book.session.query(Price)
-            if commodity_guid is not None:
-                q = q.filter(Price.commodity_guid == commodity_guid)
-            if currency_guid is not None:
-                q = q.filter(Price.currency_guid == currency_guid)
-            prices = list(q)
-            # Newest first, with same-date ties resolved by
-            # _price_tie_rank rather than row order (see its
-            # docstring for the rule), and full-key ties by guid so
-            # the ordering never falls through to arbitrary DB row
-            # order. Sorted once, at memoization time, so every
-            # consumer sees the same ordering.
-            prices.sort(
-                key=lambda p: (
-                    _to_date(p.date), _price_tie_rank(p), p.guid,
-                ),
-                reverse=True,
+            prices = CurrencyMixin._query_prices_with_time(
+                book, commodity_guid, currency_guid,
             )
+            # Most current first — the full stored time, then the
+            # smaller GUID (_price_tie_rank: GnuCash's own order) —
+            # never DB row order. Sorted once, at memoization time,
+            # so every consumer sees the same ordering.
+            prices.sort(key=_price_tie_rank, reverse=True)
             lookups[key] = prices
 
         if market_only:
             return [p for p in prices if _is_market_price(p)]
         return list(prices)
+
+    @staticmethod
+    def _query_prices_with_time(
+        book: piecash.Book, commodity_guid: str | None,
+        currency_guid: str | None,
+    ) -> list:
+        """One indexed query for a pair's Price rows, each carrying
+        its raw stored ``date`` (UTC-aware) on ``_STORED_TIME_ATTR``.
+        piecash's column type reads the timestamp back as a bare
+        day, and desktop orders prices by the full time, so the raw
+        column rides along in the same SELECT. The only reader of
+        that column; ``_find_prices`` memoizes the result and the
+        outranker check reads it fresh."""
+        from piecash.core.commodity import Price
+        from sqlalchemy import literal_column
+
+        q = book.session.query(Price, literal_column("prices.date"))
+        if commodity_guid is not None:
+            q = q.filter(Price.commodity_guid == commodity_guid)
+        if currency_guid is not None:
+            q = q.filter(Price.currency_guid == currency_guid)
+        prices = []
+        for p, raw in q:
+            setattr(p, _STORED_TIME_ATTR, _price_row_utc(raw))
+            prices.append(p)
+        return prices
 
     @staticmethod
     def _anchor_for_as_of(as_of: date) -> date:

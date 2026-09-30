@@ -1385,9 +1385,10 @@ class TestPriceWalkChokepoint:
         assert not offenders, offenders
 
     def test_latest_price_surfaces_agree_on_same_date_tie(self, tmp_path):
-        """Two market quotes on one day: the manual quote outranks
-        the feed everywhere, and the tool that shows the operator
-        'the rate on file' shows the rate the reports use."""
+        """Two market quotes on one day at the same stored time: the
+        smaller GUID wins everywhere (GnuCash's own tie order, since
+        the price twin of 2026-09-29), and the tool that shows the
+        operator 'the rate on file' shows the rate the reports use."""
         path = tmp_path / "tie.gnucash"
         book = piecash.create_book(str(path), currency="USD", overwrite=True)
         usd = book.default_currency
@@ -1409,22 +1410,25 @@ class TestPriceWalkChokepoint:
         piecash.Account(name="ZZZ", type="STOCK", commodity=zzz, parent=assets)
         # Feed row written first, manual quote second: storage order
         # and rank order disagree, which is the case that matters.
-        book.session.add(piecash.Price(
+        feed = piecash.Price(
             commodity=aaa, currency=usd, date=date(2026, 1, 15),
-            value=Decimal("50"), source="user:market-data", type="last",
-        ))
-        book.session.add(piecash.Price(
+            value=Decimal("50"), source="Finance::Quote", type="last",
+        )
+        manual = piecash.Price(
             commodity=aaa, currency=usd, date=date(2026, 1, 15),
             value=Decimal("80"), source="user:price", type="last",
-        ))
+        )
+        book.session.add(feed)
+        book.session.add(manual)
         book.save()
         aaa_guid = aaa.guid
+        expected = Decimal("50") if feed.guid < manual.guid else Decimal("80")
         book.close()
 
         gb = GnuCashBook(str(path))
         with gb.open(readonly=True) as b:
             report_rate = gb._rates_as_of(b, date(2026, 9, 1))[aaa_guid]
-        assert report_rate == Decimal("80")
+        assert report_rate == expected
         assert Decimal(
             gb.get_latest_price("AAA", "NASDAQ")["value"]
         ) == report_rate
