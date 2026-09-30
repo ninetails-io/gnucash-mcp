@@ -626,7 +626,7 @@ class InvestmentsMixin:
         Each entry: ``{ref, commodity, date (date), value,
         namespace (optional), currency (optional — quote currency,
         defaults to the book default), source (optional, default
-        "user:price"), price_type (optional, default "nav")}``.
+        "user:price"), price_type (optional, default "last")}``.
 
         Per-row semantics are ``create_price``'s exactly (shared
         upsert chokepoint): same (commodity, currency, date,
@@ -687,7 +687,7 @@ class InvestmentsMixin:
                         "currency": resolved_currency,
                         "date": p["date"],
                         "value": str(value),
-                        "type": p.get("price_type") or "nav",
+                        "type": p.get("price_type") or "last",
                         "source": p.get("source") or "user:price",
                     })
                 except (ValueError, KeyError) as e:
@@ -804,7 +804,7 @@ class InvestmentsMixin:
         value: str,
         currency: str | None = None,
         price_date: date | None = None,
-        price_type: str = "nav",
+        price_type: str = "last",
         source: str = "user:price",
     ) -> dict:
         """Record a price for a commodity (stock price, NAV, exchange rate).
@@ -818,7 +818,7 @@ class InvestmentsMixin:
                 means 1 USD = 7.30 CNY). Pass explicitly for pairs
                 that don't involve the book default.
             price_date: Defaults to today.
-            price_type: "nav" (default), "last", "bid", "ask",
+            price_type: "last" (default, as desktop's price editor), "nav", "bid", "ask",
                 "unknown".
             source: Source identifier. Default "user:price".
 

@@ -228,7 +228,7 @@ def register(mcp, get_book) -> None:
         value: str,
         currency: str | None = None,
         date: str | None = None,
-        price_type: str = "nav",
+        price_type: str = "last",
         source: str = "user:price",
     ) -> str:
         """Record a price for a commodity (stock, NAV, exchange rate).
@@ -246,7 +246,7 @@ def register(mcp, get_book) -> None:
                 natural reading). Pass explicitly for cross-currency
                 pairs that don't involve the book default.
             date: ISO date (YYYY-MM-DD). Defaults to today.
-            price_type: "nav" (default, mutual funds), "last", "bid",
+            price_type: "last" (default, as desktop's price editor), "nav" (mutual funds), "bid",
                 "ask", or "unknown".
             source: Where the price came from, one of the strings GnuCash's
                 price editor recognizes: "user:price" (default, a price you

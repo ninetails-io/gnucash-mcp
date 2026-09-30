@@ -266,8 +266,8 @@ def test_prices_carry_gnucash_source_and_neutral_time(test_book):
     rows = _rows(p, "SELECT source, type, date, value_num, value_denom "
                     "FROM prices ORDER BY date")
     # 178.70 is stored reduced, 1787/10, as the editor wrote it.
-    assert rows == [("Finance::Quote", "nav", "2026-09-28 10:59:00", 1787, 10),
-                    ("user:price", "nav", "2026-09-29 10:59:00", 200, 1)]
+    assert rows == [("Finance::Quote", "last", "2026-09-28 10:59:00", 1787, 10),
+                    ("user:price", "last", "2026-09-29 10:59:00", 200, 1)]
     # Update in place keeps the shape.
     gc.create_price(commodity="AAPL", namespace="NASDAQ", value="199.50",
                     price_date=date(2026, 9, 29))
