@@ -8509,7 +8509,17 @@ class TestPayInvoice:
         from gnucash_mcp.book.business import BusinessMixin
         from decimal import Decimal as D
 
+        class _Same:
+            """One currency for the split's account and transaction."""
+
+        usd = _Same()
+
+        class _Holder:
+            currency = commodity = usd
+
         class _Split:
+            transaction = account = _Holder()
+
             def __init__(self, value, reconcile_state):
                 self.value = value
                 self.reconcile_state = reconcile_state
@@ -11947,7 +11957,18 @@ class TestPayInvoiceDryRun:
             if s["account"] == "Income:Foreign Exchange Gain/Loss"
         ]
         assert len(fx_rows) == 1
-        assert Decimal(fx_rows[0]["value"]) == Decimal("0")
+        # The payment is a USD transaction (the pay account's
+        # currency, desktop's rule since 2026-09-30), so the gain is
+        # a real credit, and the receivable is relieved at the
+        # $1,100 it was carried at.
+        assert Decimal(fx_rows[0]["value"]) == Decimal("-100")
+        assert Decimal(fx_rows[0]["quantity"]) == Decimal("-100")
+        ar_row = result["proposed_splits"][0]
+        assert Decimal(ar_row["value"]) == Decimal("-1100")
+        assert Decimal(ar_row["quantity"]) == Decimal("-1000")
+        assert sum(
+            Decimal(r["value"]) for r in result["proposed_splits"]
+        ) == 0
         # Nothing created, nothing designated, nothing paid.
         accounts = gb.list_accounts()
         assert "Foreign Exchange" not in str(accounts)

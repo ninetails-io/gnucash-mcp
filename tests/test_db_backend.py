@@ -1073,6 +1073,71 @@ class _RealDatabaseTests:
         with db_book.open(readonly=True) as book:
             assert book.session.execute(text(stale)).scalar() == 0
 
+    def test_cross_currency_payment_on_a_real_driver(self, db_book):
+        """The payment twin's shape where the columns are typed: a
+        EUR invoice paid from USD is a USD transaction, the day's
+        price is a raw INSERT, and the lot's balance reads the
+        document's currency through a raw SELECT on ``invoices``."""
+        from datetime import date
+
+        from sqlalchemy import text
+
+        try:
+            db_book.create_commodity(
+                mnemonic="EUR", fullname="Euro", namespace="CURRENCY",
+            )
+        except ValueError:
+            pass  # an earlier test in this class created it
+        db_book.create_account("Income", "INCOME")
+        db_book.create_account("Sales", "INCOME", parent="Income")
+        db_book.create_account(
+            "AR EUR", "RECEIVABLE", parent="Assets", commodity="EUR",
+        )
+        db_book.create_price(
+            "EUR", "CURRENCY", "1.111111", price_date=date(2026, 8, 1),
+        )
+        db_book.create_price(
+            "EUR", "CURRENCY", "1.20", price_date=date(2026, 8, 9),
+        )
+        cust = db_book.create_customer(name="Berlin GmbH", currency="EUR")
+        inv = db_book.create_invoice(
+            customer_id=cust["id"], date_opened="2026-08-02",
+        )
+        db_book.add_invoice_entry(
+            invoice_id=inv["id"], account="Income:Sales",
+            description="work", quantity="1", price="900",
+        )
+        db_book.post_invoice(
+            invoice_id=inv["id"], post_account="Assets:AR EUR",
+            post_date="2026-08-02",
+        )
+        result = db_book.pay_invoice(
+            invoice_id=inv["id"], payment_account="Assets:Checking",
+            amount="900", payment_date="2026-08-10",
+        )
+        assert result["status"] == "paid"
+        assert result["fx_realized"]["amount"] == "80.00"
+        doc = db_book.get_invoice(inv["id"])
+        assert (doc["amount_paid"], doc["amount_due"]) == ("900.00", "0.00")
+        with db_book.open(readonly=True) as book:
+            rows = book.session.execute(text(
+                "SELECT c.mnemonic, a.name, s.value_num, s.quantity_num "
+                "FROM splits s JOIN accounts a ON a.guid = s.account_guid "
+                "JOIN transactions t ON t.guid = s.tx_guid "
+                "JOIN commodities c ON c.guid = t.currency_guid "
+                "WHERE s.action = 'Payment' ORDER BY a.name"
+            )).fetchall()
+            assert [tuple(r) for r in rows] == [
+                ("USD", "AR EUR", -100000, -90000),
+                ("USD", "Checking", 108000, 108000),
+                ("USD", "Foreign Exchange Gain/Loss", -8000, -8000),
+            ]
+            price = book.session.execute(text(
+                "SELECT p.source, p.value_num, p.value_denom FROM prices p "
+                "WHERE p.type = 'transaction' AND p.value_num = 6"
+            )).one()
+            assert tuple(price) == ("user:xfer-dialog", 6, 5)
+
     def test_rollback_if_aborted(self, db_book):
         """The real-driver half of ``TestRollbackIfAborted``: after a
         swallowed bad statement, the helper clears PostgreSQL's

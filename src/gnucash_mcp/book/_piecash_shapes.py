@@ -83,6 +83,10 @@ _GNC_PRICE_SOURCE_ORDER = (
     "invalid",                # PRICE_SOURCE_INVALID
 )
 _SRC_XFER_DLG = "user:xfer-dialog"
+# Set on a Split whose writer records the day's price itself: a
+# document payment, whose receivable leg's value/quantity is the
+# posting rate once realized FX is booked beside it.
+SKIP_IMPLIED_PRICE_ATTR = "_gnc_mcp_skip_implied_price"
 _SRC_SPLIT_REG = "user:split-register"
 
 # gnc-pricedb.h
@@ -287,13 +291,11 @@ def _dialog_new_price_shape(frm, to, rate: Fraction, default):
     return frm, to, rate
 
 
-def _record_price_dialog(session, split, when: datetime, default) -> None:
+def _record_dialog_price(session, frm, to, rate: Fraction, when: datetime,
+                         default) -> None:
     """``create_price`` (dialog-transfer.cpp), the to-amount path:
-    source XFER_DLG_VAL, type TRN, exact ratio."""
-    frm, to, rate = _dialog_from_to(
-        split.account.commodity, split.transaction.currency,
-        Fraction(split.quantity), Fraction(split.value),
-    )
+    source XFER_DLG_VAL, type TRN, the exact ratio. ``rate`` is
+    to-amount / from-amount."""
     source = _SRC_XFER_DLG
 
     existing = _same_day_price(session, frm.guid, to.guid, when)
@@ -319,6 +321,15 @@ def _record_price_dialog(session, split, when: datetime, default) -> None:
         session, comm.guid, curr.guid, when, source,
         rate.numerator, rate.denominator,
     )
+
+
+def _record_price_dialog(session, split, when: datetime, default) -> None:
+    """The exchange dialog's price for one cross-commodity split."""
+    frm, to, rate = _dialog_from_to(
+        split.account.commodity, split.transaction.currency,
+        Fraction(split.quantity), Fraction(split.value),
+    )
+    _record_dialog_price(session, frm, to, rate, when, default)
 
 
 def _cross_commodity_split_index(session) -> dict:
@@ -420,6 +431,8 @@ def _record_implied_price(split) -> None:
     if not split.quantity or not split.value:
         return
     if account.type == "TRADING":
+        return
+    if getattr(split, SKIP_IMPLIED_PRICE_ATTR, False):
         return
     book = split.book
     session = book.session

@@ -1141,6 +1141,37 @@ class BusinessMixin:
                 return s_quantity / s_value
         return None
 
+    def _record_payment_price(
+        self, book, doc_currency, pay_currency, doc_amount: Decimal,
+        pay_amount: Decimal, when: date, *, cash_leaves: bool,
+    ) -> None:
+        """The price a cross-currency payment leaves for its day: the
+        rate actually paid, through the exchange dialog's port
+        (desktop specimen, 2026-09-30: a EUR 900 receivable settled
+        with USD 1,000 left ``EUR/USD 10/9 user:xfer-dialog``).
+        ``cash_leaves`` is the direction: a bill payment or a
+        customer refund sends the pay currency out."""
+        from fractions import Fraction
+
+        from gnucash_mcp.book._piecash_shapes import _record_dialog_price
+
+        doc = Fraction(doc_amount)
+        paid = Fraction(pay_amount)
+        if not doc or not paid:
+            return
+        if cash_leaves:
+            frm, to, rate = pay_currency, doc_currency, abs(doc / paid)
+        else:
+            frm, to, rate = doc_currency, pay_currency, abs(paid / doc)
+        try:
+            default = self._require_default_currency(book)
+        except Exception:
+            default = None
+        _record_dialog_price(
+            book.session, frm, to, rate, _neutral_time(when), default,
+        )
+        self._invalidate_price_caches(book)
+
     def _compute_fx_gain_loss(
         self,
         book,
@@ -1158,8 +1189,20 @@ class BusinessMixin:
         discount_quantity: Decimal | None = None,
         discount_commodity=None,
         dry_run: bool = False,
+        txn_currency=None,
     ) -> dict | None:
         """Compute the realized FX gain/loss for a cross-currency payment.
+
+        ``txn_currency`` is the payment transaction's currency. When
+        it is the pay account's (desktop's rule,
+        ``gncOwnerCreatePaymentLotSecs``) the FX split carries a real
+        value in it — the drift itself, so the receivable/payable leg
+        can be relieved at its carrying amount and the transaction
+        balances in money. ``None`` or the invoice currency is the
+        pre-2026-09-30 form the server still uses for a document
+        posted to an account in another currency: value 0, the drift
+        in the quantity alone. ``"value"`` in the result is that
+        signed transaction-currency amount.
 
         ``dry_run=True`` computes identically but constructs no Split
         (``"split"`` is None) and resolves the FX account without
@@ -1259,6 +1302,12 @@ class BusinessMixin:
             ).quantize(_commodity_quantum(default_currency))
         else:
             fx_diff_default = fx_diff_pay
+        # The same drift in the transaction's currency, when that is
+        # the pay account's: the payment leg is already in it.
+        in_pay_currency = (
+            txn_currency is not None and txn_currency == pay_acct.commodity
+        )
+        fx_diff_txn = fx_diff_pay if in_pay_currency else Decimal("0")
 
         # Discount leg: booked at the pay-date rate while the A/R it
         # relieved was carried at the post-date rate — the difference
@@ -1290,6 +1339,20 @@ class BusinessMixin:
                     discount_amount * rate_at_post_disc
                 ).quantize(_commodity_quantum(discount_commodity))
                 diff_disc = discount_quantity - expected_disc_at_post
+                if in_pay_currency:
+                    if discount_commodity == pay_acct.commodity:
+                        fx_diff_txn += diff_disc
+                    else:
+                        disc_to_txn = self._find_exchange_rate(
+                            book,
+                            from_commodity=discount_commodity,
+                            to_commodity=pay_acct.commodity,
+                            as_of=parsed_date,
+                        )
+                        if disc_to_txn is not None:
+                            fx_diff_txn += (
+                                diff_disc * disc_to_txn
+                            ).quantize(_commodity_quantum(pay_acct.commodity))
                 if discount_commodity != default_currency:
                     disc_to_default = self._find_exchange_rate(
                         book,
@@ -1324,6 +1387,13 @@ class BusinessMixin:
             or (not is_bill and fx_diff_default < 0)
         )
         fx_quantity = quantity_sign * fx_diff_default
+        if not in_pay_currency:
+            fx_value = Decimal("0")
+        elif fx_acct.commodity == txn_currency:
+            # Same currency as the transaction: value IS quantity.
+            fx_value = fx_quantity
+        else:
+            fx_value = quantity_sign * fx_diff_txn
         fx_memo = (
             f"FX {'loss' if is_loss else 'gain'} on invoice "
             f"{inv.id}: post-rate {rate_at_post:.4f}, pay-rate "
@@ -1332,7 +1402,8 @@ class BusinessMixin:
         split = None
         if not dry_run:
             split = _new_split(
-                fx_acct, Decimal("0"), fx_quantity, inv.currency,
+                fx_acct, fx_value, fx_quantity,
+                txn_currency if in_pay_currency else inv.currency,
                 memo=fx_memo,
                 action="Payment",
             )
@@ -1342,6 +1413,7 @@ class BusinessMixin:
             "fx_acct": fx_acct,
             "fx_notice": fx_notice,
             "quantity": fx_quantity,
+            "value": fx_value,
             "memo": fx_memo,
         }
 
@@ -2285,7 +2357,8 @@ class BusinessMixin:
 
     @staticmethod
     def _calculate_lot_balance(lot) -> Decimal:
-        """Sum of split values in a lot, skipping voided splits.
+        """A document lot's balance in the DOCUMENT's currency,
+        skipping voided splits.
 
         A/R lots: positive = outstanding receivable. A/P lots:
         negative = outstanding payable.
@@ -2295,13 +2368,72 @@ class BusinessMixin:
         them matches the void-aware treatment everywhere else;
         summing them would be right only by accident, and
         inconsistent with callers that count splits.
+
+        Each split contributes through ``_lot_split_amount``: a
+        payment desktop (or, since 2026-09-30, the server) writes in
+        the transfer account's currency carries the document's
+        amount in its QUANTITY, not its value.
         """
         total = Decimal(0)
+        doc_currency_guid: str | None = None
+        resolved = False
         for split in lot.splits:
             if split.reconcile_state == "v":
                 continue
-            total += Decimal(str(split.value))
+            if (
+                not resolved
+                and split.transaction.currency != split.account.commodity
+            ):
+                doc_currency_guid = BusinessMixin._lot_document_currency_guid(
+                    lot,
+                )
+                resolved = True
+            total += BusinessMixin._lot_split_amount(split, doc_currency_guid)
         return total
+
+    @staticmethod
+    def _lot_document_currency_guid(lot) -> str | None:
+        """GUID of the currency of the document a lot belongs to, or
+        ``None`` when no document claims it."""
+        from sqlalchemy import text
+        from sqlalchemy.orm import object_session
+
+        session = object_session(lot)
+        if session is None:
+            return None
+        row = session.execute(
+            text("SELECT currency FROM invoices WHERE post_lot = :g"),
+            {"g": lot.guid},
+        ).first()
+        return row[0] if row else None
+
+    @staticmethod
+    def _lot_split_amount(split, doc_currency_guid: str | None) -> Decimal:
+        """What one split in a document's lot settles, in the
+        document's currency. The one reader of that amount.
+
+        A split stores ``value`` in its transaction's currency and
+        ``quantity`` in its account's commodity. When the two are
+        the same currency the amounts are equal. When they differ,
+        exactly one of them is in the document's currency:
+
+        * the account's — a payment booked in the transfer account's
+          currency (desktop's rule, and the server's since
+          2026-09-30): the receivable/payable split's QUANTITY;
+        * the transaction's — the posting and the server's earlier
+          payments, and any document posted to an account in another
+          currency (a state only pre-1.5 servers created): its VALUE.
+
+        Summing values alone — what this read did before — mixes
+        currencies the moment a desktop-written payment is in the
+        lot."""
+        if (
+            doc_currency_guid is not None
+            and split.transaction.currency != split.account.commodity
+            and split.account.commodity.guid == doc_currency_guid
+        ):
+            return Decimal(str(split.quantity))
+        return Decimal(str(split.value))
 
     @staticmethod
     def _calculate_lot_quantity(lot) -> Decimal:
@@ -2947,6 +3079,7 @@ class BusinessMixin:
         post_guid = inv.post_txn.guid if inv.post_txn is not None else None
         quantum = _commodity_quantum(settlement["post_account"].commodity)
         prefixes = self._transaction_prefix_map(book)
+        doc_currency_guid = inv.currency.guid if inv.currency else None
         rows = []
         for split in settlement["lot"].splits:
             txn = split.transaction
@@ -2964,7 +3097,9 @@ class BusinessMixin:
                 "guid": prefixes.get(txn.guid, txn.guid[:8]),
                 "date": txn.post_date.isoformat() if txn.post_date else None,
                 "amount": str(
-                    (-settlement["sign"] * split.value).quantize(quantum)
+                    (-settlement["sign"] * self._lot_split_amount(
+                        split, doc_currency_guid,
+                    )).quantize(quantum)
                 ),
                 "from": source,
             })
@@ -6940,16 +7075,15 @@ class BusinessMixin:
             # field deliberately. Same pattern as post_invoice.
             txn_desc = description if description is not None else owner_name
 
-            # Cross-currency: the transaction currency stays the
-            # invoice currency (values balance in EUR for a EUR
-            # invoice); each account's quantity reflects its own
-            # commodity. BOTH legs convert — converting only the
-            # bank side would liquidate a USD A/R holding a EUR
+            # Cross-currency: each account's quantity reflects its
+            # own commodity, and BOTH legs convert — converting only
+            # the bank side would liquidate a USD A/R holding a EUR
             # invoice in EUR-as-USD on payment. Rate lookup +
             # quantization route through _convert_invoice_amount;
             # pay also consumes the rate (it feeds
             # _compute_fx_gain_loss below) and collects stale_meta
-            # for the fx_stale response block.
+            # for the fx_stale response block. The transaction's
+            # currency is settled just below (``txn_currency``).
             fx_stale_overrides: list[dict] = []
 
             def _convert(amount, target_commodity):
@@ -6972,6 +7106,27 @@ class BusinessMixin:
             post_quantity, _post_rate = _convert(
                 payment_amount, post_acct.commodity,
             )
+
+            # Which currency the payment transaction is IN. Desktop
+            # (gncOwnerCreatePaymentLotSecs, gncOwner.c) gives a new
+            # payment transaction the TRANSFER account's commodity:
+            # a EUR invoice paid from a USD account is a USD
+            # transaction whose receivable split carries the USD
+            # value and the EUR quantity (payment twin, 2026-09-30).
+            # The server booked it in the invoice's currency until
+            # then. The one state desktop cannot create keeps the
+            # old form: a document posted to an account in a
+            # currency other than its own (refused since 1.5.0),
+            # where only the transaction's values are in the
+            # invoice's currency at all.
+            desktop_currency = (
+                exchange_rate is not None
+                and post_acct.commodity == inv.currency
+            )
+            txn_currency = (
+                pay_acct.commodity if desktop_currency else inv.currency
+            )
+            txn_quantum = _commodity_quantum(txn_currency)
 
             # A tiny exchange rate can quantize the converted
             # quantity to zero — a "successful" payment recording
@@ -7036,6 +7191,7 @@ class BusinessMixin:
             discount_amount_invoice_ccy = Decimal("0")
             disc_quantity: Decimal | None = None
             disc_value_sign = 1
+            discount_value_txn = Decimal("0")
             if apply_discount:
                 if is_credit_note:
                     raise ValueError(
@@ -7148,10 +7304,24 @@ class BusinessMixin:
                 # Vendor bill payment: discount is INCOME (credit), -value
                 disc_value_sign = -1 if effective_is_bill else 1
                 discount_booked = True
+                # The discount's value in the transaction's currency:
+                # the invoice-currency amount itself in the old form;
+                # at the pay-date rate when the transaction is in the
+                # pay account's currency (its own quantity when the
+                # discount account shares that currency — value and
+                # quantity must agree there).
+                if not desktop_currency:
+                    discount_value_txn = expected
+                elif discount_acct.commodity == txn_currency:
+                    discount_value_txn = disc_quantity
+                else:
+                    discount_value_txn = (
+                        expected * exchange_rate
+                    ).quantize(txn_quantum)
                 if not dry_run:
                     discount_split = _new_split(
-                        discount_acct, disc_value_sign * expected,
-                        disc_value_sign * disc_quantity, inv.currency,
+                        discount_acct, disc_value_sign * discount_value_txn,
+                        disc_value_sign * disc_quantity, txn_currency,
                         memo="Early-payment discount",
                         action="Payment",
                     )
@@ -7200,6 +7370,13 @@ class BusinessMixin:
             # values feeds both the rehearsal's proposed-splits
             # table and the real Split construction below — the
             # rehearsal cannot diverge from the booking.
+            # Values are in ``txn_currency``. In the pay account's
+            # currency the bank leg's value is its own quantity, and
+            # the receivable/payable leg's value is whatever balances
+            # the transaction once the discount and FX legs are
+            # known (set below): the pay-date amount when no FX is
+            # booked, exactly desktop's split; its carrying amount
+            # at the posting rate when the drift is booked beside it.
             sgn = 1 if effective_is_bill else -1
             proposed: list[dict] = [
                 {
@@ -7211,7 +7388,9 @@ class BusinessMixin:
                 },
                 {
                     "account": pay_acct.fullname,
-                    "value": -sgn * payment_amount,
+                    "value": -sgn * (
+                        pay_quantity if desktop_currency else payment_amount
+                    ),
                     "quantity": -sgn * pay_quantity,
                     "memo": memo,
                 },
@@ -7219,17 +7398,19 @@ class BusinessMixin:
             if discount_booked:
                 proposed.append({
                     "account": discount_acct.fullname,
-                    "value": disc_value_sign * discount_amount_invoice_ccy,
+                    "value": disc_value_sign * discount_value_txn,
                     "quantity": disc_value_sign * disc_quantity,
                     "memo": "Early-payment discount",
                 })
 
             # Realized FX gain/loss on post→pay rate drift, factored
             # into _compute_fx_gain_loss (the four sign quadrants
-            # are unit-testable there). The split is value=0 in the
-            # transaction currency, non-zero quantity in the FX
-            # account's commodity (book default). One account both
-            # directions; sign decides gain vs loss.
+            # are unit-testable there). In the pay account's
+            # currency the split carries the drift as a real value;
+            # in the old invoice-currency form it is value=0 with a
+            # non-zero quantity in the FX account's commodity (book
+            # default). One account both directions; sign decides
+            # gain vs loss.
             fx_result: dict | None = None
             default_currency = self._require_default_currency(book)
             if exchange_rate is not None:
@@ -7256,14 +7437,19 @@ class BusinessMixin:
                         if discount_acct is not None else None
                     ),
                     dry_run=dry_run,
+                    txn_currency=txn_currency,
                 )
                 if fx_result is not None:
                     proposed.append({
                         "account": fx_result["fx_acct"].fullname,
-                        "value": Decimal("0"),
+                        "value": fx_result["value"],
                         "quantity": fx_result["quantity"],
                         "memo": fx_result["memo"],
                     })
+            if desktop_currency:
+                proposed[0]["value"] = -sum(
+                    (row["value"] for row in proposed[1:]), Decimal("0"),
+                )
 
             # Shared result tail — identical blocks on the rehearsal
             # and the booked response, built from the same locals.
@@ -7369,13 +7555,13 @@ class BusinessMixin:
 
             ar_ap_split = _new_split(
                 post_acct, proposed[0]["value"], proposed[0]["quantity"],
-                inv.currency,
+                txn_currency,
                 memo=memo,  # desktop puts the memo on both legs
                 action="Payment",
             )
             bank_split = _new_split(
                 pay_acct, proposed[1]["value"], proposed[1]["quantity"],
-                inv.currency,
+                txn_currency,
                 memo=memo,
                 action="Payment",
             )
@@ -7386,7 +7572,7 @@ class BusinessMixin:
                 splits.append(fx_result["split"])
 
             txn = piecash.Transaction(
-                currency=inv.currency,
+                currency=txn_currency,
                 description=txn_desc,
                 post_date=parsed_date,
                 num="",
@@ -7396,7 +7582,26 @@ class BusinessMixin:
             _lot_cache_flag(lot_obj)
             ar_ap_split.lot = lot_obj
 
+            if desktop_currency:
+                # The day's price is the rate PAID, written once the
+                # way desktop's payment dialog writes it. No split
+                # may imply one: with the drift booked beside it the
+                # receivable leg's value/quantity is the POSTING
+                # rate, which is not today's price.
+                from gnucash_mcp.book._piecash_shapes import (
+                    SKIP_IMPLIED_PRICE_ATTR,
+                )
+                for s_ in splits:
+                    setattr(s_, SKIP_IMPLIED_PRICE_ATTR, True)
+
             book.flush()
+
+            if desktop_currency:
+                self._record_payment_price(
+                    book, inv.currency, pay_acct.commodity,
+                    payment_amount, pay_quantity, parsed_date,
+                    cash_leaves=effective_is_bill,
+                )
 
             txn["trans-txn-type"] = "P"
             # Desktop's payment (gncOwnerApplyPaymentSecs) carries no

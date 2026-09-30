@@ -498,3 +498,37 @@ server's two. The scheduled-transaction twin is clean.
 **Transfer on a day with a price** (`Twin Euro Parity Test`,
 2026-09-21, same USD 70 → EUR 60): no new row and no change, as the
 dialog's equal-rounded-value rule says.
+
+### Payment currency adopted — 2026-09-30
+
+Bookkeeper ruling (`BOOKKEEPER_REPORT_DASHBOARD_SENSITIVITY.md`,
+amended 00:40): 1.5 is the last version, so the adoption goes on
+this branch; the `temporary` price row is not written.
+
+`pay_invoice` now sets the payment transaction's currency to the
+pay account's whenever the document was posted to an account in its
+own currency (every post since 1.5.0, and every desktop post). The
+bank leg's value is its quantity; the discount leg's value is at
+the pay-date rate; the realized-FX split carries the drift as a
+real value; the receivable/payable leg's value is what balances the
+transaction — the pay-date amount when no FX is booked (desktop's
+row exactly), its carrying amount at the posting rate otherwise.
+The day's price is written once from the amounts paid
+(`_record_payment_price`, through the exchange-dialog port); the
+payment's own splits are flagged so none implies the posting rate
+as today's price. A document posted to an account in another
+currency, a state desktop cannot create, keeps the old
+invoice-currency form.
+
+Reading: `_lot_split_amount` is the one reader of what a lot split
+settles in the document's currency (the split's quantity when its
+account is in that currency and its transaction is not, else its
+value). Before it, the server read desktop's payment of `000049`
+as `amount_paid 1000.00, amount_due -100.00, overpaid`.
+
+`tests/test_payment_currency.py` pins the desktop specimen and
+covers drift, partial payments at different rates, a vendor bill, a
+same-currency payment, a third-currency pay account, a discount
+settlement, a credit-note refund, and a lot mixing old and new
+payment forms. Plan for the loop and the gate:
+`BOOKKEEPER_TEST_PLAN_PRICE_AND_PAYMENT_PARITY.md`.
