@@ -64,6 +64,7 @@ REGISTRY: dict[str, tuple[KVP_Type, str]] = {
     "title": (K.KVP_TYPE_STRING, "gnc-lot.cpp gnc_lot_set_title"),
     # Accounts — Account.cpp
     "placeholder": (K.KVP_TYPE_STRING, "Account.cpp 'placeholder' (boolean stored as string)"),
+    "balance-limit": (K.KVP_TYPE_FRAME, "Account.cpp KEY_BALANCE_LIMIT; dialog-account.c gnc_ui_to_account leaves the empty frame on every account it saves"),
     "reconcile-info": (K.KVP_TYPE_FRAME, "Account.cpp KEY_RECONCILE_INFO"),
     "reconcile-info/last-date": (K.KVP_TYPE_GINT64, "Account.cpp xaccAccountSetReconcileLastDate (time64)"),
     "reconcile-info/last-interval": (K.KVP_TYPE_FRAME, "Account.cpp xaccAccountSetReconcileLastInterval"),

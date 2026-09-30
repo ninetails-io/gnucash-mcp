@@ -262,3 +262,58 @@ Open from the migration: piecash rounds the implied rate to six
 decimals when it writes the transaction row; desktop stores the
 exact ratio of the split's value to its amount. A cross-currency
 transaction entered in desktop is the next twin.
+
+## Cross-currency twin — 2026-09-30
+
+The maintainer created `Assets:EUR Savings` (EUR) in the server twin
+and transferred USD 100 into it from Checking, typing 0.90 as the
+rate. The same two actions were run through the server on a copy.
+
+| Row | Desktop | Server (before) |
+|---|---|---|
+| Price | EUR/USD `10/9`, 10:59:00 UTC, `user:price`, `transaction` | none that day once desktop's existed; on a fresh day: the split's own direction, six decimals half-even, local midnight, `user:split-register` |
+| EUR split `action` | `''` | `'Buy'` (piecash stamps Buy/Sell on any cross-commodity split) |
+| Account slots | `balance-limit`, an empty frame | none |
+| Every slot row | `double_val` NULL, `timespec_val` 1970-01-01 00:00:00 | `double_val` 0.0, `timespec_val` NULL |
+
+The last row is a class, not an instance: 1,915 of the twin's
+`date-posted` slots carried piecash's filler columns against two
+desktop-written ones. The earlier twins missed it because
+`parity_dump.py` printed only a slot's typed column; it now prints
+the unused ones too, and the credit-note fixture was regenerated
+from the desktop twin (it reproduces byte for byte from
+`parity-desktop.gnucash`).
+
+Fixes, in `book/_piecash_shapes.py` (imported unconditionally):
+
+- `Split.validate` replaced. The implied price is written by ports
+  of GnuCash's own writers — `record_price` (Transaction.cpp; the
+  register calls it as `xaccTransRecordPrice(trans,
+  PRICE_SOURCE_SPLIT_REG)`) for accounts `xaccAccountIsPriced`
+  accepts, and the exchange dialog's `create_price` / `new_price` /
+  `update_price` (dialog-transfer.cpp) for the rest, on its
+  to-amount path (`user:xfer-dialog`; the maintainer typed the rate
+  instead, which is the dialog's `user:price` path and the only
+  column that differs from the specimen). No action stamped.
+- Slot column defaults set to GnuCash's; `_migrate_slot_fillers`
+  converts existing rows; `create_account` writes the
+  `balance-limit` frame (slot registry entry added).
+- `_migrate_price_shapes` no longer reduces `type='transaction'`
+  rows (`record_price` keeps a fixed denominator) and restates a
+  piecash-written currency row as the dialog's when its split can
+  be identified, in the same pass that moves it off local midnight.
+
+Reading side: `_rates_as_of_dated` and `_find_exchange_rate_aged`
+now treat a pair's direct and inverse rows as one list
+(`pricedb_get_prices_internal` merges them). Desktop's direction
+rule made this visible: an implied USD/EUR row was shadowing a newer
+EUR/USD quote.
+
+One carve-out, flagged for a ruling: the rate the server CHOOSES
+for a new posting or payment is looked up over quotes only. Counting
+implied rates there lets each posting refresh the echo of the last
+one, and the FX staleness guard never fires again.
+
+Not yet probed: a stock purchase in desktop's register (confirms the
+`record_price` port's denominator and source), a cross-currency
+invoice post (`user:invoice-post`), and the dialog's to-amount path.

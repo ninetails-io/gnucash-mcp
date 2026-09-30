@@ -6407,6 +6407,8 @@ class CoreMixin:
             if notes:
                 new_account["notes"] = notes
 
+            book.flush()
+            self._write_balance_limit_frame(book, new_account.guid)
             book.save()
 
             short_guid = _unique_prefix(

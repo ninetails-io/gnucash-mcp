@@ -2177,6 +2177,12 @@ def _shape_upgrade_lines(after: dict) -> list[str]:
             f"{_INDENT}{n} split{'s' if n != 1 else ''} given desktop's epoch "
             f"reconcile_date (was NULL; nothing posted)"
         )
+    n = after.get("slot_fillers_normalized")
+    if n:
+        lines.append(
+            f"{_INDENT}{n} slot row{'s' if n != 1 else ''} given desktop's "
+            f"unused-column values (values untouched)"
+        )
     parts = []
     if after.get("price_sources_normalized"):
         parts.append(f"{after['price_sources_normalized']} price source(s) set to a string GnuCash recognizes")
@@ -2184,6 +2190,11 @@ def _shape_upgrade_lines(after: dict) -> list[str]:
         parts.append(f"{after['price_dates_normalized']} price date(s) moved to the neutral time")
     if after.get("price_values_reduced"):
         parts.append(f"{after['price_values_reduced']} price value(s) reduced")
+    if after.get("implied_prices_restated"):
+        parts.append(
+            f"{after['implied_prices_restated']} transaction-implied price(s) "
+            f"restated as desktop's exchange dialog stores them"
+        )
     if after.get("reconcile_dates_normalized"):
         parts.append(f"{after['reconcile_dates_normalized']} statement date(s) moved to day end")
     if after.get("reconcile_frames_completed"):

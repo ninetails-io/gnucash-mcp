@@ -291,7 +291,7 @@ def test_prices_carry_gnucash_source_and_neutral_time(test_book):
         ), {"m": midnight})
         book.session.execute(text(
             "INSERT INTO prices (guid, commodity_guid, currency_guid, date, "
-            "source, type, value_num, value_denom) SELECT 'f' || substr(guid, 2), "
+            "source, type, value_num, value_denom) SELECT 'feedfacefeedfacefeedfacefeedface', "
             "commodity_guid, currency_guid, '2026-09-29 20:44:14', "
             "'user:price-editor', 'last', 0, 1 FROM prices LIMIT 1"
         ))

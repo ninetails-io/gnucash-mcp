@@ -38,27 +38,6 @@ from gnucash_mcp.book._base import (
 from gnucash_mcp._format import _format_number, _paginate
 
 
-def _price_validate(self) -> None:
-    """Replacement for piecash's ``Price.validate``. The original
-    re-queries the row by ``date=self.date``; that column binds a
-    date at LOCAL midnight, the only shape piecash itself writes, so
-    a price stored at GnuCash's neutral time (every price desktop's
-    editor writes, and ours since the price twin of 2026-09-29) never
-    matches and ``.one()`` raises ``NoResultFound`` on any save that
-    touches it. Same uniqueness rule, compared by calendar day."""
-    same_day = [
-        p for p in self.book.session.query(Price).filter_by(
-            commodity=self.commodity, currency=self.currency, source=self.source,
-        )
-        if _to_date(p.date) == _to_date(self.date)
-    ]
-    if len(same_day) > 1:
-        raise ValueError("{} already exists in this book".format(self))
-
-
-Price.validate = _price_validate
-
-
 class InvestmentsMixin:
     """Commodity/price/lot CRUD and capital-gain calculation."""
 
@@ -371,26 +350,51 @@ class InvestmentsMixin:
 
     def _migrate_price_shapes(self, book) -> dict:
         """Write path only: price rows the server (or its generators)
-        wrote before 2026-09-29 to desktop's shape — a source string
-        GnuCash recognizes (``user:market_data`` and its hyphenated
-        twin become ``Finance::Quote``, any other unknown string
-        ``user:price``), the date at the neutral time, and the value
-        reduced (``gnc_numeric_reduce``: desktop stores 178.70 as
-        1787/10; piecash keeps the typed denominator, 17870/100).
-        Only a row at the server's local-midnight shape has its date
-        moved; a row desktop stamped at some other time is desktop's
-        business. Runs through ``_upgrade_book_shapes``."""
+        wrote before 2026-09-29 to desktop's shape.
+
+        * A source string GnuCash recognizes (``user:market_data``
+          and its hyphenated twin become ``Finance::Quote``, any
+          other unknown string ``user:price``).
+        * The date at the neutral time. Only a row at the server's
+          local-midnight shape moves; a row desktop stamped at some
+          other time is desktop's business.
+        * A quote's value reduced (``gnc_numeric_reduce``: desktop's
+          editor stores 178.70 as 1787/10; piecash keeps the typed
+          denominator, 17870/100). A ``type='transaction'`` row is
+          NOT reduced — ``record_price`` stores those at a fixed
+          ``scu × 10000`` denominator.
+        * An implied price piecash wrote for a currency account
+          (``user:split-register``, six decimals, the split's own
+          direction) restated as the exchange dialog's row — exact
+          ratio, stored against the default currency,
+          ``user:xfer-dialog`` — when the split it came from can be
+          identified. Done only in the pass that moves the row off
+          local midnight, so it runs once per row.
+
+        Runs through ``_upgrade_book_shapes``."""
         from fractions import Fraction
         from sqlalchemy import text
+
+        from gnucash_mcp.book._piecash_shapes import (
+            _cross_commodity_split_index,
+            _restate_price,
+            _restated_piecash_price,
+        )
 
         out: dict = {}
         sources = 0
         dates = 0
         values = 0
+        restated = 0
+        split_index = None
+        commodities = None
         rows = book.session.execute(
-            text("SELECT guid, source, date, value_num, value_denom FROM prices")
+            text(
+                "SELECT guid, source, date, value_num, value_denom, type, "
+                "commodity_guid, currency_guid FROM prices"
+            )
         ).fetchall()
-        for guid, src, raw, num, denom in rows:
+        for guid, src, raw, num, denom, ptype, comm_guid, curr_guid in rows:
             src = src or ""
             if src not in self._GNC_PRICE_SOURCES:
                 new_src = self._PRICE_SOURCE_ALIASES.get(src, "user:price")
@@ -407,24 +411,51 @@ class InvestmentsMixin:
             as_utc = _price_row_utc(raw)
             local = as_utc.astimezone() if as_utc is not None else None
             move_date = local is not None and local.time() == datetime.min.time()
+            implied = ptype == "transaction"
+            stored = Fraction(int(num), int(denom)) if denom else None
             reduce_value = (
-                denom and Fraction(int(num), int(denom)).denominator != int(denom)
+                not implied and stored is not None
+                and stored.denominator != int(denom)
             )
             if move_date or reduce_value:
                 self._stamp_price_row(
                     book, guid,
                     price_date=local.date() if move_date else None,
-                    value=Fraction(int(num), int(denom)) if reduce_value else None,
+                    value=stored if reduce_value else None,
                 )
                 dates += int(move_date)
                 values += int(bool(reduce_value))
+            if (
+                implied and move_date and stored is not None
+                and src == "user:split-register"
+            ):
+                if split_index is None:
+                    split_index = _cross_commodity_split_index(book.session)
+                    commodities = {c.guid: c for c in book.commodities}
+                    try:
+                        default = self._require_default_currency(book)
+                    except Exception:
+                        default = None
+                comm = commodities.get(comm_guid)
+                curr = commodities.get(curr_guid)
+                shape = None
+                if comm is not None and curr is not None:
+                    shape = _restated_piecash_price(
+                        split_index.get((comm_guid, curr_guid, local.date()), []),
+                        stored, comm, curr, default,
+                    )
+                if shape is not None:
+                    _restate_price(book.session, guid, *shape)
+                    restated += 1
         if sources:
             out["price_sources_normalized"] = sources
         if dates:
             out["price_dates_normalized"] = dates
         if values:
             out["price_values_reduced"] = values
-        if sources or dates or values:
+        if restated:
+            out["implied_prices_restated"] = restated
+        if sources or dates or values or restated:
             book.session.expire_all()
             self._invalidate_price_caches(book)
         return out

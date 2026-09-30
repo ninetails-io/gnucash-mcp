@@ -60,10 +60,24 @@ def dump(path: str) -> str:
     # Slots only on objects the flow created (lot 000018 pre-exists in the base).
     objs = [g for g in names if names[g].startswith(("txn:", "inv:Parity01")) or names[g] == "lot:Credit Note Parity01"]
     def slots_of(obj, prefix):
-        rows = q("select name, slot_type, string_val, int64_val, timespec_val, gdate_val, guid_val, numeric_val_num, numeric_val_denom from slots where obj_guid=? order by name", obj)
-        for name, st, sv, iv, tv, gv, guid, nn, nd in rows:
+        rows = q("select name, slot_type, string_val, int64_val, timespec_val, gdate_val, guid_val, numeric_val_num, numeric_val_denom, double_val from slots where obj_guid=? order by name", obj)
+        for name, st, sv, iv, tv, gv, guid, nn, nd, dv in rows:
             val = {4: repr(sv), 1: iv, 6: tv, 10: gv, 5: N(guid), 3: f"{nn}/{nd}", 9: "frame"}.get(st, "?")
-            out.append(f"SLOT {prefix} {name} type={st} {val}")
+            # The columns this slot's type does NOT use: desktop's SQL
+            # backend fills them one way, piecash's ORM another, and a
+            # dump of the typed column alone can't tell (2026-09-30).
+            fill = [
+                None if st == 1 else f"i={iv}",
+                None if st == 4 else f"s={sv!r}",
+                None if st == 2 else f"d={dv}",
+                None if st == 6 else f"t={tv}",
+                None if st == 3 else f"n={nn}/{nd}",
+                None if st == 10 else f"gd={gv}",
+            ]
+            out.append(
+                f"SLOT {prefix} {name} type={st} {val} fill["
+                + " ".join(f for f in fill if f) + "]"
+            )
             if st == 9 and guid:
                 slots_of(guid, prefix)
     for obj in sorted(objs, key=lambda g: names[g]):

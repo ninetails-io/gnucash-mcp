@@ -219,11 +219,12 @@ def _is_market_price(price) -> bool:
     leaves behind. Valuation counts BOTH, as desktop does (ruling
     2026-09-29), and so does every staleness measure — one window
     for all sources (bookkeeper ruling, same evening). This
-    predicate serves one purpose: through
-    :meth:`CurrencyMixin._market_prices_only` the dashboard's
-    stale-price warning re-derives the rate over quotes alone to
-    NAME a stale rate's provenance — "valued at the rate of its
-    last transaction" when the quote view disagrees with valuation."""
+    predicate serves :meth:`CurrencyMixin._market_prices_only`,
+    which has two users: the dashboard's stale-price warning
+    re-derives the rate over quotes alone to NAME a stale rate's
+    provenance, and the business module picks the rate for a NEW
+    cross-currency posting or payment from quotes alone, so a
+    posting never prices itself off the last posting's echo."""
     return getattr(price, "type", None) != "transaction"
 
 
@@ -306,9 +307,11 @@ class CurrencyMixin:
         somebody entered or fetched (``_is_market_price``), so every
         rate derived inside — direct, inverse, chained — answers
         "when did the operator last quote this?" rather than "what
-        is it worth?". The dashboard's stale-price warning is the
-        only user, and only to name a stale rate's provenance;
-        valuation never runs inside it. The memo is untouched — the
+        is it worth?". Two users: the dashboard's stale-price
+        warning (to name a stale rate's provenance) and the
+        business module's posting-rate lookup (the rate the server
+        chooses for a write); valuation never runs inside it. The
+        memo is untouched — the
         filter is applied per call, so nothing cached inside leaks
         out."""
         setattr(book, CurrencyMixin._MARKET_ONLY_ATTR, True)
@@ -498,18 +501,32 @@ class CurrencyMixin:
         if default_currency is None:
             default_currency = self._require_default_currency(book)
         latest: dict[str, tuple[date, tuple, Decimal]] = {}
-        for p in self._find_prices(
-            book, currency_guid=default_currency.guid,
-        ):
+
+        def _offer(key: str, p, rate: Decimal) -> None:
             p_date = _to_date(p.date)
             if p_date > anchor:
-                continue
-            key = p.commodity.guid
+                return
             existing = latest.get(key)
             cand = (p_date, _price_tie_rank(p))
             if existing is None or cand > (existing[0], existing[1]):
-                latest[key] = (p_date, _price_tie_rank(p),
-                               Decimal(str(p.value)))
+                latest[key] = (p_date, cand[1], rate)
+
+        # A pair's prices are ONE list whichever way each row is
+        # stored: GnuCash merges the forward and reverse lists
+        # (``pricedb_get_prices_internal``) and takes the most
+        # current. Desktop stores a rate against the default
+        # currency but older rows, other tools and the pre-1.5
+        # server stored either way, so both directions compete.
+        for p in self._find_prices(
+            book, currency_guid=default_currency.guid,
+        ):
+            _offer(p.commodity.guid, p, Decimal(str(p.value)))
+        for p in self._find_prices(
+            book, commodity_guid=default_currency.guid,
+        ):
+            inverse = Decimal(str(p.value))
+            if inverse > 0:
+                _offer(p.currency.guid, p, Decimal("1") / inverse)
         result: dict[str, tuple[Decimal, date, str | None]] = {
             guid: (rate, p_date, None)
             for guid, (p_date, _rank, rate) in latest.items()
@@ -1252,12 +1269,19 @@ class CurrencyMixin:
                 if _better(-days, rank, best_after_inverse):
                     best_after_inverse = (-days, rank, rate, p_date)
 
-        for candidate in (
-            best_before_direct,
-            best_before_inverse,
-            best_after_direct,
-            best_after_inverse,
+        # Direct and inverse rows are one list to GnuCash
+        # (``pricedb_get_prices_internal`` merges them); the nearer,
+        # then the more current, wins whichever way it is stored.
+        # Before-anchor candidates still precede after-anchor ones.
+        for direct, inverse in (
+            (best_before_direct, best_before_inverse),
+            (best_after_direct, best_after_inverse),
         ):
+            candidate = direct
+            if inverse is not None and _better(
+                inverse[0], inverse[1], direct,
+            ):
+                candidate = inverse
             if candidate is not None:
                 age_days, _rank, rate, p_date = candidate
                 return (rate, age_days, p_date)

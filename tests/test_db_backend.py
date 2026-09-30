@@ -1012,6 +1012,67 @@ class _RealDatabaseTests:
         assert "price_dates_normalized" not in result
         assert "price_values_reduced" not in result
 
+    def test_cross_currency_transfer_writes_desktops_rows(self, db_book):
+        """The cross-currency twin on a real driver: the implied
+        price is a raw INSERT with a string timestamp and exact
+        numerator/denominator, the slot fillers come from a column
+        default bound as a datetime, and both converters run their
+        UPDATEs with the same binds. SQLite accepts anything here;
+        a typed timestamp column does not."""
+        from datetime import date
+
+        from sqlalchemy import text
+
+        db_book.create_commodity(
+            mnemonic="EUR", fullname="Euro", namespace="CURRENCY",
+        )
+        db_book.create_account(
+            "EUR Savings", "BANK", parent="Assets", commodity="EUR",
+        )
+        db_book.create_transaction(
+            "transfer",
+            splits=[
+                {"account": "Assets:Checking", "amount": "-100"},
+                {"account": "Assets:EUR Savings", "amount": "100",
+                 "quantity": "90"},
+            ],
+            trans_date=date(2026, 9, 29), check_duplicates=False,
+            notes="a note",
+        )
+        stale = (
+            "SELECT COUNT(*) FROM slots WHERE "
+            "(double_val = 0 AND slot_type <> 2) OR "
+            "(timespec_val IS NULL AND slot_type <> 6)"
+        )
+        with db_book.open(readonly=True) as book:
+            row = book.session.execute(text(
+                "SELECT c.mnemonic, u.mnemonic, p.date, p.source, p.type, "
+                "p.value_num, p.value_denom FROM prices p "
+                "JOIN commodities c ON c.guid = p.commodity_guid "
+                "JOIN commodities u ON u.guid = p.currency_guid "
+                "WHERE p.type = 'transaction' AND c.mnemonic = 'EUR'"
+            )).one()
+            assert (row[0], row[1], row[3], row[4], row[5], row[6]) == (
+                "EUR", "USD", "user:xfer-dialog", "transaction", 10, 9,
+            )
+            assert str(row[2])[:19] == "2026-09-29 10:59:00"
+            assert book.session.execute(text(stale)).scalar() == 0
+            assert book.session.execute(text(
+                "SELECT COUNT(*) FROM slots WHERE name = 'balance-limit'"
+            )).scalar() == 1
+        # piecash's old fillers, then the converter's two UPDATEs.
+        with db_book.open(readonly=False) as book:
+            book.session.execute(text(
+                "UPDATE slots SET double_val = 0, timespec_val = NULL"
+            ))
+            book.save()
+        with db_book.open(readonly=False) as book:
+            out = db_book._upgrade_book_shapes(book)
+            book.save()
+        assert out["slot_fillers_normalized"] >= 2
+        with db_book.open(readonly=True) as book:
+            assert book.session.execute(text(stale)).scalar() == 0
+
     def test_rollback_if_aborted(self, db_book):
         """The real-driver half of ``TestRollbackIfAborted``: after a
         swallowed bad statement, the helper clears PostgreSQL's

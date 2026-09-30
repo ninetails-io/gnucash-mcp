@@ -3553,6 +3553,15 @@ class TestStalePriceReadsValuationRate:
             ],
             trans_date=with_dates[0], check_duplicates=False,
         )
+        # That transaction is itself cross-currency, so it leaves a
+        # fresh implied EUR rate — the cure the warning names — and
+        # nothing is stale.
+        assert self._stale_lines(gc.get_book_summary()) == []
+        # With that row gone (the state a same-currency EUR purchase
+        # leaves: activity, no new rate) the stale quote is back.
+        from tests.conftest import drop_transaction_prices
+        # Three implied rows: the 2019 opening and spend, and coffee.
+        assert drop_transaction_prices(path) == 3
         lines = self._stale_lines(gc.get_book_summary())
         assert len(lines) == 1 and lines[0].startswith("⚠ Stale price: EUR last updated")
         # ... as does holding a balance, whatever the activity.

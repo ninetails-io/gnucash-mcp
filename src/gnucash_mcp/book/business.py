@@ -6180,12 +6180,20 @@ class BusinessMixin:
             _fx_staleness_days,
         )
 
-        aged = self._find_exchange_rate_aged(
-            book,
-            from_commodity=invoice_currency,
-            to_commodity=target_commodity,
-            as_of=as_of,
-        )
+        # The rate the server CHOOSES for a posting comes from quotes
+        # somebody entered or fetched, never from a transaction's
+        # implied rate. Valuation counts those rows, as desktop does;
+        # but desktop asks a human for the rate at this point, and a
+        # posting that priced itself off the last posting's echo
+        # would refresh that echo forever — the guard below would
+        # never see a stale rate again.
+        with self._market_prices_only(book):
+            aged = self._find_exchange_rate_aged(
+                book,
+                from_commodity=invoice_currency,
+                to_commodity=target_commodity,
+                as_of=as_of,
+            )
         if aged is None:
             cap = _fx_staleness_days()
             staleness_note = (

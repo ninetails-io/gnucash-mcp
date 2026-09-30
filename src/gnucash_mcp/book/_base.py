@@ -37,6 +37,10 @@ from gnucash_mcp.book._currency import (  # noqa: F401
     CurrencyMixin,
     _to_date,
 )
+# Imported for its side effect: replaces piecash's Price and Split
+# validators with ones that write GnuCash desktop's shapes. Must
+# hold whichever modules are enabled, hence here.
+from gnucash_mcp.book import _piecash_shapes  # noqa: F401,E402
 from gnucash_mcp.book._query import QueryMixin
 from gnucash_mcp._format import _book_display_name, _parse_book_url
 
@@ -2569,6 +2573,9 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         if n:
             out["split_reconcile_dates_filled"] = n
         out.update(self._migrate_reconcile_conventions(book))
+        n = self._migrate_slot_fillers(book)
+        if n:
+            out["slot_fillers_normalized"] = n
         prices = getattr(self, "_migrate_price_shapes", None)
         if prices is not None:
             out.update(prices(book))
@@ -2702,6 +2709,67 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
                 key = "months" if r[1].endswith("/months") else "days"
                 out[acct][key] = int(r[2])
         return out
+
+    @staticmethod
+    def _migrate_slot_fillers(book) -> int:
+        """Write path only: every slot the ORM wrote before
+        2026-09-30 carries piecash's filler columns (``double_val``
+        0.0, ``timespec_val`` NULL); GnuCash's SQL backend writes
+        NULL and the epoch (``_piecash_shapes`` has the story). Two
+        portable UPDATEs over the columns a slot's type does not
+        use, verified by re-count. Returns the rows brought along."""
+        from sqlalchemy import text
+
+        # KVP_TYPE_DOUBLE = 2 and KVP_TYPE_TIMESPEC = 6 own those
+        # columns; their values are data, not filler.
+        stale = (
+            "SELECT COUNT(*) FROM slots WHERE "
+            "(double_val = 0 AND slot_type <> 2) OR "
+            "(timespec_val IS NULL AND slot_type <> 6)"
+        )
+        n = book.session.execute(text(stale)).scalar()
+        if not n:
+            return 0
+        book.session.execute(text(
+            "UPDATE slots SET double_val = NULL "
+            "WHERE double_val = 0 AND slot_type <> 2"
+        ))
+        book.session.execute(
+            text(
+                "UPDATE slots SET timespec_val = :epoch "
+                "WHERE timespec_val IS NULL AND slot_type <> 6"
+            ),
+            {"epoch": "1970-01-01 00:00:00"},
+        )
+        left = book.session.execute(text(stale)).scalar()
+        _verify_none_remaining(left, f"slot filler columns ({n} rows)")
+        book.session.expire_all()
+        return int(n)
+
+    @staticmethod
+    def _write_balance_limit_frame(book, account_guid: str) -> None:
+        """The empty ``balance-limit`` frame desktop's account dialog
+        leaves on every account it saves: ``gnc_ui_to_account``
+        (dialog-account.c) always calls
+        ``xaccAccountSetIncludeSubAccountBalances``, which creates
+        the frame, and with no limits set nothing goes in it
+        (cross-currency twin, 2026-09-30). The account row must be
+        flushed first."""
+        import uuid
+
+        from piecash.kvp import KVP_Type, Slot
+
+        book.session.execute(
+            Slot.__table__.insert().values(
+                obj_guid=account_guid, name="balance-limit",
+                slot_type=KVP_Type.KVP_TYPE_FRAME, guid_val=uuid.uuid4().hex,
+            )
+        )
+        _verify_composite_write(
+            book.session, Slot.__table__,
+            {"obj_guid": account_guid, "name": "balance-limit"},
+            "balance-limit frame",
+        )
 
     def _write_reconcile_info(self, book, account, statement_date: date) -> None:
         """Record a reconcile the way desktop's window does on
