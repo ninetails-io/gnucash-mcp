@@ -26,6 +26,7 @@ import pytest
 from piecash import factories
 
 from gnucash_mcp.book import GnuCashBook
+from tests.conftest import drop_transaction_prices
 
 
 # --------------------------------------------------------------------------
@@ -334,7 +335,11 @@ def test_budget_report_warns_on_unconvertible_foreign_target(tmp_path):
 def test_market_value_cost_basis_converts_foreign_purchase(tmp_path):
     """When a holding has no market price, the cost-basis fallback
     values each purchase at its posting-date rate (book default), not a
-    raw sum of foreign transaction-currency values."""
+    raw sum of foreign transaction-currency values.
+
+    The EUR buy leaves a NOPRICE/EUR implied-rate row that values the
+    fund since the 2026-09-29 ruling (desktop counts it); the subject
+    is the no-price fallback, so the row is deleted below."""
     path = tmp_path / "mv.gnucash"
     book = piecash.create_book(str(path), currency="USD", overwrite=True)
     usd = book.default_currency
@@ -371,6 +376,7 @@ def test_market_value_cost_basis_converts_foreign_purchase(tmp_path):
     )
     book.save()
     book.close()
+    assert drop_transaction_prices(path) == 1
 
     gb = GnuCashBook(str(path))
     with gb.open(readonly=True) as book:
@@ -468,6 +474,11 @@ def _unpriced_holding_book(path, legs, *, commodity_ns="CRYPTO"):
     ``legs`` is a list of ``(post_date, description, quantity, value)``
     for the holding; the cash leg mirrors ``value``. Returns the
     GnuCashBook.
+
+    Every leg leaves an implied-rate ``type='transaction'`` row, which
+    values the holding since the 2026-09-29 ruling (desktop counts
+    it). "Never priced" means no price row of any type — a real state
+    after desktop's Price Editor, or in older books — so they go.
     """
     book = piecash.create_book(str(path), currency="USD", overwrite=True)
     usd = book.default_currency
@@ -498,6 +509,7 @@ def _unpriced_holding_book(path, legs, *, commodity_ns="CRYPTO"):
         )
     book.save()
     book.close()
+    assert drop_transaction_prices(path) == len(legs)
     return GnuCashBook(str(path))
 
 
@@ -631,7 +643,10 @@ class TestUnpricedCostBasis:
     def test_foreign_liability_paid_off_leaves_the_sheet(self, tmp_path):
         """Sign-agnostic: a EUR card with no EUR rate on file, charged
         then paid in full, is a zero liability — and the FX difference
-        the user never booked is the residual, on every surface."""
+        the user never booked is the residual, on every surface.
+        (Both legs leave EUR/USD implied-rate rows, which count as
+        rates since the 2026-09-29 ruling; they are deleted so the
+        card stays rate-less, as the subject needs.)"""
         path = tmp_path / "card.gnucash"
         book = piecash.create_book(str(path), currency="USD", overwrite=True)
         usd = book.default_currency
@@ -674,6 +689,7 @@ class TestUnpricedCostBasis:
         )
         book.save()
         book.close()
+        assert drop_transaction_prices(path) == 2
         gb = GnuCashBook(str(path))
         bs = gb.balance_sheet(as_of_date=self.AS_OF)
         assert bs["liabilities"]["accounts"] == []
@@ -834,8 +850,15 @@ class TestPriceLookupMemo:
                 "memoized lookups must return the same prices "
                 "in the same order as the first query"
             )
-            # The smaller GUID wins the same-time tie on both.
-            assert first[0].guid == min(p.guid for p in first)
+            # The smaller GUID wins the same-time tie on both. (The
+            # fixture's 2024 transfer row rides along, older — a
+            # price since the 2026-09-29 ruling — so the tie is the
+            # two quotes on ``d``.)
+            from gnucash_mcp.book._currency import _to_date
+
+            tied = [p for p in first if _to_date(p.date) == d]
+            assert len(tied) == 2 and len(first) == 3
+            assert first[0].guid == min(p.guid for p in tied)
             assert repeat[0].guid == first[0].guid
 
     def test_price_written_mid_call_is_visible_after_invalidation(

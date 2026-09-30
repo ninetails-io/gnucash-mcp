@@ -238,5 +238,24 @@ the dialog opens, which is the only path in the editor that stamps
 a wall-clock time; a saved price goes through the date widget and
 lands at the neutral time.
 
-Not adopted (open, issue #94 ruling stands): desktop's lookup does
-not skip `type='transaction'` rows; the server does.
+Second ruling, same evening: "The server should NOT skip
+`type='transaction'` rows because desktop doesn't. The ruling made
+before is overturned." `_find_prices` now returns every row;
+valuation, posting FX, chains, `get_latest_price`,
+`calculate_lot_gain` all count a transaction's implied rate. The
+maintainer kept one exemption: the stale-price warning and
+`list_commodities`' staleness markers measure entered or fetched
+quotes only (`_market_prices_only`); a holding priced by its
+transactions alone reads "no quote on file; valued at the rate of
+its last transaction". 25 tests migrated by subject; the ones about
+the unpriced state delete the transaction rows
+(`drop_transaction_prices`), since a book with a holding and no
+price row at all is a state desktop's Price Editor can produce.
+
+The zero-value AAPL row was deleted from the server twin after its
+origin was traced; with it gone both sides value AAPL at 200.
+
+Open from the migration: piecash rounds the implied rate to six
+decimals when it writes the transaction row; desktop stores the
+exact ratio of the split's value to its amount. A cross-currency
+transaction entered in desktop is the next twin.

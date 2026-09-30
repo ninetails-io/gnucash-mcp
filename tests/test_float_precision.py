@@ -498,24 +498,23 @@ class TestScalarAmountsAcceptFloat:
 class TestIsMarketPriceHelper:
     """Contract tests for the ``_is_market_price`` predicate.
 
-    Centralizing the ``type='transaction'`` check used to live as
-    inline conditionals in four places (core's ``_rates_as_of`` and
-    ``_collect_warnings``, reporting's ``_latest_market_rates``,
-    business's ``_find_exchange_rate``). All four now route through
-    this single predicate so adding any future placeholder type
-    (e.g., the auto-fx-account work later in this branch) only needs
-    one change.
+    Since the 2026-09-29 ruling valuation counts every price row,
+    ``type='transaction'`` included, as GnuCash desktop does. The
+    predicate now serves only the quote-staleness layer — the
+    dashboard's stale-price warning and ``list_commodities``'
+    staleness markers, via ``CurrencyMixin._market_prices_only`` —
+    and is still the single place that decides what a quote is.
     """
 
     def test_user_quote_is_market(self):
-        from gnucash_mcp.book._base import _is_market_price
+        from gnucash_mcp.book._currency import _is_market_price
 
         class _Price:
             type = "nav"
         assert _is_market_price(_Price()) is True
 
     def test_transaction_placeholder_is_not_market(self):
-        from gnucash_mcp.book._base import _is_market_price
+        from gnucash_mcp.book._currency import _is_market_price
 
         class _Price:
             type = "transaction"
@@ -524,7 +523,7 @@ class TestIsMarketPriceHelper:
     def test_missing_type_attr_treated_as_market(self):
         """Defensive: an ORM row without ``type`` shouldn't be
         silently skipped — better to value it than to under-count."""
-        from gnucash_mcp.book._base import _is_market_price
+        from gnucash_mcp.book._currency import _is_market_price
 
         class _Price:
             pass

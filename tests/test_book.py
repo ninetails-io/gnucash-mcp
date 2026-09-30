@@ -272,7 +272,14 @@ class TestGetBookSummary:
 
         In the fixture the cross-currency transfer booked value=1100 USD
         on the EUR side, so the fallback cost basis is $1,100.
+
+        The transfer's implied-rate price row values EUR since the
+        2026-09-29 ruling (desktop counts it); a book with no price
+        row of any type is still real, so drop it to reach that state.
         """
+        from tests.conftest import drop_transaction_prices
+
+        assert drop_transaction_prices(multi_currency_book) > 0
         gc_book = GnuCashBook(str(multi_currency_book))
         result = gc_book.get_book_summary()
         assert "1000 EUR — no price data" in result
@@ -2608,7 +2615,14 @@ class TestGetBookSummaryWarnings:
         self, test_book: Path,
     ):
         """A commodity referenced by an account but with no price
-        record at all → 'no price on file' warning."""
+        record at all → 'no price on file' warning.
+
+        Since the 2026-09-29 ruling the purchase's implied-rate row
+        values WILD as desktop does, so the warning first names that
+        rate ('no quote on file'); deleting the row — a real state,
+        e.g. after desktop's Price Editor — brings the old text back."""
+        from tests.conftest import drop_transaction_prices
+
         gc = GnuCashBook(str(test_book))
         with gc.open(readonly=False) as book:
             from piecash import Commodity
@@ -2628,6 +2642,19 @@ class TestGetBookSummaryWarnings:
             )
             book.save()
         self._hold_shares(gc, "Assets:WILD")
+        bought = (date.today() - timedelta(days=5)).isoformat()
+        result = gc.get_book_summary()
+        assert "Warnings:" in result
+        warnings_block = result.split("Warnings:")[1].split(
+            "Accounts:"
+        )[0]
+        assert (
+            "Stale price: WILD no quote on file; valued at the rate "
+            f"of its last transaction ({bought})"
+        ) in warnings_block
+        assert "WILD no price on file" not in warnings_block
+
+        assert drop_transaction_prices(test_book) > 0
         result = gc.get_book_summary()
         assert "Warnings:" in result
         warnings_block = result.split("Warnings:")[1].split(
@@ -2635,6 +2662,7 @@ class TestGetBookSummaryWarnings:
         )[0]
         assert "WILD" in warnings_block
         assert "no price on file" in warnings_block
+        assert "no quote on file" not in warnings_block
 
     def test_iso_currency_in_use_with_stale_rate_warns(
         self, tmp_path: Path,
@@ -3329,9 +3357,15 @@ class TestStalePriceReadsValuationRate:
         ]
 
     @staticmethod
-    def _book(path, default: str, held: list[tuple[str, str]]):
+    def _book(path, default: str, held: list[tuple]):
         """``default``-currency book with one BANK account per
-        ``(currency, balance)`` in ``held``, opened from equity."""
+        ``(currency, balance)`` in ``held``, opened from equity.
+
+        An optional third element is the opening's cost in
+        ``default``: the equity leg's quantity, so the implied-rate
+        price row the transaction leaves (which values the holding
+        since the 2026-09-29 ruling) carries a realistic rate. Without
+        it the leg's quantity equals its value — an implied rate of 1."""
         book = piecash.create_book(str(path), currency=default, overwrite=True)
         root = book.root_account
         base = book.default_currency
@@ -3343,7 +3377,7 @@ class TestStalePriceReadsValuationRate:
         equity = piecash.Account(
             name="Opening", type="EQUITY", parent=root, commodity=base,
         )
-        for code, balance in held:
+        for code, balance, *cost in held:
             if code not in currencies:
                 currencies[code] = factories.create_currency_from_ISO(code)
                 book.session.add(currencies[code])
@@ -3352,12 +3386,14 @@ class TestStalePriceReadsValuationRate:
                 commodity=currencies[code],
             )
             amt = Decimal(balance)
+            base_amt = Decimal(cost[0]) if cost else amt
             book.session.add(piecash.Transaction(
                 currency=currencies[code], description="open",
                 post_date=date.today() - timedelta(days=10),
                 splits=[
                     piecash.Split(account=acct, value=amt, quantity=amt),
-                    piecash.Split(account=equity, value=-amt, quantity=-amt),
+                    piecash.Split(account=equity, value=-amt,
+                                  quantity=-base_amt),
                 ],
             ))
         book.save()
@@ -3396,7 +3432,13 @@ class TestStalePriceReadsValuationRate:
     def test_chained_rate_is_as_old_as_its_oldest_leg(self, tmp_path):
         """USD book holding GBP; GBP is priced only in EUR (today)
         and EUR in USD (40 days ago). The valuation chains GBP→EUR→
-        USD, so GBP is stale at 40 days, named with its path."""
+        USD, so GBP is stale at 40 days, named with its path.
+
+        The subject is the chain, so the opening's implied GBP/USD row
+        (a direct rate, which desktop and the server value by since
+        the 2026-09-29 ruling) is deleted: no direct pair on file."""
+        from tests.conftest import drop_transaction_prices
+
         book, cur = self._book(tmp_path / "usd.gnucash", "USD", [("GBP", "500")])
         eur = factories.create_currency_from_ISO("EUR")
         book.session.add(eur)
@@ -3410,6 +3452,7 @@ class TestStalePriceReadsValuationRate:
         ))
         book.save()
         book.close()
+        assert drop_transaction_prices(tmp_path / "usd.gnucash") == 1
         result = GnuCashBook(str(tmp_path / "usd.gnucash")).get_book_summary()
         assert self._stale_lines(result) == [
             "⚠ Stale price: GBP last updated 40 days ago (via EUR)"
@@ -3463,8 +3506,27 @@ class TestStalePriceReadsValuationRate:
         # ... as does holding a balance, whatever the activity.
 
     def test_no_price_on_file_means_cost_basis_fallback(self, tmp_path):
-        book, cur = self._book(tmp_path / "np.gnucash", "USD", [("GBP", "500")])
+        """Since the 2026-09-29 ruling the opening's implied rate
+        values GBP as desktop does, and the warning names it ('no
+        quote on file'). Deleting that row — a book with no price of
+        any type is still real — brings back 'no price on file'."""
+        from tests.conftest import drop_transaction_prices
+
+        book, cur = self._book(
+            tmp_path / "np.gnucash", "USD", [("GBP", "500", "630")],
+        )
         book.close()
+        opened = (date.today() - timedelta(days=10)).isoformat()
+        result = GnuCashBook(str(tmp_path / "np.gnucash")).get_book_summary()
+        assert self._stale_lines(result) == [
+            "⚠ Stale price: GBP no quote on file; valued at the rate "
+            f"of its last transaction ({opened})"
+        ], result
+        assert "(USD 630.00)" in next(
+            ln for ln in result.splitlines() if "GBP Account" in ln
+        )
+
+        assert drop_transaction_prices(tmp_path / "np.gnucash") == 1
         result = GnuCashBook(str(tmp_path / "np.gnucash")).get_book_summary()
         assert self._stale_lines(result) == [
             "⚠ Stale price: GBP no price on file"
@@ -12047,7 +12109,14 @@ class TestMultiCurrencyBalances:
         ``usd_value`` alongside the human-readable triplet ``balance``.
         ``usd_value`` is dropped for currency rows where it would just
         repeat ``balance``.
+
+        The transfer's implied-rate price row values EUR since the
+        2026-09-29 ruling (desktop counts it); a book with no price
+        row of any type is still real, so drop it to reach that state.
         """
+        from tests.conftest import drop_transaction_prices
+
+        assert drop_transaction_prices(multi_currency_book) > 0
         gc_book = GnuCashBook(str(multi_currency_book))
         result = gc_book.balance_sheet(as_of_date=date(2024, 12, 31))
         accounts = {a["account"]: a for a in result["assets"]["accounts"]}
@@ -12867,18 +12936,18 @@ class TestPrices:
         assert Decimal(result["value"]) == Decimal("42.50")
         assert result["currency"] == "EUR"
 
-    def test_get_latest_price_skips_transaction_placeholder_prices(
+    def test_get_latest_price_counts_transaction_prices_like_desktop(
         self, test_book: Path,
     ):
-        """``get_latest_price`` must skip piecash's auto-created
-        ``type='transaction'`` placeholder rows so its answer agrees
-        with ``get_book_summary``, ``_find_exchange_rate``, and
-        every other valuation path.
+        """``get_latest_price`` answers with the most current row by
+        (stored time, smaller GUID), a ``type='transaction'`` row
+        included. GnuCash's lookups never filter on price type;
+        maintainer ruling 2026-09-29 overturned the issue #94 skip so
+        the server agrees with desktop on the current price.
 
-        On the bookkeeper's CNY book this surfaced as Moutai
-        returning a ``user:split-register`` rate of 33.333333 CNY
-        (the effective rate of a cross-currency transaction)
-        instead of the user's nav quote of 1810 CNY/share.
+        The shape is the bookkeeper's CNY-book one: a
+        ``user:split-register`` rate newer than the user's nav quote.
+        A quote dated after it wins back on timestamp.
         """
         import piecash
         gc_book = GnuCashBook(str(test_book))
@@ -12886,14 +12955,13 @@ class TestPrices:
             mnemonic="ZZZP", fullname="Test Stock",
             namespace="EXCHANGE",
         )
-        # User-quoted nav price (the "real" answer).
         gc_book.create_price(
             commodity="ZZZP", namespace="EXCHANGE",
             value="100.00", price_date=date(2026, 2, 1),
             price_type="nav",
         )
-        # Auto-created placeholder rows (newer date — would win on
-        # any "latest by date" sort if not filtered out).
+        # A cross-currency transaction's implied-rate row, newer than
+        # the nav quote — the current price, as desktop reads it.
         with gc_book.open(readonly=False) as book:
             usd = book.default_currency
             zzzp = next(
@@ -12910,10 +12978,19 @@ class TestPrices:
         result = gc_book.get_latest_price(
             commodity="ZZZP", namespace="EXCHANGE",
         )
-        # Must surface the user's nav quote, NOT the newer auto-
-        # created transaction artifact.
         assert result is not None
-        assert Decimal(result["value"]) == Decimal("100.00")
+        assert Decimal(result["value"]) == Decimal("33.333333")
+        assert result["type"] == "transaction"
+
+        gc_book.create_price(
+            commodity="ZZZP", namespace="EXCHANGE",
+            value="101.00", price_date=date(2026, 3, 20),
+            price_type="nav",
+        )
+        result = gc_book.get_latest_price(
+            commodity="ZZZP", namespace="EXCHANGE",
+        )
+        assert Decimal(result["value"]) == Decimal("101.00")
         assert result["type"] == "nav"
 
     def test_get_latest_price_no_prices(self, test_book: Path):
@@ -13500,13 +13577,19 @@ class TestIssue94IntermediateCurrencyChain:
       B. foreign ccy → pivot → default          (GBP via USD)
       C. security → foreign ccy → pivot → default (fund priced GBP)
 
-    plus a direct-priced control and an unreachable control, and the
-    ``type='transaction'`` trap (the cross-currency GBP funding stamps
-    a non-market GBP/AED rate of 5.0 that the chain must ignore in
-    favour of the GBP→USD→AED market legs = 4.664075).
+    plus a direct-priced control and an unreachable control.
+
+    Every purchase here is AED-funded, so each leaves a direct
+    fund/AED (and GBP/AED) ``type='transaction'`` row, and since the
+    2026-09-29 ruling those value holdings as desktop does — direct
+    pair before any chain, as ``get_nearest_price`` orders it. The
+    chain-mechanics tests are about books with no direct row, so
+    ``_build`` deletes them unless asked to keep them (case B).
     """
 
-    def _build(self, tmp_path) -> GnuCashBook:
+    def _build(
+        self, tmp_path, keep_transaction_prices: bool = False,
+    ) -> GnuCashBook:
         from datetime import date as d
         path = tmp_path / "issue94.gnucash"
         book = piecash.create_book(
@@ -13631,6 +13714,11 @@ class TestIssue94IntermediateCurrencyChain:
         price(ofund, jpy, "1000")    # E unreachable
         book.save()
         book.close()
+        if not keep_transaction_prices:
+            from tests.conftest import drop_transaction_prices
+
+            # One row per cross-currency transaction: four buys + GBP.
+            assert drop_transaction_prices(path) == 5
         return GnuCashBook(str(path))
 
     def _holdings(self, gb: GnuCashBook) -> dict:
@@ -13647,9 +13735,23 @@ class TestIssue94IntermediateCurrencyChain:
         # Provenance: derived through USD, flagged for the reader.
         assert "via USD" in h["balance"]
 
-    def test_case_b_triangulation_ignores_transaction_price(self, tmp_path):
+    def test_case_b_transaction_price_beats_chain_like_desktop(
+        self, tmp_path,
+    ):
+        """The GBP funding's implied GBP/AED 5.0 is a direct rate, and
+        a direct rate answers before any chain, stale or not. GnuCash's
+        lookups never filter on price type; maintainer ruling
+        2026-09-29 overturned the issue #94 skip so the server agrees
+        with desktop on the current price. Without the row, the
+        GBP→USD→AED triangulation values the cash."""
+        h = self._holdings(
+            self._build(tmp_path, keep_transaction_prices=True)
+        )["GBP Cash"]
+        assert h["default_currency_value"] == "4000.00"  # 800 × 5.0
+        assert "via" not in h["balance"]
+
         h = self._holdings(self._build(tmp_path))["GBP Cash"]
-        # 800 × 1.27 × 3.6725 = 3731.26 — NOT 4000 (the 5.0 txn rate).
+        # 800 × 1.27 × 3.6725 = 3731.26.
         assert h["default_currency_value"] == "3731.26"
         assert "via USD" in h["balance"]
 

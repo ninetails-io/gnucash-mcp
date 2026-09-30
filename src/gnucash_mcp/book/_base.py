@@ -35,7 +35,6 @@ from sqlalchemy import exc as sa_exc
 # churn across the codebase.
 from gnucash_mcp.book._currency import (  # noqa: F401
     CurrencyMixin,
-    _is_market_price,
     _to_date,
 )
 from gnucash_mcp.book._query import QueryMixin

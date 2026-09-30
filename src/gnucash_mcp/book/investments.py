@@ -27,7 +27,6 @@ from gnucash_mcp.book._base import (
     _lot_is_closed,
     _commodity_to_compact_line,
     _guid_prefix_map,
-    _is_market_price,
     _is_voided,
     _lot_to_compact_line,
     _neutral_time,
@@ -103,14 +102,22 @@ class InvestmentsMixin:
             # Latest market quote per commodity. ``_find_prices`` is
             # newest-first with the same-date tie-break every
             # valuation path uses, so the first row per commodity is
-            # the one the reports price by; ``market_only`` keeps a
-            # newer type='transaction' placeholder from shadowing the
-            # user's last nav quote.
+            # the one the reports price by — a transaction's implied
+            # rate included, as desktop counts it.
             latest_market: dict[str, tuple[date, "Price"]] = {}
-            for p in self._find_prices(book, market_only=True):
+            for p in self._find_prices(book):
                 latest_market.setdefault(
                     p.commodity.guid, (_to_date(p.date), p),
                 )
+            # Staleness is measured on quotes somebody entered or
+            # fetched; a transaction's implied rate values the
+            # holding but is not a quote that can go stale.
+            latest_quote: dict[str, tuple[date, "Price"]] = {}
+            with self._market_prices_only(book):
+                for p in self._find_prices(book):
+                    latest_quote.setdefault(
+                        p.commodity.guid, (_to_date(p.date), p),
+                    )
 
             today = date.today()
             default_commodity = self._require_default_currency(book)
@@ -140,7 +147,7 @@ class InvestmentsMixin:
                 if stale_days is not None:
                     if commodity == default_commodity:
                         continue
-                    latest = latest_market.get(commodity.guid)
+                    latest = latest_quote.get(commodity.guid)
                     if latest is None:
                         no_price = True
                     else:
@@ -554,7 +561,7 @@ class InvestmentsMixin:
         for p in CurrencyMixin._query_prices_with_time(
             book, comm.guid, resolved_currency.guid,
         ):
-            if _to_date(p.date) != price_date or not _is_market_price(p):
+            if _to_date(p.date) != price_date:
                 continue
             if p.source == source:
                 own = p
@@ -1094,13 +1101,12 @@ class InvestmentsMixin:
             # The chokepoint's list is newest-first with the same-date
             # tie-break every valuation path uses, so the first row in
             # the requested quote currency IS the rate the reports
-            # price by; ``market_only`` keeps a type='transaction'
-            # placeholder from answering where the user expects their
-            # nav quote.
+            # price by, a transaction's implied rate included, as
+            # desktop counts it.
             latest = next(
                 (
                     p for p in self._find_prices(
-                        book, commodity_guid=comm.guid, market_only=True,
+                        book, commodity_guid=comm.guid,
                     )
                     if p.currency.mnemonic == currency
                 ),
