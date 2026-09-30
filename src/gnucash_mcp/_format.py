@@ -743,6 +743,17 @@ def _dry_run_summary(
 # ── Numeric formatting ─────────────────────────────────────────────
 
 
+def _format_rate(rate) -> str:
+    """A valuation rate for display: at most six decimals, trailing
+    zeros dropped. A rate read off an INVERSE price row is a long
+    repeating decimal (``1 / 0.877116``); since a pair's direct and
+    inverse rows compete as one list (2026-09-30) that is an
+    everyday rate, not a corner, and
+    ``9900 EUR @ 1.140100055180842670752785264`` is noise. Display
+    only — the value beside it is computed from the full rate."""
+    return _format_number(rate, decimals=6, strip_trailing=True)
+
+
 def _format_number(
     value,
     decimals: int = 2,

@@ -21,7 +21,11 @@ from decimal import Decimal
 
 import piecash
 
-from gnucash_mcp._format import _enumerate_periods, _period_label
+from gnucash_mcp._format import (
+    _enumerate_periods,
+    _format_rate,
+    _period_label,
+)
 
 # ── FX staleness cap ───────────────────────────────────────────────
 #
@@ -1043,7 +1047,7 @@ class CurrencyMixin:
         sym = account.commodity.mnemonic
         rate = rates.get(account.commodity.guid)
         if rate is not None:
-            note = f"{quantity} {sym} @ {rate}"
+            note = f"{quantity} {sym} @ {_format_rate(rate)}"
             via = (provenance or {}).get(account.commodity.guid)
             if via:
                 note += f" ({via})"

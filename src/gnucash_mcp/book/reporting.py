@@ -26,6 +26,7 @@ from gnucash_mcp._format import (
     _enumerate_periods,
     _format_grouped_tsv,
     _format_number,
+    _format_rate,
     _mark_partial,
     _partial_period_labels,
     _period_label,
@@ -785,7 +786,7 @@ class ReportingMixin:
                             via = rate_via.get(commodity.guid)
                             via_note = f", {via}" if via else ""
                             balance_str = (
-                                f"{qty} {sym} @ {rate} "
+                                f"{qty} {sym} @ {_format_rate(rate)} "
                                 f"({ccy_mnemonic} {info['usd']:,.2f}"
                                 f"{via_note})"
                             )
