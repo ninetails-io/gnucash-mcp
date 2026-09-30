@@ -309,11 +309,38 @@ now treat a pair's direct and inverse rows as one list
 rule made this visible: an implied USD/EUR row was shadowing a newer
 EUR/USD quote.
 
-One carve-out, flagged for a ruling: the rate the server CHOOSES
-for a new posting or payment is looked up over quotes only. Counting
-implied rates there lets each posting refresh the echo of the last
-one, and the FX staleness guard never fires again.
+One carve-out: the rate the server CHOOSES for a new posting or
+payment is looked up over quotes only. Counting implied rates there
+lets each posting refresh the echo of the last one, and the FX
+staleness guard never fires again. Ruled by the maintainer,
+2026-09-30: "Carve out it is. Stale prices are our own invention in
+this case."
 
 Not yet probed: a stock purchase in desktop's register (confirms the
 `record_price` port's denominator and source), a cross-currency
 invoice post (`user:invoice-post`), and the dialog's to-amount path.
+
+### Desktop gate and second round — 2026-09-30
+
+The converters ran on the server twin (`slot_fillers_normalized`
+2,570) and the server added `Assets:EUR Savings Server` and a
+USD 50 → EUR 45 transfer dated 2026-09-28. Desktop then opened that
+file, the maintainer entered two transactions in it (a purchase of
+2 AAPL for 800.00 and a USD 50 → EUR 45 transfer typed as a
+to-amount), saved, and quit: the converted book opens, takes
+writes, and saves, and desktop left every converted slot row as the
+converter wrote it (0 rows back in piecash's shape). The maintainer
+repeated both entries in `parity-server.pre-xccy.gnucash`, the
+unconverted backup, which is where "EUR Savings Server" was missing.
+
+Both entries were dated 2026-09-29, a day that already held a
+preferred price for each pair (`user:price-editor` for AAPL,
+`user:price` for EUR). Desktop added no price row and changed none,
+and its split rows are byte-identical to the server's for the same
+two entries on the same day: empty action on the stock split too,
+AAPL quantity `20000/10000`, value `80000/100`. That confirms the
+same-day rule in both ports and the absence of a Buy stamp. It does
+not confirm the shape of a NEW row, which the server writes as
+`AAPL/USD 400000000/1000000 user:split-register` and
+`EUR/USD 10/9 user:xfer-dialog`; that needs the same two entries on
+a day with no price for the pair.
