@@ -715,6 +715,18 @@ def _worker_db_uri(env_var: str) -> str | None:
     return str(url.set(database=f"{url.database or 'gnucash'}_{worker}"))
 
 
+def _ensure_account(book, *args, **kwargs) -> None:
+    """Create an account another test in the class may already have
+    made. The class shares one database book per xdist worker, and
+    which tests land on a worker varies by run: two tests that each
+    created ``Income`` passed or failed by scheduling."""
+    try:
+        book.create_account(*args, **kwargs)
+    except ValueError as e:
+        if "already exists" not in str(e):
+            raise
+
+
 _PG_URI = _worker_db_uri("GNUCASH_TEST_PG_URI")
 _MYSQL_URI = _worker_db_uri("GNUCASH_TEST_MYSQL_URI")
 
@@ -867,11 +879,11 @@ class _RealDatabaseTests:
             name="Accounts Receivable", account_type="RECEIVABLE",
             parent="Assets",
         )
-        db_book.create_account(
-            name="Income", account_type="INCOME", placeholder=True,
+        _ensure_account(
+            db_book, name="Income", account_type="INCOME", placeholder=True,
         )
-        db_book.create_account(
-            name="Sales", account_type="INCOME", parent="Income",
+        _ensure_account(
+            db_book, name="Sales", account_type="INCOME", parent="Income",
         )
         customer = db_book.create_customer(name="Dialect Co")
         inv = db_book.create_invoice(customer_id=customer["id"])
@@ -1093,8 +1105,8 @@ class _RealDatabaseTests:
             )
         except ValueError:
             pass  # an earlier test in this class created it
-        db_book.create_account("Income", "INCOME")
-        db_book.create_account("Sales", "INCOME", parent="Income")
+        _ensure_account(db_book, "Income", "INCOME")
+        _ensure_account(db_book, "Sales", "INCOME", parent="Income")
         db_book.create_account(
             "AR EUR", "RECEIVABLE", parent="Assets", commodity="EUR",
         )
@@ -1130,8 +1142,12 @@ class _RealDatabaseTests:
                 "FROM splits s JOIN accounts a ON a.guid = s.account_guid "
                 "JOIN transactions t ON t.guid = s.tx_guid "
                 "JOIN commodities c ON c.guid = t.currency_guid "
-                "WHERE s.action = 'Payment' ORDER BY a.name"
-            )).fetchall()
+                # This payment only: the class shares one book, and
+                # another test's payment is in it when both land on
+                # the same xdist worker.
+                "WHERE s.action = 'Payment' AND t.guid LIKE :txn "
+                "ORDER BY a.name"
+            ), {"txn": result["transaction_guid"] + "%"}).fetchall()
             assert [tuple(r) for r in rows] == [
                 ("USD", "AR EUR", -100000, -90000),
                 ("USD", "Checking", 108000, 108000),
