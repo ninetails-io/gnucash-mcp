@@ -1613,3 +1613,55 @@ class TestBudgetHeadlineExpensesOnly:
         gb.set_budget_amount("H", "Income:Salary", "5000")
         with gb.open(readonly=True) as book:
             assert gb._budget_headline(book, list(book.transactions)) is None
+
+
+class TestBudgetAmountIsAMagnitude:
+    """Review C40 / IV-14. The ledger writes income as a negative, so
+    ``-5000`` is the natural slip on an income account — and it
+    stored a target in the wrong direction, which then cancelled a
+    correct one in the report."""
+
+    def _budget(self, budget_book):
+        book = GnuCashBook(str(budget_book))
+        book.create_budget(name="B", year=2026)
+        return book
+
+    @pytest.mark.parametrize("account", [
+        "Income:Salary", "Expenses:Groceries",
+    ])
+    def test_a_negative_amount_is_refused(self, budget_book, account):
+        book = self._budget(budget_book)
+        with pytest.raises(ValueError, match="positive numbers"):
+            book.set_budget_amount(
+                budget_name="B", account=account, amount="-5000",
+                period=0,
+            )
+        report = book.get_budget(name="B", compact=False)
+        assert account not in str(report.get("accounts", ""))
+
+    def test_income_target_does_not_cancel(self, budget_book):
+        book = self._budget(budget_book)
+        book.set_budget_amount(
+            budget_name="B", account="Income:Salary", amount="5000",
+            period=0,
+        )
+        with pytest.raises(ValueError):
+            book.set_budget_amount(
+                budget_name="B", account="Income:Salary",
+                amount="-5000", period=1,
+            )
+        book.set_budget_amount(
+            budget_name="B", account="Income:Salary", amount="5000",
+            period=1,
+        )
+        report = book.get_budget_report("B", period="all", compact=False)
+        row = next(
+            a for a in report["accounts"] if a["account"] == "Income:Salary"
+        )
+        assert Decimal(row["budgeted"]) == Decimal("10000")
+
+    def test_zero_still_clears_a_target(self, budget_book):
+        book = self._budget(budget_book)
+        assert book.set_budget_amount(
+            budget_name="B", account="Expenses:Groceries", amount="0",
+        )["status"] == "updated"

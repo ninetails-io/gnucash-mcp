@@ -692,6 +692,21 @@ class BudgetsMixin:
         """
 
         amount_decimal = _to_decimal(amount)
+        # A budget amount on this surface is a MAGNITUDE: 5000 is a
+        # 5,000 income target on an income account and a 5,000
+        # spending limit on an expense account; the account's type
+        # supplies the direction (``_budget_stored_sign``). The
+        # ledger's own convention writes income as a negative, so
+        # "-5000" is the natural slip, and it stored a target in the
+        # WRONG direction that cancelled a correct one in the report.
+        if amount_decimal < 0:
+            raise ValueError(
+                f"Budget amounts are entered as positive numbers "
+                f"(got {amount}): {abs(amount_decimal)} is the target "
+                f"for an income account and the limit for an expense "
+                f"account alike. The account's type supplies the "
+                f"direction."
+            )
 
         with self.open(readonly=False) as book:
             budget = self._find_budget(book, budget_name)
