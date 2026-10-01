@@ -366,7 +366,17 @@ Worth knowing before you switch:
   schedule before you move a real book over — see
   [`docs/RESTORE_FROM_BACKUP.md`](docs/RESTORE_FROM_BACKUP.md).
 - Your password is masked wherever the server names the book — in
-  tool results, in the dashboard header, and in the audit log.
+  tool results, in the dashboard header, and in the audit log — and
+  in every error message, log line, and startup error, including
+  the ones a database driver writes. A password given as a query
+  parameter (`?password=…`, `sslpassword=…`) is masked the same
+  way.
+- **Put the connection string in the `env` block, not on the
+  command line.** `--book-uri` works, but a password in a command
+  line is visible to every user of the machine in the process
+  list. On PostgreSQL you can also leave the password out of the
+  string entirely and let the driver read `PGPASSWORD` or
+  `~/.pgpass`.
 
 Both dialects are exercised by the test suite and CI: PostgreSQL
 16 and MariaDB 11, each against a real server.

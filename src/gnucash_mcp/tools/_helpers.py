@@ -45,7 +45,13 @@ from gnucash_mcp._format import (  # noqa: F401
     _paginate,
 )
 
+from gnucash_mcp.logging_config import CredentialScrubFilter  # noqa: E402
+
 logger = logging.getLogger(__name__)
+# Every error a tool raises is logged here with its exception text,
+# and this logger propagates to the host's stderr handler. Mask
+# connection-string credentials before the record leaves.
+logger.addFilter(CredentialScrubFilter())
 
 
 # ── Shared GUID parameter annotations ──────────────────────────────

@@ -14,7 +14,6 @@ extracted-to-core dependency in the whole tree.
 """
 
 import logging
-import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -23,7 +22,7 @@ import piecash
 
 from gnucash_mcp.logging_config import DEBUG_LOGGER_NAME
 from gnucash_mcp._format import (
-    _redact_uri,
+    _scrub_credentials,
     _candidate_comparison_tsv,
     _dry_run_summary,
     _format_number,
@@ -37,7 +36,6 @@ _debug_logger = logging.getLogger(DEBUG_LOGGER_NAME)
 # Longest reason a failed-check warning carries. Enough to paste into
 # an issue; short enough that the dashboard stays a dashboard.
 _CHECK_FAILURE_REASON_CHARS = 120
-_URI_IN_TEXT_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://\S+")
 
 
 def _describe_check_failure(check: str, exc: BaseException) -> str:
@@ -46,15 +44,16 @@ def _describe_check_failure(check: str, exc: BaseException) -> str:
     ``"<Check> check failed: <ExceptionType>: <first line of message>"``.
     First line only — SQLAlchemy appends the statement, its
     parameters, and a docs link on later lines, none of which belong
-    on a dashboard. Any URI in the text is password-masked through
-    ``_redact_uri`` (a connection error can quote the DSN). Truncated
-    with an ellipsis past ``_CHECK_FAILURE_REASON_CHARS``.
+    on a dashboard. Any connection string in the text has its
+    credentials masked by ``_scrub_credentials`` (a connection error
+    can quote the DSN). Truncated with an ellipsis past
+    ``_CHECK_FAILURE_REASON_CHARS``.
 
     The reason travels inline because the debug log is opt-in and
     the users this reaches are the ones who never turned it on.
     """
     first = (str(exc).strip().splitlines() or [""])[0].strip()
-    first = _URI_IN_TEXT_RE.sub(lambda m: _redact_uri(m.group(0)), first)
+    first = _scrub_credentials(first)
     if len(first) > _CHECK_FAILURE_REASON_CHARS:
         first = first[: _CHECK_FAILURE_REASON_CHARS - 1] + "…"
     reason = f"{type(exc).__name__}: {first}" if first else type(exc).__name__

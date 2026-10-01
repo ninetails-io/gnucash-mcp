@@ -96,6 +96,106 @@ def clean_server():
                 os.environ[k] = v
 
 
+# ── Credentials: end to end ───────────────────────────────────────
+
+
+class TestCredentialsNeverLeave:
+    """A URI-mode server whose database cannot be opened, with a
+    password planted in the connection string, called the way a
+    client calls it. The password must appear in nothing that leaves:
+    the tool result, the audit and debug files, or the log records
+    that propagate to the host's stderr handler. (Review C16a, C16b,
+    C59; the unit table is ``tests/test_credential_scrub.py``.)
+    """
+
+    SECRET = "S3CRET-pw-do-not-leak"
+
+    def _call_a_tool(self, srv, tmp_path, monkeypatch, caplog, uri):
+        import json
+        import logging
+
+        from gnucash_mcp.logging_config import audit_log
+        from gnucash_mcp.tools._helpers import safe_tool
+
+        monkeypatch.setenv("GNUCASH_LOG_DIR", str(tmp_path / "logs"))
+        srv._logging_audit = True
+        srv._logging_debug = True
+        srv._install_book_uri(uri, activate=True)
+
+        @safe_tool
+        @audit_log(
+            classification="write", operation="create",
+            entity_type="account",
+        )
+        def create_account(name: str) -> str:
+            return json.dumps(
+                srv.get_book().create_account(name, "EXPENSE")
+            )
+
+        with caplog.at_level(logging.DEBUG):
+            result = create_account(name="Dining")
+        files = {
+            str(p.relative_to(tmp_path)): p.read_text()
+            for p in (tmp_path / "logs").rglob("*") if p.is_file()
+        }
+        return result, files, caplog.text
+
+    def _assert_clean(self, result, files, logged):
+        assert self.SECRET not in result
+        for name, text in files.items():
+            assert self.SECRET not in text, name
+        assert self.SECRET not in logged
+        # It did fail, and said so on every surface.
+        assert '"error"' in result
+        assert any("ERROR" in text for text in files.values())
+        assert "create_account" in logged
+
+    def test_missing_database_named_by_piecash(
+        self, clean_server, tmp_path, monkeypatch, caplog,
+    ):
+        """piecash: ``Database '<the whole uri>' does not exist``."""
+        uri = (
+            f"sqlite:///{tmp_path}/missing.gnucash"
+            f"?password={self.SECRET}"
+        )
+        result, files, logged = self._call_a_tool(
+            clean_server, tmp_path, monkeypatch, caplog, uri,
+        )
+        self._assert_clean(result, files, logged)
+        # The message survives, masked: the user can still see which
+        # database is missing.
+        assert "does not exist" in result
+        assert "password=***" in result
+
+    def test_userinfo_password_quoted_by_sqlalchemy(
+        self, clean_server, tmp_path, monkeypatch, caplog,
+    ):
+        """SQLAlchemy: ``Invalid SQLite URL: sqlite://u:<pw>@``."""
+        uri = f"sqlite://dbuser:{self.SECRET}@/{tmp_path}/missing.gnucash"
+        result, files, logged = self._call_a_tool(
+            clean_server, tmp_path, monkeypatch, caplog, uri,
+        )
+        self._assert_clean(result, files, logged)
+        assert "dbuser:***@" in result
+
+    def test_the_book_is_named_without_the_password_everywhere(
+        self, clean_server, tmp_path, monkeypatch, caplog,
+    ):
+        """The header and the startup notice masked the userinfo
+        password already; a query-string one passed straight
+        through (C16b)."""
+        uri = (
+            f"sqlite:///{tmp_path}/missing.gnucash"
+            f"?sslpassword={self.SECRET}"
+        )
+        result, files, logged = self._call_a_tool(
+            clean_server, tmp_path, monkeypatch, caplog, uri,
+        )
+        self._assert_clean(result, files, logged)
+        assert self.SECRET not in BookSource.from_uri(uri).display_name
+        assert self.SECRET not in clean_server.get_server_config()
+
+
 # ── BookSource ────────────────────────────────────────────────────
 
 

@@ -17,6 +17,10 @@ from pathlib import Path
 from typing import Callable
 
 from gnucash_mcp._env import _env_errors, _parse_env_toggle
+from gnucash_mcp._format import (
+    _URI_IN_TEXT_RE as _DB_URI_IN_TEXT_RE,
+    _scrub_credentials,
+)
 
 AUDIT_LOGGER_NAME = "gnucash_mcp.audit"
 DEBUG_LOGGER_NAME = "gnucash_mcp.debug"
@@ -162,17 +166,49 @@ def _redact_enabled() -> bool:
     return enabled
 
 
-def redact_paths(text: str) -> str:
-    """Replace absolute filesystem paths with their basename when
-    ``GNUCASH_REDACT_PATHS=1`` is set; pass-through otherwise.
-
-    Opt-in (default off): paths in errors are usually the most
-    useful local-debugging signal; redaction is for messages shared
-    externally. Basename-only — the user still needs to know
-    *which* file errored; the directory structure is the sensitive
-    bit. POSIX and Windows absolute paths match; relative paths
-    pass through (they don't leak layout).
+class CredentialScrubFilter(logging.Filter):
+    """Mask connection-string credentials in a log record before any
+    handler sees it (``_scrub_credentials``). Attached to the loggers
+    this package logs errors on: their records propagate to whatever
+    root handler the host installed — FastMCP's stderr handler, which
+    Claude Desktop keeps on disk and Docker ships to ``docker logs``
+    — and an exception's text can quote the whole connection string.
     """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:
+            return True
+        scrubbed = _scrub_credentials(message)
+        if scrubbed != message:
+            record.msg = scrubbed
+            record.args = None
+        return True
+
+
+def redact_paths(text: str) -> str:
+    """Make an error message safe to leave the server.
+
+    Two steps, the first unconditional:
+
+    1. Connection-string credentials are masked, ALWAYS
+       (``_scrub_credentials``). Every error a tool returns passes
+       through here, and an exception raised while opening a database
+       book quotes the connection string, password included.
+    2. Absolute filesystem paths are replaced with their basename
+       when ``GNUCASH_REDACT_PATHS=1`` is set; pass-through otherwise.
+
+    Path redaction is opt-in (default off): paths in errors are
+    usually the most useful local-debugging signal; redaction is for
+    messages shared externally. Basename-only — the user still needs
+    to know *which* file errored; the directory structure is the
+    sensitive bit. POSIX and Windows absolute paths match; relative
+    paths pass through (they don't leak layout). A connection URI is
+    not a path: it is set aside while the path patterns run, so it
+    comes out masked rather than mangled.
+    """
+    text = _scrub_credentials(text)
     # Full toggle vocabulary via the _parse_env_toggle chokepoint —
     # =="1" once made the Advanced box's "true" a silent no-op, and
     # raw vocabulary membership repeated the shape one level up: a
@@ -201,10 +237,23 @@ def redact_paths(text: str) -> str:
         full = m.group(0).replace("\\", "/")
         return full.rsplit("/", 1)[-1]
 
+    # Set connection URIs aside: the path patterns read
+    # ``postgresql://u:***@host/db`` as a drive letter and a path and
+    # left ``postgresqdb``.
+    held: list[str] = []
+
+    def hold(m):
+        held.append(m.group(0))
+        return f"\x00{len(held) - 1}\x00"
+
+    text = _DB_URI_IN_TEXT_RE.sub(hold, text)
+
     # Windows first (more specific prefix); then POSIX.
     text = win_re.sub(to_basename, text)
     text = posix_re.sub(to_basename, text)
-    return text
+    return re.sub(
+        r"\x00(\d+)\x00", lambda m: held[int(m.group(1))], text,
+    )
 
 
 def resolve_mcp_dir(book_path: Path | str) -> Path:
@@ -380,7 +429,10 @@ class _DailyFileHandler(logging.Handler):
         try:
             path = self.ensure_file()
             with open(path, "a", encoding="utf-8") as fh:
-                fh.write(self.format(record) + "\n")
+                # Last line of defence for the files this server
+                # owns: nothing reaches the audit or debug log with
+                # a connection-string credential in it.
+                fh.write(_scrub_credentials(self.format(record)) + "\n")
         except Exception:
             self.handleError(record)
 
@@ -3017,9 +3069,13 @@ def audit_log(
                     except Exception:
                         pass
 
+                # Exception text can quote the connection string
+                # (piecash: "Database 'postgresql://user:pw@…' does
+                # not exist"); mask it before it reaches either log.
+                error_message = _scrub_credentials(str(e))
                 debug_logger.debug(
                     f"MCP response: tool={func.__name__} status=error "
-                    f"elapsed={elapsed_ms:.0f}ms error={e}"
+                    f"elapsed={elapsed_ms:.0f}ms error={error_message}"
                 )
 
                 # Log a simple error line. Exception text embeds
@@ -3030,7 +3086,7 @@ def audit_log(
                 time_part = timestamp.split("T")[1][:8] if "T" in timestamp else timestamp[:8]
                 error_text = (
                     f"{time_part}  ERROR  {func.__name__}: "
-                    f"{_escape_audit_value(str(e))}"
+                    f"{_escape_audit_value(error_message)}"
                 )
                 logger.info(error_text)
                 logger.info("")

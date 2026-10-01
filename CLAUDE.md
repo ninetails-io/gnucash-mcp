@@ -225,6 +225,7 @@ module contributes zero tools to the MCP surface.
   unregistered, `multi_book_active()` False and the ruling-6 write
   disarm inactive without any of them knowing DB books exist.
   Connection URIs are password-masked wherever a book is named,
+  and in every error and log line (`_scrub_credentials`),
   unconditionally (not behind `GNUCASH_REDACT_PATHS` — a path is a
   privacy preference, a credential is a leak).
 - **Raw SQL is written in the three-dialect intersection.** Every
@@ -328,6 +329,29 @@ Established chokepoints and the rule each one owns:
   columns.
 - `_book_display_name` — how a book is named to anyone, path
   basenamed and URI password-masked.
+- `_scrub_credentials` (`_format.py`) — the one scrubber for text
+  that leaves the server by ANY road, masking connection-string
+  credentials: the userinfo password (split at the LAST `@`, so a
+  password containing one is masked whole) and secret-bearing query
+  parameters (`?password=`, `sslpassword=`, `passwd=`), neither of
+  which SQLAlchemy's `hide_password` fully covers. Naming the book
+  safely was never enough: an exception raised while OPENING a
+  database book quotes the whole connection string (piecash's
+  "Database '…' does not exist", SQLAlchemy's "Invalid SQLite
+  URL: …"), and `str(e)` went to the model, the audit file, and
+  stderr beside a header that masked the same password (review
+  C16a). Every road passes through it now: `redact_paths` (every
+  tool error; the scrub is unconditional, the path half stays
+  opt-in), the audit ERROR and debug lines, `_DailyFileHandler.emit`
+  (the files we own), `CredentialScrubFilter` on the tool-error
+  logger (which propagates to the host's stderr handler), `main()`'s
+  startup prints, and `_describe_check_failure`. `_parse_book_url`
+  never echoes a string it could not parse. A new place that puts
+  exception text or a URI in front of anyone calls the scrubber;
+  don't reach for `render_as_string(hide_password=True)` directly.
+  Locked by `tests/test_credential_scrub.py` and the end-to-end
+  `TestCredentialsNeverLeave` (plants a password, searches every
+  output).
 - `_sx_recipe` — the one reader of a schedule's recipe: GnuCash's
   template rows first, the pre-1.5 `splits-json` slot as fallback.
   Readers never write; every schedule write converts the book's
