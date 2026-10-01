@@ -961,6 +961,9 @@ class CurrencyMixin:
         :meth:`_validate_transaction_splits` (``account``, ``value``,
         ``quantity``). ``as_of`` is the transaction date.
         """
+        # _base imports this module; resolve at call time.
+        from gnucash_mcp.book._base import _commodity_quantum
+
         as_of = as_of or date.today()
         ratio_cap = _fx_sanity_ratio()
         out: list[dict] = []
@@ -968,6 +971,20 @@ class CurrencyMixin:
             account = v["account"]
             if account.commodity == trans_currency:
                 continue
+            entered = v.get("quantity_as_entered")
+            if entered is not None:
+                # Not a rate problem, but the same kind of heads-up:
+                # what was stored is not what was typed.
+                out.append({
+                    "type": "quantity_rounded",
+                    "message": (
+                        f"Split for '{account.fullname}': quantity "
+                        f"{entered} stored as {v['quantity']} — "
+                        f"{account.commodity.mnemonic} is counted in "
+                        f"units of "
+                        f"{_commodity_quantum(account.commodity)}."
+                    ),
+                })
             value = abs(Decimal(str(v["value"])))
             quantity = abs(Decimal(str(v["quantity"])))
             if value == 0 or quantity == 0:

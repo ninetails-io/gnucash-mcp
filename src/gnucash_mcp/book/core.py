@@ -4294,6 +4294,24 @@ class CoreMixin:
                         f"must have same sign "
                         f"(got value={value}, quantity={quantity})"
                     )
+                # Money on both sides or on neither. The sign test
+                # above passes any zero, so 110 USD arriving in a EUR
+                # account as 0 EUR was accepted — the 110 then showed
+                # as an unrealized loss — and so was 100 EUR arriving
+                # for nothing. A zero leg is real only on a share
+                # account (a capital-gains split, a stock split).
+                if account.commodity.namespace == "CURRENCY" \
+                        and (value == 0) != (quantity == 0):
+                    raise ValueError(
+                        f"Split for '{ref}': one side is zero "
+                        f"(amount={value} "
+                        f"{trans_currency.mnemonic}, quantity={quantity} "
+                        f"{account.commodity.mnemonic}). A "
+                        f"{account.commodity.mnemonic} account needs "
+                        f"both: the amount in "
+                        f"{trans_currency.mnemonic} and the quantity "
+                        f"in {account.commodity.mnemonic}."
+                    )
             else:
                 raise ValueError(
                     f"Split for '{ref}' requires 'quantity' "
@@ -4310,7 +4328,26 @@ class CoreMixin:
             _, stored_quantity = _split_amounts(
                 value, quantity, trans_currency, account,
             )
+            entered_quantity = None
             if stored_quantity != quantity:
+                # GnuCash rounds a share quantity to the commodity's
+                # unit, and so must the stored row. But not silently:
+                # 0.00003 BTC at a 4-decimal fraction stored 2.00 of
+                # cost against NO coins. A quantity that rounds away
+                # entirely is refused; one that merely rounds is
+                # reported (``_fx_sanity_warnings`` reads
+                # ``quantity_as_entered``).
+                if stored_quantity == 0:
+                    raise ValueError(
+                        f"Split for '{ref}': quantity {quantity} is "
+                        f"smaller than {account.commodity.mnemonic}'s "
+                        f"smallest unit "
+                        f"({_commodity_quantum(account.commodity)}) "
+                        f"and would be stored as 0. Enter at least "
+                        f"one unit, or give the commodity a finer "
+                        f"fraction in GnuCash's Security Editor."
+                    )
+                entered_quantity = quantity
                 quantity = stored_quantity
             resolved.append({
                 "account": account,
@@ -4320,6 +4357,8 @@ class CoreMixin:
                 "action": split.get("action"),
                 "original_ref": ref,
             })
+            if entered_quantity is not None:
+                resolved[-1]["quantity_as_entered"] = entered_quantity
 
         return resolved
 
