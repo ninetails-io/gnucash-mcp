@@ -4189,7 +4189,7 @@ class CoreMixin:
         return "\n".join(
             f"{d['confidence']}\t{d['guid']}\t{d['date']}\t"
             f"{d['amount']}\t{d.get('currency', '')}\t"
-            f"{d['description']}\t{d['signals']}"
+            f"{_tsv_cell(d['description'])}\t{d['signals']}"
             for d in duplicates
         )
 
@@ -7234,7 +7234,8 @@ class CoreMixin:
             r = by_key.get(u["guid"], {})
             lines.append(
                 f"{u['guid']}\t{r.get('status', '')}\t"
-                f"{r.get('description', '')}\t{r.get('reason', '')}"
+                f"{_tsv_cell(r.get('description', ''))}\t"
+                f"{_tsv_cell(r.get('reason', ''))}"
             )
         return {"results": "\n".join(lines)}
 

@@ -42,7 +42,12 @@ from gnucash_mcp.book._currency import (  # noqa: F401
 # hold whichever modules are enabled, hence here.
 from gnucash_mcp.book import _piecash_shapes  # noqa: F401,E402
 from gnucash_mcp.book._query import QueryMixin
-from gnucash_mcp._format import _book_display_name, _parse_book_url
+from gnucash_mcp._format import (
+    _book_display_name,
+    _one_line,
+    _parse_book_url,
+    _tsv_cell,
+)
 
 # GnuCash stores GUIDs as lowercase hex (via uuid4().hex). We accept both
 # cases on input for ergonomics — users pasting from external tools may
@@ -957,9 +962,14 @@ def _account_to_compact_line(account: piecash.Account) -> str:
     if account.placeholder:
         annotations.append("PLACEHOLDER")
 
+    # Book text goes into a one-line row: escaped, so a name holding
+    # a newline or tab cannot start a row of its own, and left
+    # otherwise exactly as written so the path still resolves when a
+    # caller copies it back (_one_line).
+    shown = _one_line(fullname)
     if annotations:
-        return f"{fullname} [{', '.join(annotations)}]"
-    return fullname
+        return f"{shown} [{', '.join(annotations)}]"
+    return shown
 
 
 # GnuCash's lot flag is a tri-state, from libgnucash/engine/gnc-lot.cpp:
@@ -1173,7 +1183,7 @@ def _commodity_to_compact_line(namespace: str, entry: dict) -> str:
     Format: "NAMESPACE:MNEMONIC\\tfullname\\tprice_info"
     """
     prefix = f"{namespace}:{entry['mnemonic']}"
-    name = entry.get("fullname", "")
+    name = _tsv_cell(entry.get("fullname", ""))
     parts = [prefix, name]
     lp = entry.get("latest_price")
     if entry.get("default_currency"):
@@ -1216,7 +1226,7 @@ def _unreconciled_split_to_compact_line(
     """
     short = _short_guid(split_dict["guid"], prefixes)
     d = split_dict["date"]
-    desc = split_dict["description"]
+    desc = _tsv_cell(split_dict["description"])
     amount = split_dict["amount"]
     state = split_dict["reconcile_state"]
     return f"{short}\t{d}\t{desc}\t{amount}\t{state}"
@@ -1238,7 +1248,7 @@ def _format_one_split(split: piecash.Split, transaction: piecash.Transaction) ->
     Shared between the full and collapsed split-list paths so the
     per-split rendering stays consistent with history.
     """
-    account_name = split.account.fullname
+    account_name = _one_line(split.account.fullname)
     amount = split.quantity
     if split.quantity != split.value:
         currency = transaction.currency.mnemonic
@@ -1300,7 +1310,12 @@ def _transaction_to_compact_line(
         if transaction.post_date else "(no date)"
     )
     short = _short_guid(transaction.guid, prefixes)
-    desc = transaction.description
+    # Description and notes are book text — a bank import's, a
+    # counterparty's, anyone's — and they land in a row the model
+    # reads beside the server's own banners. Written raw, a newline
+    # in one started a new "row" (or a line in the server's voice);
+    # _tsv_cell renders it as a visible \n inside its own cell.
+    desc = _tsv_cell(transaction.description)
     splits = _ordered_splits(transaction)
 
     if focus_account is not None:
@@ -1326,7 +1341,7 @@ def _transaction_to_compact_line(
         line = f"{date_str}\t{short}\t{desc}\t{splits_str}"
 
     if transaction.notes:
-        line += f"\t{transaction.notes}"
+        line += f"\t{_tsv_cell(transaction.notes)}"
     return line
 
 
@@ -1342,7 +1357,7 @@ def _lot_to_compact_line(
                   truncation when absent.
     """
     short = _short_guid(lot_dict["guid"], prefixes)
-    title = lot_dict["title"]
+    title = _tsv_cell(lot_dict["title"])
     qty = lot_dict["quantity"]
     basis = lot_dict["cost_basis"]
     parts = [short, title, f"{qty} shares", f"{basis} basis"]
@@ -1363,7 +1378,7 @@ def _sx_to_compact_line(
                   Defaults to raw 8-char truncation when absent.
     """
     short = _short_guid(sx_dict["guid"], prefixes)
-    name = sx_dict["name"]
+    name = _tsv_cell(sx_dict["name"])
     freq = sx_dict["frequency"]
     if not sx_dict.get("enabled"):
         status = "disabled"
@@ -1392,7 +1407,7 @@ def _upcoming_to_compact_line(
                   Defaults to raw 8-char truncation when absent.
     """
     short = _short_guid(entry["guid"], prefixes)
-    name = entry["name"]
+    name = _tsv_cell(entry["name"])
     occ_date = entry["occurrence_date"]
     days = entry["days_until"]
     amount = entry["amount"]

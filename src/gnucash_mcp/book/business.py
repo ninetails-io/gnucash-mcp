@@ -46,6 +46,7 @@ from gnucash_mcp._format import (
     _paginate,
     _partial_period_labels,
     _period_label,
+    _tsv_cell,
 )
 
 
@@ -186,7 +187,7 @@ def _format_outstanding_invoices_compact(rows: list[dict]) -> str:
         return ""
     lines = []
     for r in rows:
-        owner = r.get("owner_name") or f"#{r['id']}"
+        owner = _tsv_cell(r.get("owner_name")) or f"#{r['id']}"
         is_credit_note = r.get("is_credit_note", False)
         # (CN) wins over (BILL): the credit-note tag changes how
         # the whole amount column reads.
@@ -1675,17 +1676,17 @@ class BusinessMixin:
     @staticmethod
     def _customer_to_compact_line(customer) -> str:
         """One-line compact: 'id  name  currency'."""
-        return f"{customer.id}\t{customer.name}\t{customer.currency.mnemonic}"
+        return f"{customer.id}\t{_tsv_cell(customer.name)}\t{customer.currency.mnemonic}"
 
     @staticmethod
     def _vendor_to_compact_line(vendor) -> str:
         """One-line compact: 'id  name  currency'."""
-        return f"{vendor.id}\t{vendor.name}\t{vendor.currency.mnemonic}"
+        return f"{vendor.id}\t{_tsv_cell(vendor.name)}\t{vendor.currency.mnemonic}"
 
     @staticmethod
     def _employee_to_compact_line(employee) -> str:
         """One-line compact: 'id  name  currency'."""
-        return f"{employee.id}\t{employee.name}\t{employee.currency.mnemonic}"
+        return f"{employee.id}\t{_tsv_cell(employee.name)}\t{employee.currency.mnemonic}"
 
     @staticmethod
     def _job_to_dict(job, owner_name: str | None = None) -> dict:
@@ -1720,10 +1721,13 @@ class BusinessMixin:
         owner_tag = (
             "CUSTOMER" if job.owner_type == 2 else "VENDOR"
         )
-        owner_str = owner_name or "?"
-        ref_part = f"  ref:{job.reference}" if job.reference else ""
+        owner_str = _tsv_cell(owner_name) or "?"
+        ref_part = (
+            f"  ref:{_tsv_cell(job.reference)}" if job.reference else ""
+        )
         return (
-            f"{job.id}\t{job.name}\t{owner_tag}\t{owner_str}{ref_part}"
+            f"{job.id}\t{_tsv_cell(job.name)}\t{owner_tag}\t"
+            f"{owner_str}{ref_part}"
         )
 
     @staticmethod
@@ -1957,7 +1961,7 @@ class BusinessMixin:
             amount_str = "?"
 
         return (
-            f"{invoice.id}\t{inv_type}\t{owner_name}\t{amount_str}\t"
+            f"{invoice.id}\t{inv_type}\t{_tsv_cell(owner_name)}\t{amount_str}\t"
             f"{date_str}\t{status}"
         )
 
@@ -4099,7 +4103,9 @@ class BusinessMixin:
             )
             if compact:
                 lines = [indicator]
-                lines += [f"{t.name}\t{t.duedays} days" for t in page]
+                lines += [
+                    f"{_tsv_cell(t.name)}\t{t.duedays} days" for t in page
+                ]
                 return "\n".join(lines)
             else:
                 return {
@@ -4415,7 +4421,7 @@ class BusinessMixin:
                     n = len(tt.entries)
                     suffix = "entry" if n == 1 else "entries"
                     lines.append(
-                        f"{tt.name}\t{n} {suffix}: {summary}"
+                        f"{_tsv_cell(tt.name)}\t{n} {suffix}: {summary}"
                     )
                 return "\n".join(lines)
 

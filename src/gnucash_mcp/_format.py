@@ -623,6 +623,25 @@ _CANDIDATE_COMPARISON_COLUMNS = (
 )
 
 
+def _one_line(value) -> str:
+    """Book text made safe for a single output row WITHOUT changing
+    how it reads back as a reference: tabs, newlines, and the exotic
+    separators become visible escapes or spaces, and nothing else is
+    touched. For account paths, which a caller copies out of a
+    listing and sends back as an account ref — ``_tsv_cell`` would
+    double a backslash in the name and the copied path would no
+    longer resolve."""
+    if value is None:
+        return ""
+    s = str(value)
+    if not s:
+        return ""
+    s = s.replace("\t", "\\t").replace("\n", "\\n").replace("\r", "\\r")
+    for ch in _EXOTIC_SEPARATORS:
+        s = s.replace(ch, " ")
+    return s
+
+
 def _tsv_cell(value) -> str:
     """Escape one response-TSV cell — the OUTPUT mirror of
     ``_tsv_lines``. Book-sourced free text (notes, memos,
