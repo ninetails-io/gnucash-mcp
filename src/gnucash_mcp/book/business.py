@@ -3361,6 +3361,48 @@ class BusinessMixin:
 
     # ── Customer / Vendor / Billterm CRUD ─────────────────────────
 
+    # piecash's names for the book's ID counters (``counters/gnc…``).
+    _COUNTER_SLOTS = {
+        "counter_customer": "counters/gncCustomer",
+        "counter_vendor": "counters/gncVendor",
+        "counter_employee": "counters/gncEmployee",
+        "counter_invoice": "counters/gncInvoice",
+        "counter_job": "counters/gncJob",
+        "counter_bill": "counters/gncBill",
+        "counter_exp_voucher": "counters/gncExpVoucher",
+        "counter_order": "counters/gncOrder",
+    }
+
+    @classmethod
+    def _repair_double_counters(cls, book) -> int:
+        """Rewrite any ID counter stored as a DOUBLE as the int64
+        GnuCash means it to be. Called before every auto-numbered
+        create.
+
+        GnuCash 5.0 and 5.1 saved the counters set in File >
+        Properties as doubles (bug 798930). Desktop reads such a
+        counter anyway — ``qof_book_get_counter``: "Might be a double
+        because of bug 798930", then a cast — and stores it back as
+        an integer the next time it issues an ID. Here the float
+        went into ``f"{cnt:06d}"`` (and piecash's own ``"{:06d}"``
+        for parties and jobs) and every auto-numbered create raised
+        ``Unknown format code 'd' for object of type 'float'``; a
+        customer, which takes no ID of its own, could not be created
+        at all (adversarial review 2026-09-30, FC-2). piecash will
+        not put an int in a double slot, so the row is replaced.
+        """
+        repaired = 0
+        for attr, key in cls._COUNTER_SLOTS.items():
+            value = getattr(book, attr)
+            if isinstance(value, float):
+                # Drop the double row, then set through piecash's own
+                # counter attribute — the path every counter advance
+                # already takes — which writes the int64 row.
+                del book[key]
+                setattr(book, attr, int(value))
+                repaired += 1
+        return repaired
+
     def _create_business_person(
         self,
         cls,
@@ -3410,6 +3452,7 @@ class BusinessMixin:
                 email=address.get("email", ""),
             )
 
+        self._repair_double_counters(book)
         entity = cls(
             name=name,
             currency=currency_obj,
@@ -4880,6 +4923,7 @@ class BusinessMixin:
         )
 
         with self.open(readonly=False) as book:
+            self._repair_double_counters(book)
             owner = find_owner(book, owner_id)
             if not owner:
                 raise ValueError(
@@ -5428,7 +5472,11 @@ class BusinessMixin:
             inv = self._resolve_credit_note(
                 book, credit_note_id, owner_type=owner_type,
             )
-            resolved_owner_type = inv.owner_type
+            # The SIDE (customer / vendor / employee), chased through
+            # the Job when the credit note hangs off one: desktop
+            # stores a job-attached document with owner_type 3, which
+            # is not a side and raised KeyError: 3 downstream.
+            resolved_owner_type = self._effective_owner_type(book, inv)
 
         result = self._add_entry(
             owner_type=resolved_owner_type,
@@ -5468,7 +5516,11 @@ class BusinessMixin:
             inv = self._resolve_credit_note(
                 book, credit_note_id, owner_type=owner_type,
             )
-            resolved_owner_type = inv.owner_type
+            # The SIDE (customer / vendor / employee), chased through
+            # the Job when the credit note hangs off one: desktop
+            # stores a job-attached document with owner_type 3, which
+            # is not a side and raised KeyError: 3 downstream.
+            resolved_owner_type = self._effective_owner_type(book, inv)
 
         result = self._delete_invoice_or_bill(
             credit_note_id, owner_type=resolved_owner_type,
@@ -7727,7 +7779,10 @@ class BusinessMixin:
             # to disambiguate (they must match anyway).
             target = self._find_invoice(
                 book, applies_to_invoice_id,
-                owner_type=cn.owner_type,
+                # The side, not the raw owner_type: a job-attached
+                # credit note (owner_type 3) applies to any document
+                # on its customer's or vendor's side, job or not.
+                owner_type=self._effective_owner_type(book, cn),
             )
             if not target:
                 raise ValueError(
@@ -8552,6 +8607,7 @@ class BusinessMixin:
             else self._find_vendor
         )
         with self.open(readonly=False) as book:
+            self._repair_double_counters(book)
             owner = find_owner(book, owner_id)
             if not owner:
                 label = (

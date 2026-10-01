@@ -283,3 +283,69 @@ class TestOwnerResolutionChokepoints:
         ):
             assert "_document_owner_clause" in inspect.getsource(method), \
                 method.__name__
+
+
+class TestJobAttachedCreditNote:
+    """Review C45. Desktop stores a credit note raised on a job with
+    ``owner_type`` 3 and the Job as owner. ``add`` and ``delete``
+    passed that raw value on as if it were a side and raised
+    ``KeyError: 3``; ``apply`` looked for its target among job
+    documents only."""
+
+    AR = "Assets:Accounts Receivable"
+
+    def _book(self, business_book):
+        import sqlite3
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        job = gb.create_job(
+            owner_id="000001", owner_type="customer", name="Project",
+        )
+        inv = gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id=inv["id"], account="Income:Sales",
+            description="Work", quantity="1", price="500.00",
+        )
+        gb.post_invoice(invoice_id=inv["id"], post_account=self.AR)
+
+        def job_credit_note():
+            cn = gb.create_credit_note(
+                owner_id="000001", owner_type="customer",
+            )
+            con = sqlite3.connect(str(business_book))
+            con.execute(
+                "UPDATE invoices SET owner_type = 3, owner_guid = "
+                "(SELECT guid FROM jobs WHERE id = ?) WHERE id = ? "
+                "AND guid IN (SELECT obj_guid FROM slots WHERE "
+                "name = 'credit-note' AND int64_val = 1)",
+                (job["id"], cn["id"]),
+            )
+            con.commit()
+            con.close()
+            return cn["id"]
+
+        return gb, inv["id"], job_credit_note
+
+    def test_add_post_and_apply(self, business_book):
+        gb, invoice, job_credit_note = self._book(business_book)
+        cn = job_credit_note()
+
+        gb.add_credit_note_entry(
+            credit_note_id=cn, account="Income:Sales",
+            description="Refund", quantity="1", price="120.00",
+        )
+        gb.post_invoice(
+            invoice_id=cn, post_account=self.AR, owner_type="customer",
+        )
+        result = gb.apply_credit_note(cn, invoice)
+
+        assert result["status"] == "applied"
+        assert gb.get_invoice(
+            invoice, owner_type="customer",
+        )["amount_due"] == "380.00"
+
+    def test_delete(self, business_book):
+        gb, _, job_credit_note = self._book(business_book)
+        cn = job_credit_note()
+        result = gb.delete_credit_note(cn)
+        assert result["status"] == "deleted"
