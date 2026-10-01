@@ -6188,7 +6188,7 @@ class TestEntryNotesAction:
         gb = GnuCashBook(str(business_book))
         gb.create_customer(name="Acme Corp")
         gb.create_invoice(customer_id="000001")
-        with pytest.raises(ValueError, match="notes exceeds"):
+        with pytest.raises(ValueError, match="notes is 5000 characters"):
             gb.add_invoice_entry(
                 invoice_id="000001",
                 account="Income:Sales",
@@ -11037,8 +11037,16 @@ class TestBusinessFreeTextCaps:
         """Direct ``GnuCashBook.create_customer`` call with 5000-byte
         notes should raise immediately — bypasses MCP boundary."""
         gb = GnuCashBook(str(test_book))
-        with pytest.raises(ValueError, match=r"notes exceeds 4096-byte cap"):
+        # The cap is GnuCash's own column width now (2048 characters;
+        # a longer note was a raw DataError on PostgreSQL and MySQL —
+        # adversarial review 2026-09-30, C65). The byte cap still
+        # guards multi-byte text.
+        with pytest.raises(ValueError, match=r"notes is 5000 characters"):
             gb.create_customer(name="Test", notes="X" * 5000)
+        with pytest.raises(ValueError, match=r"notes exceeds 4096-byte cap"):
+            gb.create_customer(name="Test", notes="語" * 1500)
+        with pytest.raises(ValueError, match=r"NUL"):
+            gb.create_customer(name="Test", notes="a\x00b")
 
     def test_book_layer_rejects_oversize_address_field(
         self, test_book: Path,
@@ -11055,7 +11063,7 @@ class TestBusinessFreeTextCaps:
     def test_book_layer_accepts_under_cap(self, test_book: Path):
         gb = GnuCashBook(str(test_book))
         result = gb.create_customer(
-            name="UnderCap", notes="X" * 4096,
+            name="UnderCap", notes="X" * 2048,
             address={"addr1": "Y" * 1024},
         )
         assert result["status"] == "created"

@@ -302,6 +302,14 @@ sudo apt update && sudo apt install libdbd-sqlite3
 You only do this once. From then on, GnuCash and the MCP server
 both work against the same SQLite file.
 
+**GnuCash 3.8 or newer.** Once the server has written to a book, the
+book carries a feature marker ("Use natural signs in budget
+amounts") that GnuCash 3.8 introduced, and GnuCash 3.0–3.7 refuses
+to open a book marked with a feature it does not know. GnuCash 3.8
+and later mark any book with a budget the same way when they open
+it, so this only matters if you still run an older 3.x. The server
+is tested against GnuCash 5.12.
+
 ### Set the path
 
 Update `GNUCASH_BOOK_PATH` in your Claude Desktop config to

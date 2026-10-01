@@ -22,6 +22,9 @@ import piecash
 
 from gnucash_mcp.book import _entry_math
 from gnucash_mcp.book._base import (
+    _check_text,
+    _TAXTABLE_NAME_WIDTH,
+    _TEXT_WIDTH,
     _lot_cache_flag,
     _LOT_CLOSED_UNKNOWN,
     _LOT_OPEN,
@@ -249,6 +252,25 @@ class BusinessMixin:
     # ── Finders and dict converters ───────────────────────────────
 
     @staticmethod
+    def _exact(query, attr: str, value: str):
+        """The first row of ``query`` whose ``attr`` IS ``value``,
+        compared in Python.
+
+        The database's own ``=`` is not that comparison everywhere. A
+        book GnuCash desktop created in MariaDB uses a
+        case-insensitive collation that also ignores accents and
+        trailing spaces, so ``name = 'Sales Tax'`` returns
+        ``SALES TAX``: ``delete_taxtable("Sales Tax")`` deleted the
+        other table and reported the name it was given (adversarial
+        review 2026-09-30, C66). Every name or ID lookup goes through
+        here; on SQLite and PostgreSQL it changes nothing.
+        """
+        for row in query.all():
+            if getattr(row, attr) == value:
+                return row
+        return None
+
+    @staticmethod
     def _find_customer(book, customer_id: str):
         """Find a customer by their human-readable ID (e.g., '000001').
 
@@ -257,13 +279,19 @@ class BusinessMixin:
         customer repeatedly.
         """
         from piecash.business.person import Customer
-        return book.session.query(Customer).filter_by(id=customer_id).first()
+        return BusinessMixin._exact(
+            book.session.query(Customer).filter_by(id=customer_id),
+            "id", customer_id,
+        )
 
     @staticmethod
     def _find_vendor(book, vendor_id: str):
         """Find a vendor by their human-readable ID (e.g., '000001')."""
         from piecash.business.person import Vendor
-        return book.session.query(Vendor).filter_by(id=vendor_id).first()
+        return BusinessMixin._exact(
+            book.session.query(Vendor).filter_by(id=vendor_id),
+            "id", vendor_id,
+        )
 
     @staticmethod
     def _find_customer_by_guid(book, guid: str):
@@ -1462,7 +1490,10 @@ class BusinessMixin:
     def _find_employee(book, employee_id: str):
         """Find an employee by their human-readable ID (e.g., '000001')."""
         from piecash.business.person import Employee
-        return book.session.query(Employee).filter_by(id=employee_id).first()
+        return BusinessMixin._exact(
+            book.session.query(Employee).filter_by(id=employee_id),
+            "id", employee_id,
+        )
 
     @staticmethod
     def _find_job(book, job_id: str):
@@ -1473,7 +1504,9 @@ class BusinessMixin:
         jobs alike.
         """
         from piecash.business.invoice import Job
-        return book.session.query(Job).filter_by(id=job_id).first()
+        return BusinessMixin._exact(
+            book.session.query(Job).filter_by(id=job_id), "id", job_id,
+        )
 
     @staticmethod
     def _find_taxtable(book, name: str):
@@ -1487,11 +1520,14 @@ class BusinessMixin:
         # ``invisible`` 1, ``parent`` set) when it posts a document,
         # and a name lookup that returned it would attach new lines
         # to a frozen table and edit the wrong row.
-        return book.session.query(Taxtable).filter(
-            Taxtable.name == name,
-            Taxtable.invisible == 0,
-            Taxtable.parent_guid.is_(None),
-        ).first()
+        return BusinessMixin._exact(
+            book.session.query(Taxtable).filter(
+                Taxtable.name == name,
+                Taxtable.invisible == 0,
+                Taxtable.parent_guid.is_(None),
+            ),
+            "name", name,
+        )
 
     @staticmethod
     def _find_taxtable_by_guid(book, guid: str):
@@ -1604,15 +1640,19 @@ class BusinessMixin:
             # fails "not found" on job-attached invoices. Employee
             # (owner_type=5) is exempt: piecash jobs are
             # customer/vendor only.
-            return query.filter(
-                BusinessMixin._document_owner_clause(
-                    book, owner_type=owner_type,
-                )
-            ).first()
+            return BusinessMixin._exact(
+                query.filter(
+                    BusinessMixin._document_owner_clause(
+                        book, owner_type=owner_type,
+                    )
+                ),
+                "id", invoice_id,
+            )
 
         # owner_type=None: pull all matches and fail loud on
         # collision rather than returning a row-order-dependent pick.
-        matches = query.all()
+        # Exact matches only (see ``_exact``).
+        matches = [m for m in query.all() if m.id == invoice_id]
         if len(matches) <= 1:
             return matches[0] if matches else None
 
@@ -4209,6 +4249,10 @@ class BusinessMixin:
         offending field; empty/missing values pass through.
         """
         if notes is not None:
+            # The notes columns are VARCHAR(2048) in GnuCash's schema;
+            # a longer note fit the byte cap below and failed as a raw
+            # DataError on PostgreSQL and MySQL (C65).
+            _check_text(notes, _TEXT_WIDTH, "notes")
             byte_len = len(notes.encode("utf-8"))
             if byte_len > cls._NOTES_MAX_BYTES:
                 raise ValueError(
@@ -4726,6 +4770,8 @@ class BusinessMixin:
         import uuid
         from piecash.business.invoice import Billterm
 
+        _check_text(name, _TEXT_WIDTH, "Billterm name")
+        _check_text(description, _TEXT_WIDTH, "Billterm description")
         discount = _to_decimal(discount_percent)
         # gncBillTerm has no meaning for a negative day count or a
         # discount outside 0–100%, and a discount window longer than
@@ -4761,9 +4807,12 @@ class BusinessMixin:
             # (``term=`` on the document tools resolves the first
             # visible match) — a second row with the same name
             # would make every lookup silently ambiguous.
-            existing = book.session.query(Billterm).filter(
-                Billterm.name == name, Billterm.invisible == 0
-            ).first()
+            existing = self._exact(
+                book.session.query(Billterm).filter(
+                    Billterm.name == name, Billterm.invisible == 0
+                ),
+                "name", name,
+            )
             if existing is not None:
                 raise ValueError(
                     f"Billterm already exists: '{name}' "
@@ -5062,6 +5111,8 @@ class BusinessMixin:
         """
         from piecash.business.tax import Taxtable, TaxtableEntry
 
+        # taxtables.name is the narrowest text column GnuCash has.
+        _check_text(name, _TAXTABLE_NAME_WIDTH, "Taxtable name")
         with self.open(readonly=False) as book:
             existing = self._find_taxtable(book, name)
             if existing:
@@ -5260,6 +5311,7 @@ class BusinessMixin:
             changed: dict = {}
 
             if new_name is not None and new_name != tt.name:
+                _check_text(new_name, _TAXTABLE_NAME_WIDTH, "Taxtable name")
                 collision = self._find_taxtable(book, new_name)
                 if collision and collision.guid != tt.guid:
                     raise ValueError(
@@ -5777,9 +5829,12 @@ class BusinessMixin:
 
             term_guid = None
             if term:
-                bt = book.session.query(Billterm).filter(
-                    Billterm.name == term, Billterm.invisible == 0
-                ).first()
+                bt = self._exact(
+                    book.session.query(Billterm).filter(
+                        Billterm.name == term, Billterm.invisible == 0
+                    ),
+                    "name", term,
+                )
                 if not bt:
                     raise ValueError(f"Billterm not found: {term}")
                 term_guid = bt.guid

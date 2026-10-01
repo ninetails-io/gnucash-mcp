@@ -639,3 +639,108 @@ class TestC60AManualBackupLeavesAnAuditLine:
                 del server_module.mcp._tool_manager._tools[added]
             server_module._reset_lazy_load_state()
             server_module._book = None
+
+
+class TestC65TextFitsGnuCashsColumns:
+    def test_a_transaction_description_memo_and_notes(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        splits = [
+            {"account": "Assets:Checking", "amount": "-1.00"},
+            {"account": "Expenses:Groceries", "amount": "1.00"},
+        ]
+        for kw, text in (
+            ({"description": "d" * 2049}, "description is 2049 characters"),
+            ({"description": "ok", "notes": "n" * 4097}, "notes is 4097"),
+            ({"description": "a\x00b"}, "NUL"),
+        ):
+            with pytest.raises(ValueError, match=text):
+                gb.create_transaction(
+                    splits=splits, trans_date=date(2026, 5, 21), **kw,
+                )
+        long_memo = [dict(splits[0], memo="m" * 2049), splits[1]]
+        with pytest.raises(ValueError, match="memo for 'Assets:Checking'"):
+            gb.create_transaction(
+                description="ok", splits=long_memo,
+                trans_date=date(2026, 5, 21),
+            )
+        made = gb.create_transaction(
+            description="d" * 2048, splits=splits, trans_date=date(2026, 5, 21),
+        )
+        with pytest.raises(ValueError, match="description is 3000"):
+            gb.update_transaction(made["guid"], description="x" * 3000)
+
+    def test_a_batch_row_is_rejected_not_the_batch(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        bad = _txn(2, "5.00")
+        bad["description"] = "x" * 5000
+        got = _results(gb.create_transactions(
+            [_txn(1, "50.00"), bad], on_error="skip",
+        ))
+        assert (got["1"]["status"], got["2"]["status"]) == ("created", "rejected")
+
+    def test_names(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        with pytest.raises(ValueError, match="Account name is 5000"):
+            gb.create_account(
+                name="x" * 5000, account_type="EXPENSE", parent="Expenses",
+            )
+        gb.create_account(
+            name="GST Payable", account_type="LIABILITY", parent="Liabilities",
+        )
+        with pytest.raises(ValueError, match="Taxtable name is 51 characters"):
+            gb.create_taxtable(name="T" * 51, entries=[{
+                "type": "percentage", "amount": "5",
+                "account": "Liabilities:GST Payable",
+            }])
+        assert gb.create_taxtable(name="T" * 50, entries=[{
+            "type": "percentage", "amount": "5",
+            "account": "Liabilities:GST Payable",
+        }])["status"] == "created"
+        with pytest.raises(ValueError, match="Billterm name"):
+            gb.create_billterm(name="N" * 2049)
+
+
+class TestC66ALookupMatchesTheNameItWasGiven:
+    """A book GnuCash desktop made in MariaDB compares text without
+    regard to case. SQLite's NOCASE collation on the same column is
+    that behavior in miniature."""
+
+    @staticmethod
+    def _case_insensitive_names(path):
+        _q(path, "alter table taxtables rename to taxtables_old")
+        _q(
+            path,
+            "create table taxtables (guid text(32) primary key not null, "
+            "name text(50) not null collate nocase, refcount bigint not "
+            "null, invisible integer not null, parent text(32))",
+        )
+        _q(path, "insert into taxtables select * from taxtables_old")
+        _q(path, "drop table taxtables_old")
+
+    def test_two_names_differing_only_in_case_stay_two_tables(
+        self, business_book,
+    ):
+        gb = GnuCashBook(str(business_book))
+        gb.create_account(
+            name="GST Payable", account_type="LIABILITY", parent="Liabilities",
+        )
+        entry = lambda pct: [{  # noqa: E731
+            "type": "percentage", "amount": pct,
+            "account": "Liabilities:GST Payable",
+        }]
+        gb.create_taxtable(name="SALES TAX", entries=entry("8"))
+        self._case_insensitive_names(business_book)
+        # The database now says 'Sales Tax' = 'SALES TAX'.
+        assert _q(
+            business_book, "select count(*) from taxtables where name = 'Sales Tax'",
+        ) == [(1,)]
+
+        with pytest.raises(ValueError, match="not found"):
+            gb.get_taxtable("Sales Tax")
+        gb.create_taxtable(name="Sales Tax", entries=entry("5"))
+        assert gb.get_taxtable("Sales Tax")["entries"][0]["amount"] in ("5", "5.00")
+        assert gb.get_taxtable("SALES TAX")["entries"][0]["amount"] in ("8", "8.00")
+
+        gb.delete_taxtable("Sales Tax")
+
+        assert _q(business_book, "select name from taxtables") == [("SALES TAX",)]

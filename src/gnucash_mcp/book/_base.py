@@ -606,6 +606,34 @@ def _rollback_if_aborted(session) -> bool:
     return True
 
 
+# GnuCash's own column widths for free text (the SQL backend's
+# CT_STRING lengths: gnc-transaction-sql.cpp, gnc-account-sql.cpp,
+# gnc-tax-table-sql.cpp, gnc-slots-sql.cpp). SQLite ignores them;
+# PostgreSQL and MySQL enforce them, so a longer value was a raw
+# DataError there and an unbounded one — a 5 MB account name was
+# accepted — everywhere else.
+_TEXT_WIDTH = 2048
+_SLOT_TEXT_WIDTH = 4096
+_TAXTABLE_NAME_WIDTH = 50
+
+
+def _check_text(value, width: int, what: str) -> None:
+    """Refuse text GnuCash's schema cannot hold: longer than the
+    column, or carrying a NUL (PostgreSQL rejects one outright, and
+    SQLite stores the string but shows it cut off at the NUL).
+    ``None`` and non-strings pass. Adversarial review 2026-09-30,
+    C65 / IV-19 / IV-20."""
+    if not isinstance(value, str):
+        return
+    if "\x00" in value:
+        raise ValueError(f"{what} contains a NUL character")
+    if len(value) > width:
+        raise ValueError(
+            f"{what} is {len(value)} characters; GnuCash stores at "
+            f"most {width}"
+        )
+
+
 _PLAIN_NUMBER = re.compile(
     r"[+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?"
 )

@@ -63,6 +63,9 @@ def _describe_check_failure(check: str, exc: BaseException) -> str:
     return f"{check} check failed: {reason}"
 
 from gnucash_mcp.book._base import (
+    _check_text,
+    _SLOT_TEXT_WIDTH,
+    _TEXT_WIDTH,
     _rollback_if_aborted,
     _txn_sort_key,
     _budget_period_bounds,
@@ -4333,6 +4336,7 @@ class CoreMixin:
             account = self._resolve_account(book, ref)
             if not account:
                 raise self._account_not_found_error(book, ref)
+            _check_text(split.get("memo"), _TEXT_WIDTH, f"memo for '{ref}'")
 
             value = _to_decimal(split["amount"])
             error = _money_precision_error(
@@ -4485,6 +4489,8 @@ class CoreMixin:
                 missing cross-currency quantity, or no auto-fill
                 match.
         """
+        _check_text(description, _TEXT_WIDTH, "description")
+        _check_text(notes, _SLOT_TEXT_WIDTH, "notes")
         # Dry runs don't need a writable session; all other paths do.
         readonly = dry_run
         # Defaults resolve loudly, explicit inputs echo nothing: when
@@ -4783,6 +4789,10 @@ class CoreMixin:
                     # either side of it for the duplicate screen:
                     # the OverflowError used to sink the whole batch
                     # (adversarial review 2026-09-30, IV-18).
+                    _check_text(
+                        txn.get("description"), _TEXT_WIDTH, "description",
+                    )
+                    _check_text(txn.get("notes"), _SLOT_TEXT_WIDTH, "notes")
                     try:
                         txn["date"] - timedelta(days=366)
                         txn["date"] + timedelta(days=366)
@@ -6495,6 +6505,11 @@ class CoreMixin:
             raise ValueError(
                 f"Account name {name!r} begins or ends with whitespace."
             )
+        if len(name) > _TEXT_WIDTH:
+            raise ValueError(
+                f"Account name is {len(name)} characters; GnuCash "
+                f"stores at most {_TEXT_WIDTH}"
+            )
 
     # UTF-8 byte cap for the account "notes" slot — same limit as
     # customer/vendor notes in the business module (kept as a local
@@ -7440,6 +7455,8 @@ class CoreMixin:
                 transaction, missing quantity, or reconciled or
                 lot-held amount changes without force.
         """
+        _check_text(description, _TEXT_WIDTH, "description")
+        _check_text(notes, _SLOT_TEXT_WIDTH, "notes")
         if isinstance(guid, list):
             return self._update_transactions_broadcast(
                 guid, description=description, trans_date=trans_date,
