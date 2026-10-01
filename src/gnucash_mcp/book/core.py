@@ -14,6 +14,7 @@ extracted-to-core dependency in the whole tree.
 """
 
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -3930,8 +3931,17 @@ class CoreMixin:
         today = date.today()
         stability_cutoff = today - timedelta(days=stability_days)
         recent_cutoff = today - timedelta(days=recent_days)
-        dup_start = trans_date - timedelta(days=duplicate_window_days)
-        dup_end = trans_date + timedelta(days=duplicate_window_days)
+        try:
+            dup_start = trans_date - timedelta(days=duplicate_window_days)
+            dup_end = trans_date + timedelta(days=duplicate_window_days)
+        except OverflowError:
+            # 0001-01-01 and 9999-12-31 are dates; a week either side
+            # of them is not, and the raw OverflowError sank the whole
+            # batch past its per-row handler (IV-18).
+            raise ValueError(
+                f"date {trans_date.isoformat()} is outside the range a "
+                f"ledger can hold"
+            ) from None
         desc_lower = description.lower()
 
         # Prefix map built once, shared across emitted guids;
@@ -4332,6 +4342,21 @@ class CoreMixin:
                 raise error
             if account.commodity == trans_currency:
                 quantity = value
+                # A quantity that disagrees with the amount, on a
+                # split whose account is in the transaction's own
+                # currency, was dropped without a word (IV-24) — and
+                # it is usually a sign the row names the wrong
+                # account or currency.
+                given = split.get("quantity")
+                if given not in (None, "") and _to_decimal(given) != value:
+                    raise ValueError(
+                        f"Split for '{ref}': quantity {given} differs "
+                        f"from amount {value}, but {account.fullname} "
+                        f"is in {trans_currency.mnemonic}, the "
+                        f"transaction's own currency, where the two "
+                        f"are the same number. Drop the quantity, or "
+                        f"check the account and currency."
+                    )
             elif "quantity" in split:
                 quantity = _to_decimal(split["quantity"])
                 # A foreign-currency account holds money too; shares
@@ -4754,6 +4779,18 @@ class CoreMixin:
                 ref = txn["ref"]
                 try:
                     splits = txn["splits"]
+                    # A date at the edge of the calendar has no week
+                    # either side of it for the duplicate screen:
+                    # the OverflowError used to sink the whole batch
+                    # (adversarial review 2026-09-30, IV-18).
+                    try:
+                        txn["date"] - timedelta(days=366)
+                        txn["date"] + timedelta(days=366)
+                    except OverflowError:
+                        raise ValueError(
+                            f"date {txn['date'].isoformat()} is outside "
+                            f"the range a ledger can hold"
+                        ) from None
                     # Row's transaction currency (the ``cur``
                     # column); absent means the book default.
                     row_currency = default_currency
@@ -6443,6 +6480,20 @@ class CoreMixin:
             raise ValueError(
                 f"Account name contains control characters. "
                 f"Got: {name!r}."
+            )
+        # A name that reads as an account REFERENCE can never be
+        # reached by path: ``%abcdef0`` resolves as a short GUID, a
+        # 32-hex name as a full one (IV-21).
+        if name.startswith("%") or re.fullmatch(r"[0-9a-fA-F]{32}", name):
+            raise ValueError(
+                f"Account name {name!r} reads as an account reference "
+                f"(a leading '%' is a short GUID, 32 hex characters a "
+                f"full one), so the account could never be named by "
+                f"its path. Choose another name."
+            )
+        if name != name.strip():
+            raise ValueError(
+                f"Account name {name!r} begins or ends with whitespace."
             )
 
     # UTF-8 byte cap for the account "notes" slot — same limit as

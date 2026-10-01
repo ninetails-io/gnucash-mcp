@@ -606,6 +606,11 @@ def _rollback_if_aborted(session) -> bool:
     return True
 
 
+_PLAIN_NUMBER = re.compile(
+    r"[+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?"
+)
+
+
 def _to_decimal(value) -> Decimal:
     """Safe Decimal construction for user-supplied monetary values.
 
@@ -631,15 +636,43 @@ def _to_decimal(value) -> Decimal:
     """
     if isinstance(value, Decimal):
         d = value
-    else:
-        try:
-            d = Decimal(str(value))
-        except InvalidOperation:
+        if not d.is_finite():
             raise ValueError(
-                f"not a valid decimal amount: {value!r}"
-            ) from None
+                f"amount must be a finite number, got {value!r}"
+            )
+        return d
+    try:
+        d = Decimal(str(value))
+    except InvalidOperation:
+        raise ValueError(
+            f"not a valid decimal amount: {value!r}"
+        ) from None
     if not d.is_finite():
         raise ValueError(f"amount must be a finite number, got {value!r}")
+    # Python's Decimal reads more than a ledger should accept:
+    # ``5_000`` (underscores), ``٥`` and ``５`` (any Unicode digit).
+    # An amount is plain ASCII digits; anything else is a paste
+    # artifact to look at, not to guess through (adversarial review
+    # 2026-09-30, IV-27).
+    if isinstance(value, str) and not _PLAIN_NUMBER.fullmatch(value.strip()):
+        raise ValueError(
+            f"not a valid decimal amount: {value!r} (use plain digits "
+            f"and a decimal point, e.g. 1234.56)"
+        )
+    # GnuCash stores an amount as a 64-bit numerator over a power of
+    # ten. Beyond that range piecash raised mid-save — OverflowError,
+    # or a 40-second hang building 10**1000000 — past every per-row
+    # handler (C39, BL-24, C58).
+    if d != 0 and d.adjusted() >= 17:
+        raise ValueError(
+            f"amount {value!r} is too large to store (the limit is "
+            f"below 10^17)"
+        )
+    if d.as_tuple().exponent < -18:
+        raise ValueError(
+            f"amount {value!r} has more decimal places than can be "
+            f"stored (18 at most)"
+        )
     return d
 
 

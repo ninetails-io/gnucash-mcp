@@ -174,3 +174,245 @@ class TestC27AFailedAdvanceLeavesNothingBehind:
         assert again["status"] == "created"
         assert again["transaction_guid"]
         assert again["instance_count"] == 1
+
+
+# ── input validation ────────────────────────────────────────────────
+
+from gnucash_mcp.book._base import _to_decimal  # noqa: E402
+from gnucash_mcp._format import _parse_update_tsv  # noqa: E402
+from gnucash_mcp.tools.core import _parse_transactions_tsv  # noqa: E402
+
+
+def _txn(ref, amount, d=date(2026, 5, 21), **second):
+    return {
+        "ref": str(ref), "date": d, "description": f"Row {ref}",
+        "splits": [
+            {"account": "Assets:Checking", "amount": f"-{amount}"},
+            {"account": "Expenses:Groceries", "amount": str(amount), **second},
+        ],
+    }
+
+
+def _results(env):
+    lines = env["results"].split("\n")
+    header = lines[0].split("\t")
+    return {
+        r["ref"]: r
+        for r in (dict(zip(header, ln.split("\t"))) for ln in lines[1:])
+    }
+
+
+class TestIV27AnAmountIsPlainDigits:
+    @pytest.mark.parametrize("text", [
+        "1234.56", " 12 ", "-0.5", "+3", ".5", "5.", "1e3", "2.5E-2",
+    ])
+    def test_ordinary_numbers_parse(self, text):
+        assert _to_decimal(text) == Decimal(text.strip())
+
+    @pytest.mark.parametrize("text", [
+        "5_000", "٥", "５", "１２.５", "1,000", "$10", "", "1 000",
+    ])
+    def test_lookalikes_are_refused(self, text):
+        with pytest.raises(ValueError, match="not a valid decimal amount"):
+            _to_decimal(text)
+
+    def test_non_strings_still_convert(self):
+        assert _to_decimal(94.87) == Decimal("94.87")
+        assert _to_decimal(7) == Decimal(7)
+        assert _to_decimal(Decimal("1.2345678901234567890123")) == Decimal(
+            "1.2345678901234567890123"
+        )
+
+
+class TestC39AnAmountThatCannotBeStoredIsARowError:
+    @pytest.mark.parametrize("text", ["1e17", "100000000000000000", "9e999998"])
+    def test_too_large(self, text):
+        with pytest.raises(ValueError, match="too large to store"):
+            _to_decimal(text)
+
+    @pytest.mark.parametrize("text", ["0.0000000000000000001", "1e-1000000"])
+    def test_too_fine(self, text):
+        with pytest.raises(ValueError, match="more decimal places"):
+            _to_decimal(text)
+
+    def test_the_largest_storable_amounts_still_pass(self):
+        assert _to_decimal("99999999999999999") == Decimal("99999999999999999")
+        assert _to_decimal("0.000000000000000001") == Decimal("1e-18")
+
+    def test_a_batch_skips_the_row_and_keeps_the_rest(self, test_book):
+        """It used to raise out of the save, past ``on_error="skip"``,
+        after the dry run had said ``would_create``."""
+        gb = GnuCashBook(str(test_book))
+        rows = [_txn(1, "50.00"), _txn(2, "1" + "0" * 26)]
+        dry = _results(gb.create_transactions(rows, dry_run=True, on_error="skip"))
+        assert dry["2"]["status"] == "rejected"
+        env = gb.create_transactions(rows, on_error="skip")
+        got = _results(env)
+        assert got["1"]["status"] == "created"
+        assert got["2"]["status"] == "rejected"
+        assert "too large" in env["results"]
+
+
+class TestIV18DatesAtTheEdgeOfTheCalendar:
+    @pytest.mark.parametrize("day", [date(1, 1, 1), date(9999, 12, 31)])
+    def test_a_batch_row_is_rejected_not_the_batch_crashed(self, test_book, day):
+        gb = GnuCashBook(str(test_book))
+        env = gb.create_transactions(
+            [_txn(1, "50.00"), _txn(2, "5.00", d=day)], on_error="skip",
+        )
+        got = _results(env)
+        assert got["1"]["status"] == "created"
+        assert got["2"]["status"] == "rejected"
+
+    def test_the_look_ahead_window_is_bounded(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match="between 0 and 3660"):
+            gb.get_upcoming_transactions(days=3285000)
+        assert gb.get_upcoming_transactions(days=30) is not None
+
+
+class TestIV22ABomOnTheHeader:
+    def test_the_header_parses(self):
+        tsv = (
+            "﻿ref\tdate\tdescription\tamount\taccount\tamount\taccount\n"
+            "1\t2026-05-21\tLunch\t-12.00\tAssets:Checking\t12.00\t"
+            "Expenses:Groceries"
+        )
+        rows = _parse_transactions_tsv(tsv)
+        assert rows[0]["ref"] == "1"
+        assert len(rows[0]["splits"]) == 2
+
+
+class TestIV23ACellPastTheHeaderIsNotDropped:
+    def test_the_row_is_refused(self):
+        guid = "a" * 32
+        with pytest.raises(ValueError, match="more cell.* than the header"):
+            _parse_update_tsv(
+                f"guid\tdescription\n{guid}\tCoffee\twith a stray tab"
+            )
+        # Trailing empty cells (a trailing tab) are still fine.
+        assert _parse_update_tsv(
+            f"guid\tdescription\n{guid}\tCoffee\t"
+        ) == [{"guid": guid, "description": "Coffee"}]
+
+
+class TestIV24AQuantityThatDisagreesOnASameCurrencySplit:
+    def test_refused_with_the_reason(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match="transaction's own currency"):
+            gb.create_transaction(
+                description="Lunch", trans_date=date(2026, 5, 21),
+                splits=[
+                    {"account": "Assets:Checking", "amount": "-12.00"},
+                    {"account": "Expenses:Groceries", "amount": "12.00",
+                     "quantity": "13.00"},
+                ],
+            )
+
+    def test_one_that_agrees_is_harmless(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        made = gb.create_transaction(
+            description="Lunch", trans_date=date(2026, 5, 21),
+            splits=[
+                {"account": "Assets:Checking", "amount": "-12.00"},
+                {"account": "Expenses:Groceries", "amount": "12.00",
+                 "quantity": "12.00"},
+            ],
+        )
+        assert made["guid"]
+
+
+class TestIV21AccountNamesThatReadAsReferences:
+    @pytest.mark.parametrize("name", [
+        "%abcdef0", "0123456789abcdef0123456789abcdef", " Groceries",
+        "Groceries ",
+    ])
+    def test_refused(self, test_book, name):
+        gb = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match="Account name"):
+            gb.create_account(
+                name=name, account_type="EXPENSE", parent="Expenses",
+            )
+
+    def test_a_percent_sign_inside_a_name_is_fine(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        made = gb.create_account(
+            name="401k 5% match", account_type="EXPENSE", parent="Expenses",
+        )
+        assert made["fullname"] == "Expenses:401k 5% match"
+
+
+class TestMM11AStatementBalanceFinerThanACent:
+    def test_refused_rather_than_rounded(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match="statement_balance"):
+            gb.reconcile_account(
+                account_name="Assets:Checking",
+                statement_date=date(2024, 1, 31),
+                statement_balance="100.005", reconcile_all=True,
+            )
+
+
+class TestBL23BillTermsThatCannotBeMet:
+    @pytest.mark.parametrize("kw, text", [
+        ({"due_days": -30}, "cannot be negative"),
+        ({"due_days": 30, "discount_days": -1}, "cannot be negative"),
+        ({"due_days": 10, "discount_days": 20, "discount_percent": "2"},
+         "longer than"),
+        ({"discount_percent": "150"}, "between 0 and 100"),
+        ({"discount_percent": "-2"}, "between 0 and 100"),
+    ])
+    def test_refused(self, business_book, kw, text):
+        gb = GnuCashBook(str(business_book))
+        with pytest.raises(ValueError, match=text):
+            gb.create_billterm(name="Odd", **kw)
+
+    def test_ordinary_terms_are_fine(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        assert gb.create_billterm(
+            name="2/10 Net 30", due_days=30, discount_days=10,
+            discount_percent="2",
+        )["status"] == "created"
+        assert gb.create_billterm(name="Due on receipt", due_days=0)
+
+
+class TestIV25BoundsOnBudgetsAndCommodities:
+    def test_a_budget_has_a_name_and_a_sane_length(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match="at most 1200"):
+            gb.create_budget(name="Forever", year=2026, num_periods=100000)
+        with pytest.raises(ValueError, match="name cannot be empty"):
+            gb.create_budget(name="  ", year=2026)
+
+    @pytest.mark.parametrize("fraction", [3, 8, 10 ** 12, 250])
+    def test_a_commodity_fraction_is_a_power_of_ten(self, test_book, fraction):
+        gb = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match="power of ten"):
+            gb.create_commodity(
+                mnemonic="ODD", fullname="Odd Fund", namespace="FUND",
+                fraction=fraction,
+            )
+
+    def test_ordinary_fractions_are_fine(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        for mnemonic, fraction in (("WHOLE", 1), ("FUNDX", 10000), ("COIN", 10 ** 8)):
+            gb.create_commodity(
+                mnemonic=mnemonic, fullname=mnemonic, namespace="FUND",
+                fraction=fraction,
+            )
+
+
+class TestC42AScheduleThatEndsBeforeItStarts:
+    def test_refused_at_creation(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match="is before start_date"):
+            _schedule(gb, end_date="2025-06-30")
+
+    def test_refused_at_update(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        sx = _schedule(gb)
+        with pytest.raises(ValueError, match="before the schedule's start"):
+            gb.update_scheduled_transaction(sx["guid"], end_date="2025-06-30")
+        assert gb.update_scheduled_transaction(
+            sx["guid"], end_date="2026-12-31",
+        )

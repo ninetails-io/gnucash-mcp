@@ -4727,6 +4727,26 @@ class BusinessMixin:
         from piecash.business.invoice import Billterm
 
         discount = _to_decimal(discount_percent)
+        # gncBillTerm has no meaning for a negative day count or a
+        # discount outside 0–100%, and a discount window longer than
+        # the term can never be met (adversarial review 2026-09-30,
+        # BL-23).
+        if due_days < 0 or discount_days < 0:
+            raise ValueError(
+                f"due_days and discount_days cannot be negative "
+                f"(got {due_days} and {discount_days})"
+            )
+        if discount_days > due_days:
+            raise ValueError(
+                f"discount_days ({discount_days}) is longer than "
+                f"due_days ({due_days}): the discount window would "
+                f"outlast the term"
+            )
+        if not Decimal(0) <= discount <= Decimal(100):
+            raise ValueError(
+                f"discount_percent must be between 0 and 100, got "
+                f"{discount}"
+            )
         disc_str = str(discount)
         if "." in disc_str:
             decimals = len(disc_str.split(".")[1])
@@ -4914,20 +4934,17 @@ class BusinessMixin:
                     f"Entry {i}: amount {e.get('amount')!r} not a "
                     f"valid decimal"
                 )
-            if amount <= 0:
+            # GnuCash's own rule (dialog-tax-table.c): a percentage
+            # runs from -100 to 100 inclusive, and negative entries
+            # are allowed on purpose — a reverse-charge table pairs
+            # +20 with -20. Zero is a rate too (zero-rated supplies).
+            # The server refused all three (adversarial review
+            # 2026-09-30, C51).
+            if type_val == "percentage" and abs(amount) > Decimal("100"):
                 raise ValueError(
-                    f"Entry {i}: amount must be > 0, got {amount}"
-                )
-            if (
-                type_val == "percentage"
-                and amount >= Decimal("100")
-            ):
-                raise ValueError(
-                    f"Entry {i}: percentage rate {amount} >= 100 "
-                    f"is almost certainly user error. Rates are "
-                    f"expressed as a percentage (5.0 for 5%, not "
-                    f"0.05). If you genuinely want a rate this "
-                    f"large, file an issue."
+                    f"Entry {i}: percentage rate {amount} is outside "
+                    f"-100 to 100. Rates are expressed as a percentage "
+                    f"(5.0 for 5%, not 0.05)."
                 )
 
             account_ref = e.get("account")
@@ -9327,6 +9344,13 @@ class BusinessMixin:
             # account) would produce a no-op netting transaction
             # that reports success. Same guard shape as pay_invoice.
             quantum_pre = _commodity_quantum(post_acct.commodity)
+            # Finer than the currency's unit is a typo; it was
+            # rounded without a word (MM-11).
+            error = _money_precision_error(
+                apply_amount, post_acct.commodity, "Apply amount",
+            )
+            if error:
+                raise error
             apply_amount = apply_amount.quantize(quantum_pre)
             if apply_amount == 0:
                 raise ValueError(

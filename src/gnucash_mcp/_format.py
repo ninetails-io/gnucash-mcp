@@ -259,6 +259,9 @@ def _batch_tsv_layout(header_line: str) -> dict:
     token, a wrong fixed prefix, or a first group missing
     amount/account.
     """
+    # A byte-order mark pasted with the header is invisible, and the
+    # error then named a first column that looked correct (IV-22).
+    header_line = header_line.lstrip("\ufeff")
     raw_tokens = [t.strip().lower() for t in header_line.split("\t")]
     # Tolerate trailing empty cells (a trailing tab on the header).
     while raw_tokens and not raw_tokens[-1]:
@@ -1053,6 +1056,11 @@ def _apply_limit(
     Returns:
         ``(truncated, notice)``; ``notice`` is None only in case 3.
     """
+    if limit is not None and limit < 0:
+        # Was silently the default page (IV-27).
+        raise ValueError(
+            f"limit must be 0 or a positive number, got {limit}"
+        )
     if not limit or limit < 1:
         limit = default
     capped = limit > max_cap
@@ -1174,6 +1182,11 @@ def _paginate(
             f"{_range_suffix(items, date_key)}"
         )
 
+    if limit is not None and limit < 0:
+        # Was silently the default page (IV-27).
+        raise ValueError(
+            f"limit must be 0 or a positive number, got {limit}"
+        )
     if not limit or limit < 1:
         limit = default
     capped = limit > max_cap
@@ -1266,6 +1279,18 @@ def _parse_update_tsv(tsv: str) -> list[dict]:
             raise ValueError(f"row {i}: empty guid")
         row: dict = {"guid": guid}
         clear_spec = ""
+        # A cell past the last header column belongs to no field; it
+        # was dropped without a word (a stray tab inside a description
+        # shifts everything after it, and the tail fell off) — IV-23.
+        extra = [c for c in cells[len(fields) + 1:] if c.strip()]
+        if extra:
+            raise ValueError(
+                f"row {i}: {len(extra)} more cell"
+                f"{'' if len(extra) == 1 else 's'} than the header has "
+                f"columns ({extra[0]!r}"
+                f"{', …' if len(extra) > 1 else ''}). A tab inside a "
+                f"cell shifts the rest of the row."
+            )
         for j, tok in enumerate(fields, start=1):
             cell = cells[j].strip() if j < len(cells) else ""
             if tok == "clear":

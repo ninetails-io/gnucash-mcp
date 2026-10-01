@@ -1530,9 +1530,14 @@ class ReportingMixin:
                                     if hasattr(lt_val, "value")
                                     else str(lt_val)
                                 )
-                                parsed = int(Decimal(lt_str))
-                                if parsed > 0:
-                                    term_months = parsed
+                                # A term is months, not 1e1000000:
+                                # that slot value held the tool for
+                                # 46 seconds raising a rate to it
+                                # (adversarial review 2026-09-30,
+                                # C58). A century is 1,200.
+                                term = Decimal(lt_str)
+                                if term.is_finite() and 0 < term <= 1200:
+                                    term_months = int(term)
                             except (InvalidOperation, ValueError):
                                 pass
                         if term_months is None:

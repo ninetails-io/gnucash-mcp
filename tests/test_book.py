@@ -9835,10 +9835,14 @@ class TestReconcileAccount:
         remaining_guids = {s["guid"] for s in after["splits"]}
         assert excluded_guid in remaining_guids
 
-    def test_except_guids_unknown_prefix_ignored(self, test_book: Path):
-        """A prefix that doesn't resolve to any split is silently
-        dropped — the goal is \"exclude these if present\", and
-        a non-matching prefix has no effect on the set."""
+    def test_except_guids_that_name_no_split_are_refused(
+        self, test_book: Path,
+    ):
+        """An exception that matches nothing used to be dropped
+        silently, so the item it was meant to hold back (a
+        transaction GUID pasted where the split's belonged) was
+        reconciled with everything else (adversarial review
+        2026-09-30, IV-26). It is refused, and nothing reconciles."""
         gc_book = GnuCashBook(str(test_book))
         unreconciled = gc_book.get_unreconciled_splits(
             "Assets:Checking", compact=False,
@@ -9847,16 +9851,20 @@ class TestReconcileAccount:
             (Decimal(s["amount"]) for s in unreconciled["splits"]),
             Decimal("0"),
         )
-        # Bogus prefix — well-formed hex but doesn't exist.
-        result = gc_book.reconcile_account(
-            account_name="Assets:Checking",
-            statement_date=date(2024, 1, 31),
-            statement_balance=str(total),
-            reconcile_all=True,
-            except_guids=["deadbeef" * 4],
+        with pytest.raises(ValueError) as refusal:
+            gc_book.reconcile_account(
+                account_name="Assets:Checking",
+                statement_date=date(2024, 1, 31),
+                statement_balance=str(total),
+                reconcile_all=True,
+                except_guids=["deadbeef" * 4],
+            )
+        assert "names no split of Assets:Checking" in str(refusal.value)
+        assert "Nothing was reconciled" in str(refusal.value)
+        after = gc_book.get_unreconciled_splits(
+            "Assets:Checking", compact=False,
         )
-        # All splits reconciled despite the bogus exclusion.
-        assert result["splits_reconciled"] == len(unreconciled["splits"])
+        assert len(after["splits"]) == len(unreconciled["splits"])
 
 
 class TestVoidTransaction:

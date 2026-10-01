@@ -811,6 +811,13 @@ class SchedulingMixin:
         parsed_end = (
             date.fromisoformat(end_date) if end_date else None
         )
+        # A schedule that ends before it starts has no occurrence and
+        # was accepted with ``next_occurrence: None`` (C42).
+        if parsed_end is not None and parsed_end < parsed_start:
+            raise ValueError(
+                f"end_date {parsed_end.isoformat()} is before "
+                f"start_date {parsed_start.isoformat()}"
+            )
 
         # _to_decimal rescues stray floats from direct callers so
         # the balance check doesn't fail on IEEE-754 noise.
@@ -1253,6 +1260,12 @@ class SchedulingMixin:
         """
 
         today = date.today()
+        # ``days=3285000`` raised OverflowError out of the date
+        # arithmetic (IV-18). Ten years ahead is already a forecast.
+        if not 0 <= days <= 3660:
+            raise ValueError(
+                f"days must be between 0 and 3660, got {days}"
+            )
         window_end = today + timedelta(days=days)
 
         with self.open(readonly=True) as book:
@@ -1744,7 +1757,20 @@ class SchedulingMixin:
                 if end_date == "":
                     sx.end_date = None
                 else:
-                    sx.end_date = date.fromisoformat(end_date)
+                    new_end = date.fromisoformat(end_date)
+                    current_start = sx.start_date
+                    if isinstance(current_start, datetime):
+                        current_start = current_start.date()
+                    if (
+                        start_date is None and current_start is not None
+                        and new_end < current_start
+                    ):
+                        raise ValueError(
+                            f"end_date {new_end.isoformat()} is before "
+                            f"the schedule's start date "
+                            f"{current_start.isoformat()}"
+                        )
+                    sx.end_date = new_end
 
             if start_date is not None:
                 new_start = date.fromisoformat(start_date)

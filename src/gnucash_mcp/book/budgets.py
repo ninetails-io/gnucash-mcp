@@ -26,6 +26,7 @@ from gnucash_mcp.book._base import (
     _budget_scrub_policy,
     _budget_stored_sign,
     _budget_targets,
+    _money_precision_error,
     _budget_unreversed,
     _verify_delete,
     _to_decimal,
@@ -588,6 +589,15 @@ class BudgetsMixin:
             )
         if num_periods < 1:
             raise ValueError("num_periods must be at least 1")
+        # 100,000 periods were accepted, and set_budget_amount without
+        # a period then wrote 100,000 rows (IV-25). A century of
+        # monthly periods is 1,200.
+        if num_periods > 1200:
+            raise ValueError(
+                f"num_periods must be at most 1200, got {num_periods}"
+            )
+        if not name or not name.strip():
+            raise ValueError("Budget name cannot be empty")
 
         if start_date is not None:
             try:
@@ -749,6 +759,16 @@ class BudgetsMixin:
             # different values for the same input.
             amount_denom = acct.commodity.fraction
             quantum = Decimal(1) / Decimal(amount_denom)
+            # An amount finer than the currency's unit is a typo, as
+            # everywhere else money is entered (ruling 2026-09-27);
+            # this path still rounded 12.345 to 12.34 and 0.001 to
+            # nothing (adversarial review 2026-09-30, C40).
+            if acct.commodity.namespace == "CURRENCY":
+                error = _money_precision_error(
+                    amount_decimal, acct.commodity, "Budget amount",
+                )
+                if error:
+                    raise error
             quantized = amount_decimal.quantize(
                 quantum, rounding=ROUND_HALF_EVEN,
             )

@@ -20,6 +20,7 @@ from gnucash_mcp.book._base import (
     _future_statement_warning,
     _is_unreconciled,
     _is_voided,
+    _money_precision_error,
     _set_split_amounts,
     _split_to_compact_dict,
     _to_decimal,
@@ -416,13 +417,33 @@ class ReconciliationMixin:
 
             if reconcile_all:
                 # Pre-resolve except_guids to full GUIDs for a fast
-                # set lookup; non-resolving prefixes drop silently.
+                # set lookup. One that names no split of THIS account
+                # is refused: dropped silently (a transaction GUID
+                # pasted for a split's), the item it was meant to
+                # hold back was reconciled with everything else
+                # (adversarial review 2026-09-30, IV-26).
                 exempt_guids: set[str] = set()
                 if except_guids:
+                    unmatched = []
                     for prefix in except_guids:
-                        found = self._find_split(book, prefix)
-                        if found is not None:
+                        try:
+                            found = self._find_split(book, prefix)
+                        except ValueError:
+                            found = None
+                        if found is None or found.account_guid != account.guid:
+                            unmatched.append(prefix)
+                        else:
                             exempt_guids.add(found.guid)
+                    if unmatched:
+                        raise ValueError(
+                            f"except_guids names no split of "
+                            f"{account.fullname}: "
+                            f"{', '.join(unmatched)}. These must be "
+                            f"SPLIT GUIDs from "
+                            f"get_unreconciled_splits (a transaction "
+                            f"GUID is not one). Nothing was "
+                            f"reconciled."
+                        )
 
                 for split in account.splits:
                     if split.reconcile_state == "y":
@@ -474,6 +495,16 @@ class ReconciliationMixin:
             # "1234.567" against a 2-decimal book is a perpetual
             # 0.007 mismatch even when the books agree at the cent.
             quantum = _commodity_quantum(account.commodity)
+            # A statement balance finer than the currency's unit is a
+            # typo; rounding it could tie a reconciliation that does
+            # not tie (enter_statement already refuses — MM-11).
+            if account.commodity.namespace == "CURRENCY":
+                error = _money_precision_error(
+                    expected_balance, account.commodity,
+                    "statement_balance",
+                )
+                if error:
+                    raise error
             expected_q = expected_balance.quantize(quantum)
             new_balance = (
                 reconciled_balance + reconciling_total

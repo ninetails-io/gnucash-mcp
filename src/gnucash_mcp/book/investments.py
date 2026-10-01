@@ -285,6 +285,17 @@ class InvestmentsMixin:
                 f"Commodity fraction must be a positive integer. "
                 f"Got: {fraction!r}."
             )
+        # GnuCash's fraction is a power of ten (its editor offers 1
+        # to 1/1,000,000,000). Fraction 3 raised on every later
+        # write and 8 stored 0.3 shares as 300/1000; 10^12 overflows
+        # the 64-bit numerator above a few million units
+        # (adversarial review 2026-09-30, MM-14 / IV-25).
+        if fraction not in {10 ** n for n in range(10)}:
+            raise ValueError(
+                f"Commodity fraction must be a power of ten from 1 to "
+                f"1000000000 (10000 stores four decimal places). "
+                f"Got: {fraction!r}."
+            )
 
         with self.open(readonly=False) as book:
             existing = self._find_commodity(book, mnemonic, namespace)

@@ -1877,38 +1877,51 @@ class TestCreateTaxtable:
                           "account": gst}],
             )
 
-    def test_zero_amount_rejected(self, business_book):
+    def test_zero_and_negative_rates_are_accepted_as_gnucash_accepts_them(
+        self, business_book,
+    ):
+        """GnuCash's tax-table editor takes any percentage from -100
+        to 100: zero-rated supplies are a rate, and a reverse-charge
+        table pairs +20 with -20 so the tax nets to nothing. The
+        server refused all of it (adversarial review 2026-09-30,
+        C51)."""
         gb = GnuCashBook(str(business_book))
-        gst, _ = _add_tax_accounts(gb)
-        with pytest.raises(ValueError, match="amount must be > 0"):
-            gb.create_taxtable(
-                name="Zero",
-                entries=[{"type": "percentage", "amount": "0",
-                          "account": gst}],
-            )
+        gst, pst = _add_tax_accounts(gb)
+        gb.create_taxtable(
+            name="Zero rated",
+            entries=[{"type": "percentage", "amount": "0", "account": gst}],
+        )
+        gb.create_taxtable(
+            name="Reverse charge",
+            entries=[
+                {"type": "percentage", "amount": "20", "account": gst},
+                {"type": "percentage", "amount": "-20", "account": pst},
+            ],
+        )
+        gb.create_taxtable(
+            name="All of it",
+            entries=[{"type": "percentage", "amount": "100", "account": gst}],
+        )
+        # A reverse-charged line totals its net: the two taxes cancel.
+        gb.create_customer(name="Acme Corp")
+        inv = gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id=inv["id"], account="Income:Sales",
+            description="Work", quantity="1", price="100.00",
+            taxtable="Reverse charge",
+        )
+        assert gb.get_invoice(inv["id"], owner_type="customer")["total"] == "100.00"
 
-    def test_negative_amount_rejected(self, business_book):
+    def test_a_percentage_beyond_100_either_way_is_refused(self, business_book):
         gb = GnuCashBook(str(business_book))
         gst, _ = _add_tax_accounts(gb)
-        with pytest.raises(ValueError, match="amount must be > 0"):
-            gb.create_taxtable(
-                name="Neg",
-                entries=[{"type": "percentage", "amount": "-5",
-                          "account": gst}],
-            )
-
-    def test_high_percentage_rejected(self, business_book):
-        gb = GnuCashBook(str(business_book))
-        gst, _ = _add_tax_accounts(gb)
-        # 100%+ rate almost certainly indicates the user expressed
-        # the rate as a fraction (0.05) and we're seeing 5.0 — but
-        # also 100% itself is a likely user error.
-        with pytest.raises(ValueError, match="user error"):
-            gb.create_taxtable(
-                name="Too high",
-                entries=[{"type": "percentage", "amount": "150",
-                          "account": gst}],
-            )
+        for amount in ("150", "100.01", "-100.5"):
+            with pytest.raises(ValueError, match="outside -100 to 100"):
+                gb.create_taxtable(
+                    name="Out of range",
+                    entries=[{"type": "percentage", "amount": amount,
+                              "account": gst}],
+                )
 
     def test_missing_account_rejected(self, business_book):
         gb = GnuCashBook(str(business_book))
@@ -5945,13 +5958,20 @@ class TestCreditNotePr87ReviewFollowups:
             post_account="Assets:Accounts Receivable",
             owner_type="customer",
         )
-        with pytest.raises(
-            ValueError, match="quantizes to zero",
-        ):
+        # Refused as finer than the currency's unit — the rule every
+        # other money input follows — before it can round to zero.
+        with pytest.raises(ValueError, match="Apply amount"):
             gb.apply_credit_note(
                 credit_note_id=cn["id"],
                 applies_to_invoice_id=src["id"],
                 amount="0.001",
+            )
+        # …and so is one that would have rounded to something.
+        with pytest.raises(ValueError, match="Apply amount"):
+            gb.apply_credit_note(
+                credit_note_id=cn["id"],
+                applies_to_invoice_id=src["id"],
+                amount="50.005",
             )
 
 

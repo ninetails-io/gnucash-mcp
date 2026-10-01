@@ -86,6 +86,15 @@ Schedule recipes, invoice links, and budget signs are now stored the way GnuCash
   - `post_document`, `pay_document`, and `unpost_document` call a job-attached bill a bill, in the response and the audit log.
   - `apply_credit_note` reports the date its link transaction carries, not today's.
   - The statement claim-mismatch hint names `replace_splits`, the tool that can change an amount (C36).
+- Input the server used to guess through, or choke on, is refused where it is entered:
+  - An amount is plain digits: `5_000`, `٥`, and `５` no longer parse (IV-27). An amount too large or too fine to store is a row error, not a crash during the save that `on_error="skip"` could not catch (C39, BL-24).
+  - `set_budget_amount`, `reconcile_account`, and `apply_credit_note` refuse an amount finer than the currency's unit instead of rounding it (C40, MM-11).
+  - `reconcile_account` refuses an `except_guids` entry that names no split of the account; dropped silently, the item it was meant to hold back was reconciled with the rest (IV-26).
+  - A quantity that disagrees with the amount on a same-currency split, and a cell past the last header column in `update_transactions`, are refused instead of dropped (IV-24, IV-23). A byte-order mark on a pasted header is ignored (IV-22). A negative `limit` is refused (it was the default page).
+  - Tax-table rates follow GnuCash's rule: any percentage from -100 to 100, so zero-rated and reverse-charge tables can be created (C51).
+  - `create_billterm` refuses negative days, a discount window longer than the term, and a discount outside 0–100% (BL-23). `create_scheduled_transaction` and its update refuse an end date before the start (C42). `create_budget` needs a name and at most 1,200 periods; a commodity's fraction is a power of ten up to 10^9 (IV-25, MM-14).
+  - An account name may not read as an account reference (a leading `%`, or 32 hex characters) or carry leading or trailing whitespace (IV-21).
+  - Dates at the edge of the calendar and an absurd look-ahead or loan term are refused or ignored rather than raising out of date arithmetic (IV-18, C58).
 - Books whose ID counters GnuCash 5.0 or 5.1 saved as decimals (GnuCash bug 798930) could not auto-number anything: `create_party`, `create_document`, and `create_job` raised a format error. The counter is read as GnuCash reads it and stored back as the integer it is meant to be. Review item FC-2.
 - A credit note raised on a job in GnuCash desktop can be edited, deleted, and applied: `add_document_entry` and `delete_document` raised `KeyError: 3`, and `apply_credit_note` could not find the customer's invoice. Review item C45.
 - The audit log's account-update entry lists the fields that changed, and only those. A description-only update used to log `Name: "X" → ""`, a rename that never happened, while a placeholder or type change had no line at all. Review item C41.
