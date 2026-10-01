@@ -44,7 +44,11 @@ from gnucash_mcp._env import (
     _parse_env_toggle,
 )
 
-from gnucash_mcp._format import _book_display_name, _parse_book_url
+from gnucash_mcp._format import (
+    _book_display_name,
+    _parse_book_url,
+    _scrub_credentials,
+)
 from gnucash_mcp.book import (
     BookSource,
     GnuCashBook,
@@ -1553,7 +1557,15 @@ def _seed_toggle(var: str, *, default: bool) -> bool:
 
 
 _debug_mode = _seed_toggle("GNUCASH_MCP_DEBUG", default=False)
-_audit_mode = not _seed_toggle("GNUCASH_MCP_NOAUDIT", default=False)
+# ``--noaudit`` is read here as well as in main(): logging is set up
+# below, at import, and with only the environment consulted it
+# created the day's audit file — header and all — for a server told
+# on its command line to keep none (adversarial review 2026-09-30,
+# side-finding 5).
+_audit_mode = (
+    not _seed_toggle("GNUCASH_MCP_NOAUDIT", default=False)
+    and "--noaudit" not in sys.argv[1:]
+)
 _logging_debug = _debug_mode
 _logging_audit = _audit_mode
 # Initial logging points at the first valid book. Best-effort at
@@ -1746,7 +1758,7 @@ def _parse_cli_argv(
             if i + 1 >= len(argv) or argv[i + 1].startswith("--"):
                 raise _CliParseError(
                     "--book-uri requires a connection string, e.g. "
-                    "--book-uri postgresql://user:pw@host:5432/gnucash"
+                    "--book-uri postgresql://user@host:5432/gnucash"
                 )
             if argv[i + 1].strip():
                 book_uri_arg = argv[i + 1]
@@ -1880,8 +1892,14 @@ Options:
   --book-uri URI       Serve a book GnuCash keeps in a DATABASE
                        instead of a file, as a SQLAlchemy connection
                        string:
-                         postgresql://user:pw@host:5432/gnucash
-                         mysql+pymysql://user:pw@host:3306/gnucash
+                         postgresql://user@host:5432/gnucash
+                         mysql+pymysql://user@host:3306/gnucash
+                       A password given HERE is visible to every
+                       user of this machine in the process list
+                       (ps). Put a connection string that carries a
+                       password in GNUCASH_BOOK_URI instead, or
+                       leave it out and let the driver find it
+                       (PostgreSQL: PGPASSWORD or ~/.pgpass).
                        Overrides GNUCASH_BOOK_URI, and is mutually
                        exclusive with --book. Exactly one book — a
                        connection string has no filename for
@@ -2027,7 +2045,7 @@ def main() -> None:
             _parse_cli_argv(sys.argv[1:])
         )
     except _CliParseError as exc:
-        print(str(exc), file=sys.stderr)
+        print(_scrub_credentials(str(exc)), file=sys.stderr)
         raise SystemExit(2) from None
     del sys.argv[1:]
 
@@ -2100,7 +2118,7 @@ def main() -> None:
             )
             _require_log_dir_for_uri()
         except _BookPathError as exc:
-            print(str(exc), file=sys.stderr)
+            print(_scrub_credentials(str(exc)), file=sys.stderr)
             raise SystemExit(2) from None
         for note in _book_uri_warnings(uri):
             print(note, file=sys.stderr)
@@ -2121,7 +2139,7 @@ def main() -> None:
                     activate=debug_flag or noaudit_flag,
                 )
         except _BookPathError as exc:
-            print(str(exc), file=sys.stderr)
+            print(_scrub_credentials(str(exc)), file=sys.stderr)
             raise SystemExit(2) from None
 
     # Startup format check on the USER's books: an XML-format book
@@ -2146,7 +2164,7 @@ def main() -> None:
     try:
         _append_demo_books()
     except ValueError as exc:
-        print(str(exc), file=sys.stderr)
+        print(_scrub_credentials(str(exc)), file=sys.stderr)
         raise SystemExit(2) from None
 
     # The book identity the health check and get_server_config
@@ -2166,7 +2184,7 @@ def main() -> None:
         try:
             modules_value = _modules_from_env_toggles()
         except ValueError as exc:
-            print(str(exc), file=sys.stderr)
+            print(_scrub_credentials(str(exc)), file=sys.stderr)
             raise SystemExit(2) from None
 
     # Logging was activated (or torn down) by the book-list install

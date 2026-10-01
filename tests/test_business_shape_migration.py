@@ -9,6 +9,7 @@ import sqlite3
 from datetime import date
 from decimal import Decimal
 
+import pytest
 from sqlalchemy import text
 
 from gnucash_mcp.book import GnuCashBook
@@ -94,11 +95,25 @@ def _make_legacy(gc, cn_id):
             "UPDATE splits SET memo = '' WHERE memo = 'check 12' AND account_guid IN "
             "(SELECT guid FROM accounts WHERE account_type = 'RECEIVABLE')"
         ))
+        # The old server's slot rows carried piecash's filler columns
+        # (double_val 0, timespec_val NULL) — the mark the converter
+        # reads to know a lot or a payment is the old server's and
+        # not desktop's.
         for lot_guid, in s.execute(text("SELECT guid FROM lots")).fetchall():
             s.execute(text(
-                "INSERT INTO slots (obj_guid, name, slot_type, string_val) "
-                "VALUES (:g, 'notes', 4, '')"
+                "INSERT INTO slots (obj_guid, name, slot_type, string_val, "
+                "double_val) VALUES (:g, 'notes', 4, '', 0)"
             ), {"g": lot_guid})
+        # …and piecash put a date-posted slot on every transaction,
+        # payments included.
+        for txn_guid, in s.execute(text(
+            "SELECT obj_guid FROM slots WHERE name = 'trans-txn-type' "
+            "AND string_val = 'P'"
+        )).fetchall():
+            s.execute(text(
+                "INSERT INTO slots (obj_guid, name, slot_type, gdate_val, "
+                "double_val) VALUES (:g, 'date-posted', 10, '20260810', 0)"
+            ), {"g": txn_guid})
         book.save()
 
 
@@ -168,28 +183,114 @@ def test_every_old_shape_converts_on_the_next_write(business_book):
         assert gc._upgrade_book_shapes(book) == {}
 
 
-def test_mixed_sign_unposted_credit_note_is_reported_not_guessed(business_book):
-    gc = GnuCashBook(str(business_book))
+def _unposted_credit_note(gc, lines):
     gc.create_customer(name="Acme", currency="USD")
     cn = gc.create_credit_note(owner_id="000001", owner_type="customer")
-    gc.add_credit_note_entry(
-        credit_note_id=cn["id"], account="Income:Sales",
-        description="a", quantity="1", price="10",
-    )
-    gc.add_credit_note_entry(
-        credit_note_id=cn["id"], account="Income:Sales",
-        description="b", quantity="-1", price="3",
-    )
-    # Stored as desktop does (-1, +1); flip both to fake a mixed old shape
-    # that cannot be told from a desktop credit note with a negative line.
+    for desc, qty, price in lines:
+        gc.add_credit_note_entry(
+            credit_note_id=cn["id"], account="Income:Sales",
+            description=desc, quantity=qty, price=price,
+        )
+    return cn["id"]
+
+
+def _stored_quantities(gc):
+    with gc.open(readonly=True) as book:
+        return [
+            (d, n) for d, n in book.session.execute(text(
+                "SELECT description, quantity_num FROM entries "
+                "ORDER BY description"
+            ))
+        ]
+
+
+def _as_written_by_1_4(gc):
+    """An unposted credit note as server 1.2-1.4 stored it: the
+    document quantity un-negated, and the blank entry defaults that
+    are the old server's fingerprint."""
     with gc.open(readonly=False) as book:
-        book.session.execute(text("UPDATE entries SET quantity_num = -quantity_num"))
+        book.session.execute(text(
+            "UPDATE entries SET quantity_num = -quantity_num, "
+            "i_disc_type = '', i_disc_how = '', b_paytype = 0"
+        ))
         book.save()
+
+
+def _upgrade(gc):
     with gc.open(readonly=False) as book:
         out = gc._upgrade_book_shapes(book)
         book.save()
-    assert out.get("credit_note_entries_unresolved") == 1
+    return out
+
+
+def test_unposted_credit_note_converts_by_fingerprint_not_by_sign(business_book):
+    """A pre-1.5 credit note with a negative line beside a positive
+    one: the first cut could not tell it from a desktop credit note
+    and left it unconverted. The row says who wrote it."""
+    gc = GnuCashBook(str(business_book))
+    _unposted_credit_note(gc, [("a", "1", "10"), ("b", "-1", "3")])
+    desktop_shape = _stored_quantities(gc)
+    assert desktop_shape == [("a", -1), ("b", 1)]
+    _as_written_by_1_4(gc)
+    assert _stored_quantities(gc) == [("a", 1), ("b", -1)]
+
+    out = _upgrade(gc)
+
+    assert out.get("credit_note_entries_migrated") == 1
+    assert "credit_note_entries_unresolved" not in out
+    assert _stored_quantities(gc) == desktop_shape
+    # Once: the fingerprint went with the same save.
+    again = _upgrade(gc)
+    assert "credit_note_entries_migrated" not in again
+    assert _stored_quantities(gc) == desktop_shape
+
+
+@pytest.mark.parametrize("lines", [
+    [("fee", "-1", "40")],                      # all entered negative
+    [("a", "1", "10")],                         # all entered positive
+    [("a", "1", "10"), ("b", "-1", "3")],       # mixed
+])
+def test_current_credit_note_is_never_reconverted(business_book, lines):
+    """Review C9. A credit note line entered as -1 is stored +1, by
+    this server and by desktop (gncEntrySetDocQuantity). "Every
+    stored quantity positive" was read as the old shape, and the
+    next unrelated business write negated it: a 40 restocking charge
+    became a 40 credit."""
+    gc = GnuCashBook(str(business_book))
+    cn = _unposted_credit_note(gc, lines)
+    before = _stored_quantities(gc)
+    total_before = gc.get_invoice(cn, owner_type="customer")["total"]
+
+    # An unrelated business write runs the converters.
+    other = gc.create_invoice(customer_id="000001")["id"]
+    assert other != cn      # credit notes share the invoice numbering
+    gc.add_invoice_entry(
+        invoice_id=other, account="Income:Sales",
+        description="zz other", quantity="1", price="5",
+    )
+    posted = gc.post_invoice(
+        invoice_id=other, post_account="Assets:Accounts Receivable",
+    )
+
+    assert "credit_note_entries_migrated" not in posted
+    assert [q for q in _stored_quantities(gc) if q[0] != "zz other"] == before
+    assert gc.get_invoice(cn, owner_type="customer")["total"] == total_before
+
+
+def test_desktop_written_credit_note_is_left_alone(business_book):
+    """Desktop writes PERCENT / PRETAX on every entry."""
+    gc = GnuCashBook(str(business_book))
+    _unposted_credit_note(gc, [("fee", "-1", "40")])
+    with gc.open(readonly=False) as book:
+        book.session.execute(text(
+            "UPDATE entries SET i_disc_type = 'PERCENT', "
+            "i_disc_how = 'PRETAX', b_paytype = 1"
+        ))
+        book.save()
+    before = _stored_quantities(gc)
+    out = _upgrade(gc)
     assert "credit_note_entries_migrated" not in out
+    assert _stored_quantities(gc) == before
 
 
 def test_new_splits_carry_the_epoch_reconcile_date_and_nulls_convert(test_book):
@@ -239,6 +340,8 @@ def test_terms_refcount_and_credit_note_flag_follow_desktop(business_book):
     with gc.open(readonly=False) as book:
         book.session.execute(text("UPDATE billterms SET refcount = 0"))
         book.session.execute(text("DELETE FROM slots WHERE name = 'credit-note'"))
+        # The mark the old server left on every document row.
+        book.session.execute(text("UPDATE invoices SET billto_type = 0"))
         book.save()
     with gc.open(readonly=False) as book:
         out = gc._upgrade_book_shapes(book)

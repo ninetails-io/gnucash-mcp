@@ -1375,6 +1375,62 @@ class TestConsolidatedBusinessSurface:
         assert paid["status"] == "paid"
         assert float(paid["remaining_balance"]) == 0.0
 
+    def test_overpayment_and_settling_from_it_through_the_tools(
+        self, setup_book_env,
+    ):
+        """``pay_document`` with no payment_account or amount is a
+        valid call once ``from_prepayment`` is set — the schema must
+        let it through (adversarial review 2026-09-30, C37 / C50)."""
+        server_module.create_account(
+            name="Accounts Receivable", account_type="RECEIVABLE",
+            parent="Assets",
+        )
+        c = json.loads(server_module.create_party(
+            party_type="customer", name="Acme Corp",
+        ))
+        ids = []
+        for price in ("100.00", "50.00"):
+            doc = json.loads(server_module.create_document(
+                document_type="invoice", owner_id=c["id"],
+            ))
+            server_module.add_document_entry(
+                document_type="invoice", id=doc["id"],
+                account="Income:Salary", description="Work",
+                quantity="1", price=price,
+            )
+            posted = json.loads(server_module.post_document(
+                id=doc["id"], document_type="invoice",
+                post_account="Assets:Accounts Receivable",
+            ))
+            assert posted.get("error") is None, posted
+            ids.append(doc["id"])
+
+        refused = json.loads(server_module.pay_document(
+            id=ids[0], document_type="invoice",
+            payment_account="Assets:Checking", amount="120.00",
+        ))
+        assert "allow_prepayment" in refused["error"]
+
+        paid = json.loads(server_module.pay_document(
+            id=ids[0], document_type="invoice",
+            payment_account="Assets:Checking", amount="120.00",
+            allow_prepayment=True,
+        ))
+        assert paid["prepayment"]["amount"] == "20.00"
+        assert "Unapplied payments" in server_module.get_outstanding_documents()
+
+        settled = json.loads(server_module.pay_document(
+            id=ids[1], document_type="invoice", from_prepayment=True,
+        ))
+        assert settled.get("error") is None, settled
+        assert settled["applied_from_prepayment"] == "20.00"
+        assert settled["remaining_balance"] == "30.00"
+
+        unposted = json.loads(server_module.unpost_document(
+            id=ids[0], document_type="invoice",
+        ))
+        assert unposted["payments_kept"][0]["amount"] == "100.00"
+
     def test_delete_document_unposted_invoice(self, setup_book_env):
         c = json.loads(server_module.create_party(
             party_type="customer", name="Ephemeral LLC",

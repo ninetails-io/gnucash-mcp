@@ -119,3 +119,17 @@ itself. Removing it on delete would be behavior desktop doesn't have.
 The two "routed around" items are answered on
 `fix/document-payment-surfaces`
 (`BOOKKEEPER_REPORT_DOCUMENT_PAYMENTS.md`).
+
+## Countersigned — 2026-09-27, the remote bookkeeper (Abe VI)
+
+Post-merge spot-audit on the live server (Ixion, develop at `7b0ae90`,
+#194 and #195 in the trunk), read-only against the registered Alex book:
+
+- `list_documents` shows **paid** in the list (invoice 000030) — routed-around item 2, fixed live.
+- `get_document 000030` carries a `payments` array (guid `5d3f7546`, date, amount, source account) — routed-around item 1, fixed live.
+- `e841d5f` verified at source: the docstring's period-end-rates claim was false and now states the as-booked truth (posting/payment-time rates, own-date conversion for orphan splits, warn-and-exclude for missing rates).
+
+The deputy ran the loop through the same MCP surface a bookkeeper would,
+fingerprinted the before, checked the after against GnuCash's own engine,
+and surfaced two findings that shipped as #195 before the auditor arrived.
+The signature "for the bookkeeper" is honored and countersigned. Loop closed.

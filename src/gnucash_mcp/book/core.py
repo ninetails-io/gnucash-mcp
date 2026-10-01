@@ -23,7 +23,6 @@ import piecash
 
 from gnucash_mcp.logging_config import DEBUG_LOGGER_NAME
 from gnucash_mcp._format import (
-    _redact_uri,
     _candidate_comparison_tsv,
     _dry_run_summary,
     _format_number,
@@ -37,7 +36,6 @@ _debug_logger = logging.getLogger(DEBUG_LOGGER_NAME)
 # Longest reason a failed-check warning carries. Enough to paste into
 # an issue; short enough that the dashboard stays a dashboard.
 _CHECK_FAILURE_REASON_CHARS = 120
-_URI_IN_TEXT_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://\S+")
 
 
 def _describe_check_failure(check: str, exc: BaseException) -> str:
@@ -46,21 +44,28 @@ def _describe_check_failure(check: str, exc: BaseException) -> str:
     ``"<Check> check failed: <ExceptionType>: <first line of message>"``.
     First line only — SQLAlchemy appends the statement, its
     parameters, and a docs link on later lines, none of which belong
-    on a dashboard. Any URI in the text is password-masked through
-    ``_redact_uri`` (a connection error can quote the DSN). Truncated
-    with an ellipsis past ``_CHECK_FAILURE_REASON_CHARS``.
+    on a dashboard. The text passes ``redact_paths``: a connection
+    string's credentials are masked always (a connection error can
+    quote the DSN), absolute paths when the user asked for that.
+    Truncated with an ellipsis past ``_CHECK_FAILURE_REASON_CHARS``.
 
     The reason travels inline because the debug log is opt-in and
     the users this reaches are the ones who never turned it on.
     """
     first = (str(exc).strip().splitlines() or [""])[0].strip()
-    first = _URI_IN_TEXT_RE.sub(lambda m: _redact_uri(m.group(0)), first)
+    # Credentials always; paths when GNUCASH_REDACT_PATHS is on — an
+    # OSError's text is mostly path, and this line goes to the model.
+    from gnucash_mcp.logging_config import redact_paths
+    first = redact_paths(first)
     if len(first) > _CHECK_FAILURE_REASON_CHARS:
         first = first[: _CHECK_FAILURE_REASON_CHARS - 1] + "…"
     reason = f"{type(exc).__name__}: {first}" if first else type(exc).__name__
     return f"{check} check failed: {reason}"
 
 from gnucash_mcp.book._base import (
+    _check_text,
+    _SLOT_TEXT_WIDTH,
+    _TEXT_WIDTH,
     _rollback_if_aborted,
     _txn_sort_key,
     _budget_period_bounds,
@@ -1312,6 +1317,25 @@ class CoreMixin:
                 type_labels = getattr(
                     self, "_OWNER_TYPE_TO_RESPONSE_TYPE", {},
                 )
+                # What each party has paid that no document has
+                # absorbed, keyed by (party, post account). A past-due
+                # line that leaves it out reads as money to chase
+                # when the customer has already paid — and invites a
+                # second payment (adversarial review 2026-09-30, C50).
+                unapplied: dict[tuple, dict] = {}
+                unapplied_payments = getattr(
+                    self, "_unapplied_payments", None,
+                )
+                end_owner = getattr(self, "_end_owner", None)
+                if (
+                    unapplied_payments is not None
+                    and end_owner is not None
+                    and any(row["overdue"] for row in open_documents)
+                ):
+                    unapplied = {
+                        (u["owner"], u["account"].guid): u
+                        for u in unapplied_payments(book)
+                    }
                 overdue_inv_entries: list[tuple[int, str]] = []
                 item_failures: list[str] = []
                 for row in open_documents:
@@ -1350,6 +1374,20 @@ class CoreMixin:
                             f"{'s' if days_overdue != 1 else ''} overdue, "
                             f"{currency} {amount_str}"
                         )
+                        held = (
+                            unapplied.get(
+                                (end_owner(book, inv), inv.post_acc_guid),
+                            )
+                            if unapplied else None
+                        )
+                        if held is not None:
+                            msg += (
+                                f" — {held['owner_name'] or owner_name} "
+                                f"has {held['currency']} "
+                                f"{held['amount']:,} in unapplied "
+                                f"payments; settle from them with "
+                                f"pay_document (from_prepayment=true)"
+                            )
                         overdue_inv_entries.append(
                             (days_overdue, msg),
                         )
@@ -1532,7 +1570,11 @@ class CoreMixin:
                         f"{age.days} day{'s' if age.days != 1 else ''} ago"
                         if age.days >= 1 else "today"
                     )
-                    reason = attempt.get("reason") or "unknown"
+                    from gnucash_mcp.logging_config import redact_paths
+                    # The stored reason is raw exception text.
+                    reason = redact_paths(
+                        attempt.get("reason") or "unknown"
+                    )
                     backup_health.append(
                         f"Auto-backup failing: {reason} "
                         f"(last attempt {age_str})"
@@ -3079,8 +3121,24 @@ class CoreMixin:
             # contradiction; "further" tells the reader where the
             # bucket begins.
             further = "further " if overdue_count > 0 else ""
+            upcoming = None
+            failed = None
             if hasattr(self, "_upcoming_within_days"):
-                upcoming = self._upcoming_within_days(book, days=7)
+                try:
+                    upcoming = self._upcoming_within_days(book, days=7)
+                except Exception as exc:
+                    # This read walks every schedule's recipe. One
+                    # it cannot parse must cost the dashboard one
+                    # line, not the whole summary (a desktop formula
+                    # of "100/3" once did exactly that).
+                    failed = self._check_failed(
+                        book, "Upcoming-schedule", exc,
+                    )
+            if failed is not None:
+                lines.append(line)
+                lines.append(f"⚠ {failed}")
+                return lines
+            if upcoming is not None:
                 if upcoming["count"] > 0:
                     plural = (
                         "s" if upcoming["count"] != 1 else ""
@@ -3876,8 +3934,17 @@ class CoreMixin:
         today = date.today()
         stability_cutoff = today - timedelta(days=stability_days)
         recent_cutoff = today - timedelta(days=recent_days)
-        dup_start = trans_date - timedelta(days=duplicate_window_days)
-        dup_end = trans_date + timedelta(days=duplicate_window_days)
+        try:
+            dup_start = trans_date - timedelta(days=duplicate_window_days)
+            dup_end = trans_date + timedelta(days=duplicate_window_days)
+        except OverflowError:
+            # 0001-01-01 and 9999-12-31 are dates; a week either side
+            # of them is not, and the raw OverflowError sank the whole
+            # batch past its per-row handler (IV-18).
+            raise ValueError(
+                f"date {trans_date.isoformat()} is outside the range a "
+                f"ledger can hold"
+            ) from None
         desc_lower = description.lower()
 
         # Prefix map built once, shared across emitted guids;
@@ -4168,7 +4235,7 @@ class CoreMixin:
         return "\n".join(
             f"{d['confidence']}\t{d['guid']}\t{d['date']}\t"
             f"{d['amount']}\t{d.get('currency', '')}\t"
-            f"{d['description']}\t{d['signals']}"
+            f"{_tsv_cell(d['description'])}\t{d['signals']}"
             for d in duplicates
         )
 
@@ -4269,6 +4336,7 @@ class CoreMixin:
             account = self._resolve_account(book, ref)
             if not account:
                 raise self._account_not_found_error(book, ref)
+            _check_text(split.get("memo"), _TEXT_WIDTH, f"memo for '{ref}'")
 
             value = _to_decimal(split["amount"])
             error = _money_precision_error(
@@ -4278,6 +4346,21 @@ class CoreMixin:
                 raise error
             if account.commodity == trans_currency:
                 quantity = value
+                # A quantity that disagrees with the amount, on a
+                # split whose account is in the transaction's own
+                # currency, was dropped without a word (IV-24) — and
+                # it is usually a sign the row names the wrong
+                # account or currency.
+                given = split.get("quantity")
+                if given not in (None, "") and _to_decimal(given) != value:
+                    raise ValueError(
+                        f"Split for '{ref}': quantity {given} differs "
+                        f"from amount {value}, but {account.fullname} "
+                        f"is in {trans_currency.mnemonic}, the "
+                        f"transaction's own currency, where the two "
+                        f"are the same number. Drop the quantity, or "
+                        f"check the account and currency."
+                    )
             elif "quantity" in split:
                 quantity = _to_decimal(split["quantity"])
                 # A foreign-currency account holds money too; shares
@@ -4295,6 +4378,24 @@ class CoreMixin:
                         f"must have same sign "
                         f"(got value={value}, quantity={quantity})"
                     )
+                # Money on both sides or on neither. The sign test
+                # above passes any zero, so 110 USD arriving in a EUR
+                # account as 0 EUR was accepted — the 110 then showed
+                # as an unrealized loss — and so was 100 EUR arriving
+                # for nothing. A zero leg is real only on a share
+                # account (a capital-gains split, a stock split).
+                if account.commodity.namespace == "CURRENCY" \
+                        and (value == 0) != (quantity == 0):
+                    raise ValueError(
+                        f"Split for '{ref}': one side is zero "
+                        f"(amount={value} "
+                        f"{trans_currency.mnemonic}, quantity={quantity} "
+                        f"{account.commodity.mnemonic}). A "
+                        f"{account.commodity.mnemonic} account needs "
+                        f"both: the amount in "
+                        f"{trans_currency.mnemonic} and the quantity "
+                        f"in {account.commodity.mnemonic}."
+                    )
             else:
                 raise ValueError(
                     f"Split for '{ref}' requires 'quantity' "
@@ -4311,7 +4412,26 @@ class CoreMixin:
             _, stored_quantity = _split_amounts(
                 value, quantity, trans_currency, account,
             )
+            entered_quantity = None
             if stored_quantity != quantity:
+                # GnuCash rounds a share quantity to the commodity's
+                # unit, and so must the stored row. But not silently:
+                # 0.00003 BTC at a 4-decimal fraction stored 2.00 of
+                # cost against NO coins. A quantity that rounds away
+                # entirely is refused; one that merely rounds is
+                # reported (``_fx_sanity_warnings`` reads
+                # ``quantity_as_entered``).
+                if stored_quantity == 0:
+                    raise ValueError(
+                        f"Split for '{ref}': quantity {quantity} is "
+                        f"smaller than {account.commodity.mnemonic}'s "
+                        f"smallest unit "
+                        f"({_commodity_quantum(account.commodity)}) "
+                        f"and would be stored as 0. Enter at least "
+                        f"one unit, or give the commodity a finer "
+                        f"fraction in GnuCash's Security Editor."
+                    )
+                entered_quantity = quantity
                 quantity = stored_quantity
             resolved.append({
                 "account": account,
@@ -4321,6 +4441,8 @@ class CoreMixin:
                 "action": split.get("action"),
                 "original_ref": ref,
             })
+            if entered_quantity is not None:
+                resolved[-1]["quantity_as_entered"] = entered_quantity
 
         return resolved
 
@@ -4367,6 +4489,8 @@ class CoreMixin:
                 missing cross-currency quantity, or no auto-fill
                 match.
         """
+        _check_text(description, _TEXT_WIDTH, "description")
+        _check_text(notes, _SLOT_TEXT_WIDTH, "notes")
         # Dry runs don't need a writable session; all other paths do.
         readonly = dry_run
         # Defaults resolve loudly, explicit inputs echo nothing: when
@@ -4526,6 +4650,13 @@ class CoreMixin:
                     book, validated, trans_currency, trans_date,
                 )
             )
+            closed = self._read_only_period_note(
+                book, [trans_date], "entering a transaction there",
+            )
+            if closed:
+                warnings.append(
+                    {"type": "read_only_period", "message": closed}
+                )
             proposed_pattern = self._extract_account_pattern(resolved_accounts)
             # Recent matches were gathered pre-write, so the new txn
             # is automatically absent.
@@ -4661,6 +4792,22 @@ class CoreMixin:
                 ref = txn["ref"]
                 try:
                     splits = txn["splits"]
+                    # A date at the edge of the calendar has no week
+                    # either side of it for the duplicate screen:
+                    # the OverflowError used to sink the whole batch
+                    # (adversarial review 2026-09-30, IV-18).
+                    _check_text(
+                        txn.get("description"), _TEXT_WIDTH, "description",
+                    )
+                    _check_text(txn.get("notes"), _SLOT_TEXT_WIDTH, "notes")
+                    try:
+                        txn["date"] - timedelta(days=366)
+                        txn["date"] + timedelta(days=366)
+                    except OverflowError:
+                        raise ValueError(
+                            f"date {txn['date'].isoformat()} is outside "
+                            f"the range a ledger can hold"
+                        ) from None
                     # Row's transaction currency (the ``cur``
                     # column); absent means the book default.
                     row_currency = default_currency
@@ -4815,7 +4962,31 @@ class CoreMixin:
             # (non-blocking) — surfaced as a side table keyed by ref,
             # so a decimal slip in a bulk import is caught too.
             warn_rows: list = []
+            today = date.today()
+            read_only_before = self._read_only_before(book)
             for p, _dc, _mc in accepted:
+                closed = self._read_only_period_note(
+                    book, [p["trans_date"]],
+                    "entering a transaction there",
+                    threshold=read_only_before,
+                ) if read_only_before else None
+                if closed:
+                    warn_rows.append((p["ref"], closed))
+                # A slipped year, the dashboard's own rule applied at
+                # entry instead of afterwards: more than a year
+                # ahead ("2062 for 2026"), or a year no ledger holds
+                # ("0026"). Historical imports are the point of this
+                # tool, so an ordinary old date draws nothing.
+                row_date = p["trans_date"]
+                if (row_date - today).days > 365:
+                    warn_rows.append((p["ref"], (
+                        f"dated {row_date.isoformat()}, more than a "
+                        f"year ahead — likely a typo; check the year"
+                    )))
+                elif row_date.year < 1900:
+                    warn_rows.append((p["ref"], (
+                        f"dated {row_date.isoformat()} — check the year"
+                    )))
                 for w in p["auto_fill_warnings"]:
                     warn_rows.append((p["ref"], w["message"]))
                 for w in self._fx_sanity_warnings(
@@ -5224,6 +5395,43 @@ class CoreMixin:
             future_msg = _future_statement_warning(statement_date)
             if future_msg:
                 warn_rows.append(("*", future_msg))
+            # A line's date against its statement's. A statement
+            # cannot list a line dated after it closed, and one from
+            # more than a year before it is a slipped year (2062 for
+            # 2026, 0026) far more often than a real entry. Like the
+            # statement date itself, the line goes through — the date
+            # may be what the statement prints — and the warnings
+            # table names it, in dry run and commit alike. These
+            # were entered AND reconciled in silence; the dashboard's
+            # own "likely a typo" check only saw them afterwards.
+            read_only_before = self._read_only_before(book)
+            for ln in lines:
+                line_date = ln.get("date")
+                if line_date is None:
+                    continue
+                # The book's read-only period (review C69): a line
+                # the book does not already hold is entered there.
+                closed = self._read_only_period_note(
+                    book, [line_date],
+                    "entering a transaction there (a line the book "
+                    "already holds is only reconciled)",
+                    threshold=read_only_before,
+                ) if read_only_before else None
+                if closed:
+                    warn_rows.append((ln["ref"], closed))
+                if line_date > statement_date:
+                    warn_rows.append((ln["ref"], (
+                        f"dated {line_date.isoformat()}, after the "
+                        f"statement date ({statement_date.isoformat()}) "
+                        f"— a statement cannot list a later line; "
+                        f"check the year"
+                    )))
+                elif (statement_date - line_date).days > 366:
+                    warn_rows.append((ln["ref"], (
+                        f"dated {line_date.isoformat()}, more than a "
+                        f"year before the statement date "
+                        f"({statement_date.isoformat()}); check the year"
+                    )))
             if opening_gap != 0:
                 gap_msg = (
                     f"account's reconciled balance "
@@ -5350,6 +5558,7 @@ class CoreMixin:
                 statement_date, _book_amount, _candidates_for,
                 split_prefixes, reconciled_balance, closing,
                 force_base, force_duplicates, default_currency,
+                warn_rows=warn_rows,
             )
 
     def _statement_prep_create(
@@ -5490,8 +5699,10 @@ class CoreMixin:
                 f"match split {ln['match']} has amount "
                 f"{s.quantity}, but the line says {ln['amount']} "
                 f"as printed ({book_amount} in book convention) — "
-                f"wrong split, or fix the book entry first "
-                f"(update_transactions), then claim it"
+                f"wrong split, or fix the book entry first, then "
+                f"claim it (replace_splits changes an amount and "
+                f"gives the split a new GUID; run the dry run again "
+                f"for it)"
             )
         if s.reconcile_state == "y":
             return s, "overlap"
@@ -5907,10 +6118,14 @@ class CoreMixin:
         self, book, account, lines, amounts, sign, quantum,
         statement_date, _book_amount, _candidates_for,
         split_prefixes, reconciled_balance, closing, force_base,
-        force_duplicates, default_currency,
+        force_duplicates, default_currency, warn_rows=None,
     ) -> dict:
         """The landing: resolve dispositions (the shared chokepoint),
-        check the tie, then — and only then — mutate and save once."""
+        check the tie, then — and only then — mutate and save once.
+        ``warn_rows`` are the date warnings the dry run showed (a
+        statement dated after today, a line dated after its
+        statement); the commit repeats them, since it is the commit
+        that makes them permanent."""
         phase_a = self._statement_dispositions(
             book, account, lines, _book_amount, _candidates_for,
             quantum, default_currency, force_duplicates,
@@ -6113,6 +6328,10 @@ class CoreMixin:
             "results": "\n".join(rows),
             "new_reconciled_balance": str(new_reconciled),
             "tie": tie,
+            **(
+                {"warnings": self._batch_warnings_to_tsv(warn_rows)}
+                if warn_rows else {}
+            ),
         }
 
     def search_transactions(
@@ -6298,6 +6517,25 @@ class CoreMixin:
                 f"Account name contains control characters. "
                 f"Got: {name!r}."
             )
+        # A name that reads as an account REFERENCE can never be
+        # reached by path: ``%abcdef0`` resolves as a short GUID, a
+        # 32-hex name as a full one (IV-21).
+        if name.startswith("%") or re.fullmatch(r"[0-9a-fA-F]{32}", name):
+            raise ValueError(
+                f"Account name {name!r} reads as an account reference "
+                f"(a leading '%' is a short GUID, 32 hex characters a "
+                f"full one), so the account could never be named by "
+                f"its path. Choose another name."
+            )
+        if name != name.strip():
+            raise ValueError(
+                f"Account name {name!r} begins or ends with whitespace."
+            )
+        if len(name) > _TEXT_WIDTH:
+            raise ValueError(
+                f"Account name is {len(name)} characters; GnuCash "
+                f"stores at most {_TEXT_WIDTH}"
+            )
 
     # UTF-8 byte cap for the account "notes" slot — same limit as
     # customer/vendor notes in the business module (kept as a local
@@ -6412,11 +6650,12 @@ class CoreMixin:
             self._write_balance_limit_frame(book, new_account.guid)
             book.save()
 
-            short_guid = _unique_prefix(
-                new_account.guid, (a.guid for a in book.accounts)
-            )
+            # The form every account-taking tool accepts: ``%`` and
+            # the short GUID. A bare prefix (what this returned
+            # before) resolved nowhere (adversarial review
+            # 2026-09-30, C38).
             result = {
-                "guid": short_guid,
+                "guid": self._account_short_guid(book, new_account),
                 "fullname": new_account.fullname,
                 "status": "created",
             }
@@ -6653,6 +6892,18 @@ class CoreMixin:
                 "status": "deleted",
             }
 
+            # Strip the account's GUID-valued slots and frames by raw
+            # SQL first. Desktop stores account links as GUID slots
+            # (``ofx/associated-income-account``,
+            # ``associated-account/<tag>``, ``lot-mgmt/gains-acct/…``,
+            # ``import-map/…``), and piecash's SlotGUID cascade would
+            # delete every slot of the account each one points at.
+            # Adversarial review 2026-09-30, C7.
+            self._strip_guid_slots(
+                book, [account.guid],
+                f"delete of account {account.guid[:8]}",
+                objects=[account],
+            )
             book.session.delete(account)
             book.save()
 
@@ -6674,16 +6925,7 @@ class CoreMixin:
           ``replace_splits`` applies: a lot split is cost basis or
           an invoice payment, and deleting it reopens the lot.
         """
-        from sqlalchemy import text
-        posting_for = book.session.execute(
-            text("SELECT id FROM invoices WHERE post_txn = :guid"),
-            {"guid": transaction.guid},
-        ).fetchone()
-        if posting_for:
-            raise ValueError(
-                f"Transaction is the posting record for invoice "
-                f"{posting_for[0]}. Use unpost_document first."
-            )
+        self._refuse_posting_record(book, transaction, "delete")
 
         reconciled = [
             s for s in transaction.splits if s.reconcile_state == "y"
@@ -6755,6 +6997,11 @@ class CoreMixin:
                 result["reconciled_splits_affected"] = reconciled_count
             if in_lots:
                 result["lot_splits_affected"] = len(in_lots)
+            closed = self._read_only_period_note(
+                book, [transaction.post_date], "deleting this transaction",
+            )
+            if closed:
+                result["read_only_period"] = closed
 
             # Strip GUID-valued slots (from-sched-xaction,
             # invoice-guid, gains-split…) and frames by raw SQL
@@ -6834,6 +7081,7 @@ class CoreMixin:
             # closes.
             all_guids = [t.guid for t in book.transactions]
             items = []
+            read_only_before = self._read_only_before(book)
             for transaction, reconciled_count, in_lots in resolved:
                 item = {
                     "guid": _unique_prefix(transaction.guid, all_guids),
@@ -6843,6 +7091,13 @@ class CoreMixin:
                     item["reconciled_splits_affected"] = reconciled_count
                 if in_lots:
                     item["lot_splits_affected"] = len(in_lots)
+                closed = self._read_only_period_note(
+                    book, [transaction.post_date],
+                    "deleting this transaction",
+                    threshold=read_only_before,
+                ) if read_only_before else None
+                if closed:
+                    item["read_only_period"] = closed
                 items.append(item)
 
             for transaction, _, in_lots in resolved:
@@ -7020,11 +7275,7 @@ class CoreMixin:
                 txn = self._find_transaction(book, g)
                 if not txn:
                     raise ValueError(f"Transaction not found: {g}")
-                if any(_is_voided(sp) for sp in txn.splits):
-                    raise ValueError(
-                        f"Transaction {g} is voided. Use "
-                        f"unvoid_transaction first, then update."
-                    )
+                self._require_editable(book, txn, g, "update", "update")
                 if trans_date is not None \
                         and _post_date_as_date(txn) != trans_date:
                     self._require_force_for_reconciled(
@@ -7037,6 +7288,18 @@ class CoreMixin:
                     _transaction_to_dict(t) for t in transactions
                 ],
             })
+
+            # Read before the dates move: an edit touches the day
+            # the transaction leaves as well as the day it lands on.
+            read_only_before = self._read_only_before(book)
+            closed_notes = {
+                txn.guid: self._read_only_period_note(
+                    book, [_post_date_as_date(txn), trans_date],
+                    "editing this transaction",
+                    threshold=read_only_before,
+                )
+                for txn in transactions
+            } if read_only_before else {}
 
             for txn in transactions:
                 if description is not None:
@@ -7064,6 +7327,10 @@ class CoreMixin:
                     {
                         "guid": _unique_prefix(t.guid, all_guids),
                         "description": t.description,
+                        **(
+                            {"read_only_period": closed_notes[t.guid]}
+                            if closed_notes.get(t.guid) else {}
+                        ),
                     }
                     for t in transactions
                 ],
@@ -7114,11 +7381,9 @@ class CoreMixin:
                     txn = self._find_transaction(book, key)
                     if not txn:
                         raise ValueError(f"Transaction not found: {key}")
-                    if any(_is_voided(sp) for sp in txn.splits):
-                        raise ValueError(
-                            f"Transaction {key} is voided. Use "
-                            f"unvoid_transaction first, then update."
-                        )
+                    self._require_editable(
+                        book, txn, key, "update", "update",
+                    )
                     if "date" in u \
                             and _post_date_as_date(txn) != u["date"]:
                         self._require_force_for_reconciled(
@@ -7145,6 +7410,16 @@ class CoreMixin:
                 ],
             })
 
+            read_only_before = self._read_only_before(book)
+            closed_notes = {
+                u["guid"]: self._read_only_period_note(
+                    book, [_post_date_as_date(txn), u.get("date")],
+                    "editing this transaction",
+                    threshold=read_only_before,
+                )
+                for u, txn in prepared
+            } if read_only_before else {}
+
             for u, txn in prepared:
                 if "description" in u:
                     txn.description = u["description"]
@@ -7166,6 +7441,9 @@ class CoreMixin:
                 by_key[u["guid"]] = {
                     "guid": u["guid"], "status": "updated",
                     "description": txn.description,
+                    # An updated row has no reason of its own; the
+                    # column carries the read-only-period warning.
+                    "reason": closed_notes.get(u["guid"]) or "",
                 }
 
             return self._updates_envelope(updates, by_key)
@@ -7177,7 +7455,8 @@ class CoreMixin:
             r = by_key.get(u["guid"], {})
             lines.append(
                 f"{u['guid']}\t{r.get('status', '')}\t"
-                f"{r.get('description', '')}\t{r.get('reason', '')}"
+                f"{_tsv_cell(r.get('description', ''))}\t"
+                f"{_tsv_cell(r.get('reason', ''))}"
             )
         return {"results": "\n".join(lines)}
 
@@ -7244,6 +7523,8 @@ class CoreMixin:
                 transaction, missing quantity, or reconciled or
                 lot-held amount changes without force.
         """
+        _check_text(description, _TEXT_WIDTH, "description")
+        _check_text(notes, _SLOT_TEXT_WIDTH, "notes")
         if isinstance(guid, list):
             return self._update_transactions_broadcast(
                 guid, description=description, trans_date=trans_date,
@@ -7254,16 +7535,11 @@ class CoreMixin:
             if not transaction:
                 raise ValueError(f"Transaction not found: {guid}")
 
-            # Voided transactions are immutable: writing into
-            # state='v' splits moves balance sums while staying
-            # invisible to cash_flow/lots/reconciliation, and a
-            # later re-void overwrites the void-former-* slots,
-            # destroying the originals. No force override.
-            if any(_is_voided(s) for s in transaction.splits):
-                raise ValueError(
-                    f"Transaction {guid} is voided. Use "
-                    f"unvoid_transaction first, then update."
-                )
+            # Voided transactions and posting records are immutable
+            # (``_require_editable``). No force override.
+            self._require_editable(
+                book, transaction, guid, "update", "update",
+            )
 
             # Check for reconciled splits when modifying splits
             if splits is not None:
@@ -7283,6 +7559,12 @@ class CoreMixin:
 
             # Stage pre-update state for the audit log.
             self._stage_audit_before(_transaction_to_dict(transaction))
+
+            # Read before the date moves (review C69).
+            closed = self._read_only_period_note(
+                book, [_post_date_as_date(transaction), trans_date],
+                "editing this transaction",
+            )
 
             fx_warnings: list[dict] = []
             lot_changes: list = []
@@ -7393,6 +7675,10 @@ class CoreMixin:
             }
             if lot_changes:
                 result["lot_splits_affected"] = len(lot_changes)
+            if closed:
+                fx_warnings = list(fx_warnings) + [
+                    {"type": "read_only_period", "message": closed}
+                ]
             if fx_warnings:
                 result["warnings"] = fx_warnings
             return result
@@ -7465,13 +7751,15 @@ class CoreMixin:
                 if v["account"].placeholder:
                     raise self._placeholder_error(v["account"])
 
-            # 4a. Voided transactions are immutable — same
-            # rationale as update_transaction; no force override.
-            if any(_is_voided(s) for s in transaction.splits):
-                raise ValueError(
-                    f"Transaction {guid} is voided. Use "
-                    f"unvoid_transaction first, then replace splits."
-                )
+            # 4a. Voided transactions and posting records are
+            # immutable — same gate as update_transaction; no force
+            # override. (A forced replace on a posting record took
+            # its A/R split out of the invoice's lot and the invoice
+            # read "paid" with no payment.)
+            self._require_editable(
+                book, transaction, guid,
+                "replace the splits of", "replace splits",
+            )
 
             # 4. Carry-forward snapshot: a new split that reproduces
             # an old one (same account, value, and quantity) is an
@@ -7552,8 +7840,21 @@ class CoreMixin:
                 for split in in_lots:
                     _lot_forget_flag(split.lot)
 
-            # 6. Delete existing splits
-            for split in list(transaction.splits):
+            # 6. Delete existing splits. Strip their GUID-valued
+            # slots and frames by raw SQL first, as delete_transaction
+            # does: a split's ``gains-split`` / ``gains-source`` slot
+            # points at a split in ANOTHER transaction, and piecash's
+            # SlotGUID cascade would delete every slot of that split
+            # (or raise CircularDependencyError on desktop's two-way
+            # pair). Adversarial review 2026-09-30, C4b.
+            old_splits = list(transaction.splits)
+            self._strip_guid_slots(
+                book,
+                [s.guid for s in old_splits],
+                f"replace_splits of {transaction.guid[:8]}",
+                objects=old_splits,
+            )
+            for split in old_splits:
                 book.delete(split)
 
             # 7. Create new splits
@@ -7584,6 +7885,12 @@ class CoreMixin:
                     transaction.post_date,
                 )
             )
+            closed = self._read_only_period_note(
+                book, [_post_date_as_date(transaction)],
+                "editing this transaction",
+            )
+            if closed:
+                warnings.append(closed)
 
             # 8. Save
             book.save()

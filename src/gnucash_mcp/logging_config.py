@@ -17,6 +17,11 @@ from pathlib import Path
 from typing import Callable
 
 from gnucash_mcp._env import _env_errors, _parse_env_toggle
+from gnucash_mcp._format import (
+    _URI_IN_TEXT_RE as _DB_URI_IN_TEXT_RE,
+    _book_display_name,
+    _scrub_credentials,
+)
 
 AUDIT_LOGGER_NAME = "gnucash_mcp.audit"
 DEBUG_LOGGER_NAME = "gnucash_mcp.debug"
@@ -162,17 +167,68 @@ def _redact_enabled() -> bool:
     return enabled
 
 
-def redact_paths(text: str) -> str:
-    """Replace absolute filesystem paths with their basename when
-    ``GNUCASH_REDACT_PATHS=1`` is set; pass-through otherwise.
-
-    Opt-in (default off): paths in errors are usually the most
-    useful local-debugging signal; redaction is for messages shared
-    externally. Basename-only — the user still needs to know
-    *which* file errored; the directory structure is the sensitive
-    bit. POSIX and Windows absolute paths match; relative paths
-    pass through (they don't leak layout).
+class CredentialScrubFilter(logging.Filter):
+    """Mask connection-string credentials in a log record before any
+    handler sees it (``_scrub_credentials``). Attached to the loggers
+    this package logs errors on: their records propagate to whatever
+    root handler the host installed — FastMCP's stderr handler, which
+    Claude Desktop keeps on disk and Docker ships to ``docker logs``
+    — and an exception's text can quote the whole connection string.
     """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:
+            return True
+        scrubbed = _scrub_credentials(message)
+        if scrubbed != message:
+            record.msg = scrubbed
+            record.args = None
+        return True
+
+
+def _private_prefixes() -> list[str]:
+    """Absolute directories known to be the user's own, longest
+    first: where the book lives and where the audit trail lives."""
+    found: set[str] = set()
+    book = globals().get("_book_path_str")
+    if book and "://" not in str(book):
+        try:
+            found.add(os.path.dirname(os.path.abspath(str(book))))
+        except (OSError, ValueError):
+            pass
+    log_dir = globals().get("_log_dir")
+    if log_dir:
+        found.add(str(log_dir))
+    return sorted(
+        (p.rstrip("/\\") for p in found if p and len(p) > 1),
+        key=len, reverse=True,
+    )
+
+
+def redact_paths(text: str) -> str:
+    """Make an error message safe to leave the server.
+
+    Two steps, the first unconditional:
+
+    1. Connection-string credentials are masked, ALWAYS
+       (``_scrub_credentials``). Every error a tool returns passes
+       through here, and an exception raised while opening a database
+       book quotes the connection string, password included.
+    2. Absolute filesystem paths are replaced with their basename
+       when ``GNUCASH_REDACT_PATHS=1`` is set; pass-through otherwise.
+
+    Path redaction is opt-in (default off): paths in errors are
+    usually the most useful local-debugging signal; redaction is for
+    messages shared externally. Basename-only — the user still needs
+    to know *which* file errored; the directory structure is the
+    sensitive bit. POSIX and Windows absolute paths match; relative
+    paths pass through (they don't leak layout). A connection URI is
+    not a path: it is set aside while the path patterns run, so it
+    comes out masked rather than mangled.
+    """
+    text = _scrub_credentials(text)
     # Full toggle vocabulary via the _parse_env_toggle chokepoint —
     # =="1" once made the Advanced box's "true" a silent no-op, and
     # raw vocabulary membership repeated the shape one level up: a
@@ -189,9 +245,28 @@ def redact_paths(text: str) -> str:
     # POSIX absolute paths: /foo/bar/baz.ext
     # Stop at whitespace, quotes, or common delimiter chars.
     posix_re = re.compile(r"/(?:[^\s/'\"<>]+/)+[^\s/'\"<>]+")
-    # Windows: C:\foo\bar.ext or C:/foo/bar.ext
+    # Windows: C:\foo\bar.ext or C:/foo/bar.ext. The drive letter
+    # must stand alone: without the lookbehind the ``e:`` of
+    # ``file:///Users/…`` was a drive and the result ``filb.gnucash``.
     win_re = re.compile(
-        r"[A-Za-z]:[/\\](?:[^\s'\"<>]+[/\\])*[^\s'\"<>]+"
+        r"(?<![A-Za-z])[A-Za-z]:[/\\](?:[^\s'\"<>]+[/\\])*[^\s'\"<>]+"
+    )
+    # UNC: \\server\share\dir\file
+    unc_re = re.compile(r"\\\\[^\s'\"<>\\]+(?:\\[^\s'\"<>\\]+)+")
+    # A path may contain spaces ("/Users/x/Client Books/Acme
+    # Ltd.gnucash"), and the patterns above stop at the first one —
+    # leaving " Books/Acme Ltd.gnucash", the client's name, in a
+    # message the user asked to have redacted (adversarial review
+    # 2026-09-30, C56). Two places a path's END is known despite
+    # spaces: inside quotes, and at a file extension this server
+    # writes or reads.
+    quoted_re = re.compile(
+        r"""(['"])((?:/|(?<![A-Za-z])[A-Za-z]:[/\\]|\\\\)[^'"\n]*)\1"""
+    )
+    spaced_re = re.compile(
+        r"(?:/|(?<![A-Za-z])[A-Za-z]:[/\\]|\\\\)"
+        r"(?:[^/\\'\"<>\n]+[/\\])+[^/\\'\"<>\n]*?"
+        r"\.(?:gnucash|log|json|tmp|bak|db|sqlite3?|LCK|LNK|mcp)\b"
     )
 
     def to_basename(m):
@@ -201,13 +276,97 @@ def redact_paths(text: str) -> str:
         full = m.group(0).replace("\\", "/")
         return full.rsplit("/", 1)[-1]
 
+    # Set connection URIs aside: the path patterns read
+    # ``postgresql://u:***@host/db`` as a drive letter and a path and
+    # left ``postgresqdb``.
+    held: list[str] = []
+
+    def hold(m):
+        held.append(m.group(0))
+        return f"\x00{len(held) - 1}\x00"
+
+    # A file URL is a path with a scheme on it, not a connection
+    # string to keep whole.
+    text = re.sub(
+        r"file://(/[^\s'\"<>]+)",
+        lambda m: m.group(1).rstrip("/").rsplit("/", 1)[-1], text,
+    )
+    text = _DB_URI_IN_TEXT_RE.sub(hold, text)
+
+    text = quoted_re.sub(
+        lambda m: m.group(1)
+        + m.group(2).replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+        + m.group(1),
+        text,
+    )
+    text = spaced_re.sub(to_basename, text)
+    text = unc_re.sub(to_basename, text)
+    # The directories this process knows are private — the book's own
+    # folder and the audit folder — as literal text, for a mention
+    # the patterns cannot bound: a directory with spaces in its name
+    # and no file name after it. (An unknown directory with spaces
+    # and no extension still ends at its first space; nothing in the
+    # text says where it stops.)
+    for prefix in _private_prefixes():
+        for sep in ("/", "\\"):
+            text = text.replace(prefix + sep, "")
+        text = text.replace(prefix, "[folder]")
     # Windows first (more specific prefix); then POSIX.
     text = win_re.sub(to_basename, text)
     text = posix_re.sub(to_basename, text)
-    return text
+    return re.sub(
+        r"\x00(\d+)\x00", lambda m: held[int(m.group(1))], text,
+    )
 
 
-def resolve_mcp_dir(book_path: Path | str) -> Path:
+_LOG_DIR_OWNER_FILE = ".owner"
+
+
+def _log_dir_identity(book_path: Path | str, identity: str | None) -> str:
+    """What makes a book THIS book, for telling two same-named ones
+    apart: the caller's identity (a database book's masked
+    connection string), else the file's resolved absolute path."""
+    if identity:
+        return identity
+    try:
+        return str(Path(book_path).expanduser().resolve())
+    except OSError:
+        return str(book_path)
+
+
+def _read_log_dir_owner(mcp_dir: Path) -> str | None:
+    try:
+        return (mcp_dir / _LOG_DIR_OWNER_FILE).read_text(
+            encoding="utf-8"
+        ).strip() or None
+    except OSError:
+        return None
+
+
+def claim_log_dir(mcp_dir: Path, book_path: Path | str,
+                  identity: str | None = None) -> None:
+    """Record which book a per-book folder under ``GNUCASH_LOG_DIR``
+    belongs to, the first time anything is written there. A no-op
+    outside the override (the folder sits beside its book) and when
+    the folder is already claimed. Best-effort: a failure here must
+    not fail logging or a backup."""
+    if not os.environ.get("GNUCASH_LOG_DIR"):
+        return
+    owner_file = mcp_dir / _LOG_DIR_OWNER_FILE
+    try:
+        if owner_file.exists():
+            return
+        mcp_dir.mkdir(parents=True, exist_ok=True)
+        owner_file.write_text(
+            _log_dir_identity(book_path, identity) + "\n", encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+def resolve_mcp_dir(
+    book_path: Path | str, identity: str | None = None,
+) -> Path:
     """Resolve the ``.mcp`` directory for audit / debug / backup storage.
 
     ``GNUCASH_LOG_DIR`` set → a PER-BOOK subdirectory under it:
@@ -223,6 +382,21 @@ def resolve_mcp_dir(book_path: Path | str) -> Path:
     move them into the book's subdir manually to keep old history
     attached. Permission checks are bypassed under the override
     (explicit user opt-in), as before.
+
+    The filename alone is not the book. Two servers sharing one
+    ``GNUCASH_LOG_DIR`` — ``2026/ledger.gnucash`` and
+    ``2027/ledger.gnucash``, or a PostgreSQL and a MySQL database
+    both named ``gnucash`` — resolved to ONE folder: one interleaved
+    audit trail under the first book's header, one backup state
+    file, so the second book saw every stage as fresh, took no
+    backups of its own, and listed the first book's snapshots as
+    its newest (adversarial review 2026-09-30, C31). So the folder
+    is CLAIMED: the first book to write there records its identity
+    in ``.owner`` (``claim_log_dir``), and a different book that
+    resolves to a claimed folder gets ``{name}-{hash}.mcp`` instead.
+    The first book keeps the plain name, so nobody's existing
+    history moves. ``identity`` is the masked connection string for
+    a database book; a file book is identified by its resolved path.
 
     Otherwise the directory is
     ``book_path.parent / f"{book_path.name}.mcp"`` and two POSIX
@@ -249,7 +423,15 @@ def resolve_mcp_dir(book_path: Path | str) -> Path:
     env_override = os.environ.get("GNUCASH_LOG_DIR")
     if env_override:
         base = Path(env_override).expanduser()
-        return base / f"{Path(book_path).name}.mcp"
+        name = Path(book_path).name
+        plain = base / f"{name}.mcp"
+        owner = _read_log_dir_owner(plain)
+        mine = _log_dir_identity(book_path, identity)
+        if owner is None or owner == mine:
+            return plain
+        import hashlib
+        tag = hashlib.sha256(mine.encode("utf-8")).hexdigest()[:8]
+        return base / f"{name}-{tag}.mcp"
 
     book_path = Path(book_path)
     parent = book_path.parent
@@ -357,6 +539,16 @@ class _DailyFileHandler(logging.Handler):
         path = self.path_for(day or _local_day())
         if path.exists() and path.stat().st_size > 0:
             return path
+        # The directory too: removed mid-session (a cleanup script, a
+        # sync client), every later write committed to the book with
+        # no audit line, and the only sign was a "Logging error" on
+        # stderr (adversarial review 2026-09-30, C33).
+        if not self.directory.exists():
+            self.directory.mkdir(parents=True, exist_ok=True)
+            try:
+                os.chmod(self.directory, 0o700)
+            except OSError:
+                pass
         # Explicit UTF-8: under a C/POSIX locale (common for
         # daemonized MCP servers) the platform default is ASCII, and
         # localized account names would raise inside the handler.
@@ -380,7 +572,10 @@ class _DailyFileHandler(logging.Handler):
         try:
             path = self.ensure_file()
             with open(path, "a", encoding="utf-8") as fh:
-                fh.write(self.format(record) + "\n")
+                # Last line of defence for the files this server
+                # owns: nothing reaches the audit or debug log with
+                # a connection-string credential in it.
+                fh.write(_scrub_credentials(self.format(record)) + "\n")
         except Exception:
             self.handleError(record)
 
@@ -437,8 +632,11 @@ def setup_logging(
 
     # Lives alongside the book (or GNUCASH_LOG_DIR); the helper
     # also runs the symlink-hijack sanity checks.
-    log_dir = resolve_mcp_dir(book_path)
+    log_dir = resolve_mcp_dir(book_path, identity=display_name)
     _log_dir = log_dir
+    # Under GNUCASH_LOG_DIR, record whose folder this is, so a
+    # different book with the same filename gets its own.
+    claim_log_dir(log_dir, book_path, identity=display_name)
 
     now_local = datetime.now().astimezone()
     today = now_local.strftime("%Y-%m-%d")
@@ -456,8 +654,14 @@ def setup_logging(
         audit_logger.propagate = False
 
         # Opened by path per entry (see _DailyFileHandler); the
-        # header names the book the way a human knows it.
-        book_label = display_name or book_path
+        # header names the book the way a human knows it — its
+        # filename, never its directory. ``get_audit_log`` returns
+        # this header to the model on every call, and a file book
+        # arrived here as its full path (only a database book passed
+        # a display name), so the user's home layout and client
+        # folder names went out with it whatever the redaction flag
+        # said.
+        book_label = display_name or _book_display_name(book_path)
         audit_handler = _DailyFileHandler(
             audit_dir, ".txt",
             header_fn=lambda day: _format_text_header(
@@ -1082,14 +1286,29 @@ def _fmt_account_update(entry: dict) -> list[str]:
         f"{_INDENT}{params.get('name', '')}",
     ]
     if before and after:
-        old_name = before.get("name", "")
-        new_name = after.get("name", "")
-        if old_name != new_name:
-            lines.append(f'{_INDENT}Name: "{old_name}" → "{new_name}"')
-        old_desc = before.get("description", "")
-        new_desc = after.get("description", "")
-        if old_desc != new_desc:
-            lines.append(f'{_INDENT}Description: "{old_desc}" → "{new_desc}"')
+        # ``after_state`` is the tool's response, which carries ONLY
+        # the fields the update changed. A field absent from it did
+        # not change — reading the absence as "" logged a rename to
+        # nothing on every description-only update, and a cleared
+        # description on every placeholder-only one, while the
+        # change that DID happen (placeholder, type) had no line.
+        if "name" in after and after["name"] != before.get("name"):
+            lines.append(
+                f'{_INDENT}Name: "{before.get("name", "")}" → '
+                f'"{after["name"]}"'
+            )
+        if "description" in after \
+                and after["description"] != before.get("description"):
+            lines.append(
+                f'{_INDENT}Description: '
+                f'"{before.get("description") or ""}" → '
+                f'"{after["description"] or ""}"'
+            )
+        for key, label in (("placeholder", "Placeholder"), ("type", "Type")):
+            if key in after and after[key] != before.get(key):
+                lines.append(
+                    f"{_INDENT}{label}: {before.get(key)} → {after[key]}"
+                )
         # ``notes`` is a diff-echo key: present in after_state only
         # when the update changed it ("" = cleared).
         if "notes" in after:
@@ -1650,8 +1869,26 @@ def _fmt_price_create(entry: dict) -> list[str]:
     ns = after.get("namespace", params.get("namespace", ""))
     comm = after.get("commodity", params.get("commodity", ""))
     status = after.get("status", "")
-    verb = "UPDATE" if status == "updated" else "CREATE"
-    lines = [f"{time_part}  {verb} PRICE  {ns}:{comm}"]
+    # ``kept``: GnuCash's one-price-per-day rule turned the price
+    # away, and nothing was written — the line must not read as a
+    # write.
+    verb = {"updated": "UPDATE", "replaced": "REPLACE"}.get(status, "CREATE")
+    lines = [
+        f"{time_part}  {verb} PRICE  {ns}:{comm}" if status != "kept"
+        else f"{time_part}  PRICE NOT WRITTEN  {ns}:{comm}"
+    ]
+    if status == "kept":
+        existing = after.get("existing") or {}
+        lines.append(
+            f"{_INDENT}outranked by the day's {existing.get('source', '')} "
+            f"price ({existing.get('value', '')})"
+        )
+        return lines
+    if status == "replaced":
+        gone = after.get("replaced") or {}
+        lines.append(
+            f"{_INDENT}replaced the day's {gone.get('source', '')} price"
+        )
     date_str = after.get("date", params.get("price_date", "") or "")
     value = after.get("value", params.get("value", ""))
     currency = after.get("currency", params.get("currency", "") or "")
@@ -1744,7 +1981,20 @@ def _fmt_invoice_unpost(entry: dict) -> list[str]:
             f"{_INDENT}was posted:{was_posted}  "
             f"post_account:{was_account}"
         )
-    lines.extend(_invoice_link_migration_lines(entry.get("after_state") or {}))
+    after = entry.get("after_state") or {}
+    kept = after.get("payments_kept") or []
+    if kept:
+        shown = ", ".join(
+            f"{p.get('amount', '')} (txn:{p.get('guid', '')})" for p in kept
+        )
+        lines.append(
+            f"{_INDENT}payments kept as the party's unapplied payment: {shown}"
+        )
+    if after.get("links_removed"):
+        lines.append(
+            f"{_INDENT}lot links removed: {after['links_removed']}"
+        )
+    lines.extend(_invoice_link_migration_lines(after))
     return lines
 
 
@@ -1761,6 +2011,34 @@ def _fmt_invoice_pay(entry: dict) -> list[str]:
     dry = bool(params.get("dry_run")) or bool(
         (after or {}).get("dry_run")
     )
+    # Settled from the party's earlier payment: nothing was paid and
+    # no transaction was created, and the line must not read as if
+    # one was.
+    if params.get("from_prepayment"):
+        tag = " (dry run)" if dry else ""
+        lines = [
+            f"{time_part}  PAY INVOICE{tag}  id:{params.get('id', '')}"
+        ]
+        if after:
+            verb = "would apply" if dry else "applied"
+            remaining = after.get(
+                "remaining_balance_after" if dry else "remaining_balance", "",
+            )
+            lines.append(
+                f"{_INDENT}{verb} from unapplied payments: "
+                f"{after.get('applied_from_prepayment', '')}  "
+                f"remaining: {remaining}"
+                + ("  nothing booked" if dry else "  no new transaction")
+            )
+            for used in after.get("from_payments") or []:
+                if used.get("guid"):
+                    lines.append(
+                        f"{_INDENT}from payment txn:{used['guid']}  "
+                        f"{used.get('amount', '')}"
+                    )
+        lines.extend(_invoice_link_migration_lines(after or {}))
+        return lines
+
     if dry:
         lines = [
             f"{time_part}  PAY INVOICE (dry run)  "
@@ -1796,6 +2074,19 @@ def _fmt_invoice_pay(entry: dict) -> list[str]:
         lines.append(
             f"{_INDENT}from: {params.get('payment_account', '')}  txn:{txn_guid}"
         )
+        prepayment = after.get("prepayment") or {}
+        if prepayment:
+            lines.append(
+                f"{_INDENT}held as unapplied payment: "
+                f"{prepayment.get('currency', '')} "
+                f"{prepayment.get('amount', '')}"
+            )
+        if params.get("payment_account_amount"):
+            lines.append(
+                f"{_INDENT}payment account moved: "
+                f"{after.get('payment_account_currency', '')} "
+                f"{params['payment_account_amount']}"
+            )
     memo = params.get("memo", "")
     if memo:
         lines.append(f"{_INDENT}memo: {memo}")
@@ -2216,6 +2507,11 @@ def _shape_upgrade_lines(after: dict) -> list[str]:
     if after.get("book_scrubbed"):
         lines.append(
             f"{_INDENT}existing budget rows scrubbed to natural sign"
+        )
+    if after.get("pre_upgrade_backup"):
+        lines.append(
+            f"{_INDENT}snapshot of the book before conversion: "
+            f"{after['pre_upgrade_backup']}"
         )
     return lines
 
@@ -3017,9 +3313,17 @@ def audit_log(
                     except Exception:
                         pass
 
+                # Exception text can quote the connection string
+                # (piecash: "Database 'postgresql://user:pw@…' does
+                # not exist"); mask it before it reaches either log.
+                error_message = _scrub_credentials(str(e))
+                # One record per line here too: the text echoes
+                # caller-supplied values, and a newline in one forged
+                # a debug-log record (SEC-18).
                 debug_logger.debug(
                     f"MCP response: tool={func.__name__} status=error "
-                    f"elapsed={elapsed_ms:.0f}ms error={e}"
+                    f"elapsed={elapsed_ms:.0f}ms "
+                    f"error={_escape_audit_value(error_message)}"
                 )
 
                 # Log a simple error line. Exception text embeds
@@ -3030,7 +3334,7 @@ def audit_log(
                 time_part = timestamp.split("T")[1][:8] if "T" in timestamp else timestamp[:8]
                 error_text = (
                     f"{time_part}  ERROR  {func.__name__}: "
-                    f"{_escape_audit_value(str(e))}"
+                    f"{_escape_audit_value(error_message)}"
                 )
                 logger.info(error_text)
                 logger.info("")
@@ -3055,6 +3359,19 @@ def audit_log(
 def debug_log(message: str) -> None:
     """Log a debug message if debug logging is enabled."""
     logging.getLogger(DEBUG_LOGGER_NAME).debug(message)
+
+
+def audit_note(verb: str, text: str) -> None:
+    """Write one line to the audit trail for an event that is not a
+    book write — ``HH:MM:SS  VERB  text``. A no-op when auditing is
+    off (the audit logger has no handler then)."""
+    logger = logging.getLogger(AUDIT_LOGGER_NAME)
+    if not logger.handlers:
+        return
+    stamp = datetime.now().astimezone().isoformat().split("T")[1][:8]
+    logger.info(f"{stamp}  {verb}  {_escape_audit_value(text)}")
+    logger.info("")
+    _flush_logger(logger)
 
 
 def _flush_logger(logger: logging.Logger) -> None:

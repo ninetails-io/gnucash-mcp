@@ -96,6 +96,106 @@ def clean_server():
                 os.environ[k] = v
 
 
+# ── Credentials: end to end ───────────────────────────────────────
+
+
+class TestCredentialsNeverLeave:
+    """A URI-mode server whose database cannot be opened, with a
+    password planted in the connection string, called the way a
+    client calls it. The password must appear in nothing that leaves:
+    the tool result, the audit and debug files, or the log records
+    that propagate to the host's stderr handler. (Review C16a, C16b,
+    C59; the unit table is ``tests/test_credential_scrub.py``.)
+    """
+
+    SECRET = "S3CRET-pw-do-not-leak"
+
+    def _call_a_tool(self, srv, tmp_path, monkeypatch, caplog, uri):
+        import json
+        import logging
+
+        from gnucash_mcp.logging_config import audit_log
+        from gnucash_mcp.tools._helpers import safe_tool
+
+        monkeypatch.setenv("GNUCASH_LOG_DIR", str(tmp_path / "logs"))
+        srv._logging_audit = True
+        srv._logging_debug = True
+        srv._install_book_uri(uri, activate=True)
+
+        @safe_tool
+        @audit_log(
+            classification="write", operation="create",
+            entity_type="account",
+        )
+        def create_account(name: str) -> str:
+            return json.dumps(
+                srv.get_book().create_account(name, "EXPENSE")
+            )
+
+        with caplog.at_level(logging.DEBUG):
+            result = create_account(name="Dining")
+        files = {
+            str(p.relative_to(tmp_path)): p.read_text()
+            for p in (tmp_path / "logs").rglob("*") if p.is_file()
+        }
+        return result, files, caplog.text
+
+    def _assert_clean(self, result, files, logged):
+        assert self.SECRET not in result
+        for name, text in files.items():
+            assert self.SECRET not in text, name
+        assert self.SECRET not in logged
+        # It did fail, and said so on every surface.
+        assert '"error"' in result
+        assert any("ERROR" in text for text in files.values())
+        assert "create_account" in logged
+
+    def test_missing_database_named_by_piecash(
+        self, clean_server, tmp_path, monkeypatch, caplog,
+    ):
+        """piecash: ``Database '<the whole uri>' does not exist``."""
+        uri = (
+            f"sqlite:///{tmp_path}/missing.gnucash"
+            f"?password={self.SECRET}"
+        )
+        result, files, logged = self._call_a_tool(
+            clean_server, tmp_path, monkeypatch, caplog, uri,
+        )
+        self._assert_clean(result, files, logged)
+        # The message survives, masked: the user can still see which
+        # database is missing.
+        assert "does not exist" in result
+        assert "password=***" in result
+
+    def test_userinfo_password_quoted_by_sqlalchemy(
+        self, clean_server, tmp_path, monkeypatch, caplog,
+    ):
+        """SQLAlchemy: ``Invalid SQLite URL: sqlite://u:<pw>@``."""
+        uri = f"sqlite://dbuser:{self.SECRET}@/{tmp_path}/missing.gnucash"
+        result, files, logged = self._call_a_tool(
+            clean_server, tmp_path, monkeypatch, caplog, uri,
+        )
+        self._assert_clean(result, files, logged)
+        assert "dbuser:***@" in result
+
+    def test_the_book_is_named_without_the_password_everywhere(
+        self, clean_server, tmp_path, monkeypatch, caplog,
+    ):
+        """The header and the startup notice masked the userinfo
+        password already; a query-string one passed straight
+        through (C16b)."""
+        uri = (
+            f"sqlite:///{tmp_path}/missing.gnucash"
+            f"?sslpassword={self.SECRET}"
+        )
+        result, files, logged = self._call_a_tool(
+            clean_server, tmp_path, monkeypatch, caplog, uri,
+        )
+        self._assert_clean(result, files, logged)
+        assert self.SECRET not in BookSource.from_uri(uri).display_name
+        assert self.SECRET not in clean_server.get_server_config()
+
+
 # ── BookSource ────────────────────────────────────────────────────
 
 
@@ -715,6 +815,18 @@ def _worker_db_uri(env_var: str) -> str | None:
     return str(url.set(database=f"{url.database or 'gnucash'}_{worker}"))
 
 
+def _ensure_account(book, *args, **kwargs) -> None:
+    """Create an account another test in the class may already have
+    made. The class shares one database book per xdist worker, and
+    which tests land on a worker varies by run: two tests that each
+    created ``Income`` passed or failed by scheduling."""
+    try:
+        book.create_account(*args, **kwargs)
+    except ValueError as e:
+        if "already exists" not in str(e):
+            raise
+
+
 _PG_URI = _worker_db_uri("GNUCASH_TEST_PG_URI")
 _MYSQL_URI = _worker_db_uri("GNUCASH_TEST_MYSQL_URI")
 
@@ -867,11 +979,11 @@ class _RealDatabaseTests:
             name="Accounts Receivable", account_type="RECEIVABLE",
             parent="Assets",
         )
-        db_book.create_account(
-            name="Income", account_type="INCOME", placeholder=True,
+        _ensure_account(
+            db_book, name="Income", account_type="INCOME", placeholder=True,
         )
-        db_book.create_account(
-            name="Sales", account_type="INCOME", parent="Income",
+        _ensure_account(
+            db_book, name="Sales", account_type="INCOME", parent="Income",
         )
         customer = db_book.create_customer(name="Dialect Co")
         inv = db_book.create_invoice(customer_id=customer["id"])
@@ -905,6 +1017,69 @@ class _RealDatabaseTests:
         assert db_book.get_invoice(
             "INV-EXPLICIT", owner_type="customer"
         )["id"] == "INV-EXPLICIT"
+
+    def test_prepayment_lifecycle(self, db_book):
+        """The payment-lot paths are raw SQL over the slots table
+        (owner frames joined to their children, the document-link
+        test, the party-delete guard): overpay, settle another
+        document from the excess, unpost a paid one, and read it all
+        back, on each dialect (adversarial review 2026-09-30, C37 /
+        C49 / C50)."""
+        _ensure_account(
+            db_book, name="Accounts Receivable", account_type="RECEIVABLE",
+            parent="Assets",
+        )
+        _ensure_account(
+            db_book, name="Income", account_type="INCOME", placeholder=True,
+        )
+        _ensure_account(
+            db_book, name="Sales", account_type="INCOME", parent="Income",
+        )
+        customer = db_book.create_customer(name="Prepay Co")
+        ids = []
+        for price in ("100.00", "50.00"):
+            inv = db_book.create_invoice(customer_id=customer["id"])
+            db_book.add_invoice_entry(
+                invoice_id=inv["id"], account="Income:Sales",
+                description="Work", quantity="1", price=price,
+            )
+            db_book.post_invoice(
+                invoice_id=inv["id"],
+                post_account="Assets:Accounts Receivable",
+                post_date="2026-01-15", owner_type="customer",
+            )
+            ids.append(inv["id"])
+
+        def unapplied():
+            return db_book.get_outstanding_invoices(
+                compact=False, customer_id=customer["id"],
+            ).get("unapplied_payments", [])
+
+        paid = db_book.pay_invoice(
+            invoice_id=ids[0], payment_account="Assets:Checking",
+            amount="120.00", payment_date="2026-01-20",
+            owner_type="customer", allow_prepayment=True,
+        )
+        assert paid["prepayment"]["amount"] == "20.00"
+        assert [u["amount"] for u in unapplied()] == ["20.00"]
+        assert db_book.get_invoice(
+            ids[1], owner_type="customer",
+        )["unapplied_payments_available"] == "20.00"
+
+        settled = db_book.pay_invoice(
+            invoice_id=ids[1], owner_type="customer", from_prepayment=True,
+        )
+        assert settled["remaining_balance"] == "30.00"
+        assert unapplied() == []
+
+        unposted = db_book.unpost_invoice(
+            invoice_id=ids[0], owner_type="customer",
+        )
+        assert [p["amount"] for p in unposted["payments_kept"]] == ["100.00"]
+        assert [u["amount"] for u in unapplied()] == ["100.00"]
+        assert "Book:" in db_book.get_book_summary()
+        with pytest.raises(ValueError, match="unapplied payment"):
+            db_book.delete_customer(customer["id"])
 
     def test_tax_bearing_draft_can_be_deleted(self, db_book):
         """Regression: deleting an unposted document with a taxed
@@ -1057,8 +1232,13 @@ class _RealDatabaseTests:
             )
             assert str(row[2])[:19] == "2026-09-29 10:59:00"
             assert book.session.execute(text(stale)).scalar() == 0
+            # This account's frame, not the book's: the fixture is
+            # class-scoped and another test may have created accounts
+            # first (the count was 2 on one CI run, 1 on the re-run).
             assert book.session.execute(text(
-                "SELECT COUNT(*) FROM slots WHERE name = 'balance-limit'"
+                "SELECT COUNT(*) FROM slots s JOIN accounts a "
+                "ON a.guid = s.obj_guid WHERE s.name = 'balance-limit' "
+                "AND a.name = 'EUR Savings'"
             )).scalar() == 1
         # piecash's old fillers, then the converter's two UPDATEs.
         with db_book.open(readonly=False) as book:
@@ -1088,8 +1268,8 @@ class _RealDatabaseTests:
             )
         except ValueError:
             pass  # an earlier test in this class created it
-        db_book.create_account("Income", "INCOME")
-        db_book.create_account("Sales", "INCOME", parent="Income")
+        _ensure_account(db_book, "Income", "INCOME")
+        _ensure_account(db_book, "Sales", "INCOME", parent="Income")
         db_book.create_account(
             "AR EUR", "RECEIVABLE", parent="Assets", commodity="EUR",
         )
@@ -1125,8 +1305,12 @@ class _RealDatabaseTests:
                 "FROM splits s JOIN accounts a ON a.guid = s.account_guid "
                 "JOIN transactions t ON t.guid = s.tx_guid "
                 "JOIN commodities c ON c.guid = t.currency_guid "
-                "WHERE s.action = 'Payment' ORDER BY a.name"
-            )).fetchall()
+                # This payment only: the class shares one book, and
+                # another test's payment is in it when both land on
+                # the same xdist worker.
+                "WHERE s.action = 'Payment' AND t.guid LIKE :txn "
+                "ORDER BY a.name"
+            ), {"txn": result["transaction_guid"] + "%"}).fetchall()
             assert [tuple(r) for r in rows] == [
                 ("USD", "AR EUR", -100000, -90000),
                 ("USD", "Checking", 108000, 108000),

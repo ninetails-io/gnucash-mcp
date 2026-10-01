@@ -7,7 +7,7 @@ can cross-reference what's asserted against what was designed.
 
 import json
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -613,6 +613,81 @@ class TestMaybeAutoBackup:
         assert n1 == 1
         assert n2 == 1  # no additional backup
 
+    def test_a_long_lived_process_keeps_snapshotting(
+        self, test_book: Path, monkeypatch,
+    ):
+        """Review C29. The hook ran once per process, so a server
+        left running took no further snapshots however many days
+        passed."""
+        import gnucash_mcp.book.backup as bk
+
+        clock = {"mono": 1000.0, "utc": datetime.now(timezone.utc)}
+        monkeypatch.setattr(bk, "_monotonic", lambda: clock["mono"])
+        monkeypatch.setattr(bk, "_now_utc", lambda: clock["utc"])
+        book = GnuCashBook(str(test_book))
+        book._maybe_auto_backup()
+        assert len(book.list_backups()) == 1
+
+        # Thirteen hours on, the book has changed: session is due.
+        book.update_account(name="Assets:Checking", description="edited")
+        clock["mono"] += 13 * 3600
+        clock["utc"] += timedelta(hours=13)
+        book._maybe_auto_backup()
+
+        stages = [e["stage"] for e in book.list_backups()]
+        assert len(stages) == 2 and "session" in stages
+
+    def test_within_the_recheck_window_it_is_a_flag_check(
+        self, test_book: Path, monkeypatch,
+    ):
+        import gnucash_mcp.book.backup as bk
+
+        clock = {"mono": 1000.0}
+        monkeypatch.setattr(bk, "_monotonic", lambda: clock["mono"])
+        book = GnuCashBook(str(test_book))
+        book._maybe_auto_backup()
+        clock["mono"] += book._BACKUP_RECHECK_SECONDS - 1
+        with patch.object(bk, "_read_state") as read_state:
+            book._maybe_auto_backup()
+        read_state.assert_not_called()
+
+    def test_a_failed_attempt_is_retried(self, test_book: Path, monkeypatch):
+        """Review C29. The first write of a session finds GnuCash
+        holding the book; the user closes it and retries. That retry,
+        and every write after it, used to run with no snapshot."""
+        import gnucash_mcp.book.backup as bk
+
+        clock = {"mono": 1000.0}
+        monkeypatch.setattr(bk, "_monotonic", lambda: clock["mono"])
+        book = GnuCashBook(str(test_book))
+        con = sqlite3.connect(str(test_book))
+        con.execute("INSERT INTO gnclock VALUES ('desktop', 1234)")
+        con.commit()
+
+        book._maybe_auto_backup()
+        assert book.list_backups() == []
+        assert book.get_backup_health()["last_attempt"]["status"] == "failed"
+
+        con.execute("DELETE FROM gnclock")
+        con.commit()
+        con.close()
+        # Straight away: still inside the retry wait.
+        book._maybe_auto_backup()
+        assert book.list_backups() == []
+        clock["mono"] += book._BACKUP_RETRY_SECONDS + 1
+        book._maybe_auto_backup()
+
+        assert len(book.list_backups()) == 1
+        assert book.get_backup_health()["last_attempt"]["status"] == "ok"
+
+    def test_a_flag_set_by_hand_still_switches_the_hook_off(
+        self, test_book: Path,
+    ):
+        book = GnuCashBook(str(test_book))
+        book._backup_checked_in_process = True
+        book._maybe_auto_backup()
+        assert book.list_backups() == []
+
     def test_failure_does_not_raise(self, test_book: Path):
         """If the backup machinery raises, _maybe_auto_backup
         swallows it so the user's write can proceed.
@@ -996,3 +1071,260 @@ class TestIdenticalContentSkip:
         assert len(book.list_backups()) == 2, (
             "changed content must still take a real snapshot"
         )
+
+
+class TestPreUpgradeSnapshot:
+    """Review C30. The 1.5 conversion rewrites thousands of rows in
+    one commit and cannot be undone; the routine auto-backup runs
+    once per process and only when a stage is due, so it did not
+    promise a copy of the state the conversion started from."""
+
+    @pytest.fixture(autouse=True)
+    def _armed(self, monkeypatch):
+        # conftest switches the snapshot off for the suite.
+        from gnucash_mcp.book.backup import BackupMixin
+        monkeypatch.setattr(BackupMixin, "_pre_upgrade_checked", False)
+
+    def _snapshots(self, book_path):
+        d = Path(f"{book_path}.mcp") / "backups"
+        return sorted(d.glob("*-manual-pre-1-5-upgrade.gnucash")) if d.exists() else []
+
+    def _price_rows(self, path):
+        import sqlite3
+        con = sqlite3.connect(str(path))
+        try:
+            return con.execute("SELECT COUNT(*) FROM prices").fetchone()[0]
+        finally:
+            con.close()
+
+    def _convert(self, gb):
+        """A write that runs the converters."""
+        return gb.create_price(
+            "EUR", "CURRENCY", "1.10", price_date=date(2026, 9, 1),
+        )
+
+    def test_first_converting_write_snapshots_the_prior_state(
+        self, multi_currency_book,
+    ):
+        gb = GnuCashBook(str(multi_currency_book))
+        before = self._price_rows(multi_currency_book)
+
+        result = self._convert(gb)
+
+        (snapshot,) = self._snapshots(multi_currency_book)
+        assert result["pre_upgrade_backup"] == snapshot.name
+        # The copy is of the book BEFORE this write.
+        assert self._price_rows(snapshot) == before
+        assert self._price_rows(multi_currency_book) == before + 1
+
+    def test_once_per_book_across_writes_and_processes(
+        self, multi_currency_book,
+    ):
+        gb = GnuCashBook(str(multi_currency_book))
+        self._convert(gb)
+        again = gb.create_price(
+            "EUR", "CURRENCY", "1.11", price_date=date(2026, 9, 2),
+        )
+        assert "pre_upgrade_backup" not in again
+        # A new server process on the same book.
+        fresh = GnuCashBook(str(multi_currency_book))
+        later = fresh.create_price(
+            "EUR", "CURRENCY", "1.12", price_date=date(2026, 9, 3),
+        )
+        assert "pre_upgrade_backup" not in later
+        assert len(self._snapshots(multi_currency_book)) == 1
+
+    def test_an_auto_backup_of_this_exact_state_is_enough(
+        self, multi_currency_book,
+    ):
+        gb = GnuCashBook(str(multi_currency_book))
+        gb._maybe_auto_backup()          # the audit hook, first write
+        assert gb.list_backups()
+
+        result = self._convert(gb)
+
+        assert "pre_upgrade_backup" not in result
+        assert self._snapshots(multi_currency_book) == []
+        # ...and it does not come back once the book has changed.
+        later = gb.create_price(
+            "EUR", "CURRENCY", "1.11", price_date=date(2026, 9, 2),
+        )
+        assert "pre_upgrade_backup" not in later
+        assert self._snapshots(multi_currency_book) == []
+
+    def test_a_changed_book_since_the_last_backup_gets_its_own(
+        self, multi_currency_book,
+    ):
+        """The gap: a backup exists, but the book moved on since."""
+        gb = GnuCashBook(str(multi_currency_book))
+        gb._maybe_auto_backup()
+        gb.update_account(name="Assets:Checking", description="changed")
+
+        result = self._convert(gb)
+
+        assert "pre_upgrade_backup" in result
+        assert len(self._snapshots(multi_currency_book)) == 1
+
+    def test_a_book_with_nothing_to_convert_keeps_no_snapshot(
+        self, multi_currency_book, monkeypatch,
+    ):
+        """A book 1.5 or GnuCash desktop made has no pre-1.5 shape in
+        it. The snapshot has to be taken before the converters can
+        say so; when they then convert nothing it is withdrawn,
+        rather than left as a "pre-1.5 upgrade" copy of a book that
+        was never upgraded (GUI gate 2026-10-01, G-1)."""
+        from gnucash_mcp.book.backup import BackupMixin
+
+        gb = GnuCashBook(str(multi_currency_book))
+        # Bring the fixture (piecash's own writing) to current shapes
+        # with the snapshot switched off, as if 1.5 had made the book.
+        monkeypatch.setattr(BackupMixin, "_pre_upgrade_checked", True)
+        with gb.open(readonly=False) as book:
+            assert gb._upgrade_book_shapes(book)
+            book.save()
+        monkeypatch.setattr(BackupMixin, "_pre_upgrade_checked", False)
+
+        result = self._convert(gb)
+
+        assert "pre_upgrade_backup" not in result
+        assert self._snapshots(multi_currency_book) == []
+        # The question is settled for this book: the marker is there,
+        # and a new process does not ask again.
+        assert gb._pre_upgrade_marker().exists()
+        fresh = GnuCashBook(str(multi_currency_book))
+        later = fresh.create_price(
+            "EUR", "CURRENCY", "1.12", price_date=date(2026, 9, 3),
+        )
+        assert "pre_upgrade_backup" not in later
+        assert self._snapshots(multi_currency_book) == []
+
+    def test_no_snapshot_no_conversion(self, multi_currency_book):
+        """Every other backup is best-effort; this one guards a
+        change that cannot be redone."""
+        sidecar = Path(f"{multi_currency_book}.mcp")
+        sidecar.mkdir()
+        (sidecar / "backups").write_text("not a directory")
+        gb = GnuCashBook(str(multi_currency_book))
+        before = self._price_rows(multi_currency_book)
+
+        with pytest.raises(ValueError, match="could not be written"):
+            self._convert(gb)
+
+        assert self._price_rows(multi_currency_book) == before
+
+    def test_reads_never_snapshot(self, multi_currency_book):
+        gb = GnuCashBook(str(multi_currency_book))
+        gb.get_book_summary()
+        gb.list_accounts()
+        gb.net_worth(end_date=date(2026, 9, 30))
+        assert self._snapshots(multi_currency_book) == []
+
+    def test_a_database_book_is_not_refused(self, multi_currency_book, tmp_path):
+        from gnucash_mcp.book import BookSource
+        gb = GnuCashBook(BookSource.from_uri(
+            f"sqlite:///{multi_currency_book}"
+        ))
+        result = self._convert(gb)
+        assert result["status"] == "created"
+        assert "pre_upgrade_backup" not in result
+
+
+class TestSameNamedBooksUnderOneLogDir:
+    """Review C31. Per-book scoping keyed on the FILENAME, so two
+    servers sharing one GNUCASH_LOG_DIR with ``2026/ledger.gnucash``
+    and ``2027/ledger.gnucash`` shared one audit trail and one backup
+    store: the second book saw every stage as fresh, took no backups
+    of its own, and listed the first book's snapshots as its newest —
+    a restore from its folder would have put the wrong ledger in
+    place."""
+
+    @pytest.fixture
+    def two_ledgers(self, test_book: Path, tmp_path, monkeypatch):
+        import shutil
+        a = tmp_path / "2026" / "ledger.gnucash"
+        b = tmp_path / "2027" / "ledger.gnucash"
+        for path in (a, b):
+            path.parent.mkdir()
+            shutil.copy(test_book, path)
+        monkeypatch.setenv("GNUCASH_LOG_DIR", str(tmp_path / "logs"))
+        return a, b, tmp_path / "logs"
+
+    def test_each_book_gets_its_own_backups(self, two_ledgers):
+        a_path, b_path, logs = two_ledgers
+        a, b = GnuCashBook(str(a_path)), GnuCashBook(str(b_path))
+
+        a._maybe_auto_backup()
+        b._maybe_auto_backup()
+
+        assert len(a.list_backups()) == 1
+        assert len(b.list_backups()) == 1, "B was starved by A's state"
+        assert a._backups_dir() != b._backups_dir()
+        # The first book keeps the plain name: nobody's history moves.
+        assert a._backups_dir() == logs / "ledger.gnucash.mcp" / "backups"
+        assert b._backups_dir().parent.name.startswith("ledger.gnucash-")
+
+    def test_one_books_prune_cannot_reach_the_others(self, two_ledgers):
+        a_path, b_path, _ = two_ledgers
+        a, b = GnuCashBook(str(a_path)), GnuCashBook(str(b_path))
+        for _ in range(3):
+            a.create_backup(stage="session")
+        b.create_backup(stage="session")
+
+        b.prune_backups(keep_last_n=1, dry_run=False)
+
+        assert len(a.list_backups()) == 3
+
+    def test_audit_trails_are_separate(self, two_ledgers):
+        from gnucash_mcp.logging_config import resolve_mcp_dir, setup_logging
+
+        a_path, b_path, _ = two_ledgers
+        setup_logging(book_path=str(a_path), debug=False)
+        dir_a = resolve_mcp_dir(a_path)
+        setup_logging(book_path=str(b_path), debug=False)
+        dir_b = resolve_mcp_dir(b_path)
+
+        assert dir_a != dir_b
+        assert list((dir_a / "audit").glob("*.txt"))
+        assert list((dir_b / "audit").glob("*.txt"))
+
+    def test_the_same_book_always_resolves_to_the_same_folder(
+        self, two_ledgers,
+    ):
+        from gnucash_mcp.logging_config import resolve_mcp_dir
+
+        a_path, b_path, _ = two_ledgers
+        GnuCashBook(str(a_path)).create_backup()
+        GnuCashBook(str(b_path)).create_backup()
+        for path in (a_path, b_path):
+            first = resolve_mcp_dir(path)
+            assert resolve_mcp_dir(path) == first
+            # A new process, same book.
+            assert GnuCashBook(str(path))._backups_dir().parent == first
+
+    def test_database_books_named_alike_are_told_apart(
+        self, tmp_path, monkeypatch,
+    ):
+        """README's own examples use database ``gnucash`` for both
+        PostgreSQL and MySQL."""
+        from gnucash_mcp.logging_config import claim_log_dir, resolve_mcp_dir
+
+        monkeypatch.setenv("GNUCASH_LOG_DIR", str(tmp_path / "logs"))
+        pg = "postgresql://u:***@h1/gnucash"
+        my = "mysql+pymysql://u:***@h2/gnucash"
+        first = resolve_mcp_dir("gnucash.gnucash", identity=pg)
+        claim_log_dir(first, "gnucash.gnucash", identity=pg)
+
+        assert resolve_mcp_dir("gnucash.gnucash", identity=pg) == first
+        assert resolve_mcp_dir("gnucash.gnucash", identity=my) != first
+
+    def test_an_existing_unclaimed_folder_is_kept(self, two_ledgers):
+        """A folder from before 1.5 has no owner record: the first
+        book to write there claims it and keeps its history."""
+        a_path, _, logs = two_ledgers
+        old = logs / "ledger.gnucash.mcp" / "backups"
+        old.mkdir(parents=True)
+        a = GnuCashBook(str(a_path))
+        a.create_backup()
+        assert a._backups_dir() == old
+        assert (logs / "ledger.gnucash.mcp" / ".owner").read_text().strip() \
+            == str(a_path.resolve())

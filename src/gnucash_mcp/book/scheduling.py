@@ -15,7 +15,7 @@ Depends on shared helpers from BaseGnuCashBook:
 """
 
 from datetime import date, datetime, timedelta
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 import uuid
 
 import piecash
@@ -402,7 +402,14 @@ class SchedulingMixin:
                 self._slot_insert(
                     book, mcp_frame, self._MCP_QUANTITY,
                     KVP_Type.KVP_TYPE_NUMERIC, label,
-                    numeric_val_num=int(q * q_denom),
+                    # Rounded, as a split's quantity is at storage
+                    # (it was truncated: 1.23456 kept as 1.2345 where
+                    # create_transaction stores 1.2346 — MM-15).
+                    numeric_val_num=int(
+                        (Decimal(str(q)) * q_denom).quantize(
+                            Decimal(1), rounding=ROUND_HALF_UP,
+                        )
+                    ),
                     numeric_val_denom=q_denom,
                 )
         return txn
@@ -432,17 +439,45 @@ class SchedulingMixin:
         return {r[0]: tuple(r[1:]) for r in rows}
 
     @staticmethod
-    def _slot_amount(children, numeric_key, formula_key):
+    def _rational_amount(num: int, denom: int, fraction: int) -> Decimal:
+        """A stored ``num/denom`` as a Decimal.
+
+        A decimal denominator keeps its precision as typed (4250/100
+        is 42.50, not 42.5), exactly, at any magnitude. Any OTHER
+        denominator is a formula desktop evaluated and stored as the
+        exact rational — "100/3" is 100 over 3, "1234/12" is 617 over
+        6 (gnc-exp-parser divides with GNC_HOW_DENOM_EXACT and
+        reduces) — and has no finite decimal form: it is rounded
+        half-up to ``fraction``, the template currency's, which is
+        what GnuCash's split setters do when Since-Last-Run turns
+        the template into a transaction. Quantizing to ``1/denom``
+        instead raised ``decimal.InvalidOperation`` (a third needs
+        more digits than the context has) and took ``get_book_
+        summary`` down with it, on any book holding such a schedule,
+        enabled or not (adversarial review 2026-09-30, C19).
+        """
+        from fractions import Fraction
+
+        from gnucash_mcp.book import _entry_math
+
+        places = len(str(denom)) - 1
+        if denom == 10 ** places:
+            return Decimal(num).scaleb(-places)
+        return _entry_math.round_half_up(Fraction(num, denom), fraction)
+
+    @staticmethod
+    def _slot_amount(children, numeric_key, formula_key, fraction=100):
         """Debit or credit side of a template split: the numeric when
         present and non-zero (what Since-Last-Run prefers), else the
         formula parsed as a plain number, else None (a formula with
-        variables — GnuCash prompts; we refuse)."""
+        variables — GnuCash prompts; we refuse). ``fraction`` is the
+        template currency's, for a numeric with no decimal form
+        (``_rational_amount``)."""
         num = children.get(numeric_key)
         if num and num[3] is not None and num[4] and num[3] != 0:
-            value = Decimal(num[3]) / Decimal(num[4])
-            # 4250/100 is 42.50, not 42.5 — keep the fraction's
-            # precision so amounts round-trip as typed.
-            return value.quantize(Decimal(1) / Decimal(num[4]))
+            return SchedulingMixin._rational_amount(
+                int(num[3]), int(num[4]), fraction,
+            )
         formula = children.get(formula_key)
         text_val = (formula[1] or "").strip() if formula else ""
         if not text_val:
@@ -514,9 +549,11 @@ class SchedulingMixin:
                     continue
                 debit = self._slot_amount(
                     ch, self._SX_DEBIT_NUMERIC, self._SX_DEBIT_FORMULA,
+                    txn.currency.fraction,
                 )
                 credit = self._slot_amount(
                     ch, self._SX_CREDIT_NUMERIC, self._SX_CREDIT_FORMULA,
+                    txn.currency.fraction,
                 )
                 if debit is None or credit is None:
                     bad = (ch.get(self._SX_DEBIT_FORMULA) or ch.get(
@@ -537,11 +574,9 @@ class SchedulingMixin:
                     book, split_guid, self._MCP_FRAME,
                 ).get(self._MCP_QUANTITY)
                 if q and q[4]:
-                    leg["quantity"] = str(
-                        (Decimal(q[3]) / Decimal(q[4])).quantize(
-                            Decimal(1) / Decimal(q[4])
-                        )
-                    )
+                    leg["quantity"] = str(self._rational_amount(
+                        int(q[3]), int(q[4]), int(q[4]),
+                    ))
                 recipe["splits"].append(leg)
             # The splits table has no sequence column, so the
             # caller's order is not recoverable; ledger order
@@ -783,6 +818,13 @@ class SchedulingMixin:
         parsed_end = (
             date.fromisoformat(end_date) if end_date else None
         )
+        # A schedule that ends before it starts has no occurrence and
+        # was accepted with ``next_occurrence: None`` (C42).
+        if parsed_end is not None and parsed_end < parsed_start:
+            raise ValueError(
+                f"end_date {parsed_end.isoformat()} is before "
+                f"start_date {parsed_start.isoformat()}"
+            )
 
         # _to_decimal rescues stray floats from direct callers so
         # the balance check doesn't fail on IEEE-754 noise.
@@ -1225,6 +1267,12 @@ class SchedulingMixin:
         """
 
         today = date.today()
+        # ``days=3285000`` raised OverflowError out of the date
+        # arithmetic (IV-18). Ten years ahead is already a forecast.
+        if not 0 <= days <= 3660:
+            raise ValueError(
+                f"days must be between 0 and 3660, got {days}"
+            )
         window_end = today + timedelta(days=days)
 
         with self.open(readonly=True) as book:
@@ -1372,6 +1420,27 @@ class SchedulingMixin:
 
             if transaction_date:
                 txn_date = date.fromisoformat(transaction_date)
+                # The schedule's own stops bind a date the caller
+                # names as much as one the server picks: an explicit
+                # date used to post an instance after the schedule
+                # had ended (adversarial review 2026-09-30,
+                # side-finding 3).
+                if sx.num_occur > 0 and sx.rem_occur <= 0:
+                    raise ValueError(
+                        f"'{sx.name}' has entered all {sx.num_occur} "
+                        f"occurrences. delete_scheduled_transaction "
+                        f"if it's finished, or enter this one with "
+                        f"create_transactions."
+                    )
+                if end and txn_date > end:
+                    raise ValueError(
+                        f"Transaction date {txn_date.isoformat()} is "
+                        f"after '{sx.name}' ended "
+                        f"({end.isoformat()}). Clear the end date with "
+                        f"update_scheduled_transaction(end_date=\"\") "
+                        f"to resume it, or enter this one with "
+                        f"create_transactions."
+                    )
             else:
                 # Oldest un-entered occurrence — the date the
                 # dashboard calls overdue, if one is. Never "the next
@@ -1436,28 +1505,66 @@ class SchedulingMixin:
             # quantity (GnuCash asks for the rate at Since-Last-Run).
             # Answer the one variable we can: the rate on file at
             # the instance date. No rate → refuse, naming the leg.
-            rates = None
+            #
+            # The rate goes into a stored quantity, so it is chosen
+            # the way a POSTING chooses one, not the way a report
+            # values a holding: from quotes somebody entered or
+            # fetched (never a transaction's own implied rate — an
+            # instance priced off the last instance's echo refreshes
+            # that echo forever and the stale-price warning goes
+            # quiet), and within the staleness window. This read used
+            # ``_rates_as_of``, which has no age limit and counts
+            # implied and forecast rows: a schedule booked 100 EUR at
+            # a 984-day-old rate without a word while post_document
+            # on the same book refused (adversarial review
+            # 2026-09-30, C18).
+            from gnucash_mcp.book._currency import (
+                _fx_guard_days,
+                _fx_staleness_days,
+            )
+
+            rate_notes: list[str] = []
             for s in splits:
                 if s.get("quantity") is not None:
                     continue
                 acct = self._resolve_account(book, s["account"])
                 if acct is None or acct.commodity == txn_currency:
                     continue
-                if rates is None:
-                    rates = self._rates_as_of(book, txn_date, txn_currency)
-                rate = rates.get(acct.commodity.guid)
-                if not rate:
+                pair = (
+                    f"{acct.commodity.mnemonic}/{txn_currency.mnemonic}"
+                )
+                with self._market_prices_only(book):
+                    aged = self._find_exchange_rate_aged(
+                        book, acct.commodity, txn_currency, txn_date,
+                    )
+                if aged is None:
+                    cap = _fx_staleness_days()
+                    window = f" within {cap} days of" if cap > 0 else " for"
                     raise ValueError(
                         f"Cannot instantiate '{sx.name}': the leg on "
                         f"{acct.fullname} is in {acct.commodity.mnemonic} "
-                        f"and no {acct.commodity.mnemonic}/"
-                        f"{txn_currency.mnemonic} rate is on file for "
-                        f"{txn_date.isoformat()}. create_price, or run "
-                        f"it from GnuCash desktop."
+                        f"and no {pair} quote is on file{window} "
+                        f"{txn_date.isoformat()}. Add one with "
+                        f"create_price(commodity="
+                        f"'{acct.commodity.mnemonic}', "
+                        f"namespace='{acct.commodity.namespace}', "
+                        f"currency='{txn_currency.mnemonic}', "
+                        f"value='...', date='{txn_date.isoformat()}'), "
+                        f"or run it from GnuCash desktop, which asks "
+                        f"for the rate."
+                    )
+                rate, age_days, price_date = aged
+                guard = _fx_guard_days()
+                if guard > 0 and age_days > guard:
+                    rate_notes.append(
+                        f"{acct.fullname}: converted at the {pair} "
+                        f"quote of {price_date.isoformat()}, "
+                        f"{age_days} days from the transaction date"
                     )
                 s["quantity"] = str(
                     (_to_decimal(s["amount"]) / rate).quantize(
-                        _commodity_quantum(acct.commodity)
+                        _commodity_quantum(acct.commodity),
+                        rounding=ROUND_HALF_UP,
                     )
                 )
 
@@ -1478,52 +1585,81 @@ class SchedulingMixin:
         # Re-find by guid — the phase-1 ORM object detached when
         # its session closed.
         shapes: dict = {}
-        with self.open(readonly=False) as book:
-            sx = self._find_scheduled_transaction(book, guid)
-            if not sx:
-                # SX deleted concurrently between phases — the
-                # transaction exists; respond cleanly rather than
-                # crash. Practically unreachable single-threaded.
-                instance_count = None
-                remaining = None
-            else:
-                # Desktop stamps every instance with its schedule;
-                # so do we, by raw SQL — an ORM SlotGUID in the
-                # session arms the delete cascade.
-                if txn_result.get("guid"):
-                    created = self._find_transaction(
-                        book, txn_result["guid"],
-                    )
-                    if created is not None:
-                        self._slot_insert(
-                            book, created.guid, self._SX_FROM,
-                            KVP_Type.KVP_TYPE_GUID,
-                            f"from-sched-xaction on {created.guid[:8]}",
-                            guid_val=sx.guid,
+        try:
+            with self.open(readonly=False) as book:
+                sx = self._find_scheduled_transaction(book, guid)
+                if not sx:
+                    # SX deleted concurrently between phases — the
+                    # transaction exists; respond cleanly rather than
+                    # crash. Practically unreachable single-threaded.
+                    instance_count = None
+                    remaining = None
+                else:
+                    # Desktop stamps every instance with its schedule;
+                    # so do we, by raw SQL — an ORM SlotGUID in the
+                    # session arms the delete cascade.
+                    if txn_result.get("guid"):
+                        created = self._find_transaction(
+                            book, txn_result["guid"],
                         )
-                # Every pre-1.5 shape in the book converts on this
-                # write; the other schedules are converted without
-                # being posted.
-                shapes = self._upgrade_book_shapes(book)
-                current_last = sx.last_occur
-                if isinstance(current_last, datetime):
-                    current_last = current_last.date()
-                # Advance + increment only when txn_date is beyond
-                # the current marker — a concurrent writer may have
-                # registered the period already, and a second
-                # increment would break "instance_count = distinct
-                # periods produced". Never rewind.
-                if current_last is None or txn_date > current_last:
-                    sx.last_occur = txn_date
-                    sx.instance_count += 1
-                    # Finite schedules count down, as GnuCash's
-                    # own creation does; at zero _sx_next_due
-                    # answers None and the schedule is finished.
-                    if sx.num_occur > 0 and sx.rem_occur > 0:
-                        sx.rem_occur -= 1
-                book.save()
-                instance_count = sx.instance_count
-                remaining = sx.rem_occur if sx.num_occur > 0 else None
+                        if created is not None:
+                            self._slot_insert(
+                                book, created.guid, self._SX_FROM,
+                                KVP_Type.KVP_TYPE_GUID,
+                                f"from-sched-xaction on {created.guid[:8]}",
+                                guid_val=sx.guid,
+                            )
+                    # Every pre-1.5 shape in the book converts on this
+                    # write; the other schedules are converted without
+                    # being posted.
+                    shapes = self._upgrade_book_shapes(book)
+                    current_last = sx.last_occur
+                    if isinstance(current_last, datetime):
+                        current_last = current_last.date()
+                    # Advance + increment only when txn_date is beyond
+                    # the current marker — a concurrent writer may have
+                    # registered the period already, and a second
+                    # increment would break "instance_count = distinct
+                    # periods produced". Never rewind.
+                    if current_last is None or txn_date > current_last:
+                        sx.last_occur = txn_date
+                        sx.instance_count += 1
+                        # Finite schedules count down, as GnuCash's
+                        # own creation does; at zero _sx_next_due
+                        # answers None and the schedule is finished.
+                        if sx.num_occur > 0 and sx.rem_occur > 0:
+                            sx.rem_occur -= 1
+                    book.save()
+                    instance_count = sx.instance_count
+                    remaining = sx.rem_occur if sx.num_occur > 0 else None
+        except Exception as exc:
+            # The instance is committed and the schedule is not. Left
+            # like that, the transaction carries no schedule stamp,
+            # the schedule still calls the period due, and a retry is
+            # refused as a duplicate (adversarial review 2026-09-30,
+            # C27). Take the instance back out, so a failure here
+            # changes nothing and the retry is clean.
+            created_guid = txn_result.get("guid")
+            if not created_guid or txn_result.get("status") == "rejected":
+                raise
+            try:
+                self.delete_transaction(created_guid, force=True)
+            except Exception:
+                raise RuntimeError(
+                    f"'{sx_name}' was entered as transaction "
+                    f"{created_guid}, but the schedule could not be "
+                    f"advanced ({type(exc).__name__}: {exc}) and the "
+                    f"transaction could not be removed again. It "
+                    f"carries no schedule stamp and the schedule "
+                    f"still shows this occurrence as due: delete "
+                    f"transaction {created_guid}, then retry."
+                ) from exc
+            raise RuntimeError(
+                f"'{sx_name}' could not be advanced "
+                f"({type(exc).__name__}: {exc}). The transaction that "
+                f"had just been entered for it was removed again, so "
+                f"nothing changed. Retry."
+            ) from exc
 
         # ── Build response. ─────────────────────────────────────
         response = {
@@ -1536,6 +1672,8 @@ class SchedulingMixin:
         }
         if remaining is not None:
             response["remaining_occurrences"] = remaining
+        if rate_notes:
+            response["warnings"] = rate_notes
         response.update(shapes)
         if txn_result.get("status") == "rejected":
             # Evidence that the rejection is the CORRECT outcome —
@@ -1626,7 +1764,20 @@ class SchedulingMixin:
                 if end_date == "":
                     sx.end_date = None
                 else:
-                    sx.end_date = date.fromisoformat(end_date)
+                    new_end = date.fromisoformat(end_date)
+                    current_start = sx.start_date
+                    if isinstance(current_start, datetime):
+                        current_start = current_start.date()
+                    if (
+                        start_date is None and current_start is not None
+                        and new_end < current_start
+                    ):
+                        raise ValueError(
+                            f"end_date {new_end.isoformat()} is before "
+                            f"the schedule's start date "
+                            f"{current_start.isoformat()}"
+                        )
+                    sx.end_date = new_end
 
             if start_date is not None:
                 new_start = date.fromisoformat(start_date)

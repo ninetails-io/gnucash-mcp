@@ -259,6 +259,9 @@ def _batch_tsv_layout(header_line: str) -> dict:
     token, a wrong fixed prefix, or a first group missing
     amount/account.
     """
+    # A byte-order mark pasted with the header is invisible, and the
+    # error then named a first column that looked correct (IV-22).
+    header_line = header_line.lstrip("\ufeff")
     raw_tokens = [t.strip().lower() for t in header_line.split("\t")]
     # Tolerate trailing empty cells (a trailing tab on the header).
     while raw_tokens and not raw_tokens[-1]:
@@ -623,6 +626,25 @@ _CANDIDATE_COMPARISON_COLUMNS = (
 )
 
 
+def _one_line(value) -> str:
+    """Book text made safe for a single output row WITHOUT changing
+    how it reads back as a reference: tabs, newlines, and the exotic
+    separators become visible escapes or spaces, and nothing else is
+    touched. For account paths, which a caller copies out of a
+    listing and sends back as an account ref — ``_tsv_cell`` would
+    double a backslash in the name and the copied path would no
+    longer resolve."""
+    if value is None:
+        return ""
+    s = str(value)
+    if not s:
+        return ""
+    s = s.replace("\t", "\\t").replace("\n", "\\n").replace("\r", "\\r")
+    for ch in _EXOTIC_SEPARATORS:
+        s = s.replace(ch, " ")
+    return s
+
+
 def _tsv_cell(value) -> str:
     """Escape one response-TSV cell — the OUTPUT mirror of
     ``_tsv_lines``. Book-sourced free text (notes, memos,
@@ -815,7 +837,13 @@ def _parse_book_url(uri: str):
     """Parse ``uri`` into a SQLAlchemy URL, or raise ValueError.
 
     Wraps ``make_url`` so every caller gets the same message — its
-    own ArgumentError text names internals a bookkeeper can't act on.
+    own ArgumentError text names internals a bookkeeper can't act on,
+    and QUOTES THE STRING IT COULD NOT PARSE. Neither that text nor
+    the input is echoed here: a connection string that fails to parse
+    is, more often than not, a good one with a typo in it, password
+    and all, and this message goes to stderr (which Claude Desktop
+    keeps on disk). ``_redact_uri``'s rule applies to errors too — if
+    we can't find the password we can't prove there isn't one.
     """
     from sqlalchemy.engine import make_url
     from sqlalchemy.exc import ArgumentError
@@ -824,16 +852,73 @@ def _parse_book_url(uri: str):
         raise ValueError("Book URI is empty")
     try:
         return make_url(uri.strip())
-    except ArgumentError as e:
+    except ArgumentError:
         raise ValueError(
-            f"Not a valid database URL: {uri.strip()!r}. Expected a "
-            f"SQLAlchemy connection string such as "
-            f"'postgresql://user:password@host:5432/gnucash'. ({e})"
+            "Not a valid database URL (the value is not shown, since "
+            "it may hold a password). Expected a SQLAlchemy "
+            "connection string such as "
+            "'postgresql://user:password@host:5432/gnucash'; check "
+            "the scheme and the '://' after it."
         ) from None
 
 
+# ``scheme://…`` up to whitespace or a quote — how a connection string
+# appears inside an exception message (piecash quotes it, SQLAlchemy
+# quotes it, drivers print it bare).
+_URI_IN_TEXT_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s<>\"']+")
+_URI_PARTS_RE = re.compile(
+    r"^(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*://)(?P<authority>[^/?#]*)"
+    r"(?P<rest>.*)$",
+    re.S,
+)
+# Query parameters that carry a secret: libpq's ``password`` and
+# ``sslpassword``, pymysql's ``password`` / ``passwd``, and the
+# generic spellings.
+_SECRET_QUERY_RE = re.compile(
+    r"(?P<key>(?<![A-Za-z0-9_])[A-Za-z0-9_]*"
+    r"(?:pass(?:word|wd)?|pwd|secret|token)[A-Za-z0-9_]*)="
+    r"(?P<value>[^&;#\s]*)",
+    re.I,
+)
+# ``user:password@`` after one or more slashes — a string that is
+# not a well-formed URL but still shows a credential
+# (``postgresql:/u:pw@host/db``).
+_LOOSE_USERINFO_RE = re.compile(
+    r"(?P<pre>[A-Za-z][A-Za-z0-9+.-]*:/+[^\s/@:'\"]*):"
+    r"(?P<pw>[^\s@'\"]+)@"
+)
+
+
+def _mask_uri_secrets(uri: str) -> str:
+    """``uri`` with every credential replaced by ``***``, by shape
+    alone (no parsing, so it cannot fail):
+
+    - the userinfo password — everything between the first ``:`` and
+      the LAST ``@`` of the authority, so a password that itself
+      contains ``@`` is masked whole (SQLAlchemy's own
+      ``hide_password`` splits at the first one and leaves the tail
+      in the host);
+    - secret-bearing query parameters (``?password=``,
+      ``sslpassword=``, ``passwd=``…), which ``hide_password`` does
+      not touch at all.
+    """
+    m = _URI_PARTS_RE.match(uri)
+    if not m:
+        return uri
+    authority = m.group("authority")
+    if "@" in authority:
+        userinfo, host = authority.rsplit("@", 1)
+        if ":" in userinfo:
+            authority = f"{userinfo.split(':', 1)[0]}:***@{host}"
+    rest = _SECRET_QUERY_RE.sub(
+        lambda q: f"{q.group('key')}=***", m.group("rest"),
+    )
+    return f"{m.group('scheme')}{authority}{rest}"
+
+
 def _redact_uri(uri: str) -> str:
-    """A connection URI with its password masked.
+    """A connection URI with its credentials masked: the userinfo
+    password and any secret-bearing query parameter.
 
     UNCONDITIONAL — unlike path redaction, this is not gated on
     ``GNUCASH_REDACT_PATHS``. A book path is a privacy preference; a
@@ -846,9 +931,51 @@ def _redact_uri(uri: str) -> str:
     one.
     """
     try:
-        return _parse_book_url(uri).render_as_string(hide_password=True)
-    except ValueError:
+        rendered = _parse_book_url(
+            _mask_uri_secrets(uri.strip())
+        ).render_as_string(hide_password=True)
+        # render_as_string percent-encodes the query mask.
+        return rendered.replace("%2A%2A%2A", "***")
+    except (ValueError, AttributeError):
         return "<database>"
+
+
+def _scrub_credentials(text: str) -> str:
+    """Mask every connection-string credential inside arbitrary text.
+    The one scrubber for text that leaves the server by any road: a
+    tool result, an audit line, a log line, a startup error.
+
+    An exception raised while opening a database book routinely
+    quotes the whole connection string — piecash's ``Database
+    'postgresql://user:pw@host/db' does not exist``, SQLAlchemy's
+    ``Invalid SQLite URL: sqlite://user:pw@`` — and ``str(e)`` used
+    to go out as written, to the model, the audit file, and stderr,
+    beside a header that carefully masked the same password
+    (adversarial review 2026-09-30, C16a).
+
+    Unconditional, like ``_redact_uri``. A URL with no credential in
+    it is left exactly as written.
+    """
+    if not text or "://" not in text and ":/" not in text:
+        return text
+
+    def _one(match):
+        token = match.group(0)
+        tail = ""
+        while token and token[-1] in ").,;:":
+            tail = token[-1] + tail
+            token = token[:-1]
+        masked = _mask_uri_secrets(token)
+        if masked == token:
+            return match.group(0)
+        return masked + tail
+
+    text = _URI_IN_TEXT_RE.sub(_one, text)
+    return _LOOSE_USERINFO_RE.sub(
+        lambda m: f"{m.group('pre')}:***@"
+        if m.group("pw") != "***" else m.group(0),
+        text,
+    )
 
 
 def _book_display_name(book_path) -> str:
@@ -929,6 +1056,11 @@ def _apply_limit(
     Returns:
         ``(truncated, notice)``; ``notice`` is None only in case 3.
     """
+    if limit is not None and limit < 0:
+        # Was silently the default page (IV-27).
+        raise ValueError(
+            f"limit must be 0 or a positive number, got {limit}"
+        )
     if not limit or limit < 1:
         limit = default
     capped = limit > max_cap
@@ -1050,6 +1182,11 @@ def _paginate(
             f"{_range_suffix(items, date_key)}"
         )
 
+    if limit is not None and limit < 0:
+        # Was silently the default page (IV-27).
+        raise ValueError(
+            f"limit must be 0 or a positive number, got {limit}"
+        )
     if not limit or limit < 1:
         limit = default
     capped = limit > max_cap
@@ -1142,6 +1279,18 @@ def _parse_update_tsv(tsv: str) -> list[dict]:
             raise ValueError(f"row {i}: empty guid")
         row: dict = {"guid": guid}
         clear_spec = ""
+        # A cell past the last header column belongs to no field; it
+        # was dropped without a word (a stray tab inside a description
+        # shifts everything after it, and the tail fell off) — IV-23.
+        extra = [c for c in cells[len(fields) + 1:] if c.strip()]
+        if extra:
+            raise ValueError(
+                f"row {i}: {len(extra)} more cell"
+                f"{'' if len(extra) == 1 else 's'} than the header has "
+                f"columns ({extra[0]!r}"
+                f"{', …' if len(extra) > 1 else ''}). A tab inside a "
+                f"cell shifts the rest of the row."
+            )
         for j, tok in enumerate(fields, start=1):
             cell = cells[j].strip() if j < len(cells) else ""
             if tok == "clear":

@@ -280,6 +280,10 @@ def register(mcp, get_book) -> None:
         all split values. Use this instead of delete when you need to maintain
         an audit trail.
 
+        An invoice's or bill's posting transaction cannot be voided
+        (it is read-only, as in GnuCash): use unpost_document. A
+        PAYMENT can be voided, e.g. when it bounces.
+
         Args:
             guid: Transaction GUID to void (32-character hex string, or 8+ char prefix)
             reason: Reason for voiding (required for audit trail)

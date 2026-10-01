@@ -42,7 +42,12 @@ from gnucash_mcp.book._currency import (  # noqa: F401
 # hold whichever modules are enabled, hence here.
 from gnucash_mcp.book import _piecash_shapes  # noqa: F401,E402
 from gnucash_mcp.book._query import QueryMixin
-from gnucash_mcp._format import _book_display_name, _parse_book_url
+from gnucash_mcp._format import (
+    _book_display_name,
+    _one_line,
+    _parse_book_url,
+    _tsv_cell,
+)
 
 # GnuCash stores GUIDs as lowercase hex (via uuid4().hex). We accept both
 # cases on input for ergonomics — users pasting from external tools may
@@ -245,14 +250,45 @@ def _day_end(d: date) -> datetime:
 
 
 def _neutral_time(d: date) -> datetime:
-    """GnuCash's neutral time of day for a date-valued timestamp:
-    10:59:00 UTC (``gnc_time64_get_day_neutral``), the convention
-    behind ``transactions.post_date`` and, on desktop, a document's
+    """GnuCash's neutral time of day for a date-valued timestamp
+    (``gnc_time64_get_day_neutral``), the convention behind
+    ``transactions.post_date`` and, on desktop, a document's
     ``date_opened`` / ``date_posted``. Timezone-aware so piecash's
-    local→UTC conversion is a no-op."""
-    from datetime import timezone
+    local→UTC conversion is a no-op.
 
-    return datetime(d.year, d.month, d.day, 10, 59, 0, tzinfo=timezone.utc)
+    10:59:00 UTC, which is the same calendar day in every zone from
+    UTC-10 to UTC+13 — and ported with the adjustment GnuCash makes
+    outside that band (gnc-datetime.cpp, ``LDT_from_date_daypart``):
+
+        auto offset = lt.local_time() - lt.utc_time();
+        if (offset < hours(-10)) lt -= hours(offset.hours() + 10);
+        if (offset > hours(13))  lt += hours(13 - offset.hours());
+
+    so the stamp still reads as the intended day locally: 11:59 UTC
+    in Pago Pago (UTC-11), 09:59 UTC on Kiritimati (UTC+14). A flat
+    10:59 there dated an invoice a day early and rewrote desktop's
+    own rows (adversarial review 2026-09-30, C25)."""
+    from datetime import timedelta, timezone
+
+    stamp = datetime(d.year, d.month, d.day, 10, 59, 0, tzinfo=timezone.utc)
+    offset = stamp.astimezone().utcoffset() or timedelta(0)
+    # boost's time_duration::hours() truncates toward zero.
+    hours = int(offset.total_seconds() / 3600)
+    if offset < timedelta(hours=-10):
+        stamp -= timedelta(hours=hours + 10)
+    if offset > timedelta(hours=13):
+        stamp += timedelta(hours=13 - hours)
+    return stamp
+
+
+# The book option behind desktop's read-only "red line" (qofbook.cpp:
+# KVP_OPTION_PATH / OPTION_SECTION_ACCOUNTS /
+# OPTION_NAME_AUTO_READONLY_DAYS). The SQL backend names a nested
+# slot by its full path.
+_READ_ONLY_DAYS_KEY = (
+    "options/Accounts/"
+    "Day Threshold for Read-Only Transactions (red line)"
+)
 
 
 def _future_statement_warning(statement_date: date) -> str | None:
@@ -601,6 +637,39 @@ def _rollback_if_aborted(session) -> bool:
     return True
 
 
+# GnuCash's own column widths for free text (the SQL backend's
+# CT_STRING lengths: gnc-transaction-sql.cpp, gnc-account-sql.cpp,
+# gnc-tax-table-sql.cpp, gnc-slots-sql.cpp). SQLite ignores them;
+# PostgreSQL and MySQL enforce them, so a longer value was a raw
+# DataError there and an unbounded one — a 5 MB account name was
+# accepted — everywhere else.
+_TEXT_WIDTH = 2048
+_SLOT_TEXT_WIDTH = 4096
+_TAXTABLE_NAME_WIDTH = 50
+
+
+def _check_text(value, width: int, what: str) -> None:
+    """Refuse text GnuCash's schema cannot hold: longer than the
+    column, or carrying a NUL (PostgreSQL rejects one outright, and
+    SQLite stores the string but shows it cut off at the NUL).
+    ``None`` and non-strings pass. Adversarial review 2026-09-30,
+    C65 / IV-19 / IV-20."""
+    if not isinstance(value, str):
+        return
+    if "\x00" in value:
+        raise ValueError(f"{what} contains a NUL character")
+    if len(value) > width:
+        raise ValueError(
+            f"{what} is {len(value)} characters; GnuCash stores at "
+            f"most {width}"
+        )
+
+
+_PLAIN_NUMBER = re.compile(
+    r"[+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?"
+)
+
+
 def _to_decimal(value) -> Decimal:
     """Safe Decimal construction for user-supplied monetary values.
 
@@ -626,15 +695,43 @@ def _to_decimal(value) -> Decimal:
     """
     if isinstance(value, Decimal):
         d = value
-    else:
-        try:
-            d = Decimal(str(value))
-        except InvalidOperation:
+        if not d.is_finite():
             raise ValueError(
-                f"not a valid decimal amount: {value!r}"
-            ) from None
+                f"amount must be a finite number, got {value!r}"
+            )
+        return d
+    try:
+        d = Decimal(str(value))
+    except InvalidOperation:
+        raise ValueError(
+            f"not a valid decimal amount: {value!r}"
+        ) from None
     if not d.is_finite():
         raise ValueError(f"amount must be a finite number, got {value!r}")
+    # Python's Decimal reads more than a ledger should accept:
+    # ``5_000`` (underscores), ``٥`` and ``５`` (any Unicode digit).
+    # An amount is plain ASCII digits; anything else is a paste
+    # artifact to look at, not to guess through (adversarial review
+    # 2026-09-30, IV-27).
+    if isinstance(value, str) and not _PLAIN_NUMBER.fullmatch(value.strip()):
+        raise ValueError(
+            f"not a valid decimal amount: {value!r} (use plain digits "
+            f"and a decimal point, e.g. 1234.56)"
+        )
+    # GnuCash stores an amount as a 64-bit numerator over a power of
+    # ten. Beyond that range piecash raised mid-save — OverflowError,
+    # or a 40-second hang building 10**1000000 — past every per-row
+    # handler (C39, BL-24, C58).
+    if d != 0 and d.adjusted() >= 17:
+        raise ValueError(
+            f"amount {value!r} is too large to store (the limit is "
+            f"below 10^17)"
+        )
+    if d.as_tuple().exponent < -18:
+        raise ValueError(
+            f"amount {value!r} has more decimal places than can be "
+            f"stored (18 at most)"
+        )
     return d
 
 
@@ -830,6 +927,16 @@ _OPEN_ERRORS: tuple[type[Exception], ...] = (
 )
 
 
+_LOCK_PHRASES = (
+    "database is locked",        # SQLITE_BUSY
+    "database table is locked",  # SQLITE_LOCKED
+    "lock on the file",          # piecash, off the gnclock table
+    "lock wait timeout",         # MySQL / MariaDB
+    "could not obtain lock",     # PostgreSQL
+    "deadlock",
+)
+
+
 def _is_lock_error(exc: Exception) -> bool:
     """True when ``exc`` means "someone else has this book open".
 
@@ -840,7 +947,13 @@ def _is_lock_error(exc: Exception) -> bool:
     three times just delays the real error.
     """
     msg = str(exc).lower()
-    return "lock" in msg or "busy" in msg
+    # The phrases a lock is announced with — SQLite's two, piecash's
+    # gnclock check, MySQL's and PostgreSQL's. A bare "lock" also
+    # matched ``no such table: gnclock`` (a SQLite file that is not a
+    # GnuCash book was "locked by GnuCash") and any path with "lock"
+    # in it (a missing book under ``sherlock/``) — adversarial review
+    # 2026-09-30, FC-13 / DS-13.
+    return any(phrase in msg for phrase in _LOCK_PHRASES)
 
 
 class StaleFXRateError(ValueError):
@@ -957,9 +1070,14 @@ def _account_to_compact_line(account: piecash.Account) -> str:
     if account.placeholder:
         annotations.append("PLACEHOLDER")
 
+    # Book text goes into a one-line row: escaped, so a name holding
+    # a newline or tab cannot start a row of its own, and left
+    # otherwise exactly as written so the path still resolves when a
+    # caller copies it back (_one_line).
+    shown = _one_line(fullname)
     if annotations:
-        return f"{fullname} [{', '.join(annotations)}]"
-    return fullname
+        return f"{shown} [{', '.join(annotations)}]"
+    return shown
 
 
 # GnuCash's lot flag is a tri-state, from libgnucash/engine/gnc-lot.cpp:
@@ -1010,6 +1128,17 @@ def _lot_cache_flag(lot) -> None:
         lot.is_closed = _LOT_CLOSED
     else:
         lot.is_closed = _LOT_OPEN
+
+
+def _lot_hold_open(lot) -> None:
+    """Mark a lot open while a port of GnuCash's lot arithmetic moves
+    splits through it, where ``_lot_cache_flag`` cannot be used: in
+    the middle of ``gncOwnerReduceSplitTo`` the lot's splits may sum
+    to zero for one statement (the reduced split is in, its remainder
+    not yet), and a computed "closed" would make piecash refuse the
+    very split that reopens it. The caller leaves every lot it held
+    open at UNKNOWN once the session has flushed, as desktop does."""
+    lot.is_closed = _LOT_OPEN
 
 
 def _lot_forget_flag(lot) -> None:
@@ -1173,7 +1302,7 @@ def _commodity_to_compact_line(namespace: str, entry: dict) -> str:
     Format: "NAMESPACE:MNEMONIC\\tfullname\\tprice_info"
     """
     prefix = f"{namespace}:{entry['mnemonic']}"
-    name = entry.get("fullname", "")
+    name = _tsv_cell(entry.get("fullname", ""))
     parts = [prefix, name]
     lp = entry.get("latest_price")
     if entry.get("default_currency"):
@@ -1216,7 +1345,7 @@ def _unreconciled_split_to_compact_line(
     """
     short = _short_guid(split_dict["guid"], prefixes)
     d = split_dict["date"]
-    desc = split_dict["description"]
+    desc = _tsv_cell(split_dict["description"])
     amount = split_dict["amount"]
     state = split_dict["reconcile_state"]
     return f"{short}\t{d}\t{desc}\t{amount}\t{state}"
@@ -1238,7 +1367,7 @@ def _format_one_split(split: piecash.Split, transaction: piecash.Transaction) ->
     Shared between the full and collapsed split-list paths so the
     per-split rendering stays consistent with history.
     """
-    account_name = split.account.fullname
+    account_name = _one_line(split.account.fullname)
     amount = split.quantity
     if split.quantity != split.value:
         currency = transaction.currency.mnemonic
@@ -1300,7 +1429,12 @@ def _transaction_to_compact_line(
         if transaction.post_date else "(no date)"
     )
     short = _short_guid(transaction.guid, prefixes)
-    desc = transaction.description
+    # Description and notes are book text — a bank import's, a
+    # counterparty's, anyone's — and they land in a row the model
+    # reads beside the server's own banners. Written raw, a newline
+    # in one started a new "row" (or a line in the server's voice);
+    # _tsv_cell renders it as a visible \n inside its own cell.
+    desc = _tsv_cell(transaction.description)
     splits = _ordered_splits(transaction)
 
     if focus_account is not None:
@@ -1326,7 +1460,7 @@ def _transaction_to_compact_line(
         line = f"{date_str}\t{short}\t{desc}\t{splits_str}"
 
     if transaction.notes:
-        line += f"\t{transaction.notes}"
+        line += f"\t{_tsv_cell(transaction.notes)}"
     return line
 
 
@@ -1342,7 +1476,7 @@ def _lot_to_compact_line(
                   truncation when absent.
     """
     short = _short_guid(lot_dict["guid"], prefixes)
-    title = lot_dict["title"]
+    title = _tsv_cell(lot_dict["title"])
     qty = lot_dict["quantity"]
     basis = lot_dict["cost_basis"]
     parts = [short, title, f"{qty} shares", f"{basis} basis"]
@@ -1363,7 +1497,7 @@ def _sx_to_compact_line(
                   Defaults to raw 8-char truncation when absent.
     """
     short = _short_guid(sx_dict["guid"], prefixes)
-    name = sx_dict["name"]
+    name = _tsv_cell(sx_dict["name"])
     freq = sx_dict["frequency"]
     if not sx_dict.get("enabled"):
         status = "disabled"
@@ -1392,7 +1526,7 @@ def _upcoming_to_compact_line(
                   Defaults to raw 8-char truncation when absent.
     """
     short = _short_guid(entry["guid"], prefixes)
-    name = entry["name"]
+    name = _tsv_cell(entry["name"])
     occ_date = entry["occurrence_date"]
     days = entry["days_until"]
     amount = entry["amount"]
@@ -1792,7 +1926,8 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
                         continue
                     raise GnuCashLockError(
                         f"GnuCash book is locked (possibly by GnuCash or another process). "
-                        f"Close GnuCash and try again. Details: {e}"
+                        f"Close GnuCash and try again."
+                        f"{self._lock_holder_note()} Details: {e}"
                     ) from e
                 raise
 
@@ -1818,6 +1953,57 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
             book.session.get_bind().dispose()
             close_elapsed = (time.time() - close_start) * 1000
             debug_logger.debug(f"Book closed in {close_elapsed:.0f}ms")
+
+    def _lock_holder_note(self) -> str:
+        """Who holds a file book's lock, read from its ``gnclock``
+        row: the host and process GnuCash recorded, and whether that
+        process is still running when it is this machine's. A crash
+        leaves the row behind, and "close GnuCash and try again" is
+        no help when GnuCash is not open (adversarial review
+        2026-09-30, FC-15). Empty for a database book, or when the
+        row cannot be read. Nothing is changed: clearing a stale
+        lock is the user's call, in GnuCash ("Open Anyway")."""
+        if not self.source.is_file:
+            return ""
+        import os
+        import socket
+
+        try:
+            con = sqlite3.connect(
+                f"file:{self.book_path}?mode=ro", uri=True, timeout=1,
+            )
+            try:
+                rows = con.execute("SELECT * FROM gnclock").fetchall()
+            finally:
+                con.close()
+        except Exception:
+            return ""
+        if not rows:
+            return ""
+        host, pid = str(rows[0][0]), rows[0][1]
+        note = f" The lock was taken on {host}, process {pid}"
+        try:
+            local = host.split(".")[0].lower() == (
+                socket.gethostname().split(".")[0].lower()
+            )
+            if local:
+                try:
+                    os.kill(int(pid), 0)
+                    note += ", which is still running."
+                except ProcessLookupError:
+                    note += (
+                        ", which is no longer running: a stale lock "
+                        "left by a crash. Open the book in GnuCash, "
+                        "choose \"Open Anyway\", and close it again "
+                        "to clear it."
+                    )
+                except (PermissionError, ValueError, OverflowError):
+                    note += "."
+            else:
+                note += " (another machine)."
+        except Exception:
+            note += "."
+        return note
 
     def source_open_kwargs(self) -> dict:
         """The piecash ``open_book`` argument naming this book.
@@ -2435,6 +2621,14 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         # set-membership check).
         if acct is not None and acct.guid in self._template_account_guids(book):
             return None
+        # The root is not an account anyone posts to, renames, or
+        # annotates; it has no path, so only a GUID reaches it. A
+        # batch row that did posted to ROOT and the amount left every
+        # report (net worth 10,000 → 9,877), and the slot tools could
+        # delete the designated-account markers the server keeps
+        # there (adversarial review 2026-09-30, C43).
+        if acct is not None and acct.type == "ROOT":
+            return None
         return acct
 
     def _normalize_account_refs(
@@ -2551,6 +2745,13 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         ``voids_migrated``, ``book_stamped``, ``book_scrubbed``.
         """
         out: dict = {}
+        # First, and before anything is converted: a snapshot of the
+        # book as it stands (once per book; refuses the write if a
+        # file book cannot be snapshotted). Absent when the backup
+        # module is not loaded.
+        snapshot = getattr(self, "_ensure_pre_upgrade_snapshot", None)
+        if snapshot is not None:
+            out.update(snapshot())
         sweep = getattr(self, "_migrate_all_legacy", None)
         if sweep is not None:
             n = sweep(book)
@@ -2595,6 +2796,16 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
                     out["book_stamped"] = _BUDGET_UNREVERSED_FEATURE
                 if st.get("scrubbed"):
                     out["book_scrubbed"] = True
+        # A snapshot taken above for a book that then had nothing to
+        # convert guarded nothing: withdraw it rather than leave a
+        # "pre-1.5 upgrade" copy beside a book that was never
+        # upgraded.
+        taken = out.get("pre_upgrade_backup")
+        if taken is not None and len(out) == 1:
+            withdraw = getattr(self, "_withdraw_pre_upgrade_snapshot", None)
+            if withdraw is not None:
+                withdraw(taken)
+            return {}
         return out
 
     # ── Desktop's reconcile-info frame ─────────────────────────────
@@ -2851,6 +3062,42 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
 
         f = self._RECONCILE_INFO_FRAME
         frame = frame_guid(account.guid, f)
+        # recnFinishCB clears a postponed reconcile first
+        # (xaccAccountClearReconcilePostpone): the date and balance a
+        # user parked with "Postpone" are spent once the statement is
+        # finished. Left in place, desktop's next reconcile window
+        # opened preloaded with them (adversarial review 2026-09-30,
+        # C23).
+        postpone = f"{f}/postpone"
+        parked = book.session.execute(
+            text(
+                "SELECT guid_val FROM slots WHERE obj_guid = :o "
+                "AND name = :n AND slot_type = 9"
+            ),
+            {"o": frame, "n": postpone},
+        ).first()
+        if parked is not None:
+            if parked[0]:
+                book.session.execute(
+                    Slot.__table__.delete().where(
+                        Slot.__table__.c.obj_guid == parked[0]
+                    )
+                )
+                _verify_delete(
+                    book.session, Slot.__table__, {"obj_guid": parked[0]},
+                    f"postponed {label}",
+                )
+            book.session.execute(
+                Slot.__table__.delete().where(
+                    (Slot.__table__.c.obj_guid == frame)
+                    & (Slot.__table__.c.name == postpone)
+                )
+            )
+            _verify_delete(
+                book.session, Slot.__table__,
+                {"obj_guid": frame, "name": postpone},
+                f"postponed {label}",
+            )
         if prev_date is not None:
             interval = self._reconcile_interval(
                 prev_date, statement_date, prev_interval,
@@ -3095,6 +3342,156 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
                 )
         for obj in objects:
             book.session.expire(obj, ["slots"])
+
+    # xaccTransSetReadOnly's reason on a posting transaction
+    # (gncInvoicePostToAccount, gncInvoice.c) — the string desktop
+    # shows when a user tries to edit one in the register.
+    _POSTING_READ_ONLY_REASON = (
+        "Generated from an invoice. Try unposting the invoice."
+    )
+
+    @staticmethod
+    def _posting_document_id(book, transaction) -> str | None:
+        """ID of the document ``transaction`` is the posting record
+        of, or None. Read from ``invoices.post_txn``, not from the
+        ``trans-read-only`` slot: the column is the link itself, and
+        the slot has been overwritten by a void and deleted by an
+        unvoid on books that met those paths before they were
+        guarded."""
+        from sqlalchemy import text
+        row = book.session.execute(
+            text("SELECT id FROM invoices WHERE post_txn = :guid"),
+            {"guid": transaction.guid},
+        ).fetchone()
+        return row[0] if row else None
+
+    @staticmethod
+    def _read_only_before(book) -> "date | None":
+        """The date before which GnuCash desktop treats transactions
+        as read-only, or None when the book sets no threshold.
+
+        ``qof_book_get_autoreadonly_gdate`` (qofbook.cpp): today minus
+        the book option "Day Threshold for Read-Only Transactions
+        (red line)", absent when the option is zero or unset. The
+        option is a book KVP stored as a double (``(gint)`` truncates
+        it on read). The engine reads nothing else: asked through
+        ``qof_book_get_num_days_autoreadonly``, GnuCash 5.12 answers
+        30 for a double 30 and 0 for an int64 30, so only the double
+        counts here.
+
+        Never raises: this feeds a warning, and a warning that fails
+        must not take the write down with it."""
+        from sqlalchemy import text
+        try:
+            row = book.session.execute(
+                text(
+                    "SELECT slot_type, int64_val, double_val "
+                    "FROM slots WHERE name = :name"
+                ),
+                {"name": _READ_ONLY_DAYS_KEY},
+            ).fetchone()
+        except Exception:
+            _rollback_if_aborted(book.session)
+            return None
+        if row is None:
+            return None
+        if int(row[0] or 0) != 2:
+            return None
+        try:
+            days = int(float(row[2] or 0))
+        except (TypeError, ValueError):
+            return None
+        if days <= 0:
+            return None
+        return date.today() - timedelta(days=days)
+
+    def _read_only_period_note(
+        self, book, dates, action: str, threshold: "date | None" = None,
+    ) -> "str | None":
+        """The one sentence every transaction write attaches when it
+        touches the book's read-only period (review C69, ruled a
+        warning 2026-10-01).
+
+        ``xaccTransIsReadonlyByPostedDate``: a transaction is
+        read-only when its post date is BEFORE the threshold date.
+        Desktop enforces that in the register only — the engine
+        commits such a transaction without complaint — so the server
+        writes it too, and says what the register would have said.
+        ``dates`` are the post dates the write touches (an edit that
+        moves a date passes both); ``action`` is the verb phrase
+        ("entering a transaction", "voiding this transaction").
+        Pass ``threshold`` when the caller read it once for a batch.
+        None when the book has no threshold or no date is before it."""
+        if threshold is None:
+            threshold = self._read_only_before(book)
+        if threshold is None:
+            return None
+        # piecash hands a post date back as a date; a datetime is
+        # taken by its day all the same.
+        days_touched = {
+            d.date() if isinstance(d, datetime) else d
+            for d in dates if d is not None
+        }
+        early = sorted(d for d in days_touched if d < threshold)
+        if not early:
+            return None
+        days = (date.today() - threshold).days
+        return (
+            f"dated {early[0].isoformat()}, before the book's "
+            f"read-only date {threshold.isoformat()} (the book option "
+            f"\"Day Threshold for Read-Only Transactions\" is {days} "
+            f"days). GnuCash's register would refuse {action}; the "
+            f"server does not enforce the option. Check that the "
+            f"closed period was meant to change"
+        )
+
+    def _refuse_posting_record(self, book, transaction, action: str) -> None:
+        """A document's posting transaction is read-only: the one
+        refusal every transaction-changing path shares (delete, void,
+        replace_splits, every update form).
+
+        The posting transaction IS the document's booked state — its
+        A/R or A/P split sits in the document's lot and is what paid
+        and due are measured from. Voiding it or rewriting its splits
+        left the invoice reading "paid" with no payment on file;
+        re-dating it left the document and the ledger disagreeing
+        about when it was posted; deleting it stranded the document
+        ("posted" yet un-re-postable). GnuCash refuses all of these:
+        the transaction carries ``trans-read-only`` and
+        ``xaccTransVoid`` ("Refusing to void a read-only
+        transaction!") and the register both honor it. There is no
+        force override, as there is none in desktop: the way to
+        change a posted document is to unpost it. (Adversarial review
+        2026-09-30, C4a / C4b / C4c; the delete half dates from 1.4.)
+        """
+        doc_id = self._posting_document_id(book, transaction)
+        if doc_id is not None:
+            raise ValueError(
+                f"Cannot {action} this transaction: it is the posting "
+                f"record for invoice {doc_id}, and read-only. Use "
+                f"unpost_document first, change the document, and "
+                f"post it again."
+            )
+
+    def _require_editable(
+        self, book, transaction, key: str, action: str, then: str,
+    ) -> None:
+        """Gate for every path that EDITS a transaction in place
+        (update, replace_splits). Two states are immutable, neither
+        with a force override:
+
+        - voided: writing into state='v' splits moves balance sums
+          while staying invisible to cash_flow/lots/reconciliation,
+          and a later re-void overwrites the void-former-* slots,
+          destroying the originals;
+        - a document's posting record (``_refuse_posting_record``).
+        """
+        if any(_is_voided(s) for s in transaction.splits):
+            raise ValueError(
+                f"Transaction {key} is voided. Use "
+                f"unvoid_transaction first, then {then}."
+            )
+        self._refuse_posting_record(book, transaction, action)
 
     def _find_transaction(
         self, book: piecash.Book, guid: str

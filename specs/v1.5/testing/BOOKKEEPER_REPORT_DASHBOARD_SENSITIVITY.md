@@ -298,3 +298,77 @@ populated, reminders firing), then C4/C5/C6 as planned.
 C1–C6 passed on the round-1 copy after the fix, above. The same
 writer produced `alex-r2`'s rows; a second desktop pass on it is
 optional.)*
+
+## Ruling — stale-valuation warning (2026-09-29 evening)
+
+The blanket exemption for transaction-implied rates is retired. The
+warning keys on the DATE OF THE RATE VALUATION ACTUALLY USED (A5's own
+sentence), whatever its source, against one staleness window:
+- An old implied rate warns, and names its provenance: "valued at the
+  rate of its last transaction, 60 days ago" — the phrasing carries
+  the cure (a fresh price row or transaction resets it).
+- A fresh implied rate warns of nothing: silence is earned by
+  freshness, not by category.
+Rationale: same as the runway ruling — the warning must describe the
+number displayed, never another subsystem's view. A warning that
+measures quotes while valuation reads a transaction row is auditing
+the wrong drawer.
+
+The cross-currency twin (piecash's 6-decimal implied rate vs desktop's
+exact ratio) is queued for the maintainer's next screen session; the
+typed-rate steps are in the addendum thread. Rows that drive valuation
+deserve byte-level agreement — same standard as the trans-date-due
+specimen.
+
+## Rulings — cross-currency twin follow-ups (2026-09-30, 00:30)
+
+**1. Payment currency: adopt desktop's rule (payment transaction in
+the transfer account's currency), but AFTER the 1.5 release — first
+branch of the next cycle, full loop + desktop gate.** The twin's own
+findings decide the timing: old server payments stay desktop-valid
+either way, so this is a dialect, not a defect — nobody's number is
+wrong, nothing needs converting, and the safety that permits adopting
+later removes the need to rush now. The rework (zero-value FX split →
+real balanced amounts in transfer currency) is a payment-math change
+touching pay/dry-run/discount/credit-note/FX at once, and it changes
+storage shape, which requires the desktop gate; that is not a 48-hour
+job done honestly, and 1.5's risk budget is spent. Riders: the
+divergence is named plainly in the 1.5 release notes as a known
+difference, and the adoption branch inherits tonight's twin evidence
+as its Part A.
+
+**2. The `temporary` price row: the server does not write it.**
+Concur with the maintainer's session. Class-6 established those rows
+as register litter desktop never removes (one skewed a GnuCash report
+by $1,253 after its transaction was deleted); a server whose valuation
+deliberately skips such rows must not author them. Fidelity means
+desktop-readable, not litter-compatible.
+
+### Amendment to Ruling 1 (2026-09-30, 00:40 — minutes after filing)
+
+Correction of fact from the maintainer: **1.5 is the last version.
+Only patches follow it.** Ruling 1 deferred adoption to "the first
+branch of the next cycle" — a vehicle that does not exist. A deferral
+with no destination is not a deferral; it is a permanent divergence
+written into the terminal release, which is the one outcome the
+ruling was never willing to accept.
+
+Amended disposition:
+- **The adoption goes on this branch. 1.5 ships with desktop's
+  payment-currency rule.** The zero-value FX split rework happens
+  now, before the tag.
+- The requirements do not shrink with the schedule: full bookkeeper
+  loop, desktop gate (Part C) on the reworked payment shape, and
+  tonight's twin evidence inherited as its Part A. If that costs the
+  tag a few days, the date moves — the gate does not. Release dates
+  are the maintainer's; the gate is the bookkeeper's.
+- The release-notes rider inverts: 1.5 does not name a divergence, it
+  names the adoption — payments are written in the transfer account's
+  currency, matching desktop.
+- Ruling 2 (the `temporary` price row is not written) is unaffected
+  and stands.
+
+The original ruling's reasoning — blast radius, storage-shape change,
+gate required — was sound and is why the gate rides along now. Its
+timing rested on a version that isn't coming. The ruling above stays
+as written; amendments stay visible, same as retractions.

@@ -20,6 +20,7 @@ from gnucash_mcp.book._base import (
     _future_statement_warning,
     _is_unreconciled,
     _is_voided,
+    _money_precision_error,
     _set_split_amounts,
     _split_to_compact_dict,
     _to_decimal,
@@ -416,13 +417,33 @@ class ReconciliationMixin:
 
             if reconcile_all:
                 # Pre-resolve except_guids to full GUIDs for a fast
-                # set lookup; non-resolving prefixes drop silently.
+                # set lookup. One that names no split of THIS account
+                # is refused: dropped silently (a transaction GUID
+                # pasted for a split's), the item it was meant to
+                # hold back was reconciled with everything else
+                # (adversarial review 2026-09-30, IV-26).
                 exempt_guids: set[str] = set()
                 if except_guids:
+                    unmatched = []
                     for prefix in except_guids:
-                        found = self._find_split(book, prefix)
-                        if found is not None:
+                        try:
+                            found = self._find_split(book, prefix)
+                        except ValueError:
+                            found = None
+                        if found is None or found.account_guid != account.guid:
+                            unmatched.append(prefix)
+                        else:
                             exempt_guids.add(found.guid)
+                    if unmatched:
+                        raise ValueError(
+                            f"except_guids names no split of "
+                            f"{account.fullname}: "
+                            f"{', '.join(unmatched)}. These must be "
+                            f"SPLIT GUIDs from "
+                            f"get_unreconciled_splits (a transaction "
+                            f"GUID is not one). Nothing was "
+                            f"reconciled."
+                        )
 
                 for split in account.splits:
                     if split.reconcile_state == "y":
@@ -474,6 +495,16 @@ class ReconciliationMixin:
             # "1234.567" against a 2-decimal book is a perpetual
             # 0.007 mismatch even when the books agree at the cent.
             quantum = _commodity_quantum(account.commodity)
+            # A statement balance finer than the currency's unit is a
+            # typo; rounding it could tie a reconciliation that does
+            # not tie (enter_statement already refuses — MM-11).
+            if account.commodity.namespace == "CURRENCY":
+                error = _money_precision_error(
+                    expected_balance, account.commodity,
+                    "statement_balance",
+                )
+                if error:
+                    raise error
             expected_q = expected_balance.quantize(quantum)
             new_balance = (
                 reconciled_balance + reconciling_total
@@ -567,6 +598,11 @@ class ReconciliationMixin:
             if any(s.reconcile_state == "v" for s in transaction.splits):
                 raise ValueError(f"Transaction {guid} is already voided")
 
+            # xaccTransVoid: "Refusing to void a read-only
+            # transaction!" A voided posting zeroes the split the
+            # document's lot is measured from.
+            self._refuse_posting_record(book, transaction, "void")
+
             # Detect reconciled splits BEFORE zeroing — capture the
             # account names we'll cite in the warning.
             reconciled_accounts = sorted({
@@ -607,6 +643,12 @@ class ReconciliationMixin:
                 "status": "voided",
             }
             result.update(shapes)
+            closed = self._read_only_period_note(
+                book, [transaction.post_date],
+                "voiding this transaction",
+            )
+            if closed:
+                result["read_only_period"] = closed
             if reconciled_accounts:
                 result["warning"] = (
                     f"Voided transaction contained "
@@ -807,6 +849,15 @@ class ReconciliationMixin:
             for key in ("void-reason", "void-time", "trans-read-only"):
                 if key in transaction:
                     del transaction[key]
+            # A posting record voided before the guard existed lost
+            # its read-only reason to "Transaction Voided"; clearing
+            # that (xaccTransClearReadOnly) must not leave a posting
+            # transaction desktop will let the user edit. Put back
+            # what posting wrote.
+            if self._posting_document_id(book, transaction) is not None:
+                transaction["trans-read-only"] = (
+                    self._POSTING_READ_ONLY_REASON
+                )
 
             book.save()
 
@@ -814,6 +865,10 @@ class ReconciliationMixin:
             # emitted compactly.
             short_guid = _unique_prefix(
                 transaction.guid, (t.guid for t in book.transactions)
+            )
+            closed = self._read_only_period_note(
+                book, [transaction.post_date],
+                "restoring this transaction",
             )
             return {
                 "guid": short_guid,
@@ -824,4 +879,5 @@ class ReconciliationMixin:
                     _split_to_compact_dict(s) for s in transaction.splits
                 ],
                 "status": "unvoided",
+                **({"read_only_period": closed} if closed else {}),
             }
