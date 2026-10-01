@@ -1400,6 +1400,27 @@ class SchedulingMixin:
 
             if transaction_date:
                 txn_date = date.fromisoformat(transaction_date)
+                # The schedule's own stops bind a date the caller
+                # names as much as one the server picks: an explicit
+                # date used to post an instance after the schedule
+                # had ended (adversarial review 2026-09-30,
+                # side-finding 3).
+                if sx.num_occur > 0 and sx.rem_occur <= 0:
+                    raise ValueError(
+                        f"'{sx.name}' has entered all {sx.num_occur} "
+                        f"occurrences. delete_scheduled_transaction "
+                        f"if it's finished, or enter this one with "
+                        f"create_transactions."
+                    )
+                if end and txn_date > end:
+                    raise ValueError(
+                        f"Transaction date {txn_date.isoformat()} is "
+                        f"after '{sx.name}' ended "
+                        f"({end.isoformat()}). Clear the end date with "
+                        f"update_scheduled_transaction(end_date=\"\") "
+                        f"to resume it, or enter this one with "
+                        f"create_transactions."
+                    )
             else:
                 # Oldest un-entered occurrence — the date the
                 # dashboard calls overdue, if one is. Never "the next
@@ -1544,52 +1565,81 @@ class SchedulingMixin:
         # Re-find by guid — the phase-1 ORM object detached when
         # its session closed.
         shapes: dict = {}
-        with self.open(readonly=False) as book:
-            sx = self._find_scheduled_transaction(book, guid)
-            if not sx:
-                # SX deleted concurrently between phases — the
-                # transaction exists; respond cleanly rather than
-                # crash. Practically unreachable single-threaded.
-                instance_count = None
-                remaining = None
-            else:
-                # Desktop stamps every instance with its schedule;
-                # so do we, by raw SQL — an ORM SlotGUID in the
-                # session arms the delete cascade.
-                if txn_result.get("guid"):
-                    created = self._find_transaction(
-                        book, txn_result["guid"],
-                    )
-                    if created is not None:
-                        self._slot_insert(
-                            book, created.guid, self._SX_FROM,
-                            KVP_Type.KVP_TYPE_GUID,
-                            f"from-sched-xaction on {created.guid[:8]}",
-                            guid_val=sx.guid,
+        try:
+            with self.open(readonly=False) as book:
+                sx = self._find_scheduled_transaction(book, guid)
+                if not sx:
+                    # SX deleted concurrently between phases — the
+                    # transaction exists; respond cleanly rather than
+                    # crash. Practically unreachable single-threaded.
+                    instance_count = None
+                    remaining = None
+                else:
+                    # Desktop stamps every instance with its schedule;
+                    # so do we, by raw SQL — an ORM SlotGUID in the
+                    # session arms the delete cascade.
+                    if txn_result.get("guid"):
+                        created = self._find_transaction(
+                            book, txn_result["guid"],
                         )
-                # Every pre-1.5 shape in the book converts on this
-                # write; the other schedules are converted without
-                # being posted.
-                shapes = self._upgrade_book_shapes(book)
-                current_last = sx.last_occur
-                if isinstance(current_last, datetime):
-                    current_last = current_last.date()
-                # Advance + increment only when txn_date is beyond
-                # the current marker — a concurrent writer may have
-                # registered the period already, and a second
-                # increment would break "instance_count = distinct
-                # periods produced". Never rewind.
-                if current_last is None or txn_date > current_last:
-                    sx.last_occur = txn_date
-                    sx.instance_count += 1
-                    # Finite schedules count down, as GnuCash's
-                    # own creation does; at zero _sx_next_due
-                    # answers None and the schedule is finished.
-                    if sx.num_occur > 0 and sx.rem_occur > 0:
-                        sx.rem_occur -= 1
-                book.save()
-                instance_count = sx.instance_count
-                remaining = sx.rem_occur if sx.num_occur > 0 else None
+                        if created is not None:
+                            self._slot_insert(
+                                book, created.guid, self._SX_FROM,
+                                KVP_Type.KVP_TYPE_GUID,
+                                f"from-sched-xaction on {created.guid[:8]}",
+                                guid_val=sx.guid,
+                            )
+                    # Every pre-1.5 shape in the book converts on this
+                    # write; the other schedules are converted without
+                    # being posted.
+                    shapes = self._upgrade_book_shapes(book)
+                    current_last = sx.last_occur
+                    if isinstance(current_last, datetime):
+                        current_last = current_last.date()
+                    # Advance + increment only when txn_date is beyond
+                    # the current marker — a concurrent writer may have
+                    # registered the period already, and a second
+                    # increment would break "instance_count = distinct
+                    # periods produced". Never rewind.
+                    if current_last is None or txn_date > current_last:
+                        sx.last_occur = txn_date
+                        sx.instance_count += 1
+                        # Finite schedules count down, as GnuCash's
+                        # own creation does; at zero _sx_next_due
+                        # answers None and the schedule is finished.
+                        if sx.num_occur > 0 and sx.rem_occur > 0:
+                            sx.rem_occur -= 1
+                    book.save()
+                    instance_count = sx.instance_count
+                    remaining = sx.rem_occur if sx.num_occur > 0 else None
+        except Exception as exc:
+            # The instance is committed and the schedule is not. Left
+            # like that, the transaction carries no schedule stamp,
+            # the schedule still calls the period due, and a retry is
+            # refused as a duplicate (adversarial review 2026-09-30,
+            # C27). Take the instance back out, so a failure here
+            # changes nothing and the retry is clean.
+            created_guid = txn_result.get("guid")
+            if not created_guid or txn_result.get("status") == "rejected":
+                raise
+            try:
+                self.delete_transaction(created_guid, force=True)
+            except Exception:
+                raise RuntimeError(
+                    f"'{sx_name}' was entered as transaction "
+                    f"{created_guid}, but the schedule could not be "
+                    f"advanced ({type(exc).__name__}: {exc}) and the "
+                    f"transaction could not be removed again. It "
+                    f"carries no schedule stamp and the schedule "
+                    f"still shows this occurrence as due: delete "
+                    f"transaction {created_guid}, then retry."
+                ) from exc
+            raise RuntimeError(
+                f"'{sx_name}' could not be advanced "
+                f"({type(exc).__name__}: {exc}). The transaction that "
+                f"had just been entered for it was removed again, so "
+                f"nothing changed. Retry."
+            ) from exc
 
         # ── Build response. ─────────────────────────────────────
         response = {

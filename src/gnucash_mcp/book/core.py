@@ -5626,8 +5626,10 @@ class CoreMixin:
                 f"match split {ln['match']} has amount "
                 f"{s.quantity}, but the line says {ln['amount']} "
                 f"as printed ({book_amount} in book convention) — "
-                f"wrong split, or fix the book entry first "
-                f"(update_transactions), then claim it"
+                f"wrong split, or fix the book entry first, then "
+                f"claim it (replace_splits changes an amount and "
+                f"gives the split a new GUID; run the dry run again "
+                f"for it)"
             )
         if s.reconcile_state == "y":
             return s, "overlap"
@@ -6556,11 +6558,12 @@ class CoreMixin:
             self._write_balance_limit_frame(book, new_account.guid)
             book.save()
 
-            short_guid = _unique_prefix(
-                new_account.guid, (a.guid for a in book.accounts)
-            )
+            # The form every account-taking tool accepts: ``%`` and
+            # the short GUID. A bare prefix (what this returned
+            # before) resolved nowhere (adversarial review
+            # 2026-09-30, C38).
             result = {
-                "guid": short_guid,
+                "guid": self._account_short_guid(book, new_account),
                 "fullname": new_account.fullname,
                 "status": "created",
             }

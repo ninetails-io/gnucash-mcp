@@ -3191,13 +3191,18 @@ class BusinessMixin:
         # ``YYYYMMDD``), read here until the backfill rewrites them.
         row = book.session.execute(
             text(
-                "SELECT timespec_val, gdate_val FROM slots "
+                "SELECT timespec_val, gdate_val, slot_type FROM slots "
                 "WHERE obj_guid = :guid "
                 "AND name = 'trans-date-due'"
             ),
             {"guid": txn.guid},
         ).first()
-        if row and row[0]:
+        # The row's TYPE says which column holds the date. Every slot
+        # row carries an epoch in ``timespec_val`` as filler, so a
+        # GDate row read timespec-first is due 1970-01-01 — "20726
+        # days past due" (adversarial review 2026-09-30, C64).
+        is_gdate = bool(row) and int(row[2] or 0) == 10
+        if row and row[0] and not is_gdate:
             ts = row[0]
             if isinstance(ts, datetime):
                 return ts.date()
@@ -7550,7 +7555,7 @@ class BusinessMixin:
                     "credit_note"
                     if is_credit_note
                     else self._OWNER_TYPE_TO_RESPONSE_TYPE.get(
-                        inv.owner_type, "invoice"
+                        self._effective_owner_type(book, inv), "invoice"
                     )
                 ),
                 "status": "posted",
@@ -7658,7 +7663,7 @@ class BusinessMixin:
                     "credit_note"
                     if self._get_is_credit_note(inv)
                     else self._OWNER_TYPE_TO_RESPONSE_TYPE.get(
-                        inv.owner_type, "invoice"
+                        self._effective_owner_type(book, inv), "invoice"
                     )
                 ),
                 "date_posted": (
@@ -7733,7 +7738,9 @@ class BusinessMixin:
             # session.
             is_credit_note = self._get_is_credit_note(inv)
             inv_id_snapshot = inv.id
-            owner_type_snapshot = inv.owner_type
+            # The side the response names: a job-attached bill is a
+            # bill, not the "invoice" its owner_type of 3 fell back to.
+            owner_type_snapshot = self._effective_owner_type(book, inv)
 
             # Strip GUID-valued slots and frames off the posting
             # transaction, its splits, and the lot by raw SQL FIRST.
@@ -8635,7 +8642,7 @@ class BusinessMixin:
                 "credit_note"
                 if is_credit_note
                 else self._OWNER_TYPE_TO_RESPONSE_TYPE.get(
-                    inv.owner_type, "invoice"
+                    self._effective_owner_type(book, inv), "invoice"
                 )
             )
 
@@ -9429,7 +9436,10 @@ class BusinessMixin:
                     txn.guid,
                     self._transaction_prefix_map(book).keys(),
                 ),
-                "apply_date": str(parsed_date),
+                # The date the link transaction carries — GnuCash's,
+                # the later of the two documents' latest activity —
+                # not today's.
+                "apply_date": str(link_date),
                 "status": "applied",
             }
             # The stored applies-to link is provenance, not a

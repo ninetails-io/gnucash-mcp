@@ -773,6 +773,9 @@ class TestStatementReviewFindings:
         )
         assert "REJECTED" in res["summary"]
         assert "wrong split" in res["results"]
+        # The hint names the tool that can change an amount (C36).
+        assert "replace_splits" in res["results"]
+        assert "update_transactions" not in res["results"]
 
     def test_sub_quantum_amount_rejects(self, statement_book):
         gc = GnuCashBook(str(statement_book))
