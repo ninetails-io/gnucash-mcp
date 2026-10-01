@@ -259,6 +259,12 @@ def register(mcp, get_book) -> None:
         - Either form then adds the notes when present, and a
           labeled ``num:<number>`` cell when the transaction has a
           Num.
+        - In a book with "Use Split Action Field for Number" on,
+          each account register's Num is that account's split
+          action: the register form's ``num:`` is the filtered
+          account's, a ``tnum:`` cell carries the transaction's own
+          number (desktop's T-Num), and the unfiltered form tags
+          each leg's number as ``#<number>``.
 
         Transactions with more than 4 splits collapse to the top 3 by
         |value| plus ``+N more`` — call ``get_transaction`` for the
@@ -292,6 +298,13 @@ def register(mcp, get_book) -> None:
         guid: TransactionGuid,
     ) -> str:
         """Get details for a specific transaction by GUID.
+
+        Returns its splits (account, value, quantity, memo,
+        ``action``, reconcile state) and, when set, ``notes``,
+        ``num`` (GnuCash's Num column) and ``doc_link`` (the
+        transaction's document link). In a book with "Use Split
+        Action Field for Number" on, a register's Num is that
+        account's split ``action``.
 
         Args:
             guid: Transaction GUID (32-character hex string, or 8+ char prefix)
@@ -382,6 +395,12 @@ def register(mcp, get_book) -> None:
           one. ``link`` is the transaction's document link (a URL
           or file path to the receipt/invoice; desktop opens it
           from the register). Empty cells leave either unset.
+          In a book with "Use Split Action Field for Number" on,
+          ``num`` is the transaction's T-Num and an account
+          register's Num column shows that account's split action
+          instead: to put a check number in the bank register's
+          Num, write it in an ``act`` cell on the bank leg (see
+          PER-SPLIT ACTION). The duplicate screen reads both.
 
         - PER-SPLIT QUANTITY — declare ``qty`` split columns for
           splits whose ACCOUNT commodity differs from the book
@@ -680,7 +699,10 @@ def register(mcp, get_book) -> None:
         Compact format (default):
         ``DATE<TAB>guid<TAB>Description<TAB>splits``, then the notes
         when present and a labeled ``num:<number>`` cell when the
-        transaction has a Num.
+        transaction has a Num. In a book with "Use Split Action
+        Field for Number" on, that cell reads ``tnum:`` (the
+        transaction's T-Num) and each leg's number follows it in
+        the splits as ``#<number>``.
         Transactions with more than 4 splits collapse to the top 3 by
         |value| plus ``+N more`` — call ``get_transaction`` for the
         full breakdown. Leads with a ``Showing X-Y of Z transactions``

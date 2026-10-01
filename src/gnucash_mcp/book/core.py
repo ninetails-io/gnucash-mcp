@@ -3716,10 +3716,12 @@ class CoreMixin:
                 # prefixes stay valid _resolve_guid keys; cached by
                 # book mtime.
                 prefixes = self._transaction_prefix_map(book)
+                num_on_split = self._num_is_split_action(book)
                 lines = [indicator]
                 lines += [
                     _transaction_to_compact_line(
-                        t, focus_account=focus_fullname, prefixes=prefixes
+                        t, focus_account=focus_fullname, prefixes=prefixes,
+                        num_on_split=num_on_split,
                     )
                     for t in page
                 ]
@@ -3895,7 +3897,7 @@ class CoreMixin:
         want_duplicates: bool,
         want_recent: bool,
         trans_currency: str | None = None,
-        proposed_num: str | None = None,
+        proposed_num: str | list[str] | None = None,
         num_on_split: bool = False,
         sweep: list[tuple["piecash.Transaction", str]] | None = None,
         duplicate_window_days: int = 30,
@@ -3926,9 +3928,10 @@ class CoreMixin:
             want_duplicates: Score the ±window range on description,
                 amount, date, and — when the proposal has a number —
                 Num; emit HIGH/MEDIUM candidates.
-            proposed_num: The proposal's Num. A candidate's numbers
-                are its transaction num, plus every split action
-                when ``num_on_split`` (the book keeps Num there).
+            proposed_num: The proposal's number, or its numbers
+                (``_batch_row_nums``). A candidate's numbers are its
+                transaction num, plus every split action when
+                ``num_on_split`` (the book keeps Num there).
             want_recent: Keep top N matches for the post-write
                 split-consistency warning.
             sweep: A precomputed ``_signal_sweep(book)`` — pass it
@@ -4930,7 +4933,7 @@ class CoreMixin:
                     want_auto_fill=False, want_stability=False,
                     want_duplicates=True, want_recent=False,
                     trans_currency=p["currency"].mnemonic,
-                    proposed_num=p["num"],
+                    proposed_num=self._batch_row_nums(p, num_on_split),
                     num_on_split=num_on_split,
                     sweep=_sweep(),
                 )
@@ -4949,7 +4952,11 @@ class CoreMixin:
                     ]
                     proposal = {
                         "desc": p["description"],
-                        "num": p["num"],
+                        "num": ", ".join(dict.fromkeys(
+                            n for n in self._batch_row_nums(
+                                p, num_on_split,
+                            ) if n
+                        )),
                         "date": p["trans_date"],
                         # SIGNED primary (max-abs split's value) —
                         # the comparison table reads sign as
@@ -5611,6 +5618,20 @@ class CoreMixin:
                 force_base, force_duplicates, default_currency,
                 warn_rows=warn_rows,
             )
+
+    @staticmethod
+    def _batch_row_nums(p, num_on_split: bool) -> list[str]:
+        """A batch row's numbers, read the way a candidate's are
+        (``_collect_create_signals``): its Num cell, plus, when the
+        book keeps the register's Num on split actions, its ``act``
+        cells. With the option on, ``act`` on a leg IS that
+        register's Num, so a check numbered that way must count as
+        numbered, or a different check for the same amount on the
+        same day reads as an exact twin (bookkeeper report N-3)."""
+        return [p["num"] or ""] + (
+            [v.get("action") or "" for v in p["validated"]]
+            if num_on_split else []
+        )
 
     @staticmethod
     def _statement_cand_nums(split, num_on_split: bool) -> list[str]:
@@ -6526,9 +6547,13 @@ class CoreMixin:
             if compact:
                 # Prefix map cached by book mtime.
                 prefixes = self._transaction_prefix_map(book)
+                show_split_nums = self._num_is_split_action(book)
                 lines = [indicator]
                 lines += [
-                    _transaction_to_compact_line(t, prefixes=prefixes)
+                    _transaction_to_compact_line(
+                        t, prefixes=prefixes,
+                        num_on_split=show_split_nums,
+                    )
                     for t in page
                 ]
                 return "\n".join(lines)

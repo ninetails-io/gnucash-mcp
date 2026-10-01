@@ -704,14 +704,18 @@ def _norm_num(value) -> str:
 
 
 def _num_signal(proposed, candidate_nums) -> str:
-    """The Num character: ``N`` when the proposal's number is among
-    the candidate's, ``x`` when both have numbers and none agree,
-    ``""`` when either side has none (no evidence either way)."""
-    mine = _norm_num(proposed)
+    """The Num character: ``N`` when the proposal and the candidate
+    share a number, ``x`` when both have numbers and none agree,
+    ``""`` when either side has none (no evidence either way).
+    ``proposed`` is one number or several (a batch row's Num plus,
+    in a book that keeps Num on split actions, its ``act`` cells)."""
+    if proposed is None or isinstance(proposed, str):
+        proposed = [proposed]
+    mine = {_norm_num(n) for n in proposed} - {""}
     theirs = {_norm_num(n) for n in candidate_nums} - {""}
     if not mine or not theirs:
         return ""
-    return "N" if mine in theirs else "x"
+    return "N" if mine & theirs else "x"
 
 
 def _signal_strength(signals) -> int:

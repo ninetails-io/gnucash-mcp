@@ -321,6 +321,41 @@ class TestSearch:
             )
 
 
+
+class TestCompactLinesShowSplitNums:
+    """Bookkeeper report N-2: with the option on, a register's Num is
+    its account's split action, and the compact lines showed only the
+    transaction's number, so list and search hid the number desktop's
+    register shows."""
+
+    def _two_numbers(self, book):
+        gc = GnuCashBook(str(book))
+        gc.create_transactions(_act_cheque("1044", num="INV-88"))
+        return gc
+
+    def test_register_form_shows_the_register_num(self, test_book):
+        _num_on_split_action(test_book)
+        gc = self._two_numbers(test_book)
+        line = gc.list_transactions(account="Assets:Checking").splitlines()[1]
+        assert line.endswith("\tnum:1044\ttnum:INV-88")
+
+    def test_unfiltered_form_tags_the_leg(self, test_book):
+        _num_on_split_action(test_book)
+        gc = self._two_numbers(test_book)
+        line = gc.search_transactions("1044", field="num").splitlines()[1]
+        assert "Assets:Checking -250" in line and " #1044" in line
+        assert line.endswith("\ttnum:INV-88")
+        assert "\tnum:" not in line
+
+    def test_option_off_unchanged(self, test_book):
+        gc = self._two_numbers(test_book)
+        listed = gc.list_transactions(account="Assets:Checking").splitlines()[1]
+        assert listed.endswith("\tnum:INV-88")
+        found = gc.search_transactions("INV", field="num").splitlines()[1]
+        assert found.endswith("\tnum:INV-88")
+        assert "#" not in listed + found and "tnum:" not in listed + found
+
+
 def _table(tsv: str) -> list[dict]:
     lines = tsv.splitlines()
     if not lines:
@@ -394,6 +429,63 @@ class TestDuplicateScreen:
         _num_on_split_action(test_book)
         res = gc.create_transactions(_cheque("1041"))
         assert _table(res["duplicates"])[0]["signals"] == "DADN"
+
+
+def _act_cheque(act, num="", desc="Plumber", day="2026-07-01", amount="250.00"):
+    """A check numbered on the bank leg's action: with the option on,
+    that IS the bank register's Num."""
+    return _parse_transactions_tsv(
+        "ref\tdate\tdescription\tnum\tamt\tacct\tact\tamt\tacct\tact\n"
+        f"1\t{day}\t{desc}\t{num}\t-{amount}\tAssets:Checking\t{act}"
+        f"\t{amount}\tExpenses:Groceries\t\n"
+    )
+
+
+class TestDuplicateScreenAct:
+    """Bookkeeper report N-3: with the option on, a row numbered by
+    ``act`` on its bank leg is numbered. The screen read a row's
+    number from its ``num`` cell only, so check 1045 for the same
+    amount on the day check 1043 was entered read as its exact twin
+    and was refused."""
+
+    def test_different_act_number_never_blocks(self, test_book):
+        _num_on_split_action(test_book)
+        gc = GnuCashBook(str(test_book))
+        gc.create_transactions(_act_cheque("1043"))
+        res = gc.create_transactions(_act_cheque("1045"))
+        (dup,) = _table(res["duplicates"])
+        assert (dup["signals"], dup["confidence"]) == ("DADx", "MEDIUM")
+        assert (dup["num_new"], dup["num_old"]) == ("1045", "1043")
+        assert "\tcreated\t" in res["results"]
+
+    def test_same_act_number_strengthens(self, test_book):
+        _num_on_split_action(test_book)
+        gc = GnuCashBook(str(test_book))
+        gc.create_transactions(_act_cheque("1043"))
+        res = gc.create_transactions(_act_cheque("1043", day="2026-07-09"))
+        (dup,) = _table(res["duplicates"])
+        assert dup["signals"] == "DA-N"
+
+    def test_num_and_act_both_count(self, test_book):
+        """A row may carry a T-Num and a register Num; either can
+        agree with the candidate's."""
+        _num_on_split_action(test_book)
+        gc = GnuCashBook(str(test_book))
+        gc.create_transactions(_act_cheque("1044", num="INV-88"))
+        res = gc.create_transactions(_act_cheque("1044", num="INV-99"))
+        (dup,) = _table(res["duplicates"])
+        assert dup["signals"] == "DADN"
+        assert dup["num_new"] == "INV-99, 1044"
+
+    def test_act_is_not_a_number_when_option_off(self, test_book):
+        """Without the option an action is a movement tag, not a
+        number: nothing changes."""
+        gc = GnuCashBook(str(test_book))
+        gc.create_transactions(_act_cheque("1043"))
+        res = gc.create_transactions(_act_cheque("1045"))
+        (dup,) = _table(res["duplicates"])
+        assert (dup["signals"], dup["confidence"]) == ("DAD", "HIGH")
+        assert "\trejected\t" in res["results"]
 
 
 class TestStatementScan:

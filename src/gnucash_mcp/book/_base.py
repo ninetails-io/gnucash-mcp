@@ -1368,23 +1368,37 @@ _SPLIT_COLLAPSE_THRESHOLD = 4
 _SPLIT_COLLAPSE_KEEP = 3
 
 
-def _format_one_split(split: piecash.Split, transaction: piecash.Transaction) -> str:
+def _format_one_split(
+    split: piecash.Split, transaction: piecash.Transaction,
+    num_on_split: bool = False,
+) -> str:
     """Render one split as ``account amount``, with cross-currency annotation.
 
     Shared between the full and collapsed split-list paths so the
-    per-split rendering stays consistent with history.
+    per-split rendering stays consistent with history. With
+    ``num_on_split`` (the book keeps the register's Num on split
+    actions), a leg's number follows it as `` #<number>``: it is the
+    Num that leg's account register shows.
     """
     account_name = _one_line(split.account.fullname)
     amount = split.quantity
+    tag = (
+        f" #{_one_line(split.action)}"
+        if num_on_split and split.action else ""
+    )
     if split.quantity != split.value:
         currency = transaction.currency.mnemonic
         commodity = split.account.commodity.mnemonic
-        return f"{account_name} {amount} {commodity} (={split.value} {currency})"
-    return f"{account_name} {amount}"
+        return (
+            f"{account_name} {amount} {commodity} "
+            f"(={split.value} {currency}){tag}"
+        )
+    return f"{account_name} {amount}{tag}"
 
 
 def _format_splits_collapsed(
     splits: list[piecash.Split], transaction: piecash.Transaction,
+    num_on_split: bool = False,
 ) -> str:
     """Render a split list, collapsing long tails.
 
@@ -1395,12 +1409,16 @@ def _format_splits_collapsed(
     incommensurable and produce misleading orderings.
     """
     if len(splits) <= _SPLIT_COLLAPSE_THRESHOLD:
-        return ", ".join(_format_one_split(s, transaction) for s in splits)
+        return ", ".join(
+            _format_one_split(s, transaction, num_on_split) for s in splits
+        )
 
     ranked = sorted(splits, key=lambda s: abs(s.value), reverse=True)
     kept = ranked[:_SPLIT_COLLAPSE_KEEP]
     more = len(splits) - _SPLIT_COLLAPSE_KEEP
-    shown = ", ".join(_format_one_split(s, transaction) for s in kept)
+    shown = ", ".join(
+        _format_one_split(s, transaction, num_on_split) for s in kept
+    )
     return f"{shown}, +{more} more"
 
 
@@ -1408,6 +1426,7 @@ def _transaction_to_compact_line(
     transaction: piecash.Transaction,
     focus_account: str | None = None,
     prefixes: dict[str, str] | None = None,
+    num_on_split: bool = False,
 ) -> str:
     """Convert a piecash Transaction to a compact tab-separated line.
 
@@ -1424,6 +1443,14 @@ def _transaction_to_compact_line(
     Either shape then carries the notes cell when the transaction
     has notes, and a labeled ``num:<number>`` cell when it has a
     number.
+
+    ``num_on_split`` (the book option "Use Split Action Field for
+    Number"): the register's Num is each account's split action,
+    the transaction's own number desktop's T-Num. The register
+    shape's ``num:`` is then the focused account's split action,
+    and a ``tnum:`` cell carries the transaction's number; the
+    unfiltered shape tags each leg ``#<number>`` and labels the
+    transaction's number ``tnum:``.
 
       The checking-register view: column 3 is the signed impact on
       the filtered account (what a reconciler reads), whose own
@@ -1464,10 +1491,14 @@ def _transaction_to_compact_line(
             amt_str = str(focus_amt)
         else:
             amt_str = "0"
-        splits_str = _format_splits_collapsed(other_splits, transaction)
+        splits_str = _format_splits_collapsed(
+            other_splits, transaction, num_on_split,
+        )
         line = f"{date_str}\t{short}\t{amt_str}\t{desc}\t{splits_str}"
     else:
-        splits_str = _format_splits_collapsed(splits, transaction)
+        splits_str = _format_splits_collapsed(
+            splits, transaction, num_on_split,
+        )
         line = f"{date_str}\t{short}\t{desc}\t{splits_str}"
 
     if transaction.notes:
@@ -1475,8 +1506,18 @@ def _transaction_to_compact_line(
     # Labeled, not positional: notes is already an optional trailing
     # cell, and the number must never ride inside the description
     # (auto-fill matches on description).
+    if not num_on_split:
+        if transaction.num:
+            line += f"\tnum:{_tsv_cell(transaction.num)}"
+        return line
+    if focus_account is not None:
+        register_nums = ", ".join(dict.fromkeys(
+            s.action for s in focus_splits if s.action
+        ))
+        if register_nums:
+            line += f"\tnum:{_tsv_cell(register_nums)}"
     if transaction.num:
-        line += f"\tnum:{_tsv_cell(transaction.num)}"
+        line += f"\ttnum:{_tsv_cell(transaction.num)}"
     return line
 
 
