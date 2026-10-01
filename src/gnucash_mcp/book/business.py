@@ -42,6 +42,7 @@ from gnucash_mcp._format import (
     _GROUP_BY_VALUES,
     _enumerate_periods,
     _format_grouped_tsv,
+    _format_number,
     _paginate,
     _partial_period_labels,
     _period_label,
@@ -6303,11 +6304,19 @@ class BusinessMixin:
                     f"{invoice_currency.mnemonic}/"
                     f"{target_commodity.mnemonic} rate is {age_days} "
                     f"days from the {context} date ({as_of}); last "
-                    f"quoted {price_date.isoformat()} at {rate}. This "
-                    f"rate is locked at {context} time and cannot be "
-                    f"updated retroactively. Either run create_price("
+                    f"quoted {price_date.isoformat()} at "
+                    f"{_format_number(rate, decimals=6, strip_trailing=True)}. "
+                    f"This rate is locked at {context} time and cannot "
+                    f"be updated retroactively. Either run create_price("
                     f"commodity='{invoice_currency.mnemonic}', "
-                    f"namespace='CURRENCY', value='...', "
+                    f"namespace='CURRENCY', "
+                    # Both sides named: left to its default, the
+                    # price lands against the BOOK's currency, which
+                    # is the wrong pair whenever that isn't the
+                    # target (and a self-price when it is the
+                    # invoice's own).
+                    f"currency='{target_commodity.mnemonic}', "
+                    f"value='...', "
                     f"date='{as_of}') to add a rate near {as_of}, or "
                     f"pass force=true to proceed with the stale rate.",
                     {

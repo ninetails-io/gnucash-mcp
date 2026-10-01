@@ -515,6 +515,40 @@ class InvestmentsMixin:
             book.session.expire(stale)
 
     @staticmethod
+    def _check_price(comm, resolved_currency, value) -> None:
+        """What makes a price row a price, checked before either
+        entry point writes one (single and batch share it, and the
+        batch's dry run reports the same refusal).
+
+        - Positive. Valuation multiplies a holding by the latest
+          row, so ``-1.10`` valued 1,000 EUR at −1,100 and ``0``
+          dropped the holding from the balance sheet — while the
+          rate a posting uses skipped both rows, so two readers
+          disagreed about whether the row existed (review C13).
+        - Of one commodity IN ANOTHER. USD priced in USD is always 1
+          and tells no reader anything; the row was reachable by
+          following the stale-rate refusal's own suggestion on a
+          book whose default currency was the invoice's (review C35).
+        - A number a price can be. ``9e999998`` parses, then spent
+          24 seconds becoming a rational before being refused.
+        """
+        amount = _to_decimal(value)
+        if not amount.is_finite() or amount <= 0:
+            raise ValueError(
+                f"A price must be greater than zero; got {value}."
+            )
+        if abs(amount.adjusted()) > 15:
+            raise ValueError(
+                f"Price {value} is out of range for a price."
+            )
+        if comm.guid == resolved_currency.guid:
+            raise ValueError(
+                f"A price of {comm.mnemonic} in {comm.mnemonic} is "
+                f"always 1. Name the other currency: "
+                f"currency='<the currency {comm.mnemonic} is priced in>'."
+            )
+
+    @staticmethod
     def _upsert_price(
         book, comm, resolved_currency, price_date,
         value: str, price_type: str, source: str,
@@ -702,7 +736,9 @@ class InvestmentsMixin:
                             self._get_or_create_currency(book, cur_code)
                         )
                     value = p["value"]
-                    _to_decimal(value)  # reject non-decimal early
+                    # Non-decimal, non-positive, or a self-price:
+                    # rejected per row, dry run included.
+                    self._check_price(comm, resolved_currency, value)
                     prepared.append({
                         "ref": ref,
                         "comm": comm,
@@ -874,6 +910,8 @@ class InvestmentsMixin:
                 resolved_currency = self._get_or_create_currency(
                     book, currency,
                 )
+
+            self._check_price(comm, resolved_currency, value)
 
             # A price write converts the book's pre-1.5 shapes first
             # (generator sources desktop shows as Invalid, midnight
