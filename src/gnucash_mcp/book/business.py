@@ -16,7 +16,7 @@ in the ORM). All raw inserts are paired with `_verify_write` /
 
 import logging
 from datetime import date, datetime, time, timedelta, timezone
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 
 import piecash
 
@@ -1108,9 +1108,20 @@ class BusinessMixin:
         except (ValueError, KeyError):
             return None
 
-        expected = (subtotal * discount_pct / Decimal(100)).quantize(
-            _commodity_quantum(inv.currency)
-        )
+        # A credit note applied to the document takes its share of
+        # the principal with it: what was credited back was never
+        # going to be paid, early or otherwise. Measuring the
+        # discount on the full subtotal regardless, a 1,000 invoice
+        # with 900 credited and "2/10" terms REFUSED the correct 98
+        # ("adjust amount to 80.00") and booked a 20.00 discount on
+        # a 100 balance when 80 was paid (adversarial review
+        # 2026-09-30, C47). Cash already paid does not reduce it: the
+        # settling payment takes the whole discount, as before.
+        credited_share = self._credited_share(book, inv)
+        expected = (
+            subtotal * (Decimal(1) - credited_share)
+            * discount_pct / Decimal(100)
+        ).quantize(_commodity_quantum(inv.currency), rounding=ROUND_HALF_UP)
 
         return {
             "discount_days": discount_days,
@@ -1119,6 +1130,30 @@ class BusinessMixin:
             "eligible_until": eligible_until,
             "currency": inv.currency.mnemonic,
         }
+
+    def _credited_share(self, book, inv) -> Decimal:
+        """The fraction of a posted document's total that credit
+        notes have settled (0 when none, 1 when all of it). A lot
+        split is a credit application, not a payment, when the other
+        leg of its transaction sits in a lot too — the lot-link
+        transaction ``apply_credit_note`` writes, and desktop's
+        (``_document_payments`` names its source the same way)."""
+        settlement = self._document_settlement(book, inv)
+        if settlement is None or settlement["grand_total"] <= 0:
+            return Decimal(0)
+        post_guid = inv.post_txn_guid
+        doc_currency_guid = inv.currency_guid
+        credited = Decimal(0)
+        for split in settlement["lot"].splits:
+            txn = split.transaction
+            if txn.guid == post_guid or split.reconcile_state == "v":
+                continue
+            if any(o.lot is not None for o in txn.splits if o is not split):
+                credited += -settlement["sign"] * self._lot_split_amount(
+                    split, doc_currency_guid,
+                )
+        share = credited / settlement["grand_total"]
+        return min(max(share, Decimal(0)), Decimal(1))
 
     @staticmethod
     def _rate_from_post_transaction(post_txn, target_commodity):
@@ -7276,10 +7311,17 @@ class BusinessMixin:
                         f"principal: {expected} "
                         f"{inv.currency.mnemonic} "
                         f"({disc_summary['discount_percent']}%). "
-                        f"Either adjust amount to "
-                        f"{(remaining_before - expected).quantize(quantum)} "
-                        f"to take the full discount, or pay without "
-                        f"apply_discount for a partial payment."
+                        + (
+                            f"Either adjust amount to "
+                            f"{(remaining_before - expected).quantize(quantum)} "
+                            f"to take the full discount, or pay "
+                            f"without apply_discount for a partial "
+                            f"payment."
+                            # Never suggest paying a negative amount.
+                            if remaining_before > expected else
+                            f"The discount exceeds what is still "
+                            f"owed; pay without apply_discount."
+                        )
                     )
 
                 # Book the ACTUAL shortfall, not the computed
