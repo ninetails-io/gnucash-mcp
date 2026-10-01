@@ -660,9 +660,9 @@ Established chokepoints and the rule each one owns:
   names, `debris_found` counts each kind, and every recording keeps
   the engine's counts beside its dump — never a silent filter. A new
   exception is added to the list with its reason, or it is a diff.
-  OPEN, not settled by the list: whether a posted line should point
-  at its tax table's copy (the source says yes; the headless engine
-  did not save it). The GUI gate decides.
+  SETTLED by the GUI gate (2026-10-01): a posted line may point at
+  its tax table or at the hidden copy. Desktop writes both shapes
+  and reads both; the server leaves lines on the live table.
 - `_billterm_return_child` — `gncBillTermReturnChild`: a posted
   document points at a hidden copy of its billing term (same name,
   `invisible` 1, `parent` the term, refcount 0), reused while it

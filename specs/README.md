@@ -134,3 +134,9 @@ Not a release yet — the running list of items deferred out of
 prior releases or flagged for attention.
 
 - [README.md](v1.5/README.md) — the backlog: patch candidates (1.4.1), deferred features (price auto-retrieval, i18n output localization, taxtable cascade, accrual FX revaluation, DB backend), and maintenance items.
+
+---
+
+## v1.5.1 — deferred out of 1.5
+
+- [README.md](v1.5.1/README.md) — every minor issue the 1.5 adversarial review found that 1.5 did not fix, grouped by kind, each with where it lives and what the fix would be.
