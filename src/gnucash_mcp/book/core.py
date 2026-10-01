@@ -4875,7 +4875,23 @@ class CoreMixin:
             # (non-blocking) — surfaced as a side table keyed by ref,
             # so a decimal slip in a bulk import is caught too.
             warn_rows: list = []
+            today = date.today()
             for p, _dc, _mc in accepted:
+                # A slipped year, the dashboard's own rule applied at
+                # entry instead of afterwards: more than a year
+                # ahead ("2062 for 2026"), or a year no ledger holds
+                # ("0026"). Historical imports are the point of this
+                # tool, so an ordinary old date draws nothing.
+                row_date = p["trans_date"]
+                if (row_date - today).days > 365:
+                    warn_rows.append((p["ref"], (
+                        f"dated {row_date.isoformat()}, more than a "
+                        f"year ahead — likely a typo; check the year"
+                    )))
+                elif row_date.year < 1900:
+                    warn_rows.append((p["ref"], (
+                        f"dated {row_date.isoformat()} — check the year"
+                    )))
                 for w in p["auto_fill_warnings"]:
                     warn_rows.append((p["ref"], w["message"]))
                 for w in self._fx_sanity_warnings(
@@ -5284,6 +5300,32 @@ class CoreMixin:
             future_msg = _future_statement_warning(statement_date)
             if future_msg:
                 warn_rows.append(("*", future_msg))
+            # A line's date against its statement's. A statement
+            # cannot list a line dated after it closed, and one from
+            # more than a year before it is a slipped year (2062 for
+            # 2026, 0026) far more often than a real entry. Like the
+            # statement date itself, the line goes through — the date
+            # may be what the statement prints — and the warnings
+            # table names it, in dry run and commit alike. These
+            # were entered AND reconciled in silence; the dashboard's
+            # own "likely a typo" check only saw them afterwards.
+            for ln in lines:
+                line_date = ln.get("date")
+                if line_date is None:
+                    continue
+                if line_date > statement_date:
+                    warn_rows.append((ln["ref"], (
+                        f"dated {line_date.isoformat()}, after the "
+                        f"statement date ({statement_date.isoformat()}) "
+                        f"— a statement cannot list a later line; "
+                        f"check the year"
+                    )))
+                elif (statement_date - line_date).days > 366:
+                    warn_rows.append((ln["ref"], (
+                        f"dated {line_date.isoformat()}, more than a "
+                        f"year before the statement date "
+                        f"({statement_date.isoformat()}); check the year"
+                    )))
             if opening_gap != 0:
                 gap_msg = (
                     f"account's reconciled balance "
@@ -5410,6 +5452,7 @@ class CoreMixin:
                 statement_date, _book_amount, _candidates_for,
                 split_prefixes, reconciled_balance, closing,
                 force_base, force_duplicates, default_currency,
+                warn_rows=warn_rows,
             )
 
     def _statement_prep_create(
@@ -5967,10 +6010,14 @@ class CoreMixin:
         self, book, account, lines, amounts, sign, quantum,
         statement_date, _book_amount, _candidates_for,
         split_prefixes, reconciled_balance, closing, force_base,
-        force_duplicates, default_currency,
+        force_duplicates, default_currency, warn_rows=None,
     ) -> dict:
         """The landing: resolve dispositions (the shared chokepoint),
-        check the tie, then — and only then — mutate and save once."""
+        check the tie, then — and only then — mutate and save once.
+        ``warn_rows`` are the date warnings the dry run showed (a
+        statement dated after today, a line dated after its
+        statement); the commit repeats them, since it is the commit
+        that makes them permanent."""
         phase_a = self._statement_dispositions(
             book, account, lines, _book_amount, _candidates_for,
             quantum, default_currency, force_duplicates,
@@ -6173,6 +6220,10 @@ class CoreMixin:
             "results": "\n".join(rows),
             "new_reconciled_balance": str(new_reconciled),
             "tie": tie,
+            **(
+                {"warnings": self._batch_warnings_to_tsv(warn_rows)}
+                if warn_rows else {}
+            ),
         }
 
     def search_transactions(
