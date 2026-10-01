@@ -7372,22 +7372,32 @@ class TestUnpostInvoice:
         assert result["status"] == "posted"
         assert result["post_date"] == "2026-05-15"
 
-    def test_unpost_rejects_invoice_with_payment_applied(
+    def test_unpost_keeps_the_payment_as_the_customers(
         self, business_book,
     ):
-        """Unposting an invoice that has any payment applied would
-        orphan the payment splits. Force the user to void payments
-        first."""
+        """Unposting a paid invoice used to be refused ("void
+        payments first"), which sent callers to void a bank line
+        that may already be reconciled. GnuCash keeps the payment:
+        the lot becomes the customer's, and the re-posted document
+        is settled from it (adversarial review 2026-09-30, C49;
+        the rows are pinned in test_parity_prepayment.py)."""
         gb = GnuCashBook(str(business_book))
         posted = self._post_invoice(gb)
-        gb.pay_invoice(
+        paid = gb.pay_invoice(
             invoice_id=posted["id"],
             payment_account="Assets:Checking",
             amount="100.00",
         )
 
-        with pytest.raises(ValueError, match="has payments applied"):
-            gb.unpost_invoice(invoice_id=posted["id"])
+        result = gb.unpost_invoice(invoice_id=posted["id"])
+
+        assert result["status"] == "unposted"
+        assert [p["amount"] for p in result["payments_kept"]] == ["100.00"]
+        assert result["payments_kept"][0]["guid"] == paid["transaction_guid"]
+        assert "from_prepayment" in result["note"]
+        # The bank line is untouched.
+        txn = gb.get_transaction(paid["transaction_guid"])
+        assert "void" not in str(txn).lower()
 
     def test_unpost_succeeds_when_payment_was_voided(
         self, business_book,

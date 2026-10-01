@@ -1022,6 +1022,17 @@ def _lot_cache_flag(lot) -> None:
         lot.is_closed = _LOT_OPEN
 
 
+def _lot_hold_open(lot) -> None:
+    """Mark a lot open while a port of GnuCash's lot arithmetic moves
+    splits through it, where ``_lot_cache_flag`` cannot be used: in
+    the middle of ``gncOwnerReduceSplitTo`` the lot's splits may sum
+    to zero for one statement (the reduced split is in, its remainder
+    not yet), and a computed "closed" would make piecash refuse the
+    very split that reopens it. The caller leaves every lot it held
+    open at UNKNOWN once the session has flushed, as desktop does."""
+    lot.is_closed = _LOT_OPEN
+
+
 def _lot_forget_flag(lot) -> None:
     """Mark a lot's flag UNKNOWN after a split leaves it or changes.
 

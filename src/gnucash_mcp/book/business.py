@@ -24,6 +24,9 @@ from gnucash_mcp.book import _entry_math
 from gnucash_mcp.book._base import (
     _lot_cache_flag,
     _LOT_CLOSED_UNKNOWN,
+    _LOT_OPEN,
+    _lot_hold_open,
+    _set_split_amounts,
     _commodity_quantum,
     _dialect_name,
     _gnc_bool,
@@ -2168,6 +2171,504 @@ class BusinessMixin:
             f"gncInvoice ref slot for frame {frame_guid[:8]}",
         )
 
+
+    # ── Payment lots: a party's money with no document on it ─────────
+    #
+    # gncOwner.c, verbatim — how a lot says whose it is when no
+    # document claims it (the excess of an overpayment, a payment
+    # received ahead of its invoice, the payments left behind when a
+    # document is unposted):
+    #   #define GNC_OWNER_ID    "gncOwner"
+    #   #define GNC_OWNER_TYPE  "owner-type"
+    #   #define GNC_OWNER_GUID  "owner-guid"
+    # ``gncOwnerAttachToLot`` writes the type as a gint64 and the GUID
+    # as a GUID under the ``gncOwner`` frame (gnc-lot.cpp
+    # PROP_OWNER_TYPE / PROP_OWNER_GUID). On disk, like the invoice
+    # link: a frame row on the lot, the two children named by their
+    # FULL path on the frame's guid. Pinned row for row against the
+    # engine by tests/test_parity_prepayment.py.
+    _GNC_OWNER_ID = "gncOwner"
+    _GNC_OWNER_TYPE = "gncOwner/owner-type"
+    _GNC_OWNER_GUID = "gncOwner/owner-guid"
+
+    @staticmethod
+    def _attach_owner_to_lot(
+        book, lot_guid: str, owner_type: int, owner_guid: str,
+    ) -> None:
+        """``gncOwnerAttachToLot``: mark a lot as a party's."""
+        import uuid
+        from piecash.kvp import Slot, KVP_Type
+
+        frame_guid = uuid.uuid4().hex
+        book.session.execute(
+            Slot.__table__.insert().values(
+                obj_guid=lot_guid,
+                name="gncOwner",
+                slot_type=KVP_Type.KVP_TYPE_FRAME,
+                guid_val=frame_guid,
+            )
+        )
+        _verify_composite_write(
+            book.session, Slot.__table__,
+            {"obj_guid": lot_guid, "name": "gncOwner"},
+            f"gncOwner frame slot for lot {lot_guid[:8]}",
+        )
+        book.session.execute(
+            Slot.__table__.insert().values(
+                obj_guid=frame_guid,
+                name=BusinessMixin._GNC_OWNER_TYPE,
+                slot_type=KVP_Type.KVP_TYPE_GINT64,
+                int64_val=int(owner_type),
+            )
+        )
+        _verify_composite_write(
+            book.session, Slot.__table__,
+            {"obj_guid": frame_guid, "name": BusinessMixin._GNC_OWNER_TYPE},
+            f"gncOwner type slot for frame {frame_guid[:8]}",
+        )
+        book.session.execute(
+            Slot.__table__.insert().values(
+                obj_guid=frame_guid,
+                name=BusinessMixin._GNC_OWNER_GUID,
+                slot_type=KVP_Type.KVP_TYPE_GUID,
+                guid_val=owner_guid,
+            )
+        )
+        _verify_composite_write(
+            book.session, Slot.__table__,
+            {"obj_guid": frame_guid, "name": BusinessMixin._GNC_OWNER_GUID},
+            f"gncOwner guid slot for frame {frame_guid[:8]}",
+        )
+
+    @staticmethod
+    def _document_lot_guids(book) -> set[str]:
+        """GUIDs of every object that carries a LIVE document link —
+        a ``gncInvoice`` frame with a GUID inside it
+        (``gncInvoiceGetInvoiceFromLot`` reads the child, not the
+        frame). The frame alone is not a link: desktop leaves it
+        behind, empty, on a lot it has unposted."""
+        from sqlalchemy import text
+
+        return {
+            r[0] for r in book.session.execute(
+                text(
+                    "SELECT f.obj_guid FROM slots f "
+                    "JOIN slots c ON c.obj_guid = f.guid_val "
+                    "AND c.slot_type = 5 "
+                    "WHERE f.name = 'gncInvoice' AND f.slot_type = 9"
+                ),
+            ).fetchall()
+        }
+
+    @staticmethod
+    def _detach_invoice_from_lot(book, lot) -> None:
+        """``gncInvoiceDetachFromLot``: take the document link off a
+        lot, by raw SQL (the link is a GUID slot; see
+        ``_strip_guid_slots`` for why the ORM must not delete it).
+        The engine clears the value and leaves the ``gncInvoice``
+        frame standing, empty; so does this."""
+        from piecash.kvp import Slot
+        from sqlalchemy import text
+
+        frames = [
+            r[0] for r in book.session.execute(
+                text(
+                    "SELECT guid_val FROM slots WHERE obj_guid = :g "
+                    "AND name = 'gncInvoice' AND slot_type = 9"
+                ),
+                {"g": lot.guid},
+            ).fetchall() if r[0]
+        ]
+        for frame in frames:
+            book.session.execute(
+                Slot.__table__.delete().where(
+                    Slot.__table__.c.obj_guid == frame
+                )
+            )
+            _verify_delete(
+                book.session, Slot.__table__, {"obj_guid": frame},
+                f"invoice link of lot {lot.guid[:8]}",
+            )
+        book.session.expire(lot, ["slots"])
+
+    @staticmethod
+    def _lots_held_for(book, owner_guid: str) -> int:
+        """How many lots attached to this party or job still hold a
+        split — money on the books in its name with no document. The
+        lot names its owner by GUID; deleting the owner underneath it
+        leaves a balance nobody can be asked about."""
+        from sqlalchemy import text
+
+        return book.session.execute(
+            text(
+                "SELECT COUNT(DISTINCT f.obj_guid) FROM slots g "
+                "JOIN slots f ON f.guid_val = g.obj_guid "
+                "AND f.name = 'gncOwner' AND f.slot_type = 9 "
+                "JOIN splits s ON s.lot_guid = f.obj_guid "
+                "WHERE g.name = :gn AND g.guid_val = :owner"
+            ),
+            {"gn": BusinessMixin._GNC_OWNER_GUID, "owner": owner_guid},
+        ).scalar() or 0
+
+    def _destroy_lot(self, book, lot, label: str) -> None:
+        """``gnc_lot_destroy`` for a lot with nothing left in it."""
+        self._strip_guid_slots(book, [lot.guid], label, objects=[lot])
+        book.session.delete(lot)
+
+    def _end_owner(self, book, inv) -> tuple[int, str]:
+        """``gncOwnerGetEndOwner(gncInvoiceGetOwner(invoice))`` as
+        ``(owner_type, owner_guid)``: the customer or vendor behind a
+        job, the document's own owner otherwise. The party a payment
+        lot is attached to."""
+        _eff, job = self._resolve_owner_type_and_job(book, inv)
+        if job is not None:
+            return job.owner_type, job.owner_guid
+        return inv.owner_type, inv.owner_guid
+
+    @staticmethod
+    def _txn_type(txn) -> str:
+        """``xaccTransGetTxnType``: "I", "P", "L", or ""."""
+        if txn is None:
+            return ""
+        try:
+            return str(txn.get("trans-txn-type") or "")
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _lot_amount(lot) -> Decimal:
+        """``gnc_lot_get_balance``: the lot's split AMOUNTS summed, in
+        the account's commodity. What the payment-lot ports compare;
+        a document's settlement still reads through
+        ``_calculate_lot_balance``."""
+        return sum(
+            (
+                Decimal(str(s.quantity)) for s in lot.splits
+                if s.reconcile_state != "v"
+            ),
+            Decimal(0),
+        )
+
+    def _payment_lots(self, book, account=None) -> list[dict]:
+        """Every lot that is a party's and no document's, with money
+        in it: ``[{"lot", "owner": (type, guid), "amount", "since"}]``.
+
+        ``owner`` is the END owner (``gncOwnerLotMatchOwnerFunc``: a
+        lot attached to a job counts for the job's customer or
+        vendor). ``amount`` is ``_lot_amount`` — signed as the ledger
+        has it: negative in a receivable account is the customer's
+        credit, positive in a payable account is the business's with
+        the vendor. Empty lots (desktop leaves one behind after every
+        payment it moves into a document's lot, and sweeps them up
+        lazily) and lots that net to zero are skipped.
+        """
+        from sqlalchemy import text
+
+        rows = book.session.execute(
+            text(
+                "SELECT f.obj_guid, t.int64_val, g.guid_val "
+                "FROM slots f "
+                "JOIN slots t ON t.obj_guid = f.guid_val AND t.name = :tn "
+                "JOIN slots g ON g.obj_guid = f.guid_val AND g.name = :gn "
+                "WHERE f.name = :fn AND f.slot_type = 9"
+            ),
+            {
+                "tn": self._GNC_OWNER_TYPE, "gn": self._GNC_OWNER_GUID,
+                "fn": self._GNC_OWNER_ID,
+            },
+        ).fetchall()
+        owners = {r[0]: (int(r[1]), r[2]) for r in rows if r[2]}
+        if not owners:
+            return []
+        with_document = self._document_lot_guids(book)
+        guids = sorted(g for g in owners if g not in with_document)
+        out: list[dict] = []
+        for start in range(0, len(guids), 500):
+            query = book.session.query(piecash.Lot).filter(
+                piecash.Lot.guid.in_(guids[start:start + 500])
+            )
+            if account is not None:
+                query = query.filter(
+                    piecash.Lot.account_guid == account.guid
+                )
+            for lot in query.all():
+                splits = list(lot.splits)
+                amount = self._lot_amount(lot)
+                if not splits or amount == 0:
+                    continue
+                owner_type, owner_guid = owners[lot.guid]
+                if owner_type == 3:
+                    job = self._find_job_by_guid(book, owner_guid)
+                    if job is not None:
+                        owner_type, owner_guid = (
+                            job.owner_type, job.owner_guid,
+                        )
+                dates = [
+                    s.transaction.post_date for s in splits
+                    if s.transaction is not None
+                    and s.transaction.post_date
+                ]
+                out.append({
+                    "lot": lot,
+                    "owner": (owner_type, owner_guid),
+                    "amount": amount,
+                    "since": min(dates) if dates else None,
+                })
+        out.sort(key=lambda p: (p["since"] or date.min, p["lot"].guid))
+        return out
+
+    def _unapplied_payments(self, book) -> list[dict]:
+        """What each party has paid that no document has absorbed —
+        one row per party, account, and currency, oldest first.
+        ``amount`` is positive: money the party can settle a document
+        with (``pay_document`` with ``from_prepayment``). The one
+        reader behind the outstanding list, the dashboard's overdue
+        lines, and ``get_document``."""
+        grouped: dict[tuple, dict] = {}
+        for p in self._payment_lots(book):
+            acct = p["lot"].account
+            available = (
+                -p["amount"] if acct.type == "RECEIVABLE" else p["amount"]
+            )
+            if available <= 0:
+                continue
+            key = (p["owner"], acct.guid)
+            row = grouped.get(key)
+            if row is None:
+                owner = self._find_invoice_owner_by_guid(
+                    book, p["owner"][0], p["owner"][1],
+                )
+                row = grouped[key] = {
+                    "owner": p["owner"],
+                    "owner_type": self._OWNER_TYPE_TO_PARTY.get(
+                        p["owner"][0], "customer",
+                    ),
+                    "owner_id": getattr(owner, "id", None),
+                    "owner_name": owner.name if owner else None,
+                    "account": acct,
+                    "currency": acct.commodity.mnemonic,
+                    "amount": Decimal(0),
+                    "since": p["since"],
+                    "payments": 0,
+                }
+            row["amount"] += available
+            row["payments"] += 1
+            if p["since"] and (
+                row["since"] is None or p["since"] < row["since"]
+            ):
+                row["since"] = p["since"]
+        for row in grouped.values():
+            row["amount"] = row["amount"].quantize(
+                _commodity_quantum(row["account"].commodity)
+            )
+        return sorted(
+            grouped.values(),
+            key=lambda r: (r["since"] or date.min, r["owner_name"] or ""),
+        )
+
+    _OWNER_TYPE_TO_PARTY = {2: "customer", 4: "vendor", 5: "employee"}
+
+    @staticmethod
+    def _find_offsetting_split(lot, target_amount: Decimal):
+        """``gncOwnerFindOffsettingSplit``: the split in a payment lot
+        best suited to offset ``target_amount`` — opposite in sign,
+        ranked equal > larger > smaller, a real payment over a lot
+        link, and among equals the bigger amount."""
+        best = None
+        best_flags = 0
+        best_amount = Decimal(0)
+        for split in lot.splits:
+            txn = split.transaction
+            if txn is None:
+                continue
+            amount = Decimal(str(split.quantity))
+            if (target_amount > 0) == (amount > 0):
+                continue
+            if abs(amount) == abs(target_amount):
+                flags = 8
+            elif abs(amount) > abs(target_amount):
+                flags = 4
+            else:
+                flags = 2
+            if BusinessMixin._txn_type(txn) != "L":
+                flags += 1
+            if flags >= best_flags and abs(amount) > abs(best_amount):
+                best, best_flags, best_amount = split, flags, amount
+        return best
+
+    @staticmethod
+    def _reduce_split_to(split, target_amount: Decimal) -> bool:
+        """``gncOwnerReduceSplitTo``: cut a split down to
+        ``target_amount`` and put the rest in a new split beside it —
+        same transaction, same lot, same memo and action. The reduced
+        split's value is the target at the split's own rate, rounded
+        half-up to the transaction currency; the remainder's is what
+        is left of the original value, so the transaction still
+        balances to the cent."""
+        from fractions import Fraction
+
+        amount = Decimal(str(split.quantity))
+        if (amount > 0) != (target_amount > 0):
+            return False
+        if amount == target_amount or amount == 0:
+            return False
+        txn = split.transaction
+        value = Decimal(str(split.value))
+        target_value = _entry_math.round_half_up(
+            Fraction(target_amount) * Fraction(value) / Fraction(amount),
+            txn.currency.fraction,
+        )
+        lot = split.lot
+        _set_split_amounts(split, target_value, target_amount)
+        remainder = _new_split(
+            split.account, value - target_value, amount - target_amount,
+            txn.currency,
+            memo=split.memo, action=split.action,
+            reconcile_state=split.reconcile_state,
+            reconcile_date=split.reconcile_date,
+        )
+        remainder.transaction = txn
+        if lot is not None:
+            # _set_split_amounts reset the lot's flag to UNKNOWN (-1),
+            # which piecash reads as closed and refuses to add to.
+            _lot_hold_open(lot)
+            remainder.lot = lot
+        return True
+
+    def _offset_lots(self, from_lot, to_lot, cap: Decimal | None = None):
+        """``gncOwnerOffsetLots``: move a payment out of ``from_lot``
+        (never a document's lot) into ``to_lot``, cutting it down
+        first when it is more than ``to_lot`` needs. ``cap`` limits
+        how much may move — desktop always offsets all it can; a
+        caller applying a stated amount passes the rest of it.
+        Returns the moved split, or ``None`` when nothing could
+        move."""
+        target = self._lot_amount(to_lot)
+        if cap is not None and abs(target) > cap:
+            target = cap if target > 0 else -cap
+        if target == 0:
+            return None
+        split = self._find_offsetting_split(from_lot, target)
+        if split is None:
+            return None
+        if abs(Decimal(str(split.quantity))) > abs(target):
+            self._reduce_split_to(split, -target)
+        _lot_hold_open(to_lot)
+        split.lot = to_lot
+        return split
+
+    def _create_lot_link(self, book, from_lot, to_lot, owner_name: str):
+        """``gncOwnerCreateLotLink``: offset two DOCUMENT lots against
+        each other as far as the smaller allows, with one "Lot Link"
+        split per lot in a TXN_TYPE_LINK transaction — an existing
+        one on either lot extended, else a new one described by the
+        party's name and dated at the later of the two lots' latest
+        splits."""
+        post_acct = from_lot.account
+        from_balance = self._lot_amount(from_lot)
+        to_balance = self._lot_amount(to_lot)
+        if abs(from_balance) > abs(to_balance):
+            from_balance = -to_balance
+        else:
+            to_balance = -from_balance
+        link_date = self._lot_link_date(from_lot, to_lot)
+        from_split = _new_split(
+            post_acct, -from_balance, -from_balance,
+            post_acct.commodity, memo="", action="Lot Link",
+        )
+        to_split = _new_split(
+            post_acct, -to_balance, -to_balance,
+            post_acct.commodity, memo="", action="Lot Link",
+        )
+        txn = self._lot_link_transaction(from_lot, to_lot)
+        if txn is None:
+            txn = piecash.Transaction(
+                currency=post_acct.commodity,
+                description=owner_name,
+                post_date=link_date,
+                num="",
+                splits=[from_split, to_split],
+            )
+        else:
+            txn.splits.extend([from_split, to_split])
+            if link_date > txn.post_date:
+                txn.post_date = link_date
+        _lot_hold_open(from_lot)
+        from_split.lot = from_lot
+        _lot_hold_open(to_lot)
+        to_split.lot = to_lot
+        book.flush()
+        txn["trans-txn-type"] = "L"
+        self._set_lot_link_memo(txn)
+        self._drop_date_posted_slot(book, txn)
+        return txn
+
+    def _auto_apply_lots(self, book, lots: list, owner_name: str) -> None:
+        """``gncOwnerAutoApplyPaymentsWithLots``: balance a set of one
+        party's lots against each other as far as they go. Two
+        document lots get a lot link; two payment lots, the bigger
+        closes the smaller; a document and a payment, the payment
+        moves into the document's lot. Lots found empty are
+        destroyed, as desktop destroys them.
+
+        Balances are re-read before each pairing (desktop reads the
+        left lot's once per pass and relies on the callee to notice
+        there is nothing left to offset)."""
+        from sqlalchemy import text
+
+        lots = [lot for lot in lots if lot is not None]
+        if not lots:
+            return
+        with_document = self._document_lot_guids(book)
+        for lot in lots:
+            # piecash refuses a split into a lot whose raw flag is
+            # truthy, and -1 is. Every lot here is left at -1 again
+            # by the caller once the session has flushed.
+            _lot_hold_open(lot)
+        slots = list(lots)
+
+        def live(index: int):
+            lot = slots[index]
+            if lot is None:
+                return None
+            if not list(lot.splits):
+                self._destroy_lot(book, lot, "empty lot")
+                slots[index] = None
+                return None
+            return lot
+
+        for i in range(len(slots)):
+            left = live(i)
+            if left is None or self._lot_amount(left) == 0:
+                continue
+            left_has_doc = left.guid in with_document
+            for j in range(i + 1, len(slots)):
+                right = live(j)
+                if right is None:
+                    continue
+                left_balance = self._lot_amount(left)
+                right_balance = self._lot_amount(right)
+                if left_balance == 0:
+                    break
+                if right_balance == 0:
+                    continue
+                if right.account_guid != left.account_guid:
+                    continue
+                if (left_balance > 0) == (right_balance > 0):
+                    continue
+                right_has_doc = right.guid in with_document
+                if left_has_doc and right_has_doc:
+                    self._create_lot_link(book, left, right, owner_name)
+                elif not left_has_doc and not right_has_doc:
+                    if abs(left_balance) >= abs(right_balance):
+                        self._offset_lots(left, right)
+                    else:
+                        self._offset_lots(right, left)
+                elif left_has_doc:
+                    self._offset_lots(right, left)
+                else:
+                    self._offset_lots(left, right)
+
     @staticmethod
     def _migrate_invoice_link_keys(book) -> int:
         """Write path only: rename every pre-1.5 link child (`invoice`,
@@ -3199,9 +3700,23 @@ class BusinessMixin:
             if txn.guid == post_guid or split.reconcile_state == "v":
                 continue
             others = [o for o in txn.splits if o is not split]
-            in_lot = next((o for o in others if o.lot is not None), None)
+            # A lot link names the other document. A payment names the
+            # account the money moved through — never the sibling
+            # receivable/payable split an overpayment (or a payment
+            # shared between documents) leaves beside this one.
+            in_lot = (
+                next((o for o in others if o.lot is not None), None)
+                if self._txn_type(txn) == "L" else None
+            )
+            elsewhere = [
+                o for o in others if o.account_guid != split.account_guid
+            ]
             if in_lot is not None:
                 source = in_lot.lot.title or in_lot.account.fullname
+            elif elsewhere:
+                source = max(
+                    elsewhere, key=lambda o: abs(o.value),
+                ).account.fullname
             elif others:
                 source = max(others, key=lambda o: abs(o.value)).account.fullname
             else:
@@ -6282,6 +6797,22 @@ class BusinessMixin:
                 result["payments"] = self._document_payments(
                     book, inv, settlement,
                 )
+                if settlement["amount_due"] > 0:
+                    owner_key = self._end_owner(book, inv)
+                    on_account = sum(
+                        (
+                            u["amount"]
+                            for u in self._unapplied_payments(book)
+                            if u["owner"] == owner_key
+                            and u["account"].guid
+                            == settlement["post_account"].guid
+                        ),
+                        Decimal(0),
+                    )
+                    if on_account > 0:
+                        result["unapplied_payments_available"] = str(
+                            on_account
+                        )
 
             # Forward signal: surface available (or just-expired)
             # early-payment discount so get_invoice is actionable
@@ -6788,13 +7319,22 @@ class BusinessMixin:
         """Unpost a previously-posted document (invoice, bill,
         voucher, or credit note).
 
-        Reverses ``post_invoice``: deletes the posting transaction
-        and lot, clears the posted-state metadata. The document
-        returns to "open" — editable and re-postable.
+        Reverses ``post_invoice`` the way ``gncInvoiceUnpost`` does:
+        deletes the posting transaction, clears the posted-state
+        metadata, and returns the document to "open" — editable and
+        re-postable.
 
-        Refuses if the invoice has live payments applied —
-        unposting a partially-paid invoice would orphan the payment
-        splits and corrupt the lot's balance. Void payments first.
+        Payments are KEPT. A lot with payments in it loses its link
+        to the document and is attached to the document's owner
+        instead (``gncOwnerAttachToLot``): the money stays on the
+        books as the party's unapplied payment, and after re-posting
+        ``pay_invoice(from_prepayment=True)`` settles the document
+        from it. A lot-link transaction (a credit note applied, or
+        the document this one was applied to) is removed, and the
+        lots it joined are balanced against each other again. An
+        empty lot is destroyed. The old refusal ("void payments
+        first") sent callers to void a bank line that may already be
+        reconciled (adversarial review 2026-09-30, C49).
 
         Args:
             invoice_id: Human-readable ID (e.g., '000001').
@@ -6805,7 +7345,7 @@ class BusinessMixin:
             ``{"id": "000015", "type": "invoice", "status": "unposted"}``.
 
         Raises:
-            ValueError: not found, not posted, or payments applied.
+            ValueError: not found or not posted.
         """
         ot = self._parse_owner_type(owner_type)
 
@@ -6855,29 +7395,53 @@ class BusinessMixin:
             txn = inv.post_txn
             lot = inv.post_lot
 
-            # Only *live* payment splits block unposting. The lot
-            # always holds the posting split; each pay_invoice adds
-            # one more. Voided payments keep zeroed splits for audit
-            # trail, so a naive ``len(lot.splits) > 1`` would count
-            # them as still-applied — filter to non-posting,
-            # non-zero-value splits.
+            # What else is in the lot besides the posting: payments
+            # (kept, with the lot, as the owner's) and lot-link
+            # transactions (removed; the lots they joined re-balanced)
+            # — gncInvoiceUnpost. Captured before anything is deleted.
             posting_txn_guid = txn.guid if txn else None
-            real_payment_splits = []
-            if lot is not None:
-                for s in lot.splits:
-                    if (
-                        posting_txn_guid is not None
-                        and s.transaction_guid == posting_txn_guid
-                    ):
-                        continue
-                    if Decimal(str(s.value)) == 0:
-                        continue
-                    real_payment_splits.append(s)
-            if real_payment_splits:
-                raise ValueError(
-                    f"{doc_label} {invoice_id} has payments applied. "
-                    f"Void payments first, then unpost."
-                )
+            others = [
+                s for s in (lot.splits if lot is not None else [])
+                if s.transaction_guid != posting_txn_guid
+            ]
+            link_txns: list = []
+            for s in others:
+                if (
+                    self._txn_type(s.transaction) == "L"
+                    and s.transaction not in link_txns
+                ):
+                    link_txns.append(s.transaction)
+            kept_splits = [
+                s for s in others if s.transaction not in link_txns
+            ]
+            quantum = (
+                _commodity_quantum(lot.account.commodity)
+                if lot is not None else Decimal("0.01")
+            )
+            prefixes = self._transaction_prefix_map(book)
+            payments_kept = [
+                {
+                    "guid": prefixes.get(
+                        s.transaction_guid, s.transaction_guid[:8],
+                    ),
+                    "date": (
+                        s.transaction.post_date.isoformat()
+                        if s.transaction.post_date else None
+                    ),
+                    "amount": str(
+                        abs(Decimal(str(s.quantity))).quantize(quantum)
+                    ),
+                }
+                for s in kept_splits if s.reconcile_state != "v"
+            ]
+            kept_total = sum(
+                (Decimal(p["amount"]) for p in payments_kept), Decimal(0),
+            )
+            kept_currency = (
+                lot.account.commodity.mnemonic if lot is not None else ""
+            )
+            owner_name = self._end_owner_name(book, inv)
+            lot_owner = (inv.owner_type, inv.owner_guid)
 
             # Clear posted-state pointers BEFORE deleting the
             # transaction/lot — the ORM cascade can otherwise
@@ -6908,32 +7472,65 @@ class BusinessMixin:
             # This site used to let the sweep happen and re-insert
             # two of the slots by hand, for credit notes only
             # (adversarial review 2026-09-30, C5).
+            label = f"unpost of {doc_label} {inv_id_snapshot}"
             owners = []
             objects = []
             if txn is not None:
                 txn_splits = list(txn.splits)
                 owners += [txn.guid] + [s.guid for s in txn_splits]
                 objects += [txn, *txn_splits]
-            if lot is not None:
-                owners.append(lot.guid)
-                objects.append(lot)
             if owners:
-                self._strip_guid_slots(
-                    book, owners,
-                    f"unpost of {doc_label} {inv_id_snapshot}",
-                    objects=objects,
-                )
-
-            # The transaction delete cascades its splits; the lot is
-            # empty now that the posted-state pointers are cleared.
+                self._strip_guid_slots(book, owners, label, objects=objects)
+            # The transaction delete cascades its splits.
             if txn is not None:
                 book.session.delete(txn)
+            book.flush()
+
+            # Lot links: remember the lots each one joined, remove it,
+            # and balance those lots against each other again.
+            for link in link_txns:
+                link_splits = list(link.splits)
+                other_lots: list = []
+                for s in link_splits:
+                    if (
+                        s.lot is not None and s.lot is not lot
+                        and s.lot not in other_lots
+                    ):
+                        other_lots.append(s.lot)
+                self._strip_guid_slots(
+                    book, [link.guid] + [s.guid for s in link_splits],
+                    label, objects=[link, *link_splits],
+                )
+                book.session.delete(link)
+                book.flush()
+                for other in other_lots:
+                    book.session.expire(other, ["splits"])
+                self._auto_apply_lots(book, other_lots, owner_name)
+                book.flush()
+                for other in other_lots:
+                    if other in book.session.deleted:
+                        continue
+                    if not list(other.splits):
+                        self._destroy_lot(book, other, label)
+                    else:
+                        other.is_closed = _LOT_CLOSED_UNKNOWN
+
             if lot is not None:
-                book.session.delete(lot)
+                book.session.expire(lot, ["splits"])
+                if list(lot.splits):
+                    # Payments remain: the lot stops being the
+                    # document's and becomes its owner's.
+                    self._detach_invoice_from_lot(book, lot)
+                    self._attach_owner_to_lot(
+                        book, lot.guid, lot_owner[0], lot_owner[1],
+                    )
+                    lot.is_closed = _LOT_CLOSED_UNKNOWN
+                else:
+                    self._destroy_lot(book, lot, label)
 
             book.save()
 
-            return {
+            result = {
                 **shapes,
                 "id": inv_id_snapshot,
                 "type": (
@@ -6945,12 +7542,27 @@ class BusinessMixin:
                 ),
                 "status": "unposted",
             }
+            if payments_kept:
+                n = len(payments_kept)
+                result["payments_kept"] = payments_kept
+                result["note"] = (
+                    f"{n} payment{'' if n == 1 else 's'} totalling "
+                    f"{kept_currency} {kept_total.quantize(quantum)} "
+                    f"stay{'s' if n == 1 else ''} on the books as "
+                    f"{owner_name}'s unapplied payment. After "
+                    f"re-posting, settle the document from "
+                    f"{'it' if n == 1 else 'them'} with pay_document "
+                    f"(from_prepayment=true)."
+                )
+            if link_txns:
+                result["links_removed"] = len(link_txns)
+            return result
 
     def pay_invoice(
         self,
         invoice_id: str,
-        payment_account: str,
-        amount: str,
+        payment_account: str | None = None,
+        amount: str | None = None,
         payment_date: str | None = None,
         description: str | None = None,
         owner_type: str | None = None,
@@ -6960,6 +7572,9 @@ class BusinessMixin:
         force: bool = False,
         memo: str = "",
         dry_run: bool = False,
+        allow_prepayment: bool = False,
+        from_prepayment: bool = False,
+        payment_account_amount: str | None = None,
     ) -> dict:
         """Record a payment against a posted invoice or bill.
 
@@ -6998,6 +7613,29 @@ class BusinessMixin:
         payment. ``discount_account`` overrides the routed account
         (resolution mirrors ``fx_account``).
 
+        ``payment_account_amount`` is what the payment account
+        actually moved, for a cross-currency payment — the figure on
+        the bank line, as desktop's payment dialog lets the user set
+        it. The rate paid is then that amount over ``amount``; no
+        quote is consulted (or needed), and it is the rate recorded
+        as the day's price.
+
+        ``allow_prepayment=True`` accepts an ``amount`` above what the
+        document still owes: the balance settles the document and the
+        excess stays in the receivable or payable account in a lot of
+        its own, attached to the party — GnuCash's pre-payment lot
+        (``gncOwnerApplyPaymentSecs``; the receivable/payable leg is
+        split in two inside the one payment transaction, as
+        ``gncOwnerReduceSplitTo`` splits it).
+
+        ``from_prepayment=True`` settles the document from the party's
+        unapplied payments instead of new money: no transaction is
+        created — the earlier payment's own split moves into the
+        document's lot, cut down first when it is more than is owed
+        (``gncOwnerAutoApplyPaymentsWithLots``). ``payment_account``
+        does not apply; ``amount`` is optional and defaults to all
+        that can be applied.
+
         Returns:
             Payment details and remaining balance. ``status`` is
             ``"paid"`` when the lot settles to zero, ``"partial"``
@@ -7015,9 +7653,49 @@ class BusinessMixin:
         """
         ot = self._parse_owner_type(owner_type)
 
+        if from_prepayment:
+            # No money moves and no transaction is written, so every
+            # argument that describes one is refused rather than
+            # ignored.
+            described = {
+                "payment_account": payment_account,
+                "payment_account_amount": payment_account_amount,
+                "payment_date": payment_date,
+                "description": description,
+                "memo": memo,
+                "fx_account": fx_account,
+                "discount_account": discount_account,
+                "apply_discount": apply_discount,
+                "allow_prepayment": allow_prepayment,
+            }
+            given = [name for name, value in described.items() if value]
+            if given:
+                raise ValueError(
+                    f"{', '.join(given)} "
+                    f"{'does' if len(given) == 1 else 'do'} not apply "
+                    f"with from_prepayment=True: no money moves and no "
+                    f"transaction is created — the party's earlier "
+                    f"payment is applied as it stands. Pass only the "
+                    f"document and, optionally, amount."
+                )
+            return self._settle_from_prepayment(
+                invoice_id, amount, ot, dry_run,
+            )
+        if payment_account is None or amount is None:
+            raise ValueError(
+                "payment_account and amount are required. (Only "
+                "from_prepayment=True, which settles a document from "
+                "the party's unapplied payments, goes without them.)"
+            )
+
         payment_amount = _to_decimal(amount)
         if payment_amount <= 0:
             raise ValueError("Payment amount must be positive")
+        received = None
+        if payment_account_amount is not None:
+            received = _to_decimal(payment_account_amount)
+            if received <= 0:
+                raise ValueError("payment_account_amount must be positive")
 
         parsed_date = (
             date.fromisoformat(payment_date) if payment_date
@@ -7148,9 +7826,35 @@ class BusinessMixin:
                     fx_stale_overrides.append(stale_meta)
                 return qty, rate
 
-            pay_quantity, exchange_rate = _convert(
-                payment_amount, pay_acct.commodity,
-            )
+            if received is not None:
+                # What the bank moved is a fact; the quote is a guess
+                # at it. Desktop's payment dialog lets the user set
+                # the transfer amount for exactly this reason
+                # (adversarial review 2026-09-30, C22: a two-day-old
+                # quote booked USD 1,120.00 against a statement line
+                # of 1,003.47 and re-dated the quote as today's
+                # price).
+                if pay_acct.commodity == inv.currency:
+                    raise ValueError(
+                        f"payment_account_amount applies only when the "
+                        f"payment account is in another currency than "
+                        f"the document. {pay_acct.fullname!r} and "
+                        f"{self._doc_label_for(inv.owner_type)} "
+                        f"{invoice_id} are both in "
+                        f"{inv.currency.mnemonic}: pass amount alone."
+                    )
+                error = _money_precision_error(
+                    received, pay_acct.commodity,
+                    "payment_account_amount",
+                )
+                if error:
+                    raise error
+                pay_quantity = received
+                exchange_rate = received / payment_amount
+            else:
+                pay_quantity, exchange_rate = _convert(
+                    payment_amount, pay_acct.commodity,
+                )
             post_quantity, _post_rate = _convert(
                 payment_amount, post_acct.commodity,
             )
@@ -7211,20 +7915,75 @@ class BusinessMixin:
             remaining_before_pay = self._calculate_lot_balance(lot_obj)
             if effective_is_bill:
                 remaining_before_pay = -remaining_before_pay
+            # The part of ``amount`` that settles this document, and
+            # the part beyond it. The excess is refused unless the
+            # caller says the money really moved
+            # (``allow_prepayment``); it then stays in the post
+            # account in a lot of its own, attached to the party, as
+            # desktop keeps it. The refusal used to recommend a
+            # credit note for the excess, which books cash the bank
+            # never saw short and income the business never earned
+            # down (adversarial review 2026-09-30, C37).
+            settle_amount = payment_amount
+            excess = Decimal("0")
             if payment_amount > remaining_before_pay:
                 doc_label = self._doc_label_for(inv.owner_type)
-                raise ValueError(
-                    f"Payment of {payment_amount} "
-                    f"{inv.currency.mnemonic} exceeds the "
-                    f"outstanding balance of {remaining_before_pay} "
-                    f"{inv.currency.mnemonic} on {doc_label} "
-                    f"{invoice_id}. Pay at most the outstanding "
-                    f"balance. To record a genuine overpayment, pay "
-                    f"the outstanding balance and book the excess as "
-                    f"a credit note (create_document with "
-                    f"document_type='credit_note') so it shows "
-                    f"as credit owed to the counterparty rather than "
-                    f"a phantom receivable."
+                ccy = inv.currency.mnemonic
+                owed_now = remaining_before_pay.quantize(
+                    _commodity_quantum(inv.currency)
+                )
+                if not allow_prepayment:
+                    raise ValueError(
+                        f"Payment of {payment_amount} {ccy} exceeds "
+                        f"the outstanding balance of "
+                        f"{owed_now} {ccy} on {doc_label} "
+                        f"{invoice_id}. If {payment_amount} {ccy} is "
+                        f"what really moved, pass "
+                        f"allow_prepayment=true: "
+                        f"{max(owed_now, Decimal(0))} "
+                        f"settles the document and the rest is held "
+                        f"as the party's unapplied payment, which a "
+                        f"later document can be settled from "
+                        f"(from_prepayment=true). Otherwise pay at "
+                        f"most the outstanding balance."
+                    )
+                if remaining_before_pay <= 0:
+                    raise ValueError(
+                        f"{doc_label} {invoice_id} has nothing left to "
+                        f"pay (balance {owed_now} {ccy}). "
+                        f"allow_prepayment holds the excess of a "
+                        f"payment that also settles a document; record "
+                        f"this payment against a document that is "
+                        f"still open."
+                    )
+                if apply_discount:
+                    raise ValueError(
+                        f"apply_discount=True with an amount "
+                        f"({payment_amount} {ccy}) above the "
+                        f"outstanding balance ({owed_now} "
+                        f"{ccy}): a payment cannot both fall short by "
+                        f"a discount and exceed the balance."
+                    )
+                if post_acct.commodity != inv.currency:
+                    raise ValueError(
+                        f"allow_prepayment is not available on "
+                        f"{doc_label} {invoice_id}: it is posted to "
+                        f"{post_acct.fullname!r} "
+                        f"({post_acct.commodity.mnemonic}), not an "
+                        f"account in its own currency ({ccy}), and a "
+                        f"prepayment is held in the account's "
+                        f"currency. Pay the outstanding balance."
+                    )
+                settle_amount = remaining_before_pay
+                excess = payment_amount - remaining_before_pay
+            # The settled part's share of what the payment account
+            # moved (all of it when nothing is in excess).
+            settle_pay_quantity = pay_quantity
+            if excess:
+                settle_pay_quantity = (
+                    pay_quantity * settle_amount / payment_amount
+                ).quantize(
+                    _commodity_quantum(pay_acct.commodity), ROUND_HALF_UP,
                 )
 
             # ── Early-payment discount validation ────────────────
@@ -7390,8 +8149,13 @@ class BusinessMixin:
                     full_settle_amount, post_acct.commodity,
                 )
             else:
-                full_settle_amount = payment_amount
-                full_settle_post_qty = post_quantity
+                full_settle_amount = settle_amount
+                # With an excess the post account is in the
+                # document's currency (checked above), so the settled
+                # quantity is the settled amount itself.
+                full_settle_post_qty = (
+                    settle_amount if excess else post_quantity
+                )
 
             # When the post account's commodity differs from the
             # invoice currency, relieve the lot at the rate it is
@@ -7457,6 +8221,24 @@ class BusinessMixin:
                     "quantity": disc_value_sign * disc_quantity,
                     "memo": "Early-payment discount",
                 })
+            # The excess: a second split in the post account, for its
+            # own lot. Its value is its share of what the payment
+            # account moved (gncOwnerReduceSplitTo: the remainder
+            # keeps what is left of the original value).
+            prepay_row: dict | None = None
+            if excess:
+                prepay_row = {
+                    "account": post_acct.fullname,
+                    "value": sgn * (
+                        pay_quantity - settle_pay_quantity
+                        if desktop_currency else excess
+                    ),
+                    "quantity": sgn * excess,
+                    "memo": memo,
+                    "action": "Payment",
+                    "prepayment": True,
+                }
+                proposed.append(prepay_row)
 
             # Realized FX gain/loss on post→pay rate drift, factored
             # into _compute_fx_gain_loss (the four sign quadrants
@@ -7477,8 +8259,10 @@ class BusinessMixin:
                     inv=inv,
                     is_bill=effective_is_bill,
                     pay_acct=pay_acct,
-                    payment_amount=payment_amount,
-                    pay_quantity=pay_quantity,
+                    # Realized on what settles the document; an
+                    # excess has no posting rate to drift from.
+                    payment_amount=settle_amount,
+                    pay_quantity=settle_pay_quantity,
                     parsed_date=parsed_date,
                     exchange_rate=exchange_rate,
                     fx_account=fx_account,
@@ -7545,6 +8329,17 @@ class BusinessMixin:
                         }
                         if fx_result["fx_notice"] is not None:
                             result["fx_notice"] = fx_result["fx_notice"]
+                if excess:
+                    result["prepayment"] = {
+                        "amount": str(excess),
+                        "currency": inv.currency.mnemonic,
+                        "party": owner_name,
+                        "note": (
+                            "Held in the post account as the party's "
+                            "unapplied payment. Settle a later document "
+                            "from it with from_prepayment=true."
+                        ),
+                    }
                 if discount_booked:
                     # ``account`` is the canonical path — the resolver
                     # may have picked an account the caller didn't pass.
@@ -7625,6 +8420,13 @@ class BusinessMixin:
                 splits.append(discount_split)
             if fx_result is not None:
                 splits.append(fx_result["split"])
+            prepay_split = None
+            if prepay_row is not None:
+                prepay_split = _new_split(
+                    post_acct, prepay_row["value"], prepay_row["quantity"],
+                    txn_currency, memo=memo, action="Payment",
+                )
+                splits.append(prepay_split)
 
             txn = piecash.Transaction(
                 currency=txn_currency,
@@ -7636,6 +8438,17 @@ class BusinessMixin:
 
             _lot_cache_flag(lot_obj)
             ar_ap_split.lot = lot_obj
+            prepay_lot = None
+            if prepay_split is not None:
+                # gncOwnerCreatePaymentLotSecs: a lot with no title,
+                # attached to the END owner (the customer or vendor
+                # behind a job).
+                prepay_lot = piecash.Lot(
+                    title=None, account=post_acct, notes=None,
+                    is_closed=_LOT_OPEN,
+                )
+                _lot_cache_flag(prepay_lot)
+                prepay_split.lot = prepay_lot
 
             if desktop_currency:
                 # The day's price is the rate PAID, written once the
@@ -7663,6 +8476,12 @@ class BusinessMixin:
             # date-posted slot and leaves the lot flag at -1.
             self._drop_date_posted_slot(book, txn)
             lot_obj.is_closed = _LOT_CLOSED_UNKNOWN
+            if prepay_lot is not None:
+                end_type, end_guid = self._end_owner(book, inv)
+                self._attach_owner_to_lot(
+                    book, prepay_lot.guid, end_type, end_guid,
+                )
+                prepay_lot.is_closed = _LOT_CLOSED_UNKNOWN
 
             remaining = self._calculate_lot_balance(lot_obj)
             if remaining == Decimal(0):
@@ -7714,6 +8533,203 @@ class BusinessMixin:
                 result["total_paid"] = str(total_paid)
             _attach_extras(result)
 
+        result.update(shapes)
+        return result
+
+    def _settle_from_prepayment(
+        self, invoice_id: str, amount: str | None, ot, dry_run: bool,
+    ) -> dict:
+        """``pay_invoice(from_prepayment=True)``: settle a posted
+        document from what its party has already paid.
+
+        ``gncInvoiceAutoApplyPayments`` narrowed to payments: the
+        party's payment lots in the document's post account, oldest
+        first, each moved into the document's lot through
+        ``_offset_lots`` until the document is settled, the payments
+        run out, or ``amount`` (when given) is reached. Nothing is
+        created: the earlier payment transaction's own split changes
+        lot, and is cut in two first when it is more than is needed.
+        A payment lot left empty is destroyed.
+        """
+        with self.open(readonly=dry_run) as book:
+            shapes = {} if dry_run else self._upgrade_book_shapes(book)
+            inv = self._find_invoice(book, invoice_id, owner_type=ot)
+            if not inv:
+                raise ValueError(f"Document not found: {invoice_id}")
+            doc_label = self._doc_label_for(inv.owner_type)
+            if not _is_invoice_posted(inv):
+                raise ValueError(
+                    f"{doc_label} {invoice_id} is not posted — post it "
+                    f"before settling it from a prepayment"
+                )
+            settlement = self._document_settlement(book, inv)
+            if settlement is None:
+                raise ValueError(f"Lot not found for invoice {invoice_id}")
+            post_acct = settlement["post_account"]
+            doc_lot = settlement["lot"]
+            if inv.post_txn is not None and all(
+                s.reconcile_state == "v" for s in inv.post_txn.splits
+            ):
+                raise ValueError(
+                    f"Cannot settle {doc_label} {invoice_id}: its "
+                    f"posting transaction has been voided. Unvoid it "
+                    f"(or unpost and re-post the document) first."
+                )
+            ccy = post_acct.commodity.mnemonic
+            if post_acct.commodity != inv.currency:
+                raise ValueError(
+                    f"from_prepayment is not available on {doc_label} "
+                    f"{invoice_id}: it is posted to "
+                    f"{post_acct.fullname!r} ({ccy}), not an account in "
+                    f"its own currency ({inv.currency.mnemonic})."
+                )
+            quantum = _commodity_quantum(post_acct.commodity)
+            owed_signed = self._lot_amount(doc_lot)
+            if owed_signed == 0:
+                raise ValueError(
+                    f"{doc_label} {invoice_id} has no remaining "
+                    f"balance — nothing to settle."
+                )
+            owner_key = self._end_owner(book, inv)
+            owner = self._find_invoice_owner_by_guid(
+                book, owner_key[0], owner_key[1],
+            )
+            owner_name = owner.name if owner else "the party"
+            # Usable: the same party's, in the same account, on the
+            # other side of the ledger from what the document owes.
+            lots = [
+                p for p in self._payment_lots(book, post_acct)
+                if p["owner"] == owner_key
+                and (p["amount"] > 0) != (owed_signed > 0)
+            ]
+            available = sum((abs(p["amount"]) for p in lots), Decimal(0))
+            if not lots:
+                raise ValueError(
+                    f"{owner_name} has no unapplied payment in "
+                    f"{post_acct.fullname!r} to settle {doc_label} "
+                    f"{invoice_id} from. Record the payment itself: "
+                    f"pass payment_account and amount."
+                )
+            owed = abs(owed_signed)
+            if amount is None:
+                apply_amount = min(owed, available)
+            else:
+                apply_amount = _to_decimal(amount)
+                if apply_amount <= 0:
+                    raise ValueError("amount must be positive")
+                error = _money_precision_error(
+                    apply_amount, post_acct.commodity, "amount",
+                )
+                if error:
+                    raise error
+                if apply_amount > owed or apply_amount > available:
+                    raise ValueError(
+                        f"amount {apply_amount} {ccy} is more than can "
+                        f"be applied: {doc_label} {invoice_id} owes "
+                        f"{owed.quantize(quantum)} {ccy} and "
+                        f"{owner_name} has "
+                        f"{available.quantize(quantum)} {ccy} unapplied. "
+                        f"Omit amount to apply "
+                        f"{min(owed, available).quantize(quantum)}."
+                    )
+            is_credit_note = self._get_is_credit_note(inv)
+            doc_type = (
+                "credit_note" if is_credit_note
+                else self._OWNER_TYPE_TO_RESPONSE_TYPE.get(
+                    self._effective_owner_type(book, inv), "invoice",
+                )
+            )
+            prefixes = self._transaction_prefix_map(book)
+
+            if dry_run:
+                left = apply_amount
+                plan = []
+                for p in lots:
+                    if left <= 0:
+                        break
+                    take = min(abs(p["amount"]), left)
+                    left -= take
+                    plan.append({
+                        "since": p["since"].isoformat() if p["since"] else None,
+                        "amount": str(take.quantize(quantum)),
+                    })
+                return {
+                    "dry_run": True,
+                    "id": inv.id,
+                    "type": doc_type,
+                    "status": "would_apply",
+                    "applied_from_prepayment": str(
+                        apply_amount.quantize(quantum)
+                    ),
+                    "remaining_balance_after": str(
+                        (settlement["amount_due"] - apply_amount).quantize(
+                            quantum
+                        )
+                    ),
+                    "unapplied_after": str(
+                        (available - apply_amount).quantize(quantum)
+                    ),
+                    "currency": ccy,
+                    "from_payments": plan,
+                }
+
+            left = apply_amount
+            used: list[dict] = []
+            touched = [doc_lot]
+            _lot_cache_flag(doc_lot)
+            for p in lots:
+                if left <= 0:
+                    break
+                lot = p["lot"]
+                _lot_hold_open(lot)
+                touched.append(lot)
+                while left > 0:
+                    split = self._offset_lots(lot, doc_lot, cap=left)
+                    if split is None:
+                        break
+                    moved = abs(Decimal(str(split.quantity)))
+                    left -= moved
+                    txn = split.transaction
+                    used.append({
+                        "guid": prefixes.get(txn.guid, txn.guid[:8]),
+                        "date": (
+                            txn.post_date.isoformat()
+                            if txn.post_date else None
+                        ),
+                        "amount": str(moved.quantize(quantum)),
+                    })
+            if left > 0:
+                # Unreachable while the sums above hold; refuse rather
+                # than report an application that did not happen.
+                raise RuntimeError(
+                    f"could not apply {left} of {apply_amount} {ccy} "
+                    f"from {owner_name}'s unapplied payments"
+                )
+            book.flush()
+            for lot in touched:
+                if lot is not doc_lot and not list(lot.splits):
+                    self._destroy_lot(book, lot, "emptied payment lot")
+                else:
+                    lot.is_closed = _LOT_CLOSED_UNKNOWN
+            book.save()
+
+            settlement = self._document_settlement(book, inv)
+            remaining = settlement["amount_due"]
+            result = {
+                "id": inv.id,
+                "type": doc_type,
+                "status": "partial" if remaining > 0 else "paid",
+                "applied_from_prepayment": str(
+                    apply_amount.quantize(quantum)
+                ),
+                "remaining_balance": str(remaining),
+                "total_paid": str(settlement["amount_paid"]),
+                "unapplied_remaining": str(
+                    (available - apply_amount).quantize(quantum)
+                ),
+                "currency": ccy,
+                "from_payments": used,
+            }
         result.update(shapes)
         return result
 
@@ -8506,6 +9522,18 @@ class BusinessMixin:
                         f"Delete the jobs first (delete_job), or "
                         f"retire the {label} with active=false."
                     )
+            held = BusinessMixin._lots_held_for(book, entity_guid)
+            if held:
+                blockers.append(
+                    f"{held} unapplied payment"
+                    f"{'' if held == 1 else 's'} on the books"
+                )
+                remedies.append(
+                    f"Settle a document from "
+                    f"{'it' if held == 1 else 'them'} (pay_document "
+                    f"from_prepayment=true), or retire the {label} "
+                    f"with active=false."
+                )
             if blockers:
                 raise ValueError(
                     f"Cannot delete {label} with "
@@ -8929,6 +9957,21 @@ class BusinessMixin:
                 Invoice.owner_guid == job.guid,
             ).all()
 
+            # A lot left behind by unposting one of the job's paid
+            # documents is attached to the JOB (gncInvoiceUnpost
+            # attaches the document's own owner).
+            held = self._lots_held_for(book, job.guid)
+            if held:
+                raise ValueError(
+                    f"Job '{job_id}' has {held} unapplied payment"
+                    f"{'' if held == 1 else 's'} on the books (kept "
+                    f"when one of its documents was unposted). Settle "
+                    f"a document from "
+                    f"{'it' if held == 1 else 'them'} first "
+                    f"(pay_document from_prepayment=true), or retire "
+                    f"the job with active=false."
+                )
+
             reparented_count = 0
             if linked:
                 if not force:
@@ -9134,6 +10177,35 @@ class BusinessMixin:
                 key=lambda r: -(r["days_past_due"] or 0),
             )
 
+            # What parties have paid that no document has absorbed —
+            # the other half of "what is outstanding". Without it a
+            # customer who prepaid reads as owing the whole invoice
+            # (adversarial review 2026-09-30, C50).
+            wanted_side = (
+                None if ot is None else self._is_bill_side(ot)
+            )
+            wanted_owner = (
+                customer.guid if customer_id
+                else vendor.guid if vendor_id else None
+            )
+            unapplied = [
+                {
+                    "party_type": u["owner_type"],
+                    "party_id": u["owner_id"],
+                    "party_name": u["owner_name"],
+                    "account": u["account"].fullname,
+                    "currency": u["currency"],
+                    "amount": str(u["amount"]),
+                    "since": u["since"].isoformat() if u["since"] else None,
+                }
+                for u in self._unapplied_payments(book)
+                if (
+                    wanted_side is None
+                    or self._is_bill_side(u["owner"][0]) == wanted_side
+                )
+                and (wanted_owner is None or u["owner"][1] == wanted_owner)
+            ]
+
             page, indicator = _paginate(
                 results,
                 offset=offset,
@@ -9143,14 +10215,31 @@ class BusinessMixin:
             )
             if compact:
                 body = _format_outstanding_invoices_compact(page)
-                return f"{indicator}\n{body}" if body else indicator
-            return {
+                text_out = f"{indicator}\n{body}" if body else indicator
+                if unapplied:
+                    lines = [
+                        "Unapplied payments (settle a document from one "
+                        "with pay_document from_prepayment=true):"
+                    ]
+                    for u in unapplied:
+                        lines.append("\t".join([
+                            _tsv_cell(u["party_name"] or ""),
+                            f"{u['currency']} {u['amount']}",
+                            f"since {u['since']}",
+                            _tsv_cell(u["account"]),
+                        ]))
+                    text_out += "\n" + "\n".join(lines)
+                return text_out
+            envelope = {
                 "showing": indicator,
                 "total": len(results),
                 "offset": offset,
                 "count": len(page),
                 "invoices": page,
             }
+            if unapplied:
+                envelope["unapplied_payments"] = unapplied
+            return envelope
 
     def get_job_report(self, job_id: str) -> dict:
         """Per-job summary: billed / paid / outstanding totals

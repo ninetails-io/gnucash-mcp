@@ -213,7 +213,9 @@ class TestChokepointLock:
     def test_every_split_assignment_caches_the_flag_first(self):
         """piecash's guard reads the raw column for truth, so each
         ``x.lot = lot`` must be preceded by ``_lot_cache_flag(lot)``
-        within a few lines."""
+        within a few lines — or, in the ports of GnuCash's payment-lot
+        arithmetic, by ``_lot_hold_open(lot)`` (see its docstring for
+        why the computed flag is wrong mid-move)."""
         offenders = []
         for path in sorted(self.BOOK_DIR.glob("*.py")):
             lines = path.read_text().splitlines()
@@ -222,7 +224,10 @@ class TestChokepointLock:
                 if not m:
                     continue
                 window = "\n".join(lines[max(0, i - 6):i])
-                if f"_lot_cache_flag({m.group(1)})" not in window:
+                if (
+                    f"_lot_cache_flag({m.group(1)})" not in window
+                    and f"_lot_hold_open({m.group(1)})" not in window
+                ):
                     offenders.append(f"{path.name}:{i + 1}: {line.strip()}")
         assert not offenders, "\n".join(offenders)
 

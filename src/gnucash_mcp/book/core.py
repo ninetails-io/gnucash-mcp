@@ -1313,6 +1313,25 @@ class CoreMixin:
                 type_labels = getattr(
                     self, "_OWNER_TYPE_TO_RESPONSE_TYPE", {},
                 )
+                # What each party has paid that no document has
+                # absorbed, keyed by (party, post account). A past-due
+                # line that leaves it out reads as money to chase
+                # when the customer has already paid — and invites a
+                # second payment (adversarial review 2026-09-30, C50).
+                unapplied: dict[tuple, dict] = {}
+                unapplied_payments = getattr(
+                    self, "_unapplied_payments", None,
+                )
+                end_owner = getattr(self, "_end_owner", None)
+                if (
+                    unapplied_payments is not None
+                    and end_owner is not None
+                    and any(row["overdue"] for row in open_documents)
+                ):
+                    unapplied = {
+                        (u["owner"], u["account"].guid): u
+                        for u in unapplied_payments(book)
+                    }
                 overdue_inv_entries: list[tuple[int, str]] = []
                 item_failures: list[str] = []
                 for row in open_documents:
@@ -1351,6 +1370,20 @@ class CoreMixin:
                             f"{'s' if days_overdue != 1 else ''} overdue, "
                             f"{currency} {amount_str}"
                         )
+                        held = (
+                            unapplied.get(
+                                (end_owner(book, inv), inv.post_acc_guid),
+                            )
+                            if unapplied else None
+                        )
+                        if held is not None:
+                            msg += (
+                                f" — {held['owner_name'] or owner_name} "
+                                f"has {held['currency']} "
+                                f"{held['amount']:,} in unapplied "
+                                f"payments; settle from them with "
+                                f"pay_document (from_prepayment=true)"
+                            )
                         overdue_inv_entries.append(
                             (days_overdue, msg),
                         )

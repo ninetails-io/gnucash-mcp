@@ -47,6 +47,11 @@ REGISTRY: dict[str, tuple[KVP_Type, str]] = {
     "gncInvoice": (K.KVP_TYPE_FRAME, "gncInvoice.c GNC_INVOICE_ID"),
     "gncInvoice/invoice-guid": (K.KVP_TYPE_GUID, "gncInvoice.c GNC_INVOICE_GUID"),
     "credit-note": (K.KVP_TYPE_GINT64, "gncInvoice.c GNC_INVOICE_IS_CN (gboolean → int64)"),
+    # Payment lots — gncOwner.c gncOwnerAttachToLot, through gnc-lot.cpp
+    # PROP_OWNER_TYPE / PROP_OWNER_GUID (qof_instance_set_kvp, 2 keys)
+    "gncOwner": (K.KVP_TYPE_FRAME, "gncOwner.c GNC_OWNER_ID"),
+    "gncOwner/owner-type": (K.KVP_TYPE_GINT64, "gncOwner.c GNC_OWNER_TYPE, (gint64) gncOwnerGetType"),
+    "gncOwner/owner-guid": (K.KVP_TYPE_GUID, "gncOwner.c GNC_OWNER_GUID"),
     # Transactions — Transaction.cpp
     "trans-txn-type": (K.KVP_TYPE_STRING, "Transaction.cpp TRANS_TXN_TYPE_KVP, set_kvp_string_path"),
     "trans-read-only": (K.KVP_TYPE_STRING, "Transaction.cpp TRANS_READ_ONLY_REASON"),

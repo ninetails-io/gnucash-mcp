@@ -593,6 +593,33 @@ Established chokepoints and the rule each one owns:
   records the day's price itself (`_record_payment_price`) — its
   splits carry `SKIP_IMPLIED_PRICE_ATTR` so none implies the
   posting rate as today's.
+- `_payment_lots` / `_unapplied_payments` — a party's money with no
+  document on it: lots carrying desktop's `gncOwner/owner-type` and
+  `gncOwner/owner-guid` and no LIVE invoice link
+  (`_document_lot_guids`: a GUID inside the `gncInvoice` frame — the
+  engine leaves the frame standing, empty, on a lot it has unposted).
+  The outstanding list, `get_document`, and the dashboard's past-due
+  lines all read `_unapplied_payments`. The writes are ports, named
+  for what they port: `_attach_owner_to_lot`, `_offset_lots`,
+  `_reduce_split_to`, `_find_offsetting_split`, `_create_lot_link`,
+  `_auto_apply_lots` (gncOwner.c), and `unpost_invoice` is
+  `gncInvoiceUnpost` — payments are kept, never refused.
+- **The engine twin** (`tests/fixtures/engine_twin.py`,
+  `engine_act.scm`) — the parity twin with no desktop on screen:
+  `gnucash-cli` loads a report whose renderer calls the engine
+  functions the dialogs call, and the SQL backend saves each commit
+  (a report's `SESSION_READ_ONLY` only skips the lock). Same action
+  through the server on a copy, `dump` both, the text must match;
+  the engine's dumps are recorded for CI. A new business write path
+  whose desktop side is an engine call gets a scenario in
+  `tests/test_parity_prepayment.py` (or a sibling) before it merges.
+  Two things the engine leaves in a SQL book are excluded by ruling
+  of the dump, not copied: the EMPTY payment lot it abandons after
+  every payment it moves into a document's lot (its own scrub
+  destroys them), and the stale `post_txn` / `post_lot` /
+  `post_acc` on an unposted document (its SQL backend drops a NULL
+  reference from the UPDATE). `_payment_lots` skips empty lots and
+  nothing reads those columns on an unposted document.
 - `_parse_owner_type`, `_commodity_quantum`, `_effective_owner_type`
   — same story, smaller surface. `_is_market_price` /
   `_market_prices_only` — the quotes-only re-derivation the

@@ -1018,6 +1018,69 @@ class _RealDatabaseTests:
             "INV-EXPLICIT", owner_type="customer"
         )["id"] == "INV-EXPLICIT"
 
+    def test_prepayment_lifecycle(self, db_book):
+        """The payment-lot paths are raw SQL over the slots table
+        (owner frames joined to their children, the document-link
+        test, the party-delete guard): overpay, settle another
+        document from the excess, unpost a paid one, and read it all
+        back, on each dialect (adversarial review 2026-09-30, C37 /
+        C49 / C50)."""
+        _ensure_account(
+            db_book, name="Accounts Receivable", account_type="RECEIVABLE",
+            parent="Assets",
+        )
+        _ensure_account(
+            db_book, name="Income", account_type="INCOME", placeholder=True,
+        )
+        _ensure_account(
+            db_book, name="Sales", account_type="INCOME", parent="Income",
+        )
+        customer = db_book.create_customer(name="Prepay Co")
+        ids = []
+        for price in ("100.00", "50.00"):
+            inv = db_book.create_invoice(customer_id=customer["id"])
+            db_book.add_invoice_entry(
+                invoice_id=inv["id"], account="Income:Sales",
+                description="Work", quantity="1", price=price,
+            )
+            db_book.post_invoice(
+                invoice_id=inv["id"],
+                post_account="Assets:Accounts Receivable",
+                post_date="2026-01-15", owner_type="customer",
+            )
+            ids.append(inv["id"])
+
+        def unapplied():
+            return db_book.get_outstanding_invoices(
+                compact=False, customer_id=customer["id"],
+            ).get("unapplied_payments", [])
+
+        paid = db_book.pay_invoice(
+            invoice_id=ids[0], payment_account="Assets:Checking",
+            amount="120.00", payment_date="2026-01-20",
+            owner_type="customer", allow_prepayment=True,
+        )
+        assert paid["prepayment"]["amount"] == "20.00"
+        assert [u["amount"] for u in unapplied()] == ["20.00"]
+        assert db_book.get_invoice(
+            ids[1], owner_type="customer",
+        )["unapplied_payments_available"] == "20.00"
+
+        settled = db_book.pay_invoice(
+            invoice_id=ids[1], owner_type="customer", from_prepayment=True,
+        )
+        assert settled["remaining_balance"] == "30.00"
+        assert unapplied() == []
+
+        unposted = db_book.unpost_invoice(
+            invoice_id=ids[0], owner_type="customer",
+        )
+        assert [p["amount"] for p in unposted["payments_kept"]] == ["100.00"]
+        assert [u["amount"] for u in unapplied()] == ["100.00"]
+        assert "Book:" in db_book.get_book_summary()
+        with pytest.raises(ValueError, match="unapplied payment"):
+            db_book.delete_customer(customer["id"])
+
     def test_tax_bearing_draft_can_be_deleted(self, db_book):
         """Regression: deleting an unposted document with a taxed
         entry ran ``SET refcount = MAX(0, refcount - :n)`` — SQLite's

@@ -1226,6 +1226,85 @@ class TestPayDryRunAuditRendering:
         assert "paid: 500.00" in rendered
 
 
+class TestPrepaymentAuditLines:
+    """A document settled from an earlier payment paid nothing new;
+    the audit line must not read as a payment from an account
+    (adversarial review 2026-09-30, C37 / C49 / C50)."""
+
+    def _entry(self, params, after, before=None, operation="pay"):
+        return {
+            "classification": "write", "entity_type": "invoice",
+            "operation": operation, "timestamp": "2026-09-30T21:00:00",
+            "params": {"id": "000002", **params},
+            "after_state": after, "before_state": before,
+        }
+
+    def test_settled_from_unapplied_payments(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        rendered = _format_audit_entry_text(self._entry(
+            {"from_prepayment": True},
+            {
+                "type": "invoice", "status": "partial",
+                "applied_from_prepayment": "20.00",
+                "remaining_balance": "30.00",
+                "from_payments": [{"guid": "abc12345", "amount": "20.00"}],
+            },
+        ))
+        assert "PAY INVOICE  id:000002" in rendered
+        assert "applied from unapplied payments: 20.00" in rendered
+        assert "remaining: 30.00" in rendered
+        assert "no new transaction" in rendered
+        assert "from payment txn:abc12345  20.00" in rendered
+        assert "paid: " not in rendered
+
+    def test_rehearsal_of_the_same(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        rendered = _format_audit_entry_text(self._entry(
+            {"from_prepayment": True, "dry_run": True},
+            {
+                "dry_run": True, "type": "invoice", "status": "would_apply",
+                "applied_from_prepayment": "20.00",
+                "remaining_balance_after": "30.00",
+                "from_payments": [{"since": "2026-01-20", "amount": "20.00"}],
+            },
+        ))
+        assert "PAY INVOICE (dry run)" in rendered
+        assert "would apply from unapplied payments: 20.00" in rendered
+        assert "nothing booked" in rendered
+
+    def test_an_overpayment_names_what_was_held(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        rendered = _format_audit_entry_text(self._entry(
+            {"payment_account": "Assets:Checking", "allow_prepayment": True},
+            {
+                "type": "invoice", "payment": "120.00", "total_paid": "100.00",
+                "remaining_balance": "0.00", "transaction_guid": "abc12345",
+                "prepayment": {"amount": "20.00", "currency": "USD"},
+            },
+        ))
+        assert "paid: 120.00" in rendered
+        assert "held as unapplied payment: USD 20.00" in rendered
+
+    def test_unpost_names_the_payments_it_kept(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        rendered = _format_audit_entry_text(self._entry(
+            {}, {
+                "type": "invoice", "status": "unposted",
+                "payments_kept": [{"guid": "abc12345", "amount": "100.00"}],
+                "links_removed": 1,
+            },
+            before={"date_posted": "2026-01-15",
+                    "post_account": "Assets:Accounts Receivable"},
+            operation="unpost",
+        ))
+        assert "UNPOST INVOICE" in rendered
+        assert (
+            "payments kept as the party's unapplied payment: "
+            "100.00 (txn:abc12345)"
+        ) in rendered
+        assert "lot links removed: 1" in rendered
+
+
 class TestConsolidatedParamNamesInFormatters:
     """The business consolidation renamed tool params (``id``,
     ``party_type``, ``document_type``); the entry/credit-note CREATE

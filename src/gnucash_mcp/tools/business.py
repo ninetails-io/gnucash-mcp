@@ -906,11 +906,18 @@ def register(mcp, get_book) -> None:
         voucher, or credit note (each keeps its type through the
         round-trip).
 
-        Deletes the posting transaction and lot, and clears the
-        invoice's posted-state metadata. The invoice returns to
-        "open" state and can be edited or re-posted. Refuses if
-        the invoice has any payments applied — void payments first,
-        then unpost.
+        Deletes the posting transaction and clears the document's
+        posted-state metadata. The document returns to "open" state
+        and can be edited or re-posted.
+
+        Payments are kept, as GnuCash keeps them: the money stays on
+        the books as the party's unapplied payment (``payments_kept``
+        in the response), and after re-posting the document is
+        settled from it with ``pay_document(from_prepayment=true)``.
+        Do NOT void a payment in order to unpost — the bank line is
+        real. A credit-note application is removed
+        (``links_removed``); re-apply it with ``apply_credit_note``
+        after re-posting.
 
         Args:
             id: Document ID (e.g., "000001").
@@ -931,8 +938,8 @@ def register(mcp, get_book) -> None:
     @audit_log(classification="write", operation="pay", entity_type="invoice")
     def pay_document(
         id: str,
-        payment_account: str,
-        amount: str,
+        payment_account: str | None = None,
+        amount: str | None = None,
         payment_date: str | None = None,
         description: str | None = None,
         document_type: DocumentType | None = None,
@@ -943,6 +950,9 @@ def register(mcp, get_book) -> None:
         force: bool = False,
         memo: str = "",
         dry_run: bool = False,
+        allow_prepayment: bool = False,
+        from_prepayment: bool = False,
+        payment_account_amount: str | None = None,
     ) -> str:
         """Record a payment against a posted customer invoice,
         vendor bill, employee voucher, or credit note.
@@ -988,10 +998,40 @@ def register(mcp, get_book) -> None:
         payments, ``Income:Purchase Discounts Taken`` for vendor
         bill payments).
 
+        OVERPAYMENT: when the party paid more than the document
+        owes, record what actually moved and pass
+        ``allow_prepayment=true``. The balance settles the document;
+        the excess is held in the receivable/payable account as the
+        party's unapplied payment (GnuCash's pre-payment lot). Never
+        book the excess as a credit note — that understates the bank
+        and the income.
+
+        PREPAYMENT: ``from_prepayment=true`` settles the document
+        from the party's unapplied payments (an earlier overpayment,
+        a payment made in GnuCash before the invoice existed, or the
+        payments kept when a document was unposted). No money moves
+        and no transaction is created, so ``payment_account`` is
+        omitted; ``amount`` is optional and defaults to everything
+        that can be applied. ``get_outstanding_documents`` lists
+        unapplied payments, and ``get_document`` shows
+        ``unapplied_payments_available`` on a document that could
+        use one.
+
+        CROSS-CURRENCY: ``amount`` is in the document's currency.
+        When the bank line is known, pass it as
+        ``payment_account_amount`` (in the payment account's
+        currency): that is what books, the rate paid is recorded as
+        the day's price, and no quote is needed. Without it the
+        amount is derived from the latest quote.
+
         Args:
             id: Document ID (e.g., "000001").
-            payment_account: Bank or cash account for payment (e.g., "Assets:Checking").
-            amount: Payment amount as decimal string (e.g., "500.00").
+            payment_account: Bank or cash account for payment (e.g.,
+                "Assets:Checking"). Required unless
+                ``from_prepayment``.
+            amount: Payment amount as decimal string (e.g., "500.00"),
+                in the document's currency. Required unless
+                ``from_prepayment``.
             payment_date: Payment date (YYYY-MM-DD). Defaults to today.
             description: Description for the payment transaction. Optional.
             document_type: "invoice", "bill", "voucher", or
@@ -1022,12 +1062,25 @@ def register(mcp, get_book) -> None:
             dry_run: When True, rehearse without writing — returns
                 the proposed splits and projected outcome instead of
                 booking. Default False.
+            allow_prepayment: Accept an ``amount`` above the
+                outstanding balance and hold the excess as the
+                party's unapplied payment. Default False (an
+                overpayment is refused, since it is usually a typo).
+            from_prepayment: Settle from the party's unapplied
+                payments instead of new money. Default False.
+            payment_account_amount: What the payment account actually
+                moved, in ITS currency — cross-currency payments
+                only.
 
         Returns:
             ``status`` is ``"paid"`` when the document settles to
             zero, ``"partial"`` when a balance remains, and
-            ``"would_pay"`` on dry runs — plus the amount paid,
-            remaining balance, and transaction reference.
+            ``"would_pay"`` / ``"would_apply"`` on dry runs — plus
+            the amount paid, remaining balance, and transaction
+            reference. ``prepayment`` reports an excess held;
+            ``applied_from_prepayment`` / ``from_payments`` /
+            ``unapplied_remaining`` report a settlement from
+            unapplied payments.
         """
         owner_type = _document_owner_type(document_type, party_type)
         book = get_book()
@@ -1044,6 +1097,9 @@ def register(mcp, get_book) -> None:
             force=force,
             memo=memo,
             dry_run=dry_run,
+            allow_prepayment=allow_prepayment,
+            from_prepayment=from_prepayment,
+            payment_account_amount=payment_account_amount,
         )
         return _json(result)
 

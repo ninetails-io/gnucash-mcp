@@ -1891,7 +1891,20 @@ def _fmt_invoice_unpost(entry: dict) -> list[str]:
             f"{_INDENT}was posted:{was_posted}  "
             f"post_account:{was_account}"
         )
-    lines.extend(_invoice_link_migration_lines(entry.get("after_state") or {}))
+    after = entry.get("after_state") or {}
+    kept = after.get("payments_kept") or []
+    if kept:
+        shown = ", ".join(
+            f"{p.get('amount', '')} (txn:{p.get('guid', '')})" for p in kept
+        )
+        lines.append(
+            f"{_INDENT}payments kept as the party's unapplied payment: {shown}"
+        )
+    if after.get("links_removed"):
+        lines.append(
+            f"{_INDENT}lot links removed: {after['links_removed']}"
+        )
+    lines.extend(_invoice_link_migration_lines(after))
     return lines
 
 
@@ -1908,6 +1921,34 @@ def _fmt_invoice_pay(entry: dict) -> list[str]:
     dry = bool(params.get("dry_run")) or bool(
         (after or {}).get("dry_run")
     )
+    # Settled from the party's earlier payment: nothing was paid and
+    # no transaction was created, and the line must not read as if
+    # one was.
+    if params.get("from_prepayment"):
+        tag = " (dry run)" if dry else ""
+        lines = [
+            f"{time_part}  PAY INVOICE{tag}  id:{params.get('id', '')}"
+        ]
+        if after:
+            verb = "would apply" if dry else "applied"
+            remaining = after.get(
+                "remaining_balance_after" if dry else "remaining_balance", "",
+            )
+            lines.append(
+                f"{_INDENT}{verb} from unapplied payments: "
+                f"{after.get('applied_from_prepayment', '')}  "
+                f"remaining: {remaining}"
+                + ("  nothing booked" if dry else "  no new transaction")
+            )
+            for used in after.get("from_payments") or []:
+                if used.get("guid"):
+                    lines.append(
+                        f"{_INDENT}from payment txn:{used['guid']}  "
+                        f"{used.get('amount', '')}"
+                    )
+        lines.extend(_invoice_link_migration_lines(after or {}))
+        return lines
+
     if dry:
         lines = [
             f"{time_part}  PAY INVOICE (dry run)  "
@@ -1943,6 +1984,19 @@ def _fmt_invoice_pay(entry: dict) -> list[str]:
         lines.append(
             f"{_INDENT}from: {params.get('payment_account', '')}  txn:{txn_guid}"
         )
+        prepayment = after.get("prepayment") or {}
+        if prepayment:
+            lines.append(
+                f"{_INDENT}held as unapplied payment: "
+                f"{prepayment.get('currency', '')} "
+                f"{prepayment.get('amount', '')}"
+            )
+        if params.get("payment_account_amount"):
+            lines.append(
+                f"{_INDENT}payment account moved: "
+                f"{after.get('payment_account_currency', '')} "
+                f"{params['payment_account_amount']}"
+            )
     memo = params.get("memo", "")
     if memo:
         lines.append(f"{_INDENT}memo: {memo}")
