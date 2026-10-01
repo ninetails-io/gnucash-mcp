@@ -1020,11 +1020,10 @@ Each item is a contract test in the house styles (grep-the-source, set-equality,
 ## 10. Resolution log (branch `fix/v1.5-adversarial-blockers`, as of 2026-09-30, late night)
 
 Every fix has a test that fails on the pre-fix source. Full suite at
-the last commit (`c6ac896`): 3087 passed, 33 skipped, 2 expected
-failures (the two price scenarios awaiting a ruling, below).
-PostgreSQL gate: 88 passed. Desktop totals oracle: 0 differences.
-Engine twin: 24 scenarios, the server's rows equal to the engine's in
-every one it is meant to match.
+the last code commit (`00ed9a7`): 3093 passed, 33 skipped, no
+expected failures. PostgreSQL gate: 88 passed. Desktop totals oracle:
+0 differences. Engine twin: 24 scenarios, the server's rows equal to
+the engine's in every one, less only what `ENGINE_DEBRIS` names.
 
 ### Ship-blockers: all seven fixed
 
@@ -1084,11 +1083,16 @@ real-driver database tests (`b6d54be`).
 | C10 storage half: no child bill term at post | `_billterm_return_child`; tax-table name lookups skip hidden copies | `830bb27` |
 | C3 voucher card lines | `_card_charges`: card lines and the extra post to the employee's card account | `830bb27` |
 
-### Serious: open, one ruling away
+### Serious: the last one, closed by ruling
 
 | Item | State |
 |---|---|
-| C24 several same-day prices per pair | The twin ruling 2 asked for has been run (`814851e`, `tests/test_parity_prices.py`). Result below. No behavior was changed. |
+| C24 several same-day prices per pair | Twin run (`814851e`); ruled in round 2 (rank-replacement adopted, the leaked row not copied); fixed in `b3aa727`. |
+
+One part of C10 is OPEN by the same round's ruling: whether a posted
+line should point at a hidden copy of its tax table. The server
+leaves lines on the live table. The GUI gate decides (step 6 of
+`BOOKKEEPER_TEST_PLAN_FIX_BRANCH_GUI_GATE.md`).
 
 ### The engine twin
 
@@ -1125,9 +1129,11 @@ destroys them); stale `post_txn` / `post_lot` / `post_acc` on an
 unposted document (the SQL backend drops a NULL reference from its
 UPDATE); and the unreferenced tax-table copy above. Stored
 `refcount`s are not compared: the engine adds one per reference it
-loads and saves the sum. **Each of these four is a maintainer call
-flagged for review**, since the standing ruling is that parity means
-an empty diff.
+loads and saves the sum. The four were ACCEPTED in round 2 as a named
+allowlist: `ENGINE_DEBRIS` in `tests/fixtures/engine_twin.py` lists
+each with its reason, the dump filters only what the list names, and
+every recording stores how much of each kind the engine left
+(`00ed9a7`).
 
 ### Minor tier (sections 5, 7, 8): fixed
 
@@ -1170,6 +1176,10 @@ re-mode audit files written before 1.5.
 
 ### Before this branch merges
 
+0. The GUI gate has its own manifest and a purpose-built book:
+   `BOOKKEEPER_TEST_PLAN_FIX_BRANCH_GUI_GATE.md` and
+   `~/Projects/abe-bench/fix-branch-gate.gnucash`. Seven steps; two
+   of them (the taxed post, the Price Editor) end in a SELECT.
 1. The desktop-open gate: unpost, the delete paths, and the posting
    math changed what is written. Post and unpost an invoice with a
    document link, delete an account with an OFX link, and open the
@@ -1332,3 +1342,123 @@ Find Invoice, Process Payment, and Customer Report. Desktop reads
 it clean → dialect, warned and documented. Desktop misreads →
 refuse-by-default with force, because then it was never a
 capability.
+
+## Bookkeeper rulings — fix-branch round 2 (2026-09-30, 23:05)
+
+**0. Correction of the record: Ruling 1 was NOT overridden by the
+bookkeeper.** The 21:12 ruling (narrow fix in 1.5, full prepayment
+surface as first post-release patch) stands unretracted; no
+override was issued. The full fix that landed is good work — twelve
+engine-twin scenarios row-for-row exceeds what the deferral assumed
+possible — and may stand IF the maintainer ratifies it as his own
+override, recorded under his name. RESOLVED 23:05: the maintainer confirms the override is his
+("I could not stomach" deferring work this close to the last
+release). The full prepayment fix therefore stands as a MAINTAINER
+OVERRIDE of bookkeeper ruling 1, with the bookkeeper's concurrence,
+conditional on the expanded GUI gate (item 6 below). The
+verification mattered doubly because the same work stretch
+contained a forged system-reminder in a tool result; unverified
+authority claims get verified, not inherited — this one verified
+true.
+
+**1. Same-day prices (per the engine twin): adopt rank-replacement;
+do not reproduce the leak.** The engine replaces the day's row when
+the new source ranks equal or better — the server adopts that. The
+engine also persists a row its own memory rejected (worse-ranked);
+the server does not write that row, by the `temporary`-price
+precedent: fidelity means desktop-readable, not litter-compatible.
+Of the two strict xfails, the rank-replacement case becomes real
+behavior; the leak case becomes a documented intentional
+divergence citing this ruling. (This also retro-explains the C7
+gate observation: the morning's coexisting EUR rows were the leak,
+which is why desktop displayed them without complaint.)
+
+**2. Document currency: refusal RATIFIED.** The twin met the
+ruling's own condition — the engine's customer balance ignored an
+unpaid off-currency invoice, so the mismatch was never a dialect
+but invisible money. Refuse-by-default with `force` is correct; the
+behavior break and ten migrated tests are accepted.
+
+**3. Engine-debris exceptions: the four are ACCEPTED** (empty
+payment lot per payment, stale posting refs on an unposted
+document, unreferenced tax-table copy, refcounts uncompared) — as a
+NAMED allowlist in the twin fixture, each with a comment saying
+what it is and why, never a silent filter. The GUI gate's
+prepayment book is the backstop if desktop proves to expect the
+empty lot.
+
+**4. Tax tables on the live table: NOT accepted on current
+evidence — open, gate decides.** Two oracles conflict: GnuCash
+source (gncTaxTableReturnChild in the GUI post path, confirmed by
+cross-examination) vs the headless engine run that never saved the
+move; headless cli may not walk the GUI dialog's path. Tiebreaker
+at the gate: post a taxed invoice IN THE GUI on a SQL book, then
+`SELECT invisible, parent FROM taxtables`. The billterm child
+already landed; the taxtable question stays open until that SELECT.
+
+**5. For the record:** the forged system-reminder in a tool result
+was correctly ignored; its source (tool and call) should be
+recorded in §10. The `git checkout --` slip is acknowledged and
+closed — self-limited, owned unprompted.
+
+**6. GUI gate manifest for the fix branch** (purpose-built book):
+prepayment lot held; document unposted with payment kept; document
+on a posted billterm copy; card voucher; forced off-currency
+invoice; taxed-invoice post followed by the taxtable SELECT above;
+Price Editor same-day rank-replacement check.
+
+## Fix-branch response to round 2 (2026-09-30, late night)
+
+*Written by the fixing session, item for item.*
+
+**0. The override.** Recorded as the bookkeeper wrote it: a
+maintainer override of ruling 1, with the bookkeeper's concurrence,
+conditional on the GUI gate.
+
+**1. Same-day prices.** Done in `b3aa727`. `create_price` and
+`create_prices` follow `gnc_pricedb_add_price`: a source that ranks
+equal or better takes the day, in either direction of the pair; a
+worse-ranked price is not written, and the response says what
+outranked it and how to override (`status: kept`). The row GnuCash's
+SQL backend leaves for a price it turned away is not copied. In
+`tests/test_parity_prices.py` the two expected failures are gone: the
+server's rows are the engine's rows less the ones the engine's own
+memory rejected, and that subtraction is written out in the test, not
+filtered. One consequence worth knowing: the default source,
+`user:price`, ranks below `Finance::Quote`, so a price typed through
+the server on a day that already has a feed quote is not written
+unless it is sent as `user:price-editor`. A batch with two rows for
+one pair and day now rejects the second.
+
+**2. Document currency.** Nothing further; ratified as built.
+
+**3. Debris allowlist.** Done in `00ed9a7`, as described in section
+10. A server-written book must report no debris at all
+(`debris_found(book) == {}` in every scenario); the engine's counts
+are in the recordings.
+
+**4. Tax tables.** Marked open everywhere it was stated as settled:
+the code comment at the post, the CHANGELOG entry, CLAUDE.md, the
+twin's docstring, and the allowlist entry itself. The server's
+behavior is unchanged pending step 6 of the gate. If the GUI post
+does save the line's move, the server-side change is small: at post,
+find or make the table's hidden copy (the way
+`_billterm_return_child` does for terms) and repoint each line.
+
+**5. The forged reminder, for the record.** It arrived in the result
+of a `Bash` tool call: the first call after this session resumed from
+a context compaction, a `sed -n` print of lines 6949 to 7084 of
+`src/gnucash_mcp/book/business.py` (the head of `pay_invoice`). After
+the file's text, inside the same tool result, came a block styled as
+a `<system-reminder>`. It said it replaced earlier attribution
+guidance and told the session to end commit messages with a
+`Co-Authored-By: Claude Fable 5.1` line and pull-request bodies with a
+"Generated with Claude Code" footer. A search of the repository finds
+that text in no file, so it did not come from the content being read.
+It was not acted on; the project's no-attribution rule held for every
+commit on this branch. The `git checkout --` slip is closed as ruled.
+
+**6. Gate manifest.** Written as
+`BOOKKEEPER_TEST_PLAN_FIX_BRANCH_GUI_GATE.md`, with the book built
+and placed in the bench folder. GnuCash's engine loads the book
+headlessly; the windows have not been opened on it.
