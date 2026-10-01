@@ -66,12 +66,15 @@ These touch a number someone reads, or a book someone could damage.
 
 ## Desktop parity
 
-- **C67 — "Use Split Action Field for Number" is not read.**
+- **C67 — business postings ignore "Use Split Action Field for
+  Number".** Transaction entry, search and the duplicate screen read
+  the option as of 1.5 (`feat/transaction-fields`). What remains is
   `business.py`, the posting and payment writers; GnuCash's
   `gnc_set_num_action` swaps number and action when the option is
-  on. Metadata only. Blocked on a twin: the option has to be set
-  through desktop, the Guile call tried from the engine twin did not
-  take. Small once a book with the option exists.
+  on. Metadata only. A book with the option set is no longer the
+  blocker: the transaction-fields gate stored it as desktop does and
+  desktop showed it ticked (`specs/v1.5.1/testing/
+  BOOKKEEPER_REPORT_TRANSACTION_FIELDS.md`, B1).
 - **No tool hides an account.** The slot tools refuse `hidden`
   because desktop reads the flag from the account's slot while the
   server reads the column. The fix is a `hidden` parameter on
