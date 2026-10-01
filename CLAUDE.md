@@ -552,6 +552,17 @@ Established chokepoints and the rule each one owns:
   `tests/test_posting_record_guard.py`. Tests that need the old
   voided-posting state build it with
   `tests/conftest.py::void_posting_record`.
+- `_read_only_before` / `_read_only_period_note` (`book/_base.py`)
+  — the book's read-only date (today minus the book option "Day
+  Threshold for Read-Only Transactions", a double under
+  `options/Accounts/…`; the engine reads no other type) and the one
+  sentence a write attaches when it touches a transaction dated
+  before it. A WARNING by ruling (2026-10-01, review C69): desktop
+  refuses in the register only, the engine commits. Every
+  transaction-changing path in core and reconciliation attaches it
+  (create, batch, statement, the three updates, `replace_splits`,
+  void, unvoid, both deletes); a new one does too. Tests:
+  `TestC69TheReadOnlyPeriodIsNamed`.
 - `_entry_math` (`book/_entry_math.py`) — what a document line
   comes to and what a document posts: GnuCash's own arithmetic,
   ported from `gncEntryComputeValueInt`, `gncEntryRecomputeValues`,

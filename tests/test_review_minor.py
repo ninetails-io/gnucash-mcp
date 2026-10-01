@@ -1016,3 +1016,248 @@ class TestDS12ADocumentReadTakesNoWriteLock:
                 other.rollback()
             finally:
                 other.close()
+
+
+_READ_ONLY_KEY = (
+    "options/Accounts/Day Threshold for Read-Only Transactions (red line)"
+)
+
+
+def _set_read_only_days(path, days, slot_type=2):
+    """The book option as GnuCash's SQL backend stores it: a frame
+    for ``options``, a frame for ``options/Accounts``, and the value
+    as a double. Asked of GnuCash 5.12's engine
+    (``qof_book_get_num_days_autoreadonly``), this shape answers
+    ``days``; the same number stored as an int64 answers 0."""
+    (book_guid,) = _q(path, "select guid from books")[0]
+    outer, inner = uuid.uuid4().hex, uuid.uuid4().hex
+    _q(
+        path,
+        "insert into slots (obj_guid, name, slot_type, guid_val) "
+        "values (?, 'options', 9, ?)", (book_guid, outer),
+    )
+    _q(
+        path,
+        "insert into slots (obj_guid, name, slot_type, guid_val) "
+        "values (?, 'options/Accounts', 9, ?)", (outer, inner),
+    )
+    if slot_type == 2:
+        _q(
+            path,
+            "insert into slots (obj_guid, name, slot_type, double_val) "
+            "values (?, ?, 2, ?)", (inner, _READ_ONLY_KEY, float(days)),
+        )
+    else:
+        _q(
+            path,
+            "insert into slots (obj_guid, name, slot_type, int64_val) "
+            "values (?, ?, 1, ?)", (inner, _READ_ONLY_KEY, int(days)),
+        )
+
+
+def _spend(gb, d, amount="12.00", description="Read-only probe"):
+    return gb.create_transaction(
+        description=description, trans_date=d, check_duplicates=False,
+        splits=[
+            {"account": "Assets:Checking", "amount": f"-{amount}"},
+            {"account": "Expenses:Groceries", "amount": amount},
+        ],
+    )
+
+
+def _messages(result):
+    return [
+        w["message"] if isinstance(w, dict) else w
+        for w in result.get("warnings", [])
+    ]
+
+
+class TestC69TheReadOnlyPeriodIsNamed:
+    """Desktop's register refuses to enter, edit, void, or delete a
+    transaction dated before the book's read-only date. The engine
+    does not, so the server writes it and says so (ruled a warning,
+    2026-10-01)."""
+
+    INSIDE = date.today() - timedelta(days=40)
+    EDGE = date.today() - timedelta(days=30)
+    OUTSIDE = date.today() - timedelta(days=5)
+
+    def test_no_option_no_warning(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        made = _spend(gb, self.INSIDE)
+        assert not any("read-only" in m for m in _messages(made))
+        gone = gb.delete_transaction(made["guid"])
+        assert "read_only_period" not in gone
+
+    def test_zero_days_is_off(self, test_book):
+        _set_read_only_days(test_book, 0)
+        gb = GnuCashBook(str(test_book))
+        assert not any(
+            "read-only" in m for m in _messages(_spend(gb, self.INSIDE))
+        )
+
+    def test_an_integer_slot_is_not_the_option(self, test_book):
+        """The engine reads the double and nothing else."""
+        _set_read_only_days(test_book, 30, slot_type=1)
+        gb = GnuCashBook(str(test_book))
+        with gb.open() as book:
+            assert gb._read_only_before(book) is None
+
+    def test_the_date_is_today_minus_the_days(self, test_book):
+        _set_read_only_days(test_book, 30)
+        gb = GnuCashBook(str(test_book))
+        with gb.open() as book:
+            assert gb._read_only_before(book) == self.EDGE
+
+    def test_create_warns_before_the_date_only(self, test_book):
+        _set_read_only_days(test_book, 30)
+        gb = GnuCashBook(str(test_book))
+        inside = _spend(gb, self.INSIDE)
+        types = [w["type"] for w in inside["warnings"]]
+        assert "read_only_period" in types
+        (message,) = [
+            w["message"] for w in inside["warnings"]
+            if w["type"] == "read_only_period"
+        ]
+        assert self.INSIDE.isoformat() in message
+        assert self.EDGE.isoformat() in message
+        assert "30 days" in message
+        # The write went through: this is a warning, not a refusal.
+        assert gb.get_transaction(inside["guid"])["description"] == (
+            "Read-only probe"
+        )
+        # On the threshold date itself desktop still allows the edit
+        # (xaccTransIsReadonlyByPostedDate compares strictly before).
+        for d in (self.EDGE, self.OUTSIDE):
+            assert not any(
+                "read-only" in m for m in _messages(_spend(gb, d))
+            )
+
+    def test_a_dry_run_warns_too(self, test_book):
+        _set_read_only_days(test_book, 30)
+        gb = GnuCashBook(str(test_book))
+        dry = gb.create_transaction(
+            description="Rehearsal", trans_date=self.INSIDE, dry_run=True,
+            splits=[
+                {"account": "Assets:Checking", "amount": "-5.00"},
+                {"account": "Expenses:Groceries", "amount": "5.00"},
+            ],
+        )
+        assert any("read-only" in m for m in _messages(dry))
+
+    def test_a_batch_names_the_row(self, test_book):
+        _set_read_only_days(test_book, 30)
+        gb = GnuCashBook(str(test_book))
+        env = gb.create_transactions(
+            [_txn(1, "50.00", d=self.INSIDE), _txn(2, "60.00", d=self.OUTSIDE)],
+        )
+        got = _results(env)
+        assert got["1"]["status"] == got["2"]["status"] == "created"
+        rows = [
+            ln.split("\t") for ln in env["warnings"].split("\n")[1:] if ln
+        ]
+        flagged = [r[0] for r in rows if "read-only" in r[1]]
+        assert flagged == ["1"]
+
+    def test_an_edit_warns_for_the_day_it_leaves_or_lands_on(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        leaving = _spend(gb, self.INSIDE, description="Leaving")
+        landing = _spend(gb, self.OUTSIDE, description="Landing")
+        staying = _spend(gb, self.OUTSIDE, description="Staying")
+        _set_read_only_days(test_book, 30)
+
+        out = gb.update_transaction(leaving["guid"], trans_date=self.OUTSIDE)
+        assert any("read-only" in m for m in _messages(out))
+        into = gb.update_transaction(landing["guid"], trans_date=self.INSIDE)
+        assert any("read-only" in m for m in _messages(into))
+        plain = gb.update_transaction(staying["guid"], description="Renamed")
+        assert not any("read-only" in m for m in _messages(plain))
+
+    def test_replace_splits_warns(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        made = _spend(gb, self.INSIDE)
+        _set_read_only_days(test_book, 30)
+        out = gb.replace_splits(made["guid"], [
+            {"account": "Assets:Checking", "amount": "-15.00"},
+            {"account": "Expenses:Groceries", "amount": "15.00"},
+        ])
+        assert any("read-only" in m for m in out["warnings"])
+
+    def test_a_batch_update_carries_it_on_the_row(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        old = _spend(gb, self.INSIDE, description="Old")
+        new = _spend(gb, self.OUTSIDE, description="New")
+        _set_read_only_days(test_book, 30)
+        env = gb.update_transactions([
+            {"guid": old["guid"], "description": "Old, renamed"},
+            {"guid": new["guid"], "description": "New, renamed"},
+        ])
+        lines = [ln.split("\t") for ln in env["results"].split("\n")[1:]]
+        by_guid = {ln[0]: ln for ln in lines}
+        assert by_guid[old["guid"]][1] == "updated"
+        assert "read-only" in by_guid[old["guid"]][3]
+        assert by_guid[new["guid"]][3] == ""
+
+    def test_a_broadcast_update_names_each_transaction(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        old = _spend(gb, self.INSIDE, description="Old")
+        new = _spend(gb, self.OUTSIDE, description="New")
+        _set_read_only_days(test_book, 30)
+        out = gb.update_transaction(
+            [old["guid"], new["guid"]], notes="Reviewed",
+        )
+        flagged = [
+            t["guid"] for t in out["transactions"] if "read_only_period" in t
+        ]
+        assert flagged == [old["guid"]]
+
+    def test_void_unvoid_and_delete_warn(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        made = _spend(gb, self.INSIDE)
+        recent = _spend(gb, self.OUTSIDE, description="Recent")
+        _set_read_only_days(test_book, 30)
+
+        voided = gb.void_transaction(made["guid"], "entered twice")
+        assert "voiding" in voided["read_only_period"]
+        restored = gb.unvoid_transaction(made["guid"])
+        assert "restoring" in restored["read_only_period"]
+        deleted = gb.delete_transaction(made["guid"])
+        assert deleted["status"] == "deleted"
+        assert "deleting" in deleted["read_only_period"]
+
+        assert "read_only_period" not in gb.void_transaction(
+            recent["guid"], "entered twice",
+        )
+        assert "read_only_period" not in gb.unvoid_transaction(recent["guid"])
+        assert "read_only_period" not in gb.delete_transaction(recent["guid"])
+
+    def test_a_bulk_delete_names_each_transaction(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        old = _spend(gb, self.INSIDE, description="Old")
+        new = _spend(gb, self.OUTSIDE, description="New")
+        _set_read_only_days(test_book, 30)
+        out = gb.delete_transactions([old["guid"], new["guid"]])
+        flagged = [
+            t["guid"] for t in out["transactions"] if "read_only_period" in t
+        ]
+        assert flagged == [old["guid"]]
+
+    def test_a_statement_line_in_the_period_is_named(self, test_book):
+        _set_read_only_days(test_book, 30)
+        gb = GnuCashBook(str(test_book))
+        dry = gb.enter_statement(
+            account_name="Assets:Checking",
+            statement_date=date.today() - timedelta(days=1),
+            opening_balance="0.00", closing_balance="-13.00",
+            lines=[
+                {"ref": "1", "date": self.INSIDE, "amount": "-9.00",
+                 "description": "Old line"},
+                {"ref": "2", "date": self.OUTSIDE, "amount": "-4.00",
+                 "description": "New line"},
+            ],
+            force_base=True,
+        )
+        rows = [
+            ln.split("\t") for ln in dry["warnings"].split("\n")[1:] if ln
+        ]
+        assert [r[0] for r in rows if "read-only" in r[1]] == ["1"]

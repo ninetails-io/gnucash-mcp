@@ -281,6 +281,16 @@ def _neutral_time(d: date) -> datetime:
     return stamp
 
 
+# The book option behind desktop's read-only "red line" (qofbook.cpp:
+# KVP_OPTION_PATH / OPTION_SECTION_ACCOUNTS /
+# OPTION_NAME_AUTO_READONLY_DAYS). The SQL backend names a nested
+# slot by its full path.
+_READ_ONLY_DAYS_KEY = (
+    "options/Accounts/"
+    "Day Threshold for Read-Only Transactions (red line)"
+)
+
+
 def _future_statement_warning(statement_date: date) -> str | None:
     """A statement is not dated in the future; one that is, is a
     typo. The reconcile goes through (desktop accepts the date too)
@@ -3354,6 +3364,86 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
             {"guid": transaction.guid},
         ).fetchone()
         return row[0] if row else None
+
+    @staticmethod
+    def _read_only_before(book) -> "date | None":
+        """The date before which GnuCash desktop treats transactions
+        as read-only, or None when the book sets no threshold.
+
+        ``qof_book_get_autoreadonly_gdate`` (qofbook.cpp): today minus
+        the book option "Day Threshold for Read-Only Transactions
+        (red line)", absent when the option is zero or unset. The
+        option is a book KVP stored as a double (``(gint)`` truncates
+        it on read). The engine reads nothing else: asked through
+        ``qof_book_get_num_days_autoreadonly``, GnuCash 5.12 answers
+        30 for a double 30 and 0 for an int64 30, so only the double
+        counts here.
+
+        Never raises: this feeds a warning, and a warning that fails
+        must not take the write down with it."""
+        from sqlalchemy import text
+        try:
+            row = book.session.execute(
+                text(
+                    "SELECT slot_type, int64_val, double_val "
+                    "FROM slots WHERE name = :name"
+                ),
+                {"name": _READ_ONLY_DAYS_KEY},
+            ).fetchone()
+        except Exception:
+            _rollback_if_aborted(book.session)
+            return None
+        if row is None:
+            return None
+        if int(row[0] or 0) != 2:
+            return None
+        try:
+            days = int(float(row[2] or 0))
+        except (TypeError, ValueError):
+            return None
+        if days <= 0:
+            return None
+        return date.today() - timedelta(days=days)
+
+    def _read_only_period_note(
+        self, book, dates, action: str, threshold: "date | None" = None,
+    ) -> "str | None":
+        """The one sentence every transaction write attaches when it
+        touches the book's read-only period (review C69, ruled a
+        warning 2026-10-01).
+
+        ``xaccTransIsReadonlyByPostedDate``: a transaction is
+        read-only when its post date is BEFORE the threshold date.
+        Desktop enforces that in the register only — the engine
+        commits such a transaction without complaint — so the server
+        writes it too, and says what the register would have said.
+        ``dates`` are the post dates the write touches (an edit that
+        moves a date passes both); ``action`` is the verb phrase
+        ("entering a transaction", "voiding this transaction").
+        Pass ``threshold`` when the caller read it once for a batch.
+        None when the book has no threshold or no date is before it."""
+        if threshold is None:
+            threshold = self._read_only_before(book)
+        if threshold is None:
+            return None
+        # piecash hands a post date back as a date; a datetime is
+        # taken by its day all the same.
+        days_touched = {
+            d.date() if isinstance(d, datetime) else d
+            for d in dates if d is not None
+        }
+        early = sorted(d for d in days_touched if d < threshold)
+        if not early:
+            return None
+        days = (date.today() - threshold).days
+        return (
+            f"dated {early[0].isoformat()}, before the book's "
+            f"read-only date {threshold.isoformat()} (the book option "
+            f"\"Day Threshold for Read-Only Transactions\" is {days} "
+            f"days). GnuCash's register would refuse {action}; the "
+            f"server does not enforce the option. Check that the "
+            f"closed period was meant to change"
+        )
 
     def _refuse_posting_record(self, book, transaction, action: str) -> None:
         """A document's posting transaction is read-only: the one

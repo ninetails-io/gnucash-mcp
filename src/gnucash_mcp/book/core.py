@@ -4650,6 +4650,13 @@ class CoreMixin:
                     book, validated, trans_currency, trans_date,
                 )
             )
+            closed = self._read_only_period_note(
+                book, [trans_date], "entering a transaction there",
+            )
+            if closed:
+                warnings.append(
+                    {"type": "read_only_period", "message": closed}
+                )
             proposed_pattern = self._extract_account_pattern(resolved_accounts)
             # Recent matches were gathered pre-write, so the new txn
             # is automatically absent.
@@ -4956,7 +4963,15 @@ class CoreMixin:
             # so a decimal slip in a bulk import is caught too.
             warn_rows: list = []
             today = date.today()
+            read_only_before = self._read_only_before(book)
             for p, _dc, _mc in accepted:
+                closed = self._read_only_period_note(
+                    book, [p["trans_date"]],
+                    "entering a transaction there",
+                    threshold=read_only_before,
+                ) if read_only_before else None
+                if closed:
+                    warn_rows.append((p["ref"], closed))
                 # A slipped year, the dashboard's own rule applied at
                 # entry instead of afterwards: more than a year
                 # ahead ("2062 for 2026"), or a year no ledger holds
@@ -5389,10 +5404,21 @@ class CoreMixin:
             # table names it, in dry run and commit alike. These
             # were entered AND reconciled in silence; the dashboard's
             # own "likely a typo" check only saw them afterwards.
+            read_only_before = self._read_only_before(book)
             for ln in lines:
                 line_date = ln.get("date")
                 if line_date is None:
                     continue
+                # The book's read-only period (review C69): a line
+                # the book does not already hold is entered there.
+                closed = self._read_only_period_note(
+                    book, [line_date],
+                    "entering a transaction there (a line the book "
+                    "already holds is only reconciled)",
+                    threshold=read_only_before,
+                ) if read_only_before else None
+                if closed:
+                    warn_rows.append((ln["ref"], closed))
                 if line_date > statement_date:
                     warn_rows.append((ln["ref"], (
                         f"dated {line_date.isoformat()}, after the "
@@ -6971,6 +6997,11 @@ class CoreMixin:
                 result["reconciled_splits_affected"] = reconciled_count
             if in_lots:
                 result["lot_splits_affected"] = len(in_lots)
+            closed = self._read_only_period_note(
+                book, [transaction.post_date], "deleting this transaction",
+            )
+            if closed:
+                result["read_only_period"] = closed
 
             # Strip GUID-valued slots (from-sched-xaction,
             # invoice-guid, gains-split…) and frames by raw SQL
@@ -7050,6 +7081,7 @@ class CoreMixin:
             # closes.
             all_guids = [t.guid for t in book.transactions]
             items = []
+            read_only_before = self._read_only_before(book)
             for transaction, reconciled_count, in_lots in resolved:
                 item = {
                     "guid": _unique_prefix(transaction.guid, all_guids),
@@ -7059,6 +7091,13 @@ class CoreMixin:
                     item["reconciled_splits_affected"] = reconciled_count
                 if in_lots:
                     item["lot_splits_affected"] = len(in_lots)
+                closed = self._read_only_period_note(
+                    book, [transaction.post_date],
+                    "deleting this transaction",
+                    threshold=read_only_before,
+                ) if read_only_before else None
+                if closed:
+                    item["read_only_period"] = closed
                 items.append(item)
 
             for transaction, _, in_lots in resolved:
@@ -7250,6 +7289,18 @@ class CoreMixin:
                 ],
             })
 
+            # Read before the dates move: an edit touches the day
+            # the transaction leaves as well as the day it lands on.
+            read_only_before = self._read_only_before(book)
+            closed_notes = {
+                txn.guid: self._read_only_period_note(
+                    book, [_post_date_as_date(txn), trans_date],
+                    "editing this transaction",
+                    threshold=read_only_before,
+                )
+                for txn in transactions
+            } if read_only_before else {}
+
             for txn in transactions:
                 if description is not None:
                     txn.description = description
@@ -7276,6 +7327,10 @@ class CoreMixin:
                     {
                         "guid": _unique_prefix(t.guid, all_guids),
                         "description": t.description,
+                        **(
+                            {"read_only_period": closed_notes[t.guid]}
+                            if closed_notes.get(t.guid) else {}
+                        ),
                     }
                     for t in transactions
                 ],
@@ -7355,6 +7410,16 @@ class CoreMixin:
                 ],
             })
 
+            read_only_before = self._read_only_before(book)
+            closed_notes = {
+                u["guid"]: self._read_only_period_note(
+                    book, [_post_date_as_date(txn), u.get("date")],
+                    "editing this transaction",
+                    threshold=read_only_before,
+                )
+                for u, txn in prepared
+            } if read_only_before else {}
+
             for u, txn in prepared:
                 if "description" in u:
                     txn.description = u["description"]
@@ -7376,6 +7441,9 @@ class CoreMixin:
                 by_key[u["guid"]] = {
                     "guid": u["guid"], "status": "updated",
                     "description": txn.description,
+                    # An updated row has no reason of its own; the
+                    # column carries the read-only-period warning.
+                    "reason": closed_notes.get(u["guid"]) or "",
                 }
 
             return self._updates_envelope(updates, by_key)
@@ -7492,6 +7560,12 @@ class CoreMixin:
             # Stage pre-update state for the audit log.
             self._stage_audit_before(_transaction_to_dict(transaction))
 
+            # Read before the date moves (review C69).
+            closed = self._read_only_period_note(
+                book, [_post_date_as_date(transaction), trans_date],
+                "editing this transaction",
+            )
+
             fx_warnings: list[dict] = []
             lot_changes: list = []
 
@@ -7601,6 +7675,10 @@ class CoreMixin:
             }
             if lot_changes:
                 result["lot_splits_affected"] = len(lot_changes)
+            if closed:
+                fx_warnings = list(fx_warnings) + [
+                    {"type": "read_only_period", "message": closed}
+                ]
             if fx_warnings:
                 result["warnings"] = fx_warnings
             return result
@@ -7807,6 +7885,12 @@ class CoreMixin:
                     transaction.post_date,
                 )
             )
+            closed = self._read_only_period_note(
+                book, [_post_date_as_date(transaction)],
+                "editing this transaction",
+            )
+            if closed:
+                warnings.append(closed)
 
             # 8. Save
             book.save()

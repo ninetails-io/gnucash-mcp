@@ -643,6 +643,12 @@ class ReconciliationMixin:
                 "status": "voided",
             }
             result.update(shapes)
+            closed = self._read_only_period_note(
+                book, [transaction.post_date],
+                "voiding this transaction",
+            )
+            if closed:
+                result["read_only_period"] = closed
             if reconciled_accounts:
                 result["warning"] = (
                     f"Voided transaction contained "
@@ -860,6 +866,10 @@ class ReconciliationMixin:
             short_guid = _unique_prefix(
                 transaction.guid, (t.guid for t in book.transactions)
             )
+            closed = self._read_only_period_note(
+                book, [transaction.post_date],
+                "restoring this transaction",
+            )
             return {
                 "guid": short_guid,
                 "date": transaction.post_date.isoformat(),
@@ -869,4 +879,5 @@ class ReconciliationMixin:
                     _split_to_compact_dict(s) for s in transaction.splits
                 ],
                 "status": "unvoided",
+                **({"read_only_period": closed} if closed else {}),
             }
