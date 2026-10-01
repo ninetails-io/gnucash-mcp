@@ -6951,6 +6951,21 @@ class BusinessMixin:
             pay_acct = self._resolve_account(book, payment_account)
             if not pay_acct:
                 raise self._account_not_found_error(book, payment_account)
+            # The payment account is where the money moved. A
+            # receivable or payable there (the document's own A/R
+            # included) moved nothing: the invoice read "paid", left
+            # the outstanding list, and A/R still held the balance.
+            # Desktop's payment dialog leaves these accounts out of
+            # the transfer list (gnc_payment_set_account_types:
+            # ``!xaccAccountIsAPARType``).
+            if pay_acct.type in ("RECEIVABLE", "PAYABLE"):
+                raise ValueError(
+                    f"Payment account {pay_acct.fullname!r} is a "
+                    f"{pay_acct.type.lower()} account. Name the "
+                    f"account the money moved through (bank, cash, "
+                    f"or card). To settle one document against "
+                    f"another, use apply_credit_note."
+                )
 
             post_acc_guid = inv.post_acc_guid
             post_acct = book.session.query(
@@ -7838,10 +7853,31 @@ class BusinessMixin:
 
             # Signed lot balances (A/R positive, A/P negative);
             # abs() gives the available amount on each side.
-            cn_remaining = abs(self._calculate_lot_balance(cn_lot))
-            target_remaining = abs(
-                self._calculate_lot_balance(target_lot)
-            )
+            cn_balance = self._calculate_lot_balance(cn_lot)
+            target_balance = self._calculate_lot_balance(target_lot)
+            # An application offsets a credit against a debit. Two
+            # lots on the SAME side have nothing to offset: abs() on
+            # both hid that, and "applying" a credit note whose lines
+            # net to a charge moved 70 of what the customer owed
+            # into the note's lot and reported it as credit owed TO
+            # them. gncOwnerAutoApplyPaymentsWithLots skips such a
+            # pair (``if (gnc_numeric_positive_p (left_lot_bal) ==
+            # gnc_numeric_positive_p (right_lot_bal)) continue;``).
+            if cn_balance != 0 and target_balance != 0 \
+                    and (cn_balance > 0) == (target_balance > 0):
+                # A debit balance, on A/R or A/P alike, is theirs to pay.
+                side = "owed by" if cn_balance > 0 else "owed to"
+                raise ValueError(
+                    f"Cannot apply {credit_note_id} to "
+                    f"{applies_to_invoice_id}: both carry a balance "
+                    f"{side} the counterparty, so there is nothing "
+                    f"to offset. (A credit note whose lines net to a "
+                    f"charge, or a document with a negative total, "
+                    f"sits on the other side of the ledger from an "
+                    f"ordinary one.)"
+                )
+            cn_remaining = abs(cn_balance)
+            target_remaining = abs(target_balance)
 
             if cn_remaining == 0:
                 raise ValueError(
