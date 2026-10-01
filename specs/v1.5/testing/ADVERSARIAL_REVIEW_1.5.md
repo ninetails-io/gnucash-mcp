@@ -1017,6 +1017,91 @@ Each item is a contract test in the house styles (grep-the-source, set-equality,
 
 ---
 
+## 10. Resolution log (branch `fix/v1.5-adversarial-blockers`, as of 2026-09-30 evening)
+
+Every fix has a test that fails on the pre-fix source. Full suite at
+the last commit: 2858 passed, 31 skipped. PostgreSQL gate: 87 passed.
+Desktop totals oracle: 0 differences.
+
+### Ship-blockers: all seven fixed
+
+| Item | Fix | Commit |
+|---|---|---|
+| C1 tax and line rounding | `_entry_math`, a port of GnuCash's own arithmetic | `69352d9` |
+| C2 entry discounts ignored | same port; discounts read and applied | `69352d9` |
+| C4a void of a posting transaction | `_refuse_posting_record`, shared by every path | `626287c` |
+| C4b forced rewrite of a posting; unstripped split delete | `626287c`; `2b21d45` | |
+| C5 unpost wipes the invoice's slots | strip before delete | `2b21d45` |
+| C8 (i) slot-tool frame delete cascades | reserved keys and a shape check | `2b21d45` |
+| C16a database password in errors and logs | `_scrub_credentials` on every road out | `55af187` |
+
+C1 and C2 were verified against GnuCash 5.12's own engine, headlessly
+(`19ce874`): the pre-port math differed on 383 of 600 random
+documents, the port on 0 of 1,540.
+
+### Serious: fixed
+
+| Item | Commit |
+|---|---|
+| C4c re-dating a posting transaction | `626287c` |
+| C7 `delete_account` cascade | `2b21d45` |
+| C8 (ii) `placeholder` / `hidden` slots; (iii) `reconcile-info` | `2b21d45` |
+| C10 / BL-14 posted total recomputed from live tables (the read half) | `5de139b` |
+| C12 zero side on a currency split | `4726752` |
+| C13 non-positive prices; C35 stale-rate advice | `7fd61f5` |
+| C14 receivable as payment account; C15 same-side credit note | `91fb31c` |
+| C16b query-string password; C52a echoed bad URI; C52b argv (documented); C59 (credential half) | `55af187` |
+| C18 schedule instance at a stale or implied rate | `313aca0` |
+| C19 fraction-valued schedule crashes the dashboard | `312c903` |
+| C21 share quantity rounds to nothing | `4726752` |
+| C34 far-dated statement and batch lines | `fd4b920` |
+| C40 negative budget magnitude (sign half) | `4b6be72` |
+| C41 audit log invents renames | `48fdf81` |
+| C45 job-attached credit note | `3abea88` |
+| C47 early-payment discount base | `b779fd0` |
+| C54 audit header path; C55 dashboard failure paths | `dbd43ba` |
+| C57 book text forging rows | `cca67a7` |
+| C61 / FC-2 double-typed counters | `3abea88` |
+
+Also closed along the way: SS-13 (orphaned frame children, `2b21d45`),
+SEC-11 (slow absurd price, `7fd61f5`), side-finding 2 (unvoid dropped
+a posting's read-only marker, `626287c`), a pre-existing flake in the
+real-driver database tests (`b6d54be`).
+
+### Serious: open, each a maintainer decision
+
+| Item | The decision |
+|---|---|
+| C9 credit-note migration flips a legitimate all-negative note | Gate the flip on the pre-1.5 fingerprint (`i_disc_type = ''`)? One line; touches a converter. |
+| C30 one-time conversion without its own snapshot | Force a labelled pre-upgrade snapshot before the first converting write? |
+| C29 auto-backup never retried after one failure; once per process | Retry policy, and the wording in the restore doc and manifest. |
+| C31 shared `GNUCASH_LOG_DIR` keyed on the filename | How to scope: hash of the path, or refuse a collision. |
+| C10 storage half: no child tax table or bill term at post | Write desktop's hidden child copies at post (storage shape; needs the desktop gate). |
+| C3 voucher card lines | Read `b_paytype` and the employee's card account at post. |
+| C22, C37, C49, C50 prepayments | The server has no prepayment-lot concept; four findings hang on it. A feature, not a guard. |
+| C48 document currency differs from owner's | Refuse at create? Existing multi-currency tests create such documents. |
+| C24 several same-day prices per pair | Desktop keeps one per day; a test pins the current behavior. |
+
+### Moderate and minor: open
+
+The MINOR tier of section 5 and the list in section 8 are untouched
+except where noted above. Notable ones still open: C11 (no `gnclock`
+row taken), C27 (schedule instantiation commits twice), C56 (path
+redaction misses paths with spaces), C20 (three-decimal currencies),
+C63 (legacy date formats), C17 (declare a minimum GnuCash version:
+3.8), C66 (MariaDB collation), C65 (text caps wider than columns).
+
+### Before this branch merges
+
+1. The desktop-open gate: unpost, the delete paths, and the posting
+   math changed what is written. Post and unpost an invoice with a
+   document link, delete an account with an OFX link, and open the
+   book in GnuCash.
+2. The maintainer's calls flagged in each commit's summary (new
+   response fields `total_note` and entry `discount`; `hidden`
+   refused by the slot tools with no server alternative; budget
+   sub-cent rounding left as is).
+
 *Scratch material for this review (wave-1 reports `wave1_*.md`, wave-2 verdicts `wave2_G*.md`, and every reproduction script) lives in the session scratchpad at `/private/tmp/claude-501/-Users-stephen-Projects-gnucash-mcp/60d9a729-9d7d-44e5-9095-692b003ba4ea/scratchpad/`. It is not committed.*
 
 ---

@@ -475,6 +475,26 @@ Established chokepoints and the rule each one owns:
   books on disk, and a fresh void. A new slot key goes in the
   registry first, with its citation — that is what stops the next
   "desktop can't read it" from shipping.
+- **Entry guards from the 1.5 adversarial review** — each in the
+  one place every caller passes, each with the reason beside it:
+  `_check_price` (a price is positive, of one commodity in another,
+  a plausible size; gates `create_price` and `create_prices`, dry run
+  included); `_validate_transaction_splits` (a foreign-CURRENCY split
+  has money on both sides or neither, and a share quantity that
+  rounds to nothing is refused while one that merely rounds is
+  reported through `_fx_sanity_warnings`); `pay_invoice` (the payment
+  account is never a RECEIVABLE or PAYABLE, as desktop's dialog
+  excludes them); `apply_credit_note` (two lots on the same side of
+  the ledger have nothing to offset — never `abs()` a lot balance to
+  decide that); `_credited_share` (the early-payment discount is
+  measured on what credit notes have not settled);
+  `_rational_amount` (a schedule amount desktop stored as a
+  non-decimal fraction rounds half-up to the template currency
+  instead of raising); `_repair_double_counters` (ID counters
+  GnuCash 5.0/5.1 saved as doubles, bug 798930); the row builders'
+  `_tsv_cell` / `_one_line` (book text cannot start a row of its
+  own; account paths stay resolvable). Status of every review item:
+  `specs/v1.5/testing/ADVERSARIAL_REVIEW_1.5.md` §10.
 - `_refuse_posting_record` / `_require_editable` (`book/_base.py`)
   — a document's posting transaction is read-only on every path:
   delete, void, `replace_splits`, and all three update forms route
