@@ -257,7 +257,54 @@ def redact_paths(text: str) -> str:
     )
 
 
-def resolve_mcp_dir(book_path: Path | str) -> Path:
+_LOG_DIR_OWNER_FILE = ".owner"
+
+
+def _log_dir_identity(book_path: Path | str, identity: str | None) -> str:
+    """What makes a book THIS book, for telling two same-named ones
+    apart: the caller's identity (a database book's masked
+    connection string), else the file's resolved absolute path."""
+    if identity:
+        return identity
+    try:
+        return str(Path(book_path).expanduser().resolve())
+    except OSError:
+        return str(book_path)
+
+
+def _read_log_dir_owner(mcp_dir: Path) -> str | None:
+    try:
+        return (mcp_dir / _LOG_DIR_OWNER_FILE).read_text(
+            encoding="utf-8"
+        ).strip() or None
+    except OSError:
+        return None
+
+
+def claim_log_dir(mcp_dir: Path, book_path: Path | str,
+                  identity: str | None = None) -> None:
+    """Record which book a per-book folder under ``GNUCASH_LOG_DIR``
+    belongs to, the first time anything is written there. A no-op
+    outside the override (the folder sits beside its book) and when
+    the folder is already claimed. Best-effort: a failure here must
+    not fail logging or a backup."""
+    if not os.environ.get("GNUCASH_LOG_DIR"):
+        return
+    owner_file = mcp_dir / _LOG_DIR_OWNER_FILE
+    try:
+        if owner_file.exists():
+            return
+        mcp_dir.mkdir(parents=True, exist_ok=True)
+        owner_file.write_text(
+            _log_dir_identity(book_path, identity) + "\n", encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+def resolve_mcp_dir(
+    book_path: Path | str, identity: str | None = None,
+) -> Path:
     """Resolve the ``.mcp`` directory for audit / debug / backup storage.
 
     ``GNUCASH_LOG_DIR`` set → a PER-BOOK subdirectory under it:
@@ -273,6 +320,21 @@ def resolve_mcp_dir(book_path: Path | str) -> Path:
     move them into the book's subdir manually to keep old history
     attached. Permission checks are bypassed under the override
     (explicit user opt-in), as before.
+
+    The filename alone is not the book. Two servers sharing one
+    ``GNUCASH_LOG_DIR`` — ``2026/ledger.gnucash`` and
+    ``2027/ledger.gnucash``, or a PostgreSQL and a MySQL database
+    both named ``gnucash`` — resolved to ONE folder: one interleaved
+    audit trail under the first book's header, one backup state
+    file, so the second book saw every stage as fresh, took no
+    backups of its own, and listed the first book's snapshots as
+    its newest (adversarial review 2026-09-30, C31). So the folder
+    is CLAIMED: the first book to write there records its identity
+    in ``.owner`` (``claim_log_dir``), and a different book that
+    resolves to a claimed folder gets ``{name}-{hash}.mcp`` instead.
+    The first book keeps the plain name, so nobody's existing
+    history moves. ``identity`` is the masked connection string for
+    a database book; a file book is identified by its resolved path.
 
     Otherwise the directory is
     ``book_path.parent / f"{book_path.name}.mcp"`` and two POSIX
@@ -299,7 +361,15 @@ def resolve_mcp_dir(book_path: Path | str) -> Path:
     env_override = os.environ.get("GNUCASH_LOG_DIR")
     if env_override:
         base = Path(env_override).expanduser()
-        return base / f"{Path(book_path).name}.mcp"
+        name = Path(book_path).name
+        plain = base / f"{name}.mcp"
+        owner = _read_log_dir_owner(plain)
+        mine = _log_dir_identity(book_path, identity)
+        if owner is None or owner == mine:
+            return plain
+        import hashlib
+        tag = hashlib.sha256(mine.encode("utf-8")).hexdigest()[:8]
+        return base / f"{name}-{tag}.mcp"
 
     book_path = Path(book_path)
     parent = book_path.parent
@@ -490,8 +560,11 @@ def setup_logging(
 
     # Lives alongside the book (or GNUCASH_LOG_DIR); the helper
     # also runs the symlink-hijack sanity checks.
-    log_dir = resolve_mcp_dir(book_path)
+    log_dir = resolve_mcp_dir(book_path, identity=display_name)
     _log_dir = log_dir
+    # Under GNUCASH_LOG_DIR, record whose folder this is, so a
+    # different book with the same filename gets its own.
+    claim_log_dir(log_dir, book_path, identity=display_name)
 
     now_local = datetime.now().astimezone()
     today = now_local.strftime("%Y-%m-%d")

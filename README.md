@@ -607,8 +607,9 @@ exactly what changed and when. Sample entry:
     account: Assets:Accounts Receivable  txn:a1b2c3d4
 ```
 
-**Automatic backups.** Before the very first write of each
-session, the server snapshots your book to
+**Automatic backups.** Before the first write of each session
+(and again as a long-running session crosses into a new backup
+period), the server snapshots your book to
 `<your-book>.gnucash.mcp/backups/` — so if something goes
 wrong, you can roll back to a known-good state without
 relying on Time Machine or your own habit. Backups are

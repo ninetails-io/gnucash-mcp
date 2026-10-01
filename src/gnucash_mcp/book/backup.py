@@ -4,8 +4,11 @@ Data loss is the one failure mode that can't be undone from within
 this server: a mangled book with no clean copy is game over. This
 mixin adds snapshot-based recovery: a ``create_backup()`` primitive
 built on SQLite's online backup API, plus a ``_maybe_auto_backup()``
-hook the audit decorator calls on the first write of a process to
-protect users who forget to back up manually.
+hook the audit decorator calls before a write to protect users who
+forget to back up manually. The hook does its work on the first
+write of a process and again whenever a stage has had time to come
+due — a server left running for days keeps snapshotting — and a
+failed attempt is retried on a later write.
 
 Auto-backups follow a grandfather-father-son retention policy — at
 most 7 session (12h spacing), 4 weekly (7d spacing), 6 monthly (30d
@@ -102,6 +105,12 @@ def _sanitize_label(label: str | None) -> str | None:
         return None
     safe = _LABEL_SAFE_RE.sub("-", label).strip("-")
     return safe or None
+
+
+def _monotonic() -> float:
+    """Seconds on a clock that never jumps; a seam for tests."""
+    import time
+    return time.monotonic()
 
 
 def _now_utc() -> datetime:
@@ -356,10 +365,28 @@ class BackupMixin:
     SQLite connection for atomic, lock-safe page-level copying.
     """
 
-    # Flag toggled on first auto-backup attempt per process lifecycle.
-    # Prevents stat + JSON read on every subsequent write once we've
-    # decided this process is up-to-date.
+    # Set on the first auto-backup check of a process. Keeps the
+    # stat + JSON read off the hot path: once checked, the next
+    # check waits until ``_backup_next_check`` (monotonic seconds).
     _backup_checked_in_process: bool = False
+
+    # When the hook looks again. ``None`` with the flag above set
+    # means "never" — a test or caller that sets the flag by hand to
+    # switch the hook off keeps that meaning.
+    #
+    # The hook used to run ONCE per process. A server left running
+    # (every Claude Desktop session) took no further snapshots
+    # however many days passed, and one failed first attempt — the
+    # user had GnuCash open — left the rest of the process with no
+    # auto-backup at all, while the dashboard advised "close GnuCash
+    # and try again" (adversarial review 2026-09-30, C29).
+    _backup_next_check: float | None = None
+    # Healthy: look again after this long. The shortest stage
+    # interval is 12 hours, so a quarter of an hour is prompt, and
+    # the check itself is one small file read.
+    _BACKUP_RECHECK_SECONDS = 15 * 60
+    # After a failed attempt: soon, but not on every write.
+    _BACKUP_RETRY_SECONDS = 60
 
     # Serialize the read+write of ``_backup_checked_in_process`` across
     # threads. Without this, two simultaneous "first writes" of the
@@ -384,6 +411,14 @@ class BackupMixin:
         """
         from gnucash_mcp.logging_config import resolve_mcp_dir
         return resolve_mcp_dir(self.book_path) / "backups"
+
+    def _claim_backups_dir(self, backups_dir: Path) -> None:
+        """Before the first file lands under a shared
+        ``GNUCASH_LOG_DIR``: record which book the folder belongs to
+        (``claim_log_dir``), so a same-named book elsewhere gets its
+        own and never reads, counts, or prunes these snapshots."""
+        from gnucash_mcp.logging_config import claim_log_dir
+        claim_log_dir(backups_dir.parent, self.book_path)
 
     def _require_file_backed(self, action: str) -> None:
         """Refuse a file-shaped backup operation on a DB-backed book.
@@ -596,6 +631,7 @@ class BackupMixin:
         safe_label = _sanitize_label(label)
         ts = _now_utc()
         backups_dir = self._backups_dir()
+        self._claim_backups_dir(backups_dir)
         backups_dir.mkdir(parents=True, exist_ok=True)
 
         stem = self.book_path.stem
@@ -910,15 +946,16 @@ class BackupMixin:
     # ── Auto-backup driver (called from @audit_log) ───────────────
 
     def _maybe_auto_backup(self) -> None:
-        """Called once per process, before the first write, from the
-        audit decorator: backs up under the highest-priority due
-        stage (if any) and prunes each auto stage to its
-        ``keep_last_n``.
+        """Called before every write, from the audit decorator: backs
+        up under the highest-priority due stage (if any) and prunes
+        each auto stage to its ``keep_last_n``. Does its work on the
+        first call of a process and then again no sooner than
+        ``_BACKUP_RECHECK_SECONDS`` later (``_BACKUP_RETRY_SECONDS``
+        after a failure); in between it is a flag check.
 
         Silently returns on any failure — an auto-backup error must
-        never fail the user's write; the debug log records why.
-        Safe to call repeatedly (``_backup_checked_in_process``
-        gates it).
+        never fail the user's write; the debug log and the dashboard
+        record why.
         """
         # DB-backed books have no snapshot store. Return before the
         # process gate flips so the check stays cheap and idempotent
@@ -929,12 +966,17 @@ class BackupMixin:
         # Lock so concurrent first-writes can't both pass the gate
         # and collide on the same backup filename.
         with self._backup_check_lock:
-            if self._backup_checked_in_process:
+            mono = _monotonic()
+            if self._backup_checked_in_process and (
+                self._backup_next_check is None
+                or mono < self._backup_next_check
+            ):
                 return
-            # Flag BEFORE running so a raise here won't cause the
-            # audit hook to retry on every subsequent write of the
-            # process.
+            # Set BEFORE running, so a raise below can't make the
+            # audit hook retry on every write: the failure path
+            # shortens the wait, it does not remove it.
             self._backup_checked_in_process = True
+            self._backup_next_check = mono + self._BACKUP_RECHECK_SECONDS
 
         backups_dir = self._backups_dir()
         stem = self.book_path.stem
@@ -1008,6 +1050,12 @@ class BackupMixin:
             # We persist the failure so get_book_summary's Warnings
             # section can surface it on the next read.
             debug_logger.warning(f"Auto-backup skipped: {e}")
+            # Try again on a write soon after — the usual cause is
+            # GnuCash holding the book, and the user's next move is
+            # to close it and retry.
+            self._backup_next_check = (
+                _monotonic() + self._BACKUP_RETRY_SECONDS
+            )
             try:
                 _write_attempt_status(
                     backups_dir, stem, "failed", str(e), now,
