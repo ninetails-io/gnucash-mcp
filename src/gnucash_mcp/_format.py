@@ -638,7 +638,7 @@ _CANDIDATE_COMPARISON_COLUMNS = (
     "ref", "candidate_guid", "confidence", "state",
     "date_new", "date_old", "date_delta_days",
     "amt_new", "amt_old", "amt_delta", "cur",
-    "desc_new", "desc_old", "notes_old", "memo_old",
+    "desc_new", "desc_old", "num_new", "num_old", "notes_old", "memo_old",
     "cat_new", "cat_old", "split_match", "signals",
 )
 
@@ -689,9 +689,51 @@ def _tsv_cell(value) -> str:
     return s
 
 
+# ── Correspondence signals ─────────────────────────────────────────
+#
+# A signals string is ``D``/``A``/``D`` (description, amount, date;
+# ``-`` = no match), plus a fourth character only when BOTH sides
+# carry a Num: ``N`` the same number, ``x`` different numbers. Every
+# reader goes through the three helpers below — the duplicate screen,
+# the statement scan, and the comparison table's sort agree by
+# construction.
+
+
+def _norm_num(value) -> str:
+    return " ".join(str(value or "").split()).casefold()
+
+
+def _num_signal(proposed, candidate_nums) -> str:
+    """The Num character: ``N`` when the proposal's number is among
+    the candidate's, ``x`` when both have numbers and none agree,
+    ``""`` when either side has none (no evidence either way)."""
+    mine = _norm_num(proposed)
+    theirs = {_norm_num(n) for n in candidate_nums} - {""}
+    if not mine or not theirs:
+        return ""
+    return "N" if mine in theirs else "x"
+
+
+def _signal_strength(signals) -> int:
+    """How many signals agree. ``x`` is evidence AGAINST, never for."""
+    return sum(1 for ch in str(signals or "") if ch in "DAN")
+
+
+def _signal_confidence(signals) -> str:
+    """HIGH / MEDIUM / LOW / "" for a signals string. Two documents
+    numbered differently are two events, so a Num conflict caps a
+    candidate at MEDIUM: shown for review, never blocking."""
+    n = _signal_strength(signals)
+    if n >= 3:
+        return "MEDIUM" if "x" in str(signals) else "HIGH"
+    return {2: "MEDIUM", 1: "LOW"}.get(n, "")
+
+
 def _candidate_risk(row: dict) -> int:
-    """Correspondence strength = lit signal count."""
-    return sum(1 for ch in str(row.get("signals", "")) if ch != "-")
+    """Sort rank of a comparison row: its confidence tier."""
+    return {"HIGH": 3, "MEDIUM": 2, "LOW": 1}.get(
+        _signal_confidence(row.get("signals", "")), 0,
+    )
 
 
 def _candidate_comparison_tsv(rows: list[dict]) -> str:

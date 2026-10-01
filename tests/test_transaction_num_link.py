@@ -319,3 +319,143 @@ class TestSearch:
             GnuCashBook(str(test_book)).search_transactions(
                 "x", field="number",
             )
+
+
+def _table(tsv: str) -> list[dict]:
+    lines = tsv.splitlines()
+    if not lines:
+        return []
+    header = lines[0].split("\t")
+    return [dict(zip(header, ln.split("\t"))) for ln in lines[1:]]
+
+
+def _cheque(num, desc="Plumber", day="2026-07-01", amount="250.00"):
+    return _parse_transactions_tsv(
+        "ref\tdate\tdescription\tnum\tamt\tacct\tamt\tacct\n"
+        f"1\t{day}\t{desc}\t{num}\t-{amount}\tAssets:Checking"
+        f"\t{amount}\tExpenses:Groceries\n"
+    )
+
+
+class TestDuplicateScreen:
+    """Num is a fourth correspondence signal: the same number is
+    evidence for, a different number evidence against."""
+
+    def test_same_num_strengthens(self, test_book):
+        gc = GnuCashBook(str(test_book))
+        gc.create_transactions(_cheque("1041"))
+        res = gc.create_transactions(_cheque("1041"))
+        (dup,) = _table(res["duplicates"])
+        assert dup["signals"] == "DADN"
+        assert dup["confidence"] == "HIGH"
+        assert (dup["num_new"], dup["num_old"]) == ("1041", "1041")
+        assert "\trejected\t" in res["results"]
+
+    def test_different_num_never_blocks(self, test_book):
+        """Two checks, same payee, same amount, same day: two
+        events. Shown for review, not refused."""
+        gc = GnuCashBook(str(test_book))
+        gc.create_transactions(_cheque("1041"))
+        res = gc.create_transactions(_cheque("1042"))
+        (dup,) = _table(res["duplicates"])
+        assert dup["signals"] == "DADx"
+        assert dup["confidence"] == "MEDIUM"
+        assert "\tcreated\t" in res["results"]
+
+    def test_same_num_and_amount_admit_without_desc_or_date(self, test_book):
+        """The bank's "CHECK 1041" clearing ten days after the
+        entry named for the payee: amount and number agree."""
+        gc = GnuCashBook(str(test_book))
+        gc.create_transactions(_cheque("1041"))
+        res = gc.create_transactions(
+            _cheque("1041", desc="CHECK", day="2026-07-11"),
+        )
+        (dup,) = _table(res["duplicates"])
+        assert dup["signals"] == "-A-N"
+        assert dup["confidence"] == "MEDIUM"
+
+    def test_no_num_on_either_side_unchanged(self, test_book):
+        gc = GnuCashBook(str(test_book))
+        gc.create_transactions(_cheque(""))
+        res = gc.create_transactions(_cheque(""))
+        (dup,) = _table(res["duplicates"])
+        assert dup["signals"] == "DAD"
+
+    def test_split_action_is_the_candidates_num_when_option_on(
+        self, test_book,
+    ):
+        gc = GnuCashBook(str(test_book))
+        gc.create_transactions(_cheque(""))
+        b = piecash.open_book(str(test_book), readonly=False, open_if_lock=True)
+        (t,) = [t for t in b.transactions if t.description == "Plumber"]
+        t.splits[0].action = "1041"
+        b.save()
+        b.close()
+        _num_on_split_action(test_book)
+        res = gc.create_transactions(_cheque("1041"))
+        assert _table(res["duplicates"])[0]["signals"] == "DADN"
+
+
+class TestStatementScan:
+    def _number_rent(self, statement_book, num):
+        b = piecash.open_book(
+            str(statement_book), readonly=False, open_if_lock=True,
+        )
+        (rent,) = [t for t in b.transactions if t.description == "July Rent"]
+        rent.num = num
+        b.save()
+        b.close()
+
+    def _rent_line(self, num):
+        return [_line(
+            "1", date(2026, 7, 1), "-800.00", raw="CHECK", num=num,
+            splits=[{"account": "Expenses:Rent", "amount": "800.00"}],
+        )]
+
+    def _run(self, statement_book, num, dry_run=True):
+        return GnuCashBook(str(statement_book)).enter_statement(
+            "Assets:Checking", date(2026, 7, 31), "1000.00", "200.00",
+            self._rent_line(num), dry_run=dry_run,
+        )
+
+    def test_same_num_is_a_match(self, statement_book):
+        self._number_rent(statement_book, "1041")
+        res = self._run(statement_book, "1041")
+        assert res["lines"].splitlines()[1].split("\t")[1] == "MATCH"
+        (cand,) = _table(res["candidates"])
+        assert (cand["signals"], cand["confidence"]) == ("-ADN", "HIGH")
+        assert cand["num_old"] == "1041"
+
+    def test_different_num_is_new_and_commits(self, statement_book):
+        """Check 1042 for the same rent amount on the day check 1041
+        was entered is a second check, not the first one: the line
+        is NEW and the exact-twin guard does not stop it."""
+        self._number_rent(statement_book, "1041")
+        res = self._run(statement_book, "1042")
+        assert res["lines"].splitlines()[1].split("\t")[1] == "NEW"
+        (cand,) = _table(res["candidates"])
+        assert (cand["signals"], cand["confidence"]) == ("-ADx", "MEDIUM")
+        out = self._run(statement_book, "1042", dry_run=False)
+        assert "\tcreated\t" in out["results"]
+
+    def test_unnumbered_twin_still_guarded(self, statement_book):
+        out_lines = self._run(statement_book, "")["lines"]
+        assert out_lines.splitlines()[1].split("\t")[1] == "MATCH"
+
+
+def test_signals_are_read_through_the_helpers():
+    """Counting lit characters by hand read a Num conflict ("x") as
+    agreement. Every reader goes through _signal_strength /
+    _signal_confidence (_format.py)."""
+    import re
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parent.parent / "src" / "gnucash_mcp"
+    pattern = re.compile(r'for ch in [^\n]*signals[^\n]*if ch != "-"')
+    offenders = [
+        f"{p.relative_to(src)}:{n}"
+        for p in [src / "_format.py", *sorted((src / "book").glob("*.py"))]
+        for n, line in enumerate(p.read_text().splitlines(), 1)
+        if pattern.search(line)
+    ]
+    assert offenders == []

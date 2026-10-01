@@ -460,8 +460,8 @@ def register(mcp, get_book) -> None:
           comparison rows, sorted strongest-correspondence first —
           ``ref, candidate_guid, confidence, state, date_new,
           date_old, date_delta_days, amt_new, amt_old, amt_delta,
-          cur, desc_new, desc_old, notes_old, memo_old, cat_new,
-          cat_old, split_match, signals``. ``_new`` = your proposed
+          cur, desc_new, desc_old, num_new, num_old, notes_old,
+          memo_old, cat_new, cat_old, split_match, signals``. ``_new`` = your proposed
           row, ``_old`` = the existing transaction; ``cat_*`` are
           the category (non-payment) legs as
           ``account=amount|...``; ``split_match``
@@ -469,6 +469,11 @@ def register(mcp, get_book) -> None:
           date+amount but ``none`` on category is usually a
           distinct purchase. Amounts are SIGNED (direction
           matters: a deposit is not a payment's twin).
+          ``signals`` reads description/amount/date (``D``/``A``/
+          ``D``, ``-`` = no match), plus ``N`` when both sides carry
+          the SAME Num or ``x`` when their Nums differ — a
+          different number means a different document, so an
+          ``x`` candidate is at most MEDIUM and never blocks.
           ``amt_delta`` is blank on cross-currency candidates
           (``cur`` names the candidate's currency exactly when
           the frames differ); ``memo_old`` and ``state`` blanks
@@ -595,14 +600,18 @@ def register(mcp, get_book) -> None:
         SELF-CONTAINED comparison rows sorted
         strongest-correspondence first (``ref, candidate_guid,
         confidence, state, date_new/old + delta, amt_new/old +
-        delta, cur, desc_new/old, notes_old, memo_old, cat_new/old,
-        split_match, signals``; ``_new`` = the statement line in
+        delta, cur, desc_new/old, num_new/old, notes_old, memo_old,
+        cat_new/old, split_match, signals``; ``_new`` = the statement line in
         book convention, ``_old`` = the existing split — never
         re-read your own input; ``cur`` is structurally blank on
         this surface), plus ``warnings`` (only when present;
         ``candidates`` likewise) and ``tie`` — the projected
         reconciled balance vs the closing, with a count of rows
-        this exact payload would refuse at commit. The dry-run
+        this exact payload would refuse at commit. A candidate
+        whose Num differs from the line's (``signals`` ends in
+        ``x``) is a different check or document: it never drives
+        MATCH and never trips the exact-twin guard; the same Num
+        (``N``) counts as a signal. The dry-run
         rehearses the SAME disposition procedure commit runs —
         force included. The tie is the only verdict;
         MATCH/AMBIGUOUS rows are yours to rule.

@@ -26,7 +26,10 @@ from gnucash_mcp._format import (
     _candidate_comparison_tsv,
     _dry_run_summary,
     _format_number,
+    _num_signal,
     _paginate,
+    _signal_confidence,
+    _signal_strength,
     _split_match_verdict,
     _tsv_cell,
 )
@@ -3892,6 +3895,8 @@ class CoreMixin:
         want_duplicates: bool,
         want_recent: bool,
         trans_currency: str | None = None,
+        proposed_num: str | None = None,
+        num_on_split: bool = False,
         sweep: list[tuple["piecash.Transaction", str]] | None = None,
         duplicate_window_days: int = 30,
         stability_days: int = 90,
@@ -3919,7 +3924,11 @@ class CoreMixin:
             want_stability: Warn when recent matches disagree on the
                 categorization pattern.
             want_duplicates: Score the ±window range on description,
-                amount, date; emit HIGH/MEDIUM candidates.
+                amount, date, and — when the proposal has a number —
+                Num; emit HIGH/MEDIUM candidates.
+            proposed_num: The proposal's Num. A candidate's numbers
+                are its transaction num, plus every split action
+                when ``num_on_split`` (the book keeps Num there).
             want_recent: Keep top N matches for the post-write
                 split-consistency warning.
             sweep: A precomputed ``_signal_sweep(book)`` — pass it
@@ -4087,14 +4096,17 @@ class CoreMixin:
                     <= _MATCH_DATE_TIGHT_DAYS
                 )
 
-                signals = sum([desc_match, amount_match, date_match])
-                if signals >= 2:
-                    confidence = "HIGH" if signals == 3 else "MEDIUM"
-                    signal_str = (
-                        ("D" if desc_match else "-")
-                        + ("A" if amount_match else "-")
-                        + ("D" if date_match else "-")
-                    )
+                cand_nums = [txn.num] + (
+                    [s.action for s in txn.splits] if num_on_split else []
+                )
+                signal_str = (
+                    ("D" if desc_match else "-")
+                    + ("A" if amount_match else "-")
+                    + ("D" if date_match else "-")
+                    + _num_signal(proposed_num, cand_nums)
+                )
+                if _signal_strength(signal_str) >= 2:
+                    confidence = _signal_confidence(signal_str)
                     # Category (non-funding) legs, for the ruling-9
                     # self-contained comparison; all legs when
                     # filtering leaves nothing (transfers), same
@@ -4145,6 +4157,9 @@ class CoreMixin:
                         "currency_code": txn.currency.mnemonic,
                         "date": txn.post_date.isoformat(),
                         "description": txn.description,
+                        "num": ", ".join(
+                            n for n in dict.fromkeys(cand_nums) if n
+                        ),
                         "notes": txn.notes or "",
                         "categories": cat_legs,
                         "amount": str(primary_amount),
@@ -4481,8 +4496,9 @@ class CoreMixin:
 
                 confidence<TAB>guid<TAB>date<TAB>amount<TAB>cur<TAB>description<TAB>signals
 
-            Confidence is HIGH or MEDIUM; signals is a three-char
-            D/A/D code (description / amount / date, dash = no match).
+            Confidence is HIGH or MEDIUM; signals is a D/A/D code
+            (description / amount / date, dash = no match) — see
+            ``_format._num_signal`` for the fourth, Num, character.
 
         Raises:
             ValueError: imbalance, <2 splits, unknown account,
@@ -4895,6 +4911,7 @@ class CoreMixin:
                 return self._batch_envelope(transactions, by_ref, [])
 
             # --- Phase 2: duplicate screen (against existing book) ---
+            num_on_split = self._num_is_split_action(book)
             accepted = []
             for p in prepared:
                 p_cat_values = [
@@ -4913,6 +4930,8 @@ class CoreMixin:
                     want_auto_fill=False, want_stability=False,
                     want_duplicates=True, want_recent=False,
                     trans_currency=p["currency"].mnemonic,
+                    proposed_num=p["num"],
+                    num_on_split=num_on_split,
                     sweep=_sweep(),
                 )
                 dups = signals.duplicates
@@ -4930,6 +4949,7 @@ class CoreMixin:
                     ]
                     proposal = {
                         "desc": p["description"],
+                        "num": p["num"],
                         "date": p["trans_date"],
                         # SIGNED primary (max-abs split's value) —
                         # the comparison table reads sign as
@@ -5246,6 +5266,8 @@ class CoreMixin:
                 ),
                 "desc_new": prop["desc"],
                 "desc_old": d["description"],
+                "num_new": prop.get("num", ""),
+                "num_old": d.get("num", ""),
                 "notes_old": d.get("notes", ""),
                 "cat_new": CoreMixin._cats_str(prop["cats"]),
                 "cat_old": CoreMixin._cats_str(
@@ -5499,13 +5521,19 @@ class CoreMixin:
             def _book_amount(ln) -> Decimal:
                 return (sign * amounts[ln["ref"]]).quantize(quantum)
 
+            # A candidate's Num is what this account's register shows
+            # in the Num column (gnc_get_num_action with its split).
+            num_on_split = self._num_is_split_action(book)
+
             def _candidates_for(ln) -> list[dict]:
                 """DAD-style scoring against the account's own
                 splits. A candidate needs the amount signal alone
                 (the universe is narrow enough that an amount match
-                is meaningful — and the rent case has ONLY that), or
+                is meaningful — and the rent case has ONLY that),
                 desc+date without amount (the fix-the-book-typo
-                case)."""
+                case), or the same Num. A different Num rules a
+                candidate out as the same event: it can be neither
+                exact nor strong."""
                 target = _book_amount(ln)
                 probe = (
                     ln.get("description") or ln.get("raw") or ""
@@ -5530,8 +5558,13 @@ class CoreMixin:
                         bool(probe) and bool(tdesc)
                         and (probe in tdesc or tdesc in probe)
                     )
+                    num_char = _num_signal(
+                        ln.get("num"),
+                        [s.action if num_on_split else s.transaction.num],
+                    )
                     if not (
                         amount_match or (desc_match and date_match)
+                        or num_char == "N"
                     ):
                         continue
                     cands.append({
@@ -5540,13 +5573,16 @@ class CoreMixin:
                             ("D" if desc_match else "-")
                             + ("A" if amount_match else "-")
                             + ("D" if date_match else "-")
+                            + num_char
                         ),
                         # Exact = the same event, not the monthly
                         # pattern: amount to the quantum AND date
-                        # within the tight window. Drives the
-                        # OVERLAP class and the commit guard.
+                        # within the tight window, and no other
+                        # number on it. Drives the OVERLAP class and
+                        # the commit guard.
                         "exact": (
                             date_match
+                            and num_char != "x"
                             and s.quantity.quantize(quantum)
                             == target
                         ),
@@ -5748,6 +5784,7 @@ class CoreMixin:
         n_refuse = len(phase_a["errors"]) + len(phase_a["guards"])
 
         counts = {"NEW": 0, "MATCH": 0, "OVERLAP": 0, "AMBIGUOUS": 0}
+        num_on_split = self._num_is_split_action(book)
         line_rows: list[tuple] = []
         cand_rows: list[dict] = []
         projected = reconciled_balance.quantize(quantum)
@@ -5771,7 +5808,8 @@ class CoreMixin:
             # (bookkeeper findings, maiden flight + T6).
             strong = [
                 c for c in unrec
-                if sum(1 for ch in c["signals"] if ch != "-") >= 2
+                if _signal_strength(c["signals"]) >= 2
+                and "x" not in c["signals"]
                 and not c["recurring"]
             ]
             if strong:
@@ -5859,8 +5897,7 @@ class CoreMixin:
             if not show_all:
                 strong_listed = [
                     c for c in listed
-                    if sum(1 for ch in c["signals"] if ch != "-")
-                    >= 2
+                    if _signal_strength(c["signals"]) >= 2
                 ]
                 if strong_listed and len(strong_listed) < len(listed):
                     n_suppressed = len(listed) - len(strong_listed)
@@ -5877,13 +5914,10 @@ class CoreMixin:
                     for s2 in txn.splits
                     if s2.account.guid != account.guid
                 ]
-                risk = sum(1 for ch in c["signals"] if ch != "-")
                 cand_rows.append({
                     "ref": ln["ref"],
                     "candidate_guid": split_prefixes[s.guid],
-                    "confidence": {
-                        3: "HIGH", 2: "MEDIUM", 1: "LOW",
-                    }.get(risk, ""),
+                    "confidence": _signal_confidence(c["signals"]),
                     "state": s.reconcile_state,
                     "date_new": ln["date"].isoformat(),
                     "date_old": txn.post_date.isoformat(),
@@ -5899,6 +5933,10 @@ class CoreMixin:
                         ln.get("description") or ln.get("raw") or ""
                     ),
                     "desc_old": txn.description or "",
+                    "num_new": ln.get("num", ""),
+                    "num_old": (
+                        s.action if num_on_split else txn.num
+                    ) or "",
                     "notes_old": txn.notes or "",
                     "memo_old": s.memo or "",
                     "cat_new": (
