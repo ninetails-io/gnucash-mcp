@@ -188,6 +188,25 @@ class CredentialScrubFilter(logging.Filter):
         return True
 
 
+def _private_prefixes() -> list[str]:
+    """Absolute directories known to be the user's own, longest
+    first: where the book lives and where the audit trail lives."""
+    found: set[str] = set()
+    book = globals().get("_book_path_str")
+    if book and "://" not in str(book):
+        try:
+            found.add(os.path.dirname(os.path.abspath(str(book))))
+        except (OSError, ValueError):
+            pass
+    log_dir = globals().get("_log_dir")
+    if log_dir:
+        found.add(str(log_dir))
+    return sorted(
+        (p.rstrip("/\\") for p in found if p and len(p) > 1),
+        key=len, reverse=True,
+    )
+
+
 def redact_paths(text: str) -> str:
     """Make an error message safe to leave the server.
 
@@ -226,9 +245,28 @@ def redact_paths(text: str) -> str:
     # POSIX absolute paths: /foo/bar/baz.ext
     # Stop at whitespace, quotes, or common delimiter chars.
     posix_re = re.compile(r"/(?:[^\s/'\"<>]+/)+[^\s/'\"<>]+")
-    # Windows: C:\foo\bar.ext or C:/foo/bar.ext
+    # Windows: C:\foo\bar.ext or C:/foo/bar.ext. The drive letter
+    # must stand alone: without the lookbehind the ``e:`` of
+    # ``file:///Users/…`` was a drive and the result ``filb.gnucash``.
     win_re = re.compile(
-        r"[A-Za-z]:[/\\](?:[^\s'\"<>]+[/\\])*[^\s'\"<>]+"
+        r"(?<![A-Za-z])[A-Za-z]:[/\\](?:[^\s'\"<>]+[/\\])*[^\s'\"<>]+"
+    )
+    # UNC: \\server\share\dir\file
+    unc_re = re.compile(r"\\\\[^\s'\"<>\\]+(?:\\[^\s'\"<>\\]+)+")
+    # A path may contain spaces ("/Users/x/Client Books/Acme
+    # Ltd.gnucash"), and the patterns above stop at the first one —
+    # leaving " Books/Acme Ltd.gnucash", the client's name, in a
+    # message the user asked to have redacted (adversarial review
+    # 2026-09-30, C56). Two places a path's END is known despite
+    # spaces: inside quotes, and at a file extension this server
+    # writes or reads.
+    quoted_re = re.compile(
+        r"""(['"])((?:/|(?<![A-Za-z])[A-Za-z]:[/\\]|\\\\)[^'"\n]*)\1"""
+    )
+    spaced_re = re.compile(
+        r"(?:/|(?<![A-Za-z])[A-Za-z]:[/\\]|\\\\)"
+        r"(?:[^/\\'\"<>\n]+[/\\])+[^/\\'\"<>\n]*?"
+        r"\.(?:gnucash|log|json|tmp|bak|db|sqlite3?|LCK|LNK|mcp)\b"
     )
 
     def to_basename(m):
@@ -247,8 +285,32 @@ def redact_paths(text: str) -> str:
         held.append(m.group(0))
         return f"\x00{len(held) - 1}\x00"
 
+    # A file URL is a path with a scheme on it, not a connection
+    # string to keep whole.
+    text = re.sub(
+        r"file://(/[^\s'\"<>]+)",
+        lambda m: m.group(1).rstrip("/").rsplit("/", 1)[-1], text,
+    )
     text = _DB_URI_IN_TEXT_RE.sub(hold, text)
 
+    text = quoted_re.sub(
+        lambda m: m.group(1)
+        + m.group(2).replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+        + m.group(1),
+        text,
+    )
+    text = spaced_re.sub(to_basename, text)
+    text = unc_re.sub(to_basename, text)
+    # The directories this process knows are private — the book's own
+    # folder and the audit folder — as literal text, for a mention
+    # the patterns cannot bound: a directory with spaces in its name
+    # and no file name after it. (An unknown directory with spaces
+    # and no extension still ends at its first space; nothing in the
+    # text says where it stops.)
+    for prefix in _private_prefixes():
+        for sep in ("/", "\\"):
+            text = text.replace(prefix + sep, "")
+        text = text.replace(prefix, "[folder]")
     # Windows first (more specific prefix); then POSIX.
     text = win_re.sub(to_basename, text)
     text = posix_re.sub(to_basename, text)
@@ -477,6 +539,16 @@ class _DailyFileHandler(logging.Handler):
         path = self.path_for(day or _local_day())
         if path.exists() and path.stat().st_size > 0:
             return path
+        # The directory too: removed mid-session (a cleanup script, a
+        # sync client), every later write committed to the book with
+        # no audit line, and the only sign was a "Logging error" on
+        # stderr (adversarial review 2026-09-30, C33).
+        if not self.directory.exists():
+            self.directory.mkdir(parents=True, exist_ok=True)
+            try:
+                os.chmod(self.directory, 0o700)
+            except OSError:
+                pass
         # Explicit UTF-8: under a C/POSIX locale (common for
         # daemonized MCP servers) the platform default is ASCII, and
         # localized account names would raise inside the handler.
@@ -3227,9 +3299,13 @@ def audit_log(
                 # (piecash: "Database 'postgresql://user:pw@…' does
                 # not exist"); mask it before it reaches either log.
                 error_message = _scrub_credentials(str(e))
+                # One record per line here too: the text echoes
+                # caller-supplied values, and a newline in one forged
+                # a debug-log record (SEC-18).
                 debug_logger.debug(
                     f"MCP response: tool={func.__name__} status=error "
-                    f"elapsed={elapsed_ms:.0f}ms error={error_message}"
+                    f"elapsed={elapsed_ms:.0f}ms "
+                    f"error={_escape_audit_value(error_message)}"
                 )
 
                 # Log a simple error line. Exception text embeds
@@ -3265,6 +3341,19 @@ def audit_log(
 def debug_log(message: str) -> None:
     """Log a debug message if debug logging is enabled."""
     logging.getLogger(DEBUG_LOGGER_NAME).debug(message)
+
+
+def audit_note(verb: str, text: str) -> None:
+    """Write one line to the audit trail for an event that is not a
+    book write — ``HH:MM:SS  VERB  text``. A no-op when auditing is
+    off (the audit logger has no handler then)."""
+    logger = logging.getLogger(AUDIT_LOGGER_NAME)
+    if not logger.handlers:
+        return
+    stamp = datetime.now().astimezone().isoformat().split("T")[1][:8]
+    logger.info(f"{stamp}  {verb}  {_escape_audit_value(text)}")
+    logger.info("")
+    _flush_logger(logger)
 
 
 def _flush_logger(logger: logging.Logger) -> None:

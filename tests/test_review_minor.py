@@ -579,3 +579,63 @@ class TestMM15ATemplateQuantityIsRoundedNotTruncated:
             "select numeric_val_num, numeric_val_denom from slots "
             "where slot_type = 3 and name like '%quantity%'",
         ) == [(12346, 10000)]
+
+
+# ── logging ─────────────────────────────────────────────────────────
+
+import json  # noqa: E402
+import logging  # noqa: E402
+import shutil  # noqa: E402
+
+
+class TestC33AnAuditFolderRemovedMidSessionComesBack:
+    def test_the_next_entry_is_written(self, tmp_path):
+        from gnucash_mcp.logging_config import _DailyFileHandler
+
+        directory = tmp_path / "ledger.mcp" / "audit"
+        directory.mkdir(parents=True)
+        handler = _DailyFileHandler(directory, ".log", lambda day: f"# {day}")
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        record = logging.LogRecord("a", logging.INFO, "", 0, "first", None, None)
+        handler.emit(record)
+        shutil.rmtree(tmp_path / "ledger.mcp")
+
+        record = logging.LogRecord("a", logging.INFO, "", 0, "second", None, None)
+        handler.emit(record)
+
+        files = list(directory.glob("*.log"))
+        assert len(files) == 1
+        assert "second" in files[0].read_text()
+
+
+class TestC60AManualBackupLeavesAnAuditLine:
+    def test_the_line_names_the_file(self, test_book, tmp_path, monkeypatch):
+        from gnucash_mcp import server as server_module
+        from gnucash_mcp.logging_config import setup_logging
+
+        monkeypatch.setenv("GNUCASH_LOG_DIR", str(tmp_path / "logs"))
+        monkeypatch.setenv("GNUCASH_BOOK_PATH", str(test_book))
+        server_module._book = None
+        pre = dict(server_module.mcp._tool_manager._tools)
+        server_module._reset_lazy_load_state()
+        server_module._apply_module_filter("all")
+        try:
+            setup_logging(
+                book_path=str(test_book), audit=True,
+                get_book=server_module.get_book,
+            )
+            tool = server_module.mcp._tool_manager._tools["create_backup"].fn
+            made = json.loads(tool(label="before-cleanup"))
+            name = os.path.basename(made["path"])
+            files = [
+                p for p in (tmp_path / "logs").rglob("*")
+                if p.is_file() and "audit" in p.parts
+            ]
+            log = "\n".join(p.read_text() for p in files)
+            assert f"CREATE BACKUP  {name}" in log, [str(f) for f in files]
+        finally:
+            setup_logging(book_path=None, audit=False, debug=False)
+            for added in set(server_module.mcp._tool_manager._tools) - set(pre):
+                del server_module.mcp._tool_manager._tools[added]
+            server_module._reset_lazy_load_state()
+            server_module._book = None

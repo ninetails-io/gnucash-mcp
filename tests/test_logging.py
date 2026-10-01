@@ -2251,6 +2251,54 @@ class TestRedactPaths:
         assert "/Users" not in result
         assert "book.gnucash" in result
 
+    # ── adversarial review 2026-09-30, C56 ───────────────────────
+    @pytest.mark.parametrize("text, kept, gone", [
+        ("GnuCash book not found: /home/dana/Client Books/Acme Ltd.gnucash",
+         "Acme Ltd.gnucash", ["Client Books", "dana"]),
+        ("Lock on file '/home/dana/My Books/book one.gnucash' detected",
+         "'book one.gnucash'", ["My Books", "dana"]),
+        (r"Cannot open C:\Users\Alice Smith\Documents\book.gnucash",
+         "book.gnucash", ["Alice Smith", "Documents"]),
+        (r"Cannot open \\fileserver\Finance Share\books\ledger.gnucash now",
+         "ledger.gnucash now", ["fileserver", "Finance Share"]),
+        ("Backup dir /home/dana/Client Books/ledger.mcp/backups missing",
+         "ledger.mcp/backups missing", ["Client Books", "dana"]),
+    ])
+    def test_paths_with_spaces_and_network_paths(
+        self, monkeypatch, text, kept, gone,
+    ):
+        monkeypatch.setenv("GNUCASH_REDACT_PATHS", "1")
+        result = self._rp(text)
+        assert kept in result
+        for fragment in gone:
+            assert fragment not in result
+
+    def test_a_file_url_is_reduced_not_mangled(self, monkeypatch):
+        """``file:///…`` came out as ``filb.gnucash``: the ``e:`` of
+        ``file:`` was read as a drive letter."""
+        monkeypatch.setenv("GNUCASH_REDACT_PATHS", "1")
+        result = self._rp("opened file:///home/dana/books/b.gnucash ok")
+        assert result == "opened b.gnucash ok"
+
+    def test_the_books_own_folder_is_removed_even_with_spaces(
+        self, monkeypatch,
+    ):
+        """A directory with spaces and nothing after it cannot be
+        bounded by a pattern — but the server knows its own book's
+        folder."""
+        from gnucash_mcp import logging_config
+        monkeypatch.setenv("GNUCASH_REDACT_PATHS", "1")
+        monkeypatch.setattr(
+            logging_config, "_book_path_str",
+            "/home/dana/Client Books 2026/acme.gnucash",
+        )
+        result = self._rp(
+            "could not write to /home/dana/Client Books 2026 (disk full); "
+            "see /home/dana/Client Books 2026/acme.gnucash"
+        )
+        assert "Client Books" not in result and "dana" not in result
+        assert "acme.gnucash" in result
+
     def test_no_paths_no_change(self, monkeypatch):
         """Plain error messages with no paths pass through unchanged."""
         monkeypatch.setenv("GNUCASH_REDACT_PATHS", "1")

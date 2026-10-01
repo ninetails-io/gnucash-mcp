@@ -15,7 +15,9 @@ performed with the server stopped — see
 ``docs/RESTORE_FROM_BACKUP.md``.
 """
 
-from gnucash_mcp.logging_config import audit_log
+import os
+
+from gnucash_mcp.logging_config import audit_log, audit_note
 from gnucash_mcp.tools._helpers import _json, safe_tool
 
 
@@ -63,4 +65,10 @@ def register(mcp, get_book) -> None:
         """
         book = get_book()
         result = book.create_backup(stage="manual", label=label)
+        # Read-classified (the book did not change), which also meant
+        # unrecorded: a session could write a thousand copies and
+        # get_audit_log showed nothing (adversarial review
+        # 2026-09-30, C60). The trail names each one.
+        name = os.path.basename(str(result.get("path") or ""))
+        audit_note("CREATE BACKUP", name or "(manual)")
         return _json(result)

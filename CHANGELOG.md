@@ -101,6 +101,10 @@ Schedule recipes, invoice links, and budget signs are now stored the way GnuCash
   - `create_lot` writes GnuCash's shape: the closed flag left to be computed and no empty notes slot (SS-15). A schedule's share quantity is rounded like a transaction's, not truncated (MM-15).
   - Backups are created readable by their owner only; they were world-readable copies of the whole book (DS-15).
   - Only a lock is reported as a lock. A SQLite file that is not a GnuCash book, or a missing book under a folder with "lock" in its name, was reported as "locked by GnuCash" after three retries (FC-13, DS-13).
+- Logging and privacy, from the same review:
+  - `GNUCASH_REDACT_PATHS` handles folders with spaces, network paths, and `file://` URLs. A path stopped at its first space, so `/Users/x/Client Books/Acme Ltd.gnucash` left "Books/Acme Ltd.gnucash" in the message; a file URL came out as `filb.gnucash`. The book's own folder and the audit folder are removed wherever they appear (C56).
+  - An audit folder removed while the server runs is recreated on the next entry. Every later write used to commit with no audit line (C33).
+  - `create_backup` leaves a line in the audit trail naming the file (C60). `--noaudit` on the command line no longer creates the day's audit file at startup. A newline in an echoed value can no longer forge a debug-log record (SEC-18).
 - Books whose ID counters GnuCash 5.0 or 5.1 saved as decimals (GnuCash bug 798930) could not auto-number anything: `create_party`, `create_document`, and `create_job` raised a format error. The counter is read as GnuCash reads it and stored back as the integer it is meant to be. Review item FC-2.
 - A credit note raised on a job in GnuCash desktop can be edited, deleted, and applied: `add_document_entry` and `delete_document` raised `KeyError: 3`, and `apply_credit_note` could not find the customer's invoice. Review item C45.
 - The audit log's account-update entry lists the fields that changed, and only those. A description-only update used to log `Name: "X" → ""`, a rename that never happened, while a placeholder or type change had no line at all. Review item C41.

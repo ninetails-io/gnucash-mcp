@@ -1557,7 +1557,15 @@ def _seed_toggle(var: str, *, default: bool) -> bool:
 
 
 _debug_mode = _seed_toggle("GNUCASH_MCP_DEBUG", default=False)
-_audit_mode = not _seed_toggle("GNUCASH_MCP_NOAUDIT", default=False)
+# ``--noaudit`` is read here as well as in main(): logging is set up
+# below, at import, and with only the environment consulted it
+# created the day's audit file — header and all — for a server told
+# on its command line to keep none (adversarial review 2026-09-30,
+# side-finding 5).
+_audit_mode = (
+    not _seed_toggle("GNUCASH_MCP_NOAUDIT", default=False)
+    and "--noaudit" not in sys.argv[1:]
+)
 _logging_debug = _debug_mode
 _logging_audit = _audit_mode
 # Initial logging points at the first valid book. Best-effort at
