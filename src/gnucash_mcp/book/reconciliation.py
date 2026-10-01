@@ -567,6 +567,11 @@ class ReconciliationMixin:
             if any(s.reconcile_state == "v" for s in transaction.splits):
                 raise ValueError(f"Transaction {guid} is already voided")
 
+            # xaccTransVoid: "Refusing to void a read-only
+            # transaction!" A voided posting zeroes the split the
+            # document's lot is measured from.
+            self._refuse_posting_record(book, transaction, "void")
+
             # Detect reconciled splits BEFORE zeroing — capture the
             # account names we'll cite in the warning.
             reconciled_accounts = sorted({
@@ -807,6 +812,15 @@ class ReconciliationMixin:
             for key in ("void-reason", "void-time", "trans-read-only"):
                 if key in transaction:
                     del transaction[key]
+            # A posting record voided before the guard existed lost
+            # its read-only reason to "Transaction Voided"; clearing
+            # that (xaccTransClearReadOnly) must not leave a posting
+            # transaction desktop will let the user edit. Put back
+            # what posting wrote.
+            if self._posting_document_id(book, transaction) is not None:
+                transaction["trans-read-only"] = (
+                    self._POSTING_READ_ONLY_REASON
+                )
 
             book.save()
 

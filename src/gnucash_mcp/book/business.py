@@ -6616,10 +6616,7 @@ class BusinessMixin:
 
             # Metadata slots matching GnuCash UI behavior
             txn["trans-txn-type"] = "I"
-            txn["trans-read-only"] = (
-                "Generated from an invoice. "
-                "Try unposting the invoice."
-            )
+            txn["trans-read-only"] = self._POSTING_READ_ONLY_REASON
             self._write_gncinvoice_slot(
                 book, txn.guid, inv.guid
             )

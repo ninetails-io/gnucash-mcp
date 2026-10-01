@@ -865,7 +865,10 @@ def register(mcp, get_book) -> None:
         sinks the batch on any bad row, ``"skip"`` keeps good rows.
         Date moves on transactions with reconciled splits are
         rejected per row unless ``force=true`` (they shift the
-        transaction out of its reconciled statement period).
+        transaction out of its reconciled statement period). A
+        voided transaction, or an invoice's posting record
+        (read-only, as in GnuCash: unpost_document first), is
+        rejected whatever ``force`` says.
         Returns a results TSV keyed by your input guids. This is
         the canonical update tool for one transaction or many (the
         former ``update_transaction`` tool was removed; this
@@ -913,7 +916,7 @@ def register(mcp, get_book) -> None:
                 - 'memo' (optional): Split memo
             force: Required only when the replacement would CHANGE a
                 reconciled split (or remove splits from lots) —
-                unchanged reconciled legs are preserved without it.
+                unchanged reconciled legs are preserved without it. Never overrides the refusal on a voided transaction or on an invoice's posting record (unpost_document first).
         """
         book = get_book()
         result = book.replace_splits(

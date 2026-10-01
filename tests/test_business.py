@@ -8494,7 +8494,10 @@ class TestPayInvoice:
             from piecash.business.invoice import Invoice
             inv = book.session.query(Invoice).filter_by(id="000001").first()
             post_txn_guid = inv.post_txn.guid
-        gb.void_transaction(guid=post_txn_guid, reason="test")
+        # void_transaction refuses a posting record since 1.5; books
+        # voided before then still hold this state.
+        from tests.conftest import void_posting_record
+        void_posting_record(gb, post_txn_guid)
 
         with pytest.raises(ValueError, match="posting transaction has been voided"):
             gb.pay_invoice(

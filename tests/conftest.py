@@ -24,6 +24,23 @@ def _quiet_restart_guards():
     yield
 
 
+def void_posting_record(gb, txn_guid: str, reason: str = "test setup"):
+    """Void a document's posting transaction, as servers before 1.5
+    allowed (review C4a): the real void writer with the read-only
+    guard switched off for the one call, so the rows are exactly what
+    such a book holds. ``void_transaction`` refuses this now, but the
+    state outlives the door that made it — the guards that protect
+    it (``pay_document``'s refusal, the posted-total fallback,
+    ``unvoid``'s repair) need tests that can still construct it.
+    """
+    from unittest import mock
+
+    with mock.patch.object(
+        type(gb), "_refuse_posting_record", lambda *a, **k: None,
+    ):
+        return gb.void_transaction(txn_guid, reason)
+
+
 def drop_transaction_prices(book_path) -> int:
     """Delete every ``type='transaction'`` price row from the book at
     ``book_path`` and return how many went.

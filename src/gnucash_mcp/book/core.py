@@ -6686,16 +6686,7 @@ class CoreMixin:
           ``replace_splits`` applies: a lot split is cost basis or
           an invoice payment, and deleting it reopens the lot.
         """
-        from sqlalchemy import text
-        posting_for = book.session.execute(
-            text("SELECT id FROM invoices WHERE post_txn = :guid"),
-            {"guid": transaction.guid},
-        ).fetchone()
-        if posting_for:
-            raise ValueError(
-                f"Transaction is the posting record for invoice "
-                f"{posting_for[0]}. Use unpost_document first."
-            )
+        self._refuse_posting_record(book, transaction, "delete")
 
         reconciled = [
             s for s in transaction.splits if s.reconcile_state == "y"
@@ -7032,11 +7023,7 @@ class CoreMixin:
                 txn = self._find_transaction(book, g)
                 if not txn:
                     raise ValueError(f"Transaction not found: {g}")
-                if any(_is_voided(sp) for sp in txn.splits):
-                    raise ValueError(
-                        f"Transaction {g} is voided. Use "
-                        f"unvoid_transaction first, then update."
-                    )
+                self._require_editable(book, txn, g, "update", "update")
                 if trans_date is not None \
                         and _post_date_as_date(txn) != trans_date:
                     self._require_force_for_reconciled(
@@ -7126,11 +7113,9 @@ class CoreMixin:
                     txn = self._find_transaction(book, key)
                     if not txn:
                         raise ValueError(f"Transaction not found: {key}")
-                    if any(_is_voided(sp) for sp in txn.splits):
-                        raise ValueError(
-                            f"Transaction {key} is voided. Use "
-                            f"unvoid_transaction first, then update."
-                        )
+                    self._require_editable(
+                        book, txn, key, "update", "update",
+                    )
                     if "date" in u \
                             and _post_date_as_date(txn) != u["date"]:
                         self._require_force_for_reconciled(
@@ -7266,16 +7251,11 @@ class CoreMixin:
             if not transaction:
                 raise ValueError(f"Transaction not found: {guid}")
 
-            # Voided transactions are immutable: writing into
-            # state='v' splits moves balance sums while staying
-            # invisible to cash_flow/lots/reconciliation, and a
-            # later re-void overwrites the void-former-* slots,
-            # destroying the originals. No force override.
-            if any(_is_voided(s) for s in transaction.splits):
-                raise ValueError(
-                    f"Transaction {guid} is voided. Use "
-                    f"unvoid_transaction first, then update."
-                )
+            # Voided transactions and posting records are immutable
+            # (``_require_editable``). No force override.
+            self._require_editable(
+                book, transaction, guid, "update", "update",
+            )
 
             # Check for reconciled splits when modifying splits
             if splits is not None:
@@ -7477,13 +7457,15 @@ class CoreMixin:
                 if v["account"].placeholder:
                     raise self._placeholder_error(v["account"])
 
-            # 4a. Voided transactions are immutable — same
-            # rationale as update_transaction; no force override.
-            if any(_is_voided(s) for s in transaction.splits):
-                raise ValueError(
-                    f"Transaction {guid} is voided. Use "
-                    f"unvoid_transaction first, then replace splits."
-                )
+            # 4a. Voided transactions and posting records are
+            # immutable — same gate as update_transaction; no force
+            # override. (A forced replace on a posting record took
+            # its A/R split out of the invoice's lot and the invoice
+            # read "paid" with no payment.)
+            self._require_editable(
+                book, transaction, guid,
+                "replace the splits of", "replace splits",
+            )
 
             # 4. Carry-forward snapshot: a new split that reproduces
             # an old one (same account, value, and quantity) is an

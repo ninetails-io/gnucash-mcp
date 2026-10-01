@@ -3096,6 +3096,76 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         for obj in objects:
             book.session.expire(obj, ["slots"])
 
+    # xaccTransSetReadOnly's reason on a posting transaction
+    # (gncInvoicePostToAccount, gncInvoice.c) — the string desktop
+    # shows when a user tries to edit one in the register.
+    _POSTING_READ_ONLY_REASON = (
+        "Generated from an invoice. Try unposting the invoice."
+    )
+
+    @staticmethod
+    def _posting_document_id(book, transaction) -> str | None:
+        """ID of the document ``transaction`` is the posting record
+        of, or None. Read from ``invoices.post_txn``, not from the
+        ``trans-read-only`` slot: the column is the link itself, and
+        the slot has been overwritten by a void and deleted by an
+        unvoid on books that met those paths before they were
+        guarded."""
+        from sqlalchemy import text
+        row = book.session.execute(
+            text("SELECT id FROM invoices WHERE post_txn = :guid"),
+            {"guid": transaction.guid},
+        ).fetchone()
+        return row[0] if row else None
+
+    def _refuse_posting_record(self, book, transaction, action: str) -> None:
+        """A document's posting transaction is read-only: the one
+        refusal every transaction-changing path shares (delete, void,
+        replace_splits, every update form).
+
+        The posting transaction IS the document's booked state — its
+        A/R or A/P split sits in the document's lot and is what paid
+        and due are measured from. Voiding it or rewriting its splits
+        left the invoice reading "paid" with no payment on file;
+        re-dating it left the document and the ledger disagreeing
+        about when it was posted; deleting it stranded the document
+        ("posted" yet un-re-postable). GnuCash refuses all of these:
+        the transaction carries ``trans-read-only`` and
+        ``xaccTransVoid`` ("Refusing to void a read-only
+        transaction!") and the register both honor it. There is no
+        force override, as there is none in desktop: the way to
+        change a posted document is to unpost it. (Adversarial review
+        2026-09-30, C4a / C4b / C4c; the delete half dates from 1.4.)
+        """
+        doc_id = self._posting_document_id(book, transaction)
+        if doc_id is not None:
+            raise ValueError(
+                f"Cannot {action} this transaction: it is the posting "
+                f"record for invoice {doc_id}, and read-only. Use "
+                f"unpost_document first, change the document, and "
+                f"post it again."
+            )
+
+    def _require_editable(
+        self, book, transaction, key: str, action: str, then: str,
+    ) -> None:
+        """Gate for every path that EDITS a transaction in place
+        (update, replace_splits). Two states are immutable, neither
+        with a force override:
+
+        - voided: writing into state='v' splits moves balance sums
+          while staying invisible to cash_flow/lots/reconciliation,
+          and a later re-void overwrites the void-former-* slots,
+          destroying the originals;
+        - a document's posting record (``_refuse_posting_record``).
+        """
+        if any(_is_voided(s) for s in transaction.splits):
+            raise ValueError(
+                f"Transaction {key} is voided. Use "
+                f"unvoid_transaction first, then {then}."
+            )
+        self._refuse_posting_record(book, transaction, action)
+
     def _find_transaction(
         self, book: piecash.Book, guid: str
     ) -> piecash.Transaction | None:

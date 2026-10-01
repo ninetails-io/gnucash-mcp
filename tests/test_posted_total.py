@@ -238,12 +238,13 @@ class TestWhenThePostingCannotBeRead:
 
     def test_a_voided_posting_falls_back_to_the_entries(self, business_book):
         """The voided split is a zeroed zombie, not a total of zero.
-        (Voiding a posting is its own defect — review C4a — but books
+        (Voiding a posting is refused since review C4a, but books
         that already hold one must keep reading as they did.)"""
+        from tests.conftest import void_posting_record
         gb = GnuCashBook(str(business_book))
         doc = _invoice(gb)
         posted = gb.post_invoice(invoice_id=doc, post_account=AR)
-        gb.void_transaction(posted["transaction_guid"], "test setup")
+        void_posting_record(gb, posted["transaction_guid"])
 
         got = gb.get_invoice(doc, owner_type="customer")
         assert got["total"] == "100.00"

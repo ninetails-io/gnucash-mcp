@@ -451,6 +451,22 @@ Established chokepoints and the rule each one owns:
   books on disk, and a fresh void. A new slot key goes in the
   registry first, with its citation — that is what stops the next
   "desktop can't read it" from shipping.
+- `_refuse_posting_record` / `_require_editable` (`book/_base.py`)
+  — a document's posting transaction is read-only on every path:
+  delete, void, `replace_splits`, and all three update forms route
+  through the one refusal, keyed on `invoices.post_txn` (the link
+  itself, not the `trans-read-only` slot, which a void used to
+  overwrite and an unvoid delete). No `force` override, as desktop
+  has none: `xaccTransVoid` refuses a read-only transaction and the
+  register won't edit one. Before 1.5 only delete refused; a void or
+  a forced `replace_splits` left the invoice reading "paid" with no
+  payment, and a date edit left the document and ledger with two
+  posting dates. `_require_editable` also carries the
+  voided-is-immutable rule the four edit paths each had a copy of.
+  A new transaction-changing path goes in the `ATTEMPTS` table in
+  `tests/test_posting_record_guard.py`. Tests that need the old
+  voided-posting state build it with
+  `tests/conftest.py::void_posting_record`.
 - `_entry_math` (`book/_entry_math.py`) — what a document line
   comes to and what a document posts: GnuCash's own arithmetic,
   ported from `gncEntryComputeValueInt`, `gncEntryRecomputeValues`,
