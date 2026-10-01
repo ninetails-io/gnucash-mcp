@@ -19,9 +19,17 @@ def _quiet_restart_guards():
     outcomes depend on execution order. Tests that exercise the
     guards re-arm these globals explicitly in their own bodies."""
     import gnucash_mcp.server as _server
+    from gnucash_mcp.book.backup import BackupMixin
     _server._startup_notice_pending = False
     _server._writes_armed = True
+    # The one-time pre-upgrade snapshot (a full copy of the book
+    # before its first converting write) would be taken by nearly
+    # every test, each on a throwaway book. Off by default; the tests
+    # of the feature switch the class flag back.
+    saved = BackupMixin._pre_upgrade_checked
+    BackupMixin._pre_upgrade_checked = True
     yield
+    BackupMixin._pre_upgrade_checked = saved
 
 
 def void_posting_record(gb, txn_guid: str, reason: str = "test setup"):

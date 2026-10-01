@@ -7,7 +7,7 @@ can cross-reference what's asserted against what was designed.
 
 import json
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -996,3 +996,126 @@ class TestIdenticalContentSkip:
         assert len(book.list_backups()) == 2, (
             "changed content must still take a real snapshot"
         )
+
+
+class TestPreUpgradeSnapshot:
+    """Review C30. The 1.5 conversion rewrites thousands of rows in
+    one commit and cannot be undone; the routine auto-backup runs
+    once per process and only when a stage is due, so it did not
+    promise a copy of the state the conversion started from."""
+
+    @pytest.fixture(autouse=True)
+    def _armed(self, monkeypatch):
+        # conftest switches the snapshot off for the suite.
+        from gnucash_mcp.book.backup import BackupMixin
+        monkeypatch.setattr(BackupMixin, "_pre_upgrade_checked", False)
+
+    def _snapshots(self, book_path):
+        d = Path(f"{book_path}.mcp") / "backups"
+        return sorted(d.glob("*-manual-pre-1-5-upgrade.gnucash")) if d.exists() else []
+
+    def _price_rows(self, path):
+        import sqlite3
+        con = sqlite3.connect(str(path))
+        try:
+            return con.execute("SELECT COUNT(*) FROM prices").fetchone()[0]
+        finally:
+            con.close()
+
+    def _convert(self, gb):
+        """A write that runs the converters."""
+        return gb.create_price(
+            "EUR", "CURRENCY", "1.10", price_date=date(2026, 9, 1),
+        )
+
+    def test_first_converting_write_snapshots_the_prior_state(
+        self, multi_currency_book,
+    ):
+        gb = GnuCashBook(str(multi_currency_book))
+        before = self._price_rows(multi_currency_book)
+
+        result = self._convert(gb)
+
+        (snapshot,) = self._snapshots(multi_currency_book)
+        assert result["pre_upgrade_backup"] == snapshot.name
+        # The copy is of the book BEFORE this write.
+        assert self._price_rows(snapshot) == before
+        assert self._price_rows(multi_currency_book) == before + 1
+
+    def test_once_per_book_across_writes_and_processes(
+        self, multi_currency_book,
+    ):
+        gb = GnuCashBook(str(multi_currency_book))
+        self._convert(gb)
+        again = gb.create_price(
+            "EUR", "CURRENCY", "1.11", price_date=date(2026, 9, 2),
+        )
+        assert "pre_upgrade_backup" not in again
+        # A new server process on the same book.
+        fresh = GnuCashBook(str(multi_currency_book))
+        later = fresh.create_price(
+            "EUR", "CURRENCY", "1.12", price_date=date(2026, 9, 3),
+        )
+        assert "pre_upgrade_backup" not in later
+        assert len(self._snapshots(multi_currency_book)) == 1
+
+    def test_an_auto_backup_of_this_exact_state_is_enough(
+        self, multi_currency_book,
+    ):
+        gb = GnuCashBook(str(multi_currency_book))
+        gb._maybe_auto_backup()          # the audit hook, first write
+        assert gb.list_backups()
+
+        result = self._convert(gb)
+
+        assert "pre_upgrade_backup" not in result
+        assert self._snapshots(multi_currency_book) == []
+        # ...and it does not come back once the book has changed.
+        later = gb.create_price(
+            "EUR", "CURRENCY", "1.11", price_date=date(2026, 9, 2),
+        )
+        assert "pre_upgrade_backup" not in later
+        assert self._snapshots(multi_currency_book) == []
+
+    def test_a_changed_book_since_the_last_backup_gets_its_own(
+        self, multi_currency_book,
+    ):
+        """The gap: a backup exists, but the book moved on since."""
+        gb = GnuCashBook(str(multi_currency_book))
+        gb._maybe_auto_backup()
+        gb.update_account(name="Assets:Checking", description="changed")
+
+        result = self._convert(gb)
+
+        assert "pre_upgrade_backup" in result
+        assert len(self._snapshots(multi_currency_book)) == 1
+
+    def test_no_snapshot_no_conversion(self, multi_currency_book):
+        """Every other backup is best-effort; this one guards a
+        change that cannot be redone."""
+        sidecar = Path(f"{multi_currency_book}.mcp")
+        sidecar.mkdir()
+        (sidecar / "backups").write_text("not a directory")
+        gb = GnuCashBook(str(multi_currency_book))
+        before = self._price_rows(multi_currency_book)
+
+        with pytest.raises(ValueError, match="could not be written"):
+            self._convert(gb)
+
+        assert self._price_rows(multi_currency_book) == before
+
+    def test_reads_never_snapshot(self, multi_currency_book):
+        gb = GnuCashBook(str(multi_currency_book))
+        gb.get_book_summary()
+        gb.list_accounts()
+        gb.net_worth(end_date=date(2026, 9, 30))
+        assert self._snapshots(multi_currency_book) == []
+
+    def test_a_database_book_is_not_refused(self, multi_currency_book, tmp_path):
+        from gnucash_mcp.book import BookSource
+        gb = GnuCashBook(BookSource.from_uri(
+            f"sqlite:///{multi_currency_book}"
+        ))
+        result = self._convert(gb)
+        assert result["status"] == "created"
+        assert "pre_upgrade_backup" not in result

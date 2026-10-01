@@ -2566,6 +2566,13 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         ``voids_migrated``, ``book_stamped``, ``book_scrubbed``.
         """
         out: dict = {}
+        # First, and before anything is converted: a snapshot of the
+        # book as it stands (once per book; refuses the write if a
+        # file book cannot be snapshotted). Absent when the backup
+        # module is not loaded.
+        snapshot = getattr(self, "_ensure_pre_upgrade_snapshot", None)
+        if snapshot is not None:
+            out.update(snapshot())
         sweep = getattr(self, "_migrate_all_legacy", None)
         if sweep is not None:
             n = sweep(book)

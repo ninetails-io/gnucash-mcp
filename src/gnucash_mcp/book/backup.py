@@ -474,11 +474,96 @@ class BackupMixin:
 
     # ── Core primitive: create a backup ──────────────────────────
 
+    # ── The one-time snapshot before a book's shapes are converted ──
+
+    _PRE_UPGRADE_LABEL = "pre-1-5-upgrade"
+
+    # Per-instance once-flag (the marker file is the durable record).
+    # The test suite sets the class default True so 2,800 throwaway
+    # books don't each take a snapshot; the tests of this feature
+    # switch it back.
+    _pre_upgrade_checked: bool = False
+
+    def _pre_upgrade_marker(self) -> Path:
+        return self._backups_dir() / (
+            f".pre-1-5-upgrade-{self.book_path.stem.lower()}"
+        )
+
+    def _ensure_pre_upgrade_snapshot(self) -> dict:
+        """Before this server first converts a book's stored shapes:
+        make sure a snapshot of the book AS IT IS exists. Called by
+        ``_upgrade_book_shapes`` ahead of every converter; does its
+        work once per book and is a single flag check afterwards.
+
+        The 1.5 conversion rewrites thousands of rows in one commit —
+        schedule recipes, invoice links, reconcile dates, slot
+        fillers, price dates — and cannot be undone. The only way
+        back is a copy from before it. The routine auto-backup does
+        not promise one: it runs once per process and only when a
+        stage is due, so a server whose first write of the day
+        converted nothing, or one restarted within the session
+        window after the book changed, converted with no snapshot of
+        the state it converted from (adversarial review 2026-09-30,
+        C30).
+
+        - A snapshot of exactly this state already exists (the
+          auto-backup just took one): nothing more to copy.
+        - Otherwise a ``manual``-stage snapshot labelled
+          ``pre-1-5-upgrade`` is written. Manual snapshots are never
+          pruned.
+        - It cannot be written: the write is REFUSED. Every other
+          backup here is best-effort, because a routine write can be
+          redone; this one guards a change that cannot.
+        - A database book has no snapshot store: nothing is taken,
+          and the release notes say to dump the database first.
+
+        The copy is read from the file's last COMMITTED state through
+        a separate read-only connection, so whatever the calling
+        write has already staged is not in it. It runs BEFORE the
+        converters, not after they report work: a large conversion
+        can spill SQLite's page cache and take the exclusive lock
+        mid-transaction, after which nothing else can read the file.
+
+        Returns ``{"pre_upgrade_backup": <filename>}`` when it wrote
+        one, else ``{}``.
+        """
+        if self._pre_upgrade_checked or not self.source.is_file:
+            return {}
+        try:
+            marker = self._pre_upgrade_marker()
+            if marker.exists():
+                self._pre_upgrade_checked = True
+                return {}
+            result: dict = {}
+            if not self._book_unchanged_since_last_backup(
+                self._current_book_hash()
+            ):
+                made = self.create_backup(
+                    stage=_MANUAL_STAGE_NAME,
+                    label=self._PRE_UPGRADE_LABEL,
+                    _committed_state=True,
+                )
+                result["pre_upgrade_backup"] = Path(made["path"]).name
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(_format_ts(_now_utc()) + "\n")
+        except Exception as e:
+            raise ValueError(
+                f"This write would convert the book's stored shapes to "
+                f"GnuCash's own, which cannot be undone, and the "
+                f"snapshot that guards it could not be written "
+                f"({type(e).__name__}: {e}). Nothing was changed. Make "
+                f"the backup folder writable (or point GNUCASH_LOG_DIR "
+                f"at a private folder) and retry."
+            ) from e
+        self._pre_upgrade_checked = True
+        return result
+
     def create_backup(
         self,
         *,
         stage: str = _MANUAL_STAGE_NAME,
         label: str | None = None,
+        _committed_state: bool = False,
     ) -> dict:
         """Write a fresh snapshot via SQLite's online backup API and
         verify it with PRAGMA integrity_check.
@@ -530,10 +615,7 @@ class BackupMixin:
                 f"collision; retry."
             )
 
-        # Source opened readonly (no write lock on the live book);
-        # SQLite's backup() copies pages without blocking readers.
-        with self.open(readonly=True) as book:
-            source_conn = book.session.connection().connection
+        def _copy(source_conn) -> None:
             dest_conn = sqlite3.connect(str(backup_path))
             try:
                 source_conn.backup(dest_conn)
@@ -551,6 +633,27 @@ class BackupMixin:
             finally:
                 # Idempotent — close() is a no-op on a closed conn.
                 dest_conn.close()
+
+        if _committed_state:
+            # Called from INSIDE a write session
+            # (``_ensure_pre_upgrade_snapshot``): no second book open,
+            # and no piecash at all — a plain read-only connection
+            # sees the file's last committed state, which is the
+            # state the caller is about to change.
+            from urllib.parse import quote
+            source_conn = sqlite3.connect(
+                f"file:{quote(str(self.book_path))}?mode=ro", uri=True,
+            )
+            try:
+                _copy(source_conn)
+            finally:
+                source_conn.close()
+        else:
+            # Source opened readonly (no write lock on the live
+            # book); SQLite's backup() copies pages without blocking
+            # readers.
+            with self.open(readonly=True) as book:
+                _copy(book.session.connection().connection)
 
         # Verify before declaring success; a failed check deletes
         # the file so no broken snapshot masquerades as recovery.

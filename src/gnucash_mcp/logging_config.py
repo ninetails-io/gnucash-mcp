@@ -2291,6 +2291,11 @@ def _shape_upgrade_lines(after: dict) -> list[str]:
         lines.append(
             f"{_INDENT}existing budget rows scrubbed to natural sign"
         )
+    if after.get("pre_upgrade_backup"):
+        lines.append(
+            f"{_INDENT}snapshot of the book before conversion: "
+            f"{after['pre_upgrade_backup']}"
+        )
     return lines
 
 

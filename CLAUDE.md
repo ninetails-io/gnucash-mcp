@@ -399,7 +399,22 @@ Established chokepoints and the rule each one owns:
   business write runs it, merges its counts into the response, and
   one audit renderer names what converted. Reads never write. A new
   converter for a shape we shipped wrong goes here, not on its own
-  module's writes.
+  module's writes. Two rules the 1.5 adversarial review added:
+  **(1) it snapshots first** — `_ensure_pre_upgrade_snapshot`
+  (`book/backup.py`) runs ahead of every converter, once per book
+  (a marker file in the backups folder), copying the file's last
+  COMMITTED state through a separate read-only connection and
+  REFUSING the write if a file book can't be copied; it runs before
+  the converters, not after they report work, because a large
+  conversion can spill SQLite's page cache and take the exclusive
+  lock mid-transaction. The suite switches it off in
+  `tests/conftest.py`. **(2) a converter identifies old rows by
+  what the old writer left, never by what the values look like.**
+  The credit-note pass guessed from signs ("all positive means
+  pre-1.5") and negated a legitimate credit note desktop and 1.5
+  both store that way; it now keys on the old server's own
+  fingerprint (`entries.i_disc_type = ''`). A converter that cannot
+  tell its own old rows from desktop's rows must not run on them.
 - `_dialect_name` / `_rollback_if_aborted` — the only backend
   branch a raw-SQL site may take, and the only way a swallowed
   database error is cleared. A statement one backend rejects
