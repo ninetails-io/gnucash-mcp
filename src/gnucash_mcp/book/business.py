@@ -2734,9 +2734,19 @@ class BusinessMixin:
           credit note as a charge. A posted credit note converts
           when its stored entry sum disagrees in sign with its A/R or
           A/P posting split (customer side: same sign; bill side:
-          opposite); an unposted one converts when every line is
-          positive. A mixed-sign unposted credit note is counted in
-          ``credit_note_entries_unresolved`` and left alone.
+          opposite). An unposted one has no posting to read, so
+          it converts ROW BY ROW on the pre-1.5 fingerprint: an
+          entry the old server wrote carries ``i_disc_type = ''``
+          (1.5 and desktop write PERCENT or VALUE), and exactly
+          those rows are negated, whatever their sign. The first cut
+          guessed from the signs ("every line positive means old")
+          and so negated a current or desktop credit note whose
+          lines were all entered negative — stored positive, as
+          ``gncEntrySetDocQuantity`` stores them — turning a 40
+          charge into a 40 credit on the next unrelated business
+          write (adversarial review 2026-09-30, C9). The
+          ``entries_normalized`` pass below then rewrites the
+          fingerprint, in the same save, so a row converts once.
         - ``credit_applications_migrated`` — the server's payment-
           typed credit application becomes the TXN_TYPE_LINK
           transaction gncOwnerCreateLotLink writes.
@@ -2777,7 +2787,8 @@ class BusinessMixin:
                 text(
                     "SELECT guid, quantity_num, quantity_denom, "
                     "i_price_num, i_price_denom, b_price_num, b_price_denom, "
-                    "invoice FROM entries WHERE invoice = :g OR bill = :g"
+                    "invoice, i_disc_type "
+                    "FROM entries WHERE invoice = :g OR bill = :g"
                 ),
                 {"g": inv.guid},
             ).fetchall()
@@ -2793,6 +2804,7 @@ class BusinessMixin:
                 )
                 stored_sum += qty * price
             flip = False
+            to_negate = []
             if _is_invoice_posted(inv) and inv.post_txn is not None:
                 post_split = next(
                     (sp for sp in inv.post_txn.splits
@@ -2804,13 +2816,12 @@ class BusinessMixin:
                     expected = split_sign if customer_side else -split_sign
                     flip = sum_sign != expected
             else:
-                qtys = [Decimal(r[1] or 0) for r in rows]
-                if all(q > 0 for q in qtys):
-                    flip = True
-                elif any(q > 0 for q in qtys) and any(q < 0 for q in qtys):
-                    unresolved += 1
+                # No posting to read: the row says who wrote it.
+                to_negate = [r for r in rows if (r[8] or "") == ""]
             if flip:
-                for r in rows:
+                to_negate = list(rows)
+            if to_negate:
+                for r in to_negate:
                     book.session.execute(
                         Entry.__table__.update()
                         .where(Entry.__table__.c.guid == r[0])
