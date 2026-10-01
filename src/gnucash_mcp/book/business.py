@@ -3344,6 +3344,75 @@ class BusinessMixin:
         out: dict = {}
         book.flush()
 
+        # ── whose rows are these? ──
+        # Every pass below changes a row only if the OLD SERVER wrote
+        # it, and it decides that from a mark the old server left —
+        # never from what the values look like. The first cut of two
+        # passes guessed from content, and each rewrote rows desktop
+        # had made: a credit note stored the way desktop stores it
+        # (review C9), and line dates written by desktop's Duplicate
+        # Invoice, which are at 10:59 UTC exactly as the old server's
+        # were (GUI gate 2026-10-01, G-1). The marks, read once here,
+        # before any pass can erase one:
+        #
+        # * an ENTRY the old server wrote carries ``i_disc_type = ''``
+        #   (desktop and 1.5 write PERCENT or VALUE);
+        # * a DOCUMENT is the old server's if any of its entries is,
+        #   or if its row carries ``billto_type = 0`` with no bill-to
+        #   owner (the old insert wrote 0; desktop writes NULL);
+        # * a SLOT ROW the old server wrote carries piecash's filler
+        #   columns (``double_val`` 0, ``timespec_val`` NULL), which
+        #   GnuCash's backend never writes — so its payments are the
+        #   ``P`` transactions whose ``date-posted`` slot is such a
+        #   row, and its lots the ones whose empty ``notes`` slot is.
+        #
+        # A row with no mark is left exactly as it is. Locked by
+        # tests/test_converter_false_positives.py.
+        old_entries = {
+            r[0] for r in book.session.execute(
+                text(
+                    "SELECT guid FROM entries "
+                    "WHERE LENGTH(COALESCE(i_disc_type, '')) = 0"
+                ),
+            ).fetchall()
+        }
+        old_documents = {
+            g for r in book.session.execute(
+                text(
+                    "SELECT invoice, bill FROM entries "
+                    "WHERE LENGTH(COALESCE(i_disc_type, '')) = 0"
+                ),
+            ).fetchall() for g in r if g
+        } | {
+            r[0] for r in book.session.execute(
+                text(
+                    "SELECT guid FROM invoices "
+                    "WHERE billto_type = 0 AND billto_guid IS NULL"
+                ),
+            ).fetchall()
+        }
+        _PIECASH_FILLER = (
+            "((double_val = 0 AND slot_type <> 2) OR "
+            "(timespec_val IS NULL AND slot_type <> 6))"
+        )
+        old_payments = {
+            r[0] for r in book.session.execute(
+                text(
+                    "SELECT obj_guid FROM slots WHERE name = 'date-posted' "
+                    f"AND {_PIECASH_FILLER}"
+                ),
+            ).fetchall()
+        }
+        old_lots = {
+            r[0] for r in book.session.execute(
+                text(
+                    "SELECT obj_guid FROM slots WHERE name = 'notes' "
+                    "AND LENGTH(COALESCE(string_val, '')) = 0 "
+                    f"AND {_PIECASH_FILLER}"
+                ),
+            ).fetchall()
+        }
+
         # ── credit-note entries ──
         migrated = unresolved = 0
         for inv in book.session.query(Invoice).all():
@@ -3444,6 +3513,8 @@ class BusinessMixin:
         # ── document dates at the neutral time ──
         dated = 0
         for inv in book.session.query(Invoice).all():
+            if inv.guid not in old_documents:
+                continue
             changed = False
             for col in ("date_opened", "date_posted"):
                 val = getattr(inv, col)
@@ -3472,6 +3543,8 @@ class BusinessMixin:
         # ── entry defaults and the entry date ──
         normalized = 0
         for e in book.session.query(Entry).all():
+            if e.guid not in old_entries:
+                continue
             changed = False
             if (e.i_disc_type or "") == "":
                 e.i_disc_type = "PERCENT"; changed = True
@@ -3496,6 +3569,8 @@ class BusinessMixin:
             if changed:
                 normalized += 1
         for inv in book.session.query(Invoice).all():
+            if inv.guid not in old_documents:
+                continue
             if inv.billto_type is not None and int(inv.billto_type) == 0 and not inv.billto_guid:
                 inv.billto_type = None
         if normalized:
@@ -3517,7 +3592,10 @@ class BusinessMixin:
             ).fetchall()
         }
         for lot in book.session.query(Lot).all():
-            if lot.guid in doc_lots and lot.guid in stored:
+            if (
+                lot.guid in doc_lots and lot.guid in stored
+                and lot.guid in old_lots
+            ):
                 lot.is_closed = _LOT_CLOSED_UNKNOWN
                 reset += 1
         if reset:
@@ -3531,6 +3609,11 @@ class BusinessMixin:
                 "AND string_val IN ('P', 'L')"
             ),
         ).fetchall():
+            # Desktop makes a payment out of a register transaction
+            # too (Assign as Payment): that one has its own
+            # date-posted slot and whatever memos the user typed.
+            if guid not in old_payments:
+                continue
             txn = book.session.query(Transaction).filter_by(guid=guid).first()
             if txn is None:
                 continue
@@ -3566,12 +3649,17 @@ class BusinessMixin:
                 ),
                 {"g": bt.guid},
             ).scalar()
+            # A posted document's frozen copy carries no count
+            # ("children don't need refcounts", gncBillTerm.c).
             if bt.parent_guid:
-                # A posted document's frozen copy: "children don't
-                # need refcounts" (gncBillTerm.c) — the engine writes
-                # 0 and never counts them.
-                refs = 0
-            if int(bt.refcount or 0) != int(refs):
+                continue
+            # RAISED, never lowered. The old server left every count
+            # at 0, which let desktop delete a term still in use;
+            # that is the defect to repair. Desktop's own counts run
+            # HIGH (it adds one for each reference it loads and saves
+            # the sum), which only keeps a term from being deleted —
+            # and lowering one is rewriting a row desktop wrote.
+            if int(bt.refcount or 0) < int(refs):
                 bt.refcount = int(refs)
                 recounted += 1
         if recounted:
@@ -3580,6 +3668,8 @@ class BusinessMixin:
         # ── credit-note 0 on every document that isn't one ──
         flagged = 0
         for inv in book.session.query(Invoice).all():
+            if inv.guid not in old_documents:
+                continue
             try:
                 inv[self._CREDIT_NOTE_SLOT_KEY]
             except KeyError:
@@ -3596,7 +3686,7 @@ class BusinessMixin:
                     "AND LENGTH(COALESCE(string_val, '')) = 0"
                 ),
             ).fetchall()
-            if r[0] in doc_lots
+            if r[0] in doc_lots and r[0] in old_lots
         ]
         for lot_guid in empty_notes:
             book.session.execute(

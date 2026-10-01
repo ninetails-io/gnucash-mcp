@@ -1165,6 +1165,39 @@ class TestPreUpgradeSnapshot:
         assert "pre_upgrade_backup" in result
         assert len(self._snapshots(multi_currency_book)) == 1
 
+    def test_a_book_with_nothing_to_convert_keeps_no_snapshot(
+        self, multi_currency_book, monkeypatch,
+    ):
+        """A book 1.5 or GnuCash desktop made has no pre-1.5 shape in
+        it. The snapshot has to be taken before the converters can
+        say so; when they then convert nothing it is withdrawn,
+        rather than left as a "pre-1.5 upgrade" copy of a book that
+        was never upgraded (GUI gate 2026-10-01, G-1)."""
+        from gnucash_mcp.book.backup import BackupMixin
+
+        gb = GnuCashBook(str(multi_currency_book))
+        # Bring the fixture (piecash's own writing) to current shapes
+        # with the snapshot switched off, as if 1.5 had made the book.
+        monkeypatch.setattr(BackupMixin, "_pre_upgrade_checked", True)
+        with gb.open(readonly=False) as book:
+            assert gb._upgrade_book_shapes(book)
+            book.save()
+        monkeypatch.setattr(BackupMixin, "_pre_upgrade_checked", False)
+
+        result = self._convert(gb)
+
+        assert "pre_upgrade_backup" not in result
+        assert self._snapshots(multi_currency_book) == []
+        # The question is settled for this book: the marker is there,
+        # and a new process does not ask again.
+        assert gb._pre_upgrade_marker().exists()
+        fresh = GnuCashBook(str(multi_currency_book))
+        later = fresh.create_price(
+            "EUR", "CURRENCY", "1.12", price_date=date(2026, 9, 3),
+        )
+        assert "pre_upgrade_backup" not in later
+        assert self._snapshots(multi_currency_book) == []
+
     def test_no_snapshot_no_conversion(self, multi_currency_book):
         """Every other backup is best-effort; this one guards a
         change that cannot be redone."""

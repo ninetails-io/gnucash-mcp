@@ -593,6 +593,28 @@ class BackupMixin:
         self._pre_upgrade_checked = True
         return result
 
+    def _withdraw_pre_upgrade_snapshot(self, filename: str) -> None:
+        """Remove the pre-upgrade snapshot this call just took, because
+        the converters then found nothing to convert.
+
+        The snapshot has to be taken before the converters run (see
+        above), so it is taken on every book's first converting
+        write — including a book 1.5 or GnuCash desktop made, which
+        has no pre-1.5 shape in it. Kept, that was a never-pruned
+        file labelled "pre-1.5 upgrade" beside a book that was never
+        upgraded (GUI gate 2026-10-01, G-1). The marker stays, so the
+        question is not asked again. Best-effort: a file that cannot
+        be removed is only an extra copy. Manual-stage snapshots do
+        not move the auto-backup's hash anchor, so nothing else
+        refers to this one.
+        """
+        try:
+            (self._backups_dir() / filename).unlink()
+        except OSError as e:
+            debug_logger.warning(
+                f"Unneeded pre-upgrade snapshot not removed: {e}"
+            )
+
     def create_backup(
         self,
         *,

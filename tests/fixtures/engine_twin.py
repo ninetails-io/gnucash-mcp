@@ -127,12 +127,14 @@ ENGINE_DEBRIS = {
     "unreferenced_taxtable_copy": (
         "A hidden child tax table no entry row names. "
         "gncInvoicePostToAccount makes the copy and repoints each line "
-        "at it in memory; in the headless engine run the line was never "
-        "re-saved, so the copy is referenced by nothing. ACCEPTED as "
-        "debris; whether a GUI post saves the line's move is a separate "
-        "question, OPEN until the gate (ruling item 4: post a taxed "
-        "invoice in the GUI on a SQL book, then SELECT invisible, "
-        "parent FROM taxtables and the entries' i_taxtable)."
+        "at it in memory, and saves that move only when it writes the "
+        "line for some other reason. So the copy is SOMETIMES "
+        "referenced: at the GUI gate (2026-10-01) an invoice whose "
+        "lines were loaded and untouched kept them on the live table, "
+        "and a duplicated invoice, whose lines were freshly written, "
+        "had them on the copy. Desktop writes both shapes and reads "
+        "both; the server leaves lines on the live table (the common "
+        "case) and posts correctly against either. CLOSED by the gate."
     ),
     "refcount": (
         "The stored refcount of a billing term (not compared, not "

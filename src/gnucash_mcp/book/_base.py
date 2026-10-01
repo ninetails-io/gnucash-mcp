@@ -2786,6 +2786,16 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
                     out["book_stamped"] = _BUDGET_UNREVERSED_FEATURE
                 if st.get("scrubbed"):
                     out["book_scrubbed"] = True
+        # A snapshot taken above for a book that then had nothing to
+        # convert guarded nothing: withdraw it rather than leave a
+        # "pre-1.5 upgrade" copy beside a book that was never
+        # upgraded.
+        taken = out.get("pre_upgrade_backup")
+        if taken is not None and len(out) == 1:
+            withdraw = getattr(self, "_withdraw_pre_upgrade_snapshot", None)
+            if withdraw is not None:
+                withdraw(taken)
+            return {}
         return out
 
     # ── Desktop's reconcile-info frame ─────────────────────────────

@@ -95,11 +95,25 @@ def _make_legacy(gc, cn_id):
             "UPDATE splits SET memo = '' WHERE memo = 'check 12' AND account_guid IN "
             "(SELECT guid FROM accounts WHERE account_type = 'RECEIVABLE')"
         ))
+        # The old server's slot rows carried piecash's filler columns
+        # (double_val 0, timespec_val NULL) — the mark the converter
+        # reads to know a lot or a payment is the old server's and
+        # not desktop's.
         for lot_guid, in s.execute(text("SELECT guid FROM lots")).fetchall():
             s.execute(text(
-                "INSERT INTO slots (obj_guid, name, slot_type, string_val) "
-                "VALUES (:g, 'notes', 4, '')"
+                "INSERT INTO slots (obj_guid, name, slot_type, string_val, "
+                "double_val) VALUES (:g, 'notes', 4, '', 0)"
             ), {"g": lot_guid})
+        # …and piecash put a date-posted slot on every transaction,
+        # payments included.
+        for txn_guid, in s.execute(text(
+            "SELECT obj_guid FROM slots WHERE name = 'trans-txn-type' "
+            "AND string_val = 'P'"
+        )).fetchall():
+            s.execute(text(
+                "INSERT INTO slots (obj_guid, name, slot_type, gdate_val, "
+                "double_val) VALUES (:g, 'date-posted', 10, '20260810', 0)"
+            ), {"g": txn_guid})
         book.save()
 
 
@@ -326,6 +340,8 @@ def test_terms_refcount_and_credit_note_flag_follow_desktop(business_book):
     with gc.open(readonly=False) as book:
         book.session.execute(text("UPDATE billterms SET refcount = 0"))
         book.session.execute(text("DELETE FROM slots WHERE name = 'credit-note'"))
+        # The mark the old server left on every document row.
+        book.session.execute(text("UPDATE invoices SET billto_type = 0"))
         book.save()
     with gc.open(readonly=False) as book:
         out = gc._upgrade_book_shapes(book)

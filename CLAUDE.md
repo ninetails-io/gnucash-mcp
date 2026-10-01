@@ -426,6 +426,21 @@ Established chokepoints and the rule each one owns:
   both store that way; it now keys on the old server's own
   fingerprint (`entries.i_disc_type = ''`). A converter that cannot
   tell its own old rows from desktop's rows must not run on them.
+  The GUI gate found the same class a second time (G-1: desktop's
+  Duplicate Invoice dates a line at 10:59 UTC, as the old server
+  did, and the entry pass moved it), so the rule now covers the
+  whole of `_migrate_business_shapes`: the marks are read once at
+  the top (blank discount defaults on an entry; `billto_type = 0`
+  on a document; piecash's filler columns on a slot row, which make
+  a payment's `date-posted` slot or a lot's empty `notes` slot the
+  old server's) and every pass skips an unmarked row. Bill-term
+  counts are raised, never lowered. **(3) a snapshot that guarded
+  nothing is withdrawn**: when the converters report no work, the
+  pre-upgrade snapshot just taken is removed (the marker stays).
+  Locked by `tests/test_converter_false_positives.py`, which
+  compares every row of every table across a converter run on a
+  1.5-written book, on desktop's shapes set down byte for byte, and
+  on rows the engine has just written. A new pass gets a case there.
 - `_dialect_name` / `_rollback_if_aborted` — the only backend
   branch a raw-SQL site may take, and the only way a swallowed
   database error is cleared. A statement one backend rejects
