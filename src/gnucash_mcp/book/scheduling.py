@@ -402,7 +402,14 @@ class SchedulingMixin:
                 self._slot_insert(
                     book, mcp_frame, self._MCP_QUANTITY,
                     KVP_Type.KVP_TYPE_NUMERIC, label,
-                    numeric_val_num=int(q * q_denom),
+                    # Rounded, as a split's quantity is at storage
+                    # (it was truncated: 1.23456 kept as 1.2345 where
+                    # create_transaction stores 1.2346 — MM-15).
+                    numeric_val_num=int(
+                        (Decimal(str(q)) * q_denom).quantize(
+                            Decimal(1), rounding=ROUND_HALF_UP,
+                        )
+                    ),
                     numeric_val_denom=q_denom,
                 )
         return txn

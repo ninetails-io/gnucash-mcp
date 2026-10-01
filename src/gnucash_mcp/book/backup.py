@@ -669,6 +669,14 @@ class BackupMixin:
             finally:
                 # Idempotent — close() is a no-op on a closed conn.
                 dest_conn.close()
+            # The whole book, readable by its owner only — like the
+            # audit log beside it. It was created 0644, so a 0600
+            # book had world-readable copies (adversarial review
+            # 2026-09-30, DS-15 / SEC-15).
+            try:
+                os.chmod(backup_path, 0o600)
+            except OSError:
+                pass
 
         if _committed_state:
             # Called from INSIDE a write session

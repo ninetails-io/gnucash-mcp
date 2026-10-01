@@ -23,6 +23,7 @@ from gnucash_mcp.book._currency import _price_row_utc, _price_tie_rank
 from gnucash_mcp.book._base import (
     _lot_cache_flag,
     _LOT_CLOSED,
+    _LOT_CLOSED_UNKNOWN,
     _LOT_OPEN,
     _lot_is_closed,
     _commodity_to_compact_line,
@@ -1357,14 +1358,20 @@ class InvestmentsMixin:
             if not acct:
                 raise self._account_not_found_error(book, account)
 
+            # gnc_lot_new's shape: the closed flag UNKNOWN (-1,
+            # computed on read) and no notes slot until someone
+            # writes a note. The server wrote 0 and an empty slot
+            # (adversarial review 2026-09-30, SS-15).
             lot = Lot(
                 title=title,
                 account=acct,
-                notes=notes,
+                notes=notes or None,
                 is_closed=_LOT_OPEN,
             )
             # No session.add — the Lot auto-registers via the
             # Account.lots back-populate.
+            book.flush()
+            lot.is_closed = _LOT_CLOSED_UNKNOWN
             book.save()
 
             all_lot_guids = [

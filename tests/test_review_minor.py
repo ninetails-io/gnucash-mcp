@@ -416,3 +416,166 @@ class TestC42AScheduleThatEndsBeforeItStarts:
         assert gb.update_scheduled_transaction(
             sx["guid"], end_date="2026-12-31",
         )
+
+
+# ── storage shape and safety ────────────────────────────────────────
+
+import os  # noqa: E402
+import stat  # noqa: E402
+import uuid  # noqa: E402
+
+from gnucash_mcp.book._base import _is_lock_error  # noqa: E402
+
+
+class TestC43TheRootIsNotAnAccountToPostTo:
+    def test_a_root_guid_resolves_to_nothing(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        root = _q(
+            test_book, "select guid from accounts where account_type = 'ROOT' "
+            "and name = 'Root Account'",
+        )[0][0]
+        with gb.open() as book:
+            assert gb._resolve_account(book, root) is None
+            assert gb._resolve_account(book, "%" + root[:8]) is None
+        row = _txn(1, "123.00")
+        row["splits"][1]["account"] = root
+        got = _results(gb.create_transactions([row]))
+        assert got["1"]["status"] == "rejected"
+        assert _q(
+            test_book, "select count(*) from splits where account_guid = ?",
+            (root,),
+        ) == [(0,)]
+        with pytest.raises(ValueError):
+            gb.delete_account_slot(root, "notes")
+
+
+class TestFC13OnlyALockIsALock:
+    @pytest.mark.parametrize("message", [
+        "database is locked", "(sqlite3.OperationalError) database is locked",
+        "Lock on the file /books/a.gnucash", "database table is locked",
+        "Lock wait timeout exceeded; try restarting transaction",
+        "could not obtain lock on row in relation \"gnclock\"",
+    ])
+    def test_real_locks(self, message):
+        assert _is_lock_error(Exception(message))
+
+    @pytest.mark.parametrize("message", [
+        "no such table: gnclock",
+        "unable to open database file: /home/sherlock/books/a.gnucash",
+        "disk I/O error on /mnt/busybox/a.gnucash",
+        "connection refused",
+    ])
+    def test_other_failures_are_not(self, message):
+        assert not _is_lock_error(Exception(message))
+
+
+class TestC23FinishingAReconcileClearsAPostponedOne:
+    def test_the_postpone_frame_goes(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        splits = gb.get_unreconciled_splits("Assets:Checking", compact=False)
+        total = sum((Decimal(s["amount"]) for s in splits["splits"]), Decimal(0))
+        gb.reconcile_account(
+            account_name="Assets:Checking", statement_date=date(2024, 1, 31),
+            statement_balance=str(total), reconcile_all=True,
+        )
+        frame = _q(
+            test_book,
+            "select s.guid_val from slots s join accounts a on a.guid = "
+            "s.obj_guid where a.name = 'Checking' and s.name = 'reconcile-info'",
+        )[0][0]
+        # What desktop's "Postpone" leaves: a date and a balance.
+        parked = uuid.uuid4().hex
+        _q(
+            test_book,
+            "insert into slots (obj_guid, name, slot_type, guid_val) "
+            "values (?, 'reconcile-info/postpone', 9, ?)", (frame, parked),
+        )
+        _q(
+            test_book,
+            "insert into slots (obj_guid, name, slot_type, int64_val) "
+            "values (?, 'reconcile-info/postpone/date', 1, 1706745599)",
+            (parked,),
+        )
+        _q(
+            test_book,
+            "insert into slots (obj_guid, name, slot_type, numeric_val_num, "
+            "numeric_val_denom) values (?, 'reconcile-info/postpone/balance', "
+            "3, 12345, 100)", (parked,),
+        )
+
+        gb.reconcile_account(
+            account_name="Assets:Checking", statement_date=date(2024, 2, 29),
+            statement_balance=str(total), reconcile_all=True,
+        )
+
+        assert _q(
+            test_book, "select count(*) from slots where name like "
+            "'reconcile-info/postpone%'",
+        ) == [(0,)]
+        # The rest of the frame is intact.
+        assert _q(
+            test_book, "select count(*) from slots where name = "
+            "'reconcile-info/last-date'",
+        ) == [(1,)]
+
+
+class TestSS15ANewLotHasDesktopsShape:
+    def test_flag_unknown_and_no_empty_notes(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        gb.create_lot(account="Assets:Checking", title="Lot A")
+        assert _q(test_book, "select is_closed from lots") == [(-1,)]
+        assert _q(
+            test_book,
+            "select name from slots where obj_guid in (select guid from lots)",
+        ) == [("title",)]
+
+    def test_a_note_is_kept(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        gb.create_lot(account="Assets:Checking", title="Lot B", notes="2024 buy")
+        assert sorted(_q(
+            test_book,
+            "select name, string_val from slots where obj_guid in "
+            "(select guid from lots)",
+        )) == [("notes", "2024 buy"), ("title", "Lot B")]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+class TestDS15ABackupIsReadableByItsOwnerOnly:
+    def test_mode(self, test_book, tmp_path, monkeypatch):
+        monkeypatch.setenv("GNUCASH_LOG_DIR", str(tmp_path / "logs"))
+        gb = GnuCashBook(str(test_book))
+        made = gb.create_backup(label="manual")
+        path = made.get("path") or made.get("backup_path")
+        files = [path] if path and os.path.exists(path) else [
+            str(p) for p in (tmp_path / "logs").rglob("*.gnucash")
+        ]
+        assert files
+        for f in files:
+            assert stat.S_IMODE(os.stat(f).st_mode) == 0o600
+
+
+class TestMM15ATemplateQuantityIsRoundedNotTruncated:
+    def test_the_fifth_decimal_rounds(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        gb.create_commodity(
+            mnemonic="VTSAX", fullname="Total Market", namespace="FUND",
+            fraction=10000,
+        )
+        gb.create_account(
+            name="Brokerage", account_type="MUTUAL", parent="Assets",
+            commodity="VTSAX", commodity_namespace="FUND",
+        )
+        gb.create_scheduled_transaction(
+            name="Monthly buy", description="Monthly buy",
+            splits=[
+                {"account": "Assets:Brokerage", "amount": "150.00",
+                 "quantity": "1.23456"},
+                {"account": "Assets:Checking", "amount": "-150.00"},
+            ],
+            start_date="2026-01-01", frequency="monthly",
+        )
+        assert _q(
+            test_book,
+            "select numeric_val_num, numeric_val_denom from slots "
+            "where slot_type = 3 and name like '%quantity%'",
+        ) == [(12346, 10000)]

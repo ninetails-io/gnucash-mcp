@@ -868,6 +868,16 @@ _OPEN_ERRORS: tuple[type[Exception], ...] = (
 )
 
 
+_LOCK_PHRASES = (
+    "database is locked",        # SQLITE_BUSY
+    "database table is locked",  # SQLITE_LOCKED
+    "lock on the file",          # piecash, off the gnclock table
+    "lock wait timeout",         # MySQL / MariaDB
+    "could not obtain lock",     # PostgreSQL
+    "deadlock",
+)
+
+
 def _is_lock_error(exc: Exception) -> bool:
     """True when ``exc`` means "someone else has this book open".
 
@@ -878,7 +888,13 @@ def _is_lock_error(exc: Exception) -> bool:
     three times just delays the real error.
     """
     msg = str(exc).lower()
-    return "lock" in msg or "busy" in msg
+    # The phrases a lock is announced with — SQLite's two, piecash's
+    # gnclock check, MySQL's and PostgreSQL's. A bare "lock" also
+    # matched ``no such table: gnclock`` (a SQLite file that is not a
+    # GnuCash book was "locked by GnuCash") and any path with "lock"
+    # in it (a missing book under ``sherlock/``) — adversarial review
+    # 2026-09-30, FC-13 / DS-13.
+    return any(phrase in msg for phrase in _LOCK_PHRASES)
 
 
 class StaleFXRateError(ValueError):
@@ -2494,6 +2510,14 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         # set-membership check).
         if acct is not None and acct.guid in self._template_account_guids(book):
             return None
+        # The root is not an account anyone posts to, renames, or
+        # annotates; it has no path, so only a GUID reaches it. A
+        # batch row that did posted to ROOT and the amount left every
+        # report (net worth 10,000 → 9,877), and the slot tools could
+        # delete the designated-account markers the server keeps
+        # there (adversarial review 2026-09-30, C43).
+        if acct is not None and acct.type == "ROOT":
+            return None
         return acct
 
     def _normalize_account_refs(
@@ -2917,6 +2941,42 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
 
         f = self._RECONCILE_INFO_FRAME
         frame = frame_guid(account.guid, f)
+        # recnFinishCB clears a postponed reconcile first
+        # (xaccAccountClearReconcilePostpone): the date and balance a
+        # user parked with "Postpone" are spent once the statement is
+        # finished. Left in place, desktop's next reconcile window
+        # opened preloaded with them (adversarial review 2026-09-30,
+        # C23).
+        postpone = f"{f}/postpone"
+        parked = book.session.execute(
+            text(
+                "SELECT guid_val FROM slots WHERE obj_guid = :o "
+                "AND name = :n AND slot_type = 9"
+            ),
+            {"o": frame, "n": postpone},
+        ).first()
+        if parked is not None:
+            if parked[0]:
+                book.session.execute(
+                    Slot.__table__.delete().where(
+                        Slot.__table__.c.obj_guid == parked[0]
+                    )
+                )
+                _verify_delete(
+                    book.session, Slot.__table__, {"obj_guid": parked[0]},
+                    f"postponed {label}",
+                )
+            book.session.execute(
+                Slot.__table__.delete().where(
+                    (Slot.__table__.c.obj_guid == frame)
+                    & (Slot.__table__.c.name == postpone)
+                )
+            )
+            _verify_delete(
+                book.session, Slot.__table__,
+                {"obj_guid": frame, "name": postpone},
+                f"postponed {label}",
+            )
         if prev_date is not None:
             interval = self._reconcile_interval(
                 prev_date, statement_date, prev_interval,

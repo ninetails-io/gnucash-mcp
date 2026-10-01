@@ -95,6 +95,12 @@ Schedule recipes, invoice links, and budget signs are now stored the way GnuCash
   - `create_billterm` refuses negative days, a discount window longer than the term, and a discount outside 0–100% (BL-23). `create_scheduled_transaction` and its update refuse an end date before the start (C42). `create_budget` needs a name and at most 1,200 periods; a commodity's fraction is a power of ten up to 10^9 (IV-25, MM-14).
   - An account name may not read as an account reference (a leading `%`, or 32 hex characters) or carry leading or trailing whitespace (IV-21).
   - Dates at the edge of the calendar and an absurd look-ahead or loan term are refused or ignored rather than raising out of date arithmetic (IV-18, C58).
+- Storage shape and safety, from the same review:
+  - The root account cannot be reached by GUID. A batch row that named it posted there and the amount left every report; the slot tools could delete the markers the server keeps on it (C43).
+  - Finishing a reconcile clears a postponed one, as GnuCash's reconcile window does; the parked date and balance used to reappear in desktop's next reconcile (C23).
+  - `create_lot` writes GnuCash's shape: the closed flag left to be computed and no empty notes slot (SS-15). A schedule's share quantity is rounded like a transaction's, not truncated (MM-15).
+  - Backups are created readable by their owner only; they were world-readable copies of the whole book (DS-15).
+  - Only a lock is reported as a lock. A SQLite file that is not a GnuCash book, or a missing book under a folder with "lock" in its name, was reported as "locked by GnuCash" after three retries (FC-13, DS-13).
 - Books whose ID counters GnuCash 5.0 or 5.1 saved as decimals (GnuCash bug 798930) could not auto-number anything: `create_party`, `create_document`, and `create_job` raised a format error. The counter is read as GnuCash reads it and stored back as the integer it is meant to be. Review item FC-2.
 - A credit note raised on a job in GnuCash desktop can be edited, deleted, and applied: `add_document_entry` and `delete_document` raised `KeyError: 3`, and `apply_credit_note` could not find the customer's invoice. Review item C45.
 - The audit log's account-update entry lists the fields that changed, and only those. A description-only update used to log `Name: "X" → ""`, a rename that never happened, while a placeholder or type change had no line at all. Review item C41.
