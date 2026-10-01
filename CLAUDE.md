@@ -470,7 +470,25 @@ Established chokepoints and the rule each one owns:
   C1/C2. Don't "tidy" a total that differs from the summed prices by
   a cent on tax-included lines: desktop shows and posts that total.
   Pinned by `tests/test_entry_math.py`, every figure worked from the
-  GnuCash source.
+  GnuCash source, and against the engine itself by the totals oracle
+  (next entry).
+- **The totals oracle** (`tests/fixtures/desktop_totals.py` +
+  `parity_totals.scm`) — the parity twin's sibling for NUMBERS, and
+  it needs no GUI: draft documents through the server, then have
+  `gnucash-cli` load the book and print `gncInvoiceGetTotal` /
+  `…Subtotal` / `…Tax` for each, through a tiny report loaded from a
+  temp `GNC_CONFIG_HOME` (nothing is installed; Guile's compile cache
+  is off). `tests/test_entry_math_desktop.py` has two halves: 300
+  recorded documents with GnuCash 5.12's answers
+  (`desktop_totals_5_12.json`), replayed through the server's row
+  reader everywhere including CI; and a live run on a fresh random
+  book whenever `gnucash-cli` is installed. Change the entry math and
+  both must stay at zero differences; re-record
+  (`uv run python tests/fixtures/desktop_totals.py record`) only when
+  the generator changes or a new GnuCash release is the reference.
+  Any question of the form "what would desktop compute for this
+  draft" can be asked the same way — write the report, not a
+  screenshot plan.
 - `_posted_total` — what a POSTED document came to: its posting
   transaction's split in the document's lot, direction-normalized.
   The posting is the record; the entries describe the document.
