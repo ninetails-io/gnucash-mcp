@@ -613,13 +613,26 @@ Established chokepoints and the rule each one owns:
   the engine's dumps are recorded for CI. A new business write path
   whose desktop side is an engine call gets a scenario in
   `tests/test_parity_prepayment.py` (or a sibling) before it merges.
-  Two things the engine leaves in a SQL book are excluded by ruling
+  Three things the engine leaves in a SQL book are excluded by ruling
   of the dump, not copied: the EMPTY payment lot it abandons after
   every payment it moves into a document's lot (its own scrub
-  destroys them), and the stale `post_txn` / `post_lot` /
-  `post_acc` on an unposted document (its SQL backend drops a NULL
-  reference from the UPDATE). `_payment_lots` skips empty lots and
-  nothing reads those columns on an unposted document.
+  destroys them); the stale `post_txn` / `post_lot` / `post_acc` on
+  an unposted document (its SQL backend drops a NULL reference from
+  the UPDATE); and the hidden child TAX TABLE it makes at post, which
+  no saved row ever references (the line is repointed in memory and
+  not re-saved). `_payment_lots` skips empty lots, nothing reads
+  those columns on an unposted document, and `_find_taxtable` /
+  `list_taxtables` see live tables only. Stored `refcount`s are not
+  compared either: the engine adds one per reference it loads and
+  saves the sum.
+- `_billterm_return_child` — `gncBillTermReturnChild`: a posted
+  document points at a hidden copy of its billing term (same name,
+  `invisible` 1, `parent` the term, refcount 0), reused while it
+  still matches the term field for field. `_card_charges` — the
+  `GNC_PAYMENT_CARD` branch of `gncInvoicePostToAccount`: what an
+  employee voucher sends to the company card instead of the payable;
+  `post_invoice` and `get_invoice` both read it. Both pinned by
+  `tests/test_parity_posting.py`.
 - `_parse_owner_type`, `_commodity_quantum`, `_effective_owner_type`
   — same story, smaller surface. `_is_market_price` /
   `_market_prices_only` — the quotes-only re-derivation the

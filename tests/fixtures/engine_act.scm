@@ -15,6 +15,9 @@
 ;;       gnc_pricedb_add_price — what the Price Editor's OK button and
 ;;       a Finance::Quote fetch both call. Result "ok" when the price
 ;;       went in, "rejected" when the database kept what it had.
+;;   post|<invoice guid>|<post account guid>|<d>|<m>|<y>|<due d>|<due m>|<due y>|<memo>
+;;       gncInvoicePostToAccount with splits accumulated per account
+;;       and no auto-pay — the Post dialog's defaults.
 ;;   balance|<customer guid>
 ;;       gncOwnerGetBalanceInCurrency, in the customer's own currency —
 ;;       the figure behind the Customers Overview balance column.
@@ -70,6 +73,18 @@
         (if (null? inv)
             "missing"
             (begin (gncInvoiceAutoApplyPayments inv) "ok"))))
+     ((string=? verb "post")
+      (let ((inv (gncInvoiceLookupFlip (list-ref fields 1) book))
+            (acc (xaccAccountLookup (list-ref fields 2) book))
+            (n (lambda (i) (string->number (list-ref fields i)))))
+        (cond ((or (null? inv) (null? acc)) "missing")
+              ((null? (gncInvoicePostToAccount
+                       inv acc
+                       (gnc-dmy2time64-neutral (n 3) (n 4) (n 5))
+                       (gnc-dmy2time64-neutral (n 6) (n 7) (n 8))
+                       (list-ref fields 9) #t #f))
+               "refused")
+              (else "ok"))))
      ((string=? verb "balance")
       (let ((customer (gncCustomerLookupFlip (list-ref fields 1) book))
             (owner (gncOwnerNew)))

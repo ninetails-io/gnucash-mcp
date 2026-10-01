@@ -1483,7 +1483,15 @@ class BusinessMixin:
         namespace. Returns None if not found; callers raise.
         """
         from piecash.business.tax import Taxtable
-        return book.session.query(Taxtable).filter_by(name=name).first()
+        # Never a hidden copy: desktop makes one (same name,
+        # ``invisible`` 1, ``parent`` set) when it posts a document,
+        # and a name lookup that returned it would attach new lines
+        # to a frozen table and edit the wrong row.
+        return book.session.query(Taxtable).filter(
+            Taxtable.name == name,
+            Taxtable.invisible == 0,
+            Taxtable.parent_guid.is_(None),
+        ).first()
 
     @staticmethod
     def _find_taxtable_by_guid(book, guid: str):
@@ -3496,6 +3504,11 @@ class BusinessMixin:
                 ),
                 {"g": bt.guid},
             ).scalar()
+            if bt.parent_guid:
+                # A posted document's frozen copy: "children don't
+                # need refcounts" (gncBillTerm.c) — the engine writes
+                # 0 and never counts them.
+                refs = 0
             if int(bt.refcount or 0) != int(refs):
                 bt.refcount = int(refs)
                 recounted += 1
@@ -3917,12 +3930,139 @@ class BusinessMixin:
 
         return {
             "rows": rows,
+            # ``(account_guid, EntryValues)`` per row, same order.
+            "lines": lines,
             "acct_totals": totals.by_account,
             "grand_total": totals.total,
             "subtotal": totals.net,
             "tax_breakdown": totals.tax_by_account,
             "tax_by_taxtable": tax_by_taxtable,
         }
+
+    # gncEntry.h GncEntryPaymentType, as stored in entries.b_paytype:
+    # GNC_PAYMENT_CASH = 1, GNC_PAYMENT_CARD = 2.
+    _PAYMENT_CARD = 2
+
+    def _card_charges(self, book, inv, totals: dict | None = None) -> dict:
+        """What an employee's expense voucher charges to the company
+        card instead of owing to the employee — the
+        ``GNC_PAYMENT_CARD`` branch of ``gncInvoicePostToAccount``.
+
+        Applies only when the voucher's employee has a credit-card
+        account (``employees.ccard_guid``): each line paid by card
+        (``b_paytype`` 2) at its rounded value, plus the voucher's
+        "extra to charge card" amount (``invoices.charge_amt``).
+        Desktop sets both in its voucher window; this server writes
+        neither, so they are only ever read here, off a voucher
+        drafted in desktop.
+
+        Returns ``{"account": Account | None, "lines": [(description,
+        Decimal)], "extra": Decimal, "total": Decimal}`` in the
+        document's sign; ``account`` is ``None`` (and the rest zero)
+        when nothing goes to a card.
+        """
+        from fractions import Fraction
+
+        nothing = {
+            "account": None, "lines": [], "extra": Decimal(0),
+            "total": Decimal(0),
+        }
+        if inv.owner_type != 5:
+            return nothing
+        employee = self._find_employee_by_guid(book, inv.owner_guid)
+        card_guid = getattr(employee, "ccard_guid", None)
+        if not card_guid:
+            return nothing
+        account = book.session.get(piecash.Account, card_guid)
+        if account is None:
+            return nothing
+        if totals is None:
+            try:
+                totals = self._get_invoice_entries_and_total(book, inv)
+            except ValueError:
+                return nothing
+        fraction = inv.currency.fraction
+        sign = -1 if self._get_is_credit_note(inv) else 1
+        lines = []
+        for row, (_acct, values) in zip(totals["rows"], totals["lines"]):
+            if int(row.b_paytype or 0) != self._PAYMENT_CARD:
+                continue
+            lines.append((
+                row.description or "",
+                _entry_math.round_half_up(sign * values.value, fraction),
+            ))
+        extra = Decimal(0)
+        num = inv._charge_amt_num
+        if num:
+            extra = _entry_math.round_half_up(
+                Fraction(int(num), int(inv._charge_amt_denom or 1)),
+                fraction,
+            )
+        total = sum((v for _, v in lines), Decimal(0)) + extra
+        if not lines and not extra:
+            return nothing
+        return {
+            "account": account, "lines": lines, "extra": extra,
+            "total": total,
+        }
+
+    def _billterm_return_child(self, book, term):
+        """``gncBillTermReturnChild(term, TRUE)``: the frozen copy of
+        a billing term that a POSTED document points at, so editing
+        the term later changes what new documents get and not what
+        old ones were posted under.
+
+        A term that is already a child (or hidden) is returned as it
+        is. Otherwise an existing child of this term is reused when
+        it still matches the term field for field, and a new one is
+        written when none does: the same name and values,
+        ``invisible`` 1, ``parent`` the term, ``refcount`` 0
+        ("children don't need refcounts", gncBillTerm.c). The
+        engine tracks "the" child of a term in memory and forgets it
+        when the term is edited; matching on the fields is that rule
+        for a process that keeps nothing in memory.
+        """
+        import uuid
+        from piecash.business.invoice import Billterm
+
+        if term is None:
+            return None
+        if term.parent_guid or term.invisible:
+            return term
+
+        def fields(t):
+            return (
+                t.name, t.description, t.type, t.duedays, t.discountdays,
+                t._discount_num, t._discount_denom, t.cutoff,
+            )
+
+        for child in book.session.query(Billterm).filter(
+            Billterm.parent_guid == term.guid,
+        ).order_by(Billterm.guid).all():
+            if child.invisible and fields(child) == fields(term):
+                return child
+        child_guid = uuid.uuid4().hex
+        book.session.execute(
+            Billterm.__table__.insert().values(
+                guid=child_guid,
+                name=term.name,
+                description=term.description,
+                refcount=0,
+                invisible=_gnc_bool(True),
+                parent=term.guid,
+                type=term.type,
+                duedays=term.duedays,
+                discountdays=term.discountdays,
+                discount_num=term._discount_num,
+                discount_denom=term._discount_denom,
+                cutoff=term.cutoff,
+            )
+        )
+        _verify_write(
+            book.session, Billterm.__table__, child_guid,
+            f"posted copy of billterm '{term.name}'",
+        )
+        return book.session.query(Billterm).filter_by(guid=child_guid).first()
 
     # ── Customer / Vendor / Billterm CRUD ─────────────────────────
 
@@ -4964,9 +5104,11 @@ class BusinessMixin:
         from piecash.business.tax import Taxtable
 
         with self.open() as book:
-            tables = book.session.query(Taxtable).order_by(
-                Taxtable.name,
-            ).all()
+            # Live tables only; see _find_taxtable.
+            tables = book.session.query(Taxtable).filter(
+                Taxtable.invisible == 0,
+                Taxtable.parent_guid.is_(None),
+            ).order_by(Taxtable.name).all()
 
             page, indicator = _paginate(
                 tables, offset=offset, limit=limit,
@@ -6849,6 +6991,19 @@ class BusinessMixin:
                 posted_total = settlement["grand_total"]
                 entries_total = total.quantize(posted_total)
                 result["total"] = str(posted_total)
+                # A voucher's card lines post to the card, not the
+                # payable: its lot carries less than its entries by
+                # exactly that, and that is not drift.
+                card = self._card_charges(book, inv)
+                if card["account"] is not None:
+                    result["charged_to_card"] = {
+                        "account": card["account"].fullname,
+                        "amount": str(card["total"]),
+                        "document_total": str(entries_total),
+                    }
+                    entries_total = (total - card["total"]).quantize(
+                        posted_total
+                    )
                 if entries_total != posted_total:
                     result["total_note"] = (
                         f"Posted at {posted_total}; the entries now "
@@ -7258,10 +7413,20 @@ class BusinessMixin:
             effective_is_bill = is_bill ^ is_credit_note
             piecash_splits = []
 
+            # An employee's voucher: lines paid with the company card,
+            # and any "extra to charge card", go to the card account
+            # and come off what is owed to the employee
+            # (gncInvoicePostToAccount, GNC_PAYMENT_CARD). They used
+            # to post to the payable with everything else — the
+            # employee was owed, and later reimbursed, for what the
+            # card had paid (adversarial review 2026-09-30, C3).
+            card = self._card_charges(book, inv, totals)
+            owed_total = grand_total - card["total"]
+
             if effective_is_bill:
-                ar_ap_value = -grand_total
+                ar_ap_value = -owed_total
             else:
-                ar_ap_value = grand_total
+                ar_ap_value = owed_total
             # Desktop vocabulary on EVERY leg ("Invoice" / "Credit
             # Note"), not just A/R: a leg left with action="" gets
             # auto-stamped "Buy"/"Sell" by piecash when its account
@@ -7300,6 +7465,41 @@ class BusinessMixin:
                         action=doc_action,
                     )
                 )
+
+            # One split per card line, its memo the line's
+            # description, on the same side as the payable; then the
+            # extra, under desktop's memo.
+            card_side = -1 if effective_is_bill else 1
+            for memo_text, value in card["lines"] + (
+                [("Extra to Charge Card", card["extra"])]
+                if card["extra"] else []
+            ):
+                card_value = card_side * value
+                piecash_splits.append(
+                    _new_split(
+                        card["account"], card_value,
+                        _qty_for_split(card["account"], card_value),
+                        inv.currency,
+                        memo=memo_text,
+                        action=doc_action,
+                    )
+                )
+
+            # Stabilize the billing terms: the posted document points
+            # at a frozen copy (gncBillTermReturnChild). Posting used
+            # to leave it on the live term, so editing the term
+            # changed the terms of documents already posted under it
+            # (adversarial review 2026-09-30, C10). The tax table on
+            # each line is NOT repointed: the engine does it in
+            # memory, but its SQL backend never saves the change —
+            # a desktop-posted book's entries still name the parent
+            # table (engine twin, 2026-09-30).
+            if term is not None:
+                child_term = self._billterm_return_child(book, term)
+                if child_term.guid != term.guid:
+                    inv.term_guid = child_term.guid
+                    if (term.refcount or 0) > 0:
+                        term.refcount = term.refcount - 1
 
             # num = invoice ID, matching GnuCash UI behavior
             txn = piecash.Transaction(
@@ -7354,7 +7554,9 @@ class BusinessMixin:
                     )
                 ),
                 "status": "posted",
-                "total": str(grand_total),
+                # What the lot carries: all of it, or — a voucher with
+                # card lines — what is owed to the employee.
+                "total": str(owed_total),
                 "post_date": str(parsed_date),
                 # GUIDs emitted as short prefixes — consumers pass
                 # them back through _resolve_guid (8+ chars accepted).
@@ -7368,6 +7570,12 @@ class BusinessMixin:
                 ),
                 "post_account": post_acct.fullname,
             }
+            if card["account"] is not None:
+                result["charged_to_card"] = {
+                    "account": card["account"].fullname,
+                    "amount": str(card["total"]),
+                    "document_total": str(grand_total),
+                }
             # Surface the worst-aged forced override (if any) as a
             # single fx_stale block — the common case is one foreign
             # currency, so there is usually exactly one.

@@ -122,7 +122,7 @@ def dump(book: Path, skip_transactions_before: str | None = None) -> str:
     ``enter_date`` is the wall clock and is left out. Slots are read
     through their frames, so a frame's own GUID never appears.
 
-    Two things the engine leaves in a SQL book are NOT part of the
+    Three things the engine leaves in a SQL book are NOT part of the
     comparison, and the dump leaves them out on both sides:
 
     * EMPTY LOTS. ``gncOwnerApplyPaymentSecs`` makes a payment lot,
@@ -131,6 +131,12 @@ def dump(book: Path, skip_transactions_before: str | None = None) -> str:
       them (``gncOwnerAutoApplyPaymentsWithLots``,
       ``gncScrubBusinessLot``). Debris by desktop's own account; the
       server never creates one. Counted by ``empty_lots``.
+    * HIDDEN TAX TABLE COPIES. ``gncInvoicePostToAccount`` makes a
+      child of each line's tax table and repoints the line at it —
+      in memory. The line's row is never re-saved, so in the SQL
+      book every entry still names the parent table and the child
+      is referenced by nothing. Tax tables are not dumped; each
+      ENTRY line shows which table its row names.
     * STALE POSTING REFERENCES on an unposted document.
       ``gncInvoiceUnpost`` clears the posted account, transaction,
       and lot, but the SQL backend leaves a NULL object reference out
@@ -154,6 +160,11 @@ def dump(book: Path, skip_transactions_before: str | None = None) -> str:
         names[g] = f"ccy:{m}"
     for g, i, owner_type in q("select guid, id, owner_type from invoices"):
         names[g] = f"doc:{owner_type}:{i}"
+    # A posted document points at a hidden copy of its billing term
+    # (and desktop makes one of each tax table): same name, a parent.
+    for table, tag in (("billterms", "term"), ("taxtables", "tax")):
+        for g, name, parent in q(f"select guid, name, parent from {table}"):
+            names[g] = f"{tag}:{name}" + (" (posted copy)" if parent else "")
 
     def n(v):
         return names.get(v, v) if isinstance(v, str) else v
@@ -271,6 +282,29 @@ def dump(book: Path, skip_transactions_before: str | None = None) -> str:
         )
         out.append(f"DOC {names[inv['guid']]} {shown}")
         out += slots(inv["guid"], "  ")
+        for entry in sorted(
+            q("select * from entries where invoice = ? or bill = ?",
+              inv["guid"], inv["guid"]),
+            key=lambda e: (e["description"], e["quantity_num"]),
+        ):
+            # ``date`` is local noon (the entry ledger's date cell)
+            # and ``date_entered`` the wall clock.
+            shown = " ".join(
+                f"{k}={n(entry[k])!r}" for k in entry.keys()
+                if k not in ("guid", "date", "date_entered")
+            )
+            out.append(f"  ENTRY {shown}")
+    for term in sorted(
+        q("select * from billterms"), key=lambda t: names[t["guid"]],
+    ):
+        # ``refcount`` is left out: the engine adds one for every
+        # reference it loads and saves the sum, so the stored number
+        # grows with each session (2 references read 3 after two).
+        shown = " ".join(
+            f"{k}={n(term[k])!r}" for k in term.keys()
+            if k not in ("guid", "refcount")
+        )
+        out.append(f"TERM {names[term['guid']]} {shown}")
     con.close()
     return "\n".join(out) + "\n"
 
