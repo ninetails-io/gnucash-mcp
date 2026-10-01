@@ -1,0 +1,126 @@
+{
+ "import_option_off": {
+  "results": [
+   "ok"
+  ],
+  "rows": {
+   "actions": [
+    [
+     "Checking",
+     ""
+    ],
+    [
+     "Income",
+     ""
+    ]
+   ],
+   "assoc_uri": [
+    [
+     4,
+     0,
+     "https://bank.example/stmt/1042",
+     null,
+     "1970-01-01 00:00:00",
+     null,
+     0,
+     1,
+     null
+    ]
+   ],
+   "num": "1042"
+  }
+ },
+ "import_option_on": {
+  "results": [
+   "ok"
+  ],
+  "rows": {
+   "actions": [
+    [
+     "Checking",
+     ""
+    ],
+    [
+     "Income",
+     ""
+    ]
+   ],
+   "assoc_uri": [
+    [
+     4,
+     0,
+     "https://bank.example/stmt/1042",
+     null,
+     "1970-01-01 00:00:00",
+     null,
+     0,
+     1,
+     null
+    ]
+   ],
+   "num": "1042"
+  }
+ },
+ "register_option_off": {
+  "results": [
+   "ok"
+  ],
+  "rows": {
+   "actions": [
+    [
+     "Checking",
+     ""
+    ],
+    [
+     "Income",
+     ""
+    ]
+   ],
+   "assoc_uri": [
+    [
+     4,
+     0,
+     "https://bank.example/stmt/1042",
+     null,
+     "1970-01-01 00:00:00",
+     null,
+     0,
+     1,
+     null
+    ]
+   ],
+   "num": "1042"
+  }
+ },
+ "register_option_on": {
+  "results": [
+   "ok"
+  ],
+  "rows": {
+   "actions": [
+    [
+     "Checking",
+     "1042"
+    ],
+    [
+     "Income",
+     ""
+    ]
+   ],
+   "assoc_uri": [
+    [
+     4,
+     0,
+     "https://bank.example/stmt/1042",
+     null,
+     "1970-01-01 00:00:00",
+     null,
+     0,
+     1,
+     null
+    ]
+   ],
+   "num": ""
+  }
+ }
+}
