@@ -47,6 +47,13 @@ Slot filler columns
 
     Both honor GnuCash's same-day rule: an existing price from a
     preferred source stays; otherwise the row is updated in place.
+
+``Transaction.doc_link``
+    piecash maps ``notes`` but not the register's other slot field,
+    the document link. ``xaccTransSetDocLink`` (Transaction.cpp)
+    keeps it in a string slot under its pre-4.x name ``assoc_uri``
+    and removes the slot when the link is set empty; the property
+    does both, through the same accessor piecash uses for notes.
 """
 
 from __future__ import annotations
@@ -57,7 +64,8 @@ from fractions import Fraction
 
 from piecash._common import GncValidationError
 from piecash.core.commodity import Price
-from piecash.core.transaction import Split
+from piecash.core.transaction import Split, Transaction
+from piecash.sa_extra import pure_slot_property
 
 from gnucash_mcp.book._currency import (
     CurrencyMixin,
@@ -554,3 +562,6 @@ def _use_gnucash_slot_fillers() -> None:
 _use_gnucash_slot_fillers()
 Price.validate = _price_validate
 Split.validate = _split_validate
+# Transaction.cpp: doclink_uri_str = "assoc_uri" ("the old name for
+# the document link, kept for compatibility"). Set None to remove.
+Transaction.doc_link = pure_slot_property("assoc_uri")

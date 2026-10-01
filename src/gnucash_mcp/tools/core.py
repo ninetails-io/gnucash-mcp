@@ -10,6 +10,7 @@ from datetime import date
 
 from gnucash_mcp._format import (
     _BATCH_CONTRACT,
+    _batch_row_fixed,
     _batch_row_splits,
     _batch_tsv_layout,
     _parse_statement_tsv,
@@ -34,8 +35,8 @@ def _parse_transactions_tsv(tsv: str) -> list[dict]:
     documented base header parses as positional ``(amount, account)``
     pairs exactly as before; ``memo`` and/or ``qty`` split columns
     widen each split group accordingly (field order per the header's
-    first group); a ``notes`` token in column 4 inserts a
-    per-transaction notes column after ``description``. Unknown or
+    first group); ``notes``, ``num``, ``link``, and ``cur`` tokens
+    after ``description`` insert per-transaction columns. Unknown or
     typo'd column names reject with the offending name.
 
     Rows may be ragged (2 splits vs 3). Raises ValueError on a
@@ -93,12 +94,7 @@ def _parse_transactions_tsv(tsv: str) -> list[dict]:
             "description": desc,
             "splits": splits,
         }
-        ni = layout["notes_idx"]
-        if ni is not None and len(fields) > ni and fields[ni].strip():
-            txn["notes"] = fields[ni].strip()
-        ci = layout["cur_idx"]
-        if ci is not None and len(fields) > ci and fields[ci].strip():
-            txn["currency"] = fields[ci].strip().upper()
+        txn.update(_batch_row_fixed(fields, layout))
         out.append(txn)
     return out
 
@@ -370,6 +366,20 @@ def register(mcp, get_book) -> None:
           ``qty``. The currency must already exist in the book, and
           ``cur`` cannot combine with an auto-fill row.
 
+        - PER-TRANSACTION NUM AND LINK — declare ``num`` and/or
+          ``link`` after ``description`` (any order with ``notes``
+          and ``cur``)::
+
+              ref<TAB>date<TAB>description<TAB>num<TAB>link<TAB>amt1<TAB>acct1<TAB>amt2<TAB>acct2
+              1<TAB>2026-07-01<TAB>Office chairs<TAB>ER 2658<TAB>file:///receipts/er2658.pdf<TAB>-120.00<TAB>Assets:Checking<TAB>120.00<TAB>Expenses:Office
+
+          ``num`` is GnuCash's Num column: a check number, invoice
+          reference, or receipt ID — whatever the source document
+          numbers itself with. Fill it whenever the source prints
+          one. ``link`` is the transaction's document link (a URL
+          or file path to the receipt/invoice; desktop opens it
+          from the register). Empty cells leave either unset.
+
         - PER-SPLIT QUANTITY — declare ``qty`` split columns for
           splits whose ACCOUNT commodity differs from the book
           default (investment shares, foreign-currency accounts)::
@@ -529,7 +539,8 @@ def register(mcp, get_book) -> None:
 
         INPUT — ``lines`` is a TSV block. Header: ``ref, date``
         first, then any order of ``description``, ``notes``,
-        ``raw``, ``match``, ``amount`` (required), then optional
+        ``raw``, ``match``, ``num``, ``link``, ``amount``
+        (required), then optional
         ``amt, acct, memo, qty`` counter-split groups (batch
         grammar). The statement account's own leg is SYNTHESIZED —
         never a column. Dry-run typically needs only::
@@ -540,6 +551,11 @@ def register(mcp, get_book) -> None:
         - ``raw`` = the verbatim statement line; it lands on the
           bank leg's memo (provenance). ``description``/``notes``
           are your interpretation (commit).
+        - ``num`` = the number the statement prints for the line
+          (check number, reference) — GnuCash's Num column; the
+          server stores it where the book's register reads it.
+          ``link`` = a document link for the transaction. Both
+          also apply to claim rows.
         - ``match`` = the split GUID this line claims instead of
           creating (from the dry-run candidates table). Claim rows
           may also carry ``raw`` (updates the claimed split's memo)
@@ -842,8 +858,9 @@ def register(mcp, get_book) -> None:
         """Update MANY transactions with per-row values (bulk edit).
 
         INPUT — ``updates`` is a TSV block: header ``guid`` plus any
-        of ``description``, ``notes``, ``date`` (at least one), then
-        one row per transaction::
+        of ``description``, ``notes``, ``date``, ``num`` (GnuCash's
+        Num column), ``link`` (the document link) — at least one —
+        then one row per transaction::
 
             guid<TAB>description<TAB>notes
             56926ac2<TAB>PayPal Credit Payment<TAB>Resolved — card payment
@@ -851,7 +868,7 @@ def register(mcp, get_book) -> None:
 
         An EMPTY cell leaves that field UNCHANGED. To blank a field,
         opt in with a ``clear`` column: its cell names the fields to
-        clear on that row (``notes`` or ``description,notes``) —
+        clear on that row (``notes``, ``num,link``, …) —
         explicit per row, so a sparse batch can never mass-erase by
         accident. ``date`` is not clearable; a row that sets and
         clears the same field rejects. Splits and memos are not

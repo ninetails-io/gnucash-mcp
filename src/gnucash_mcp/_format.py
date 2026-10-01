@@ -221,25 +221,43 @@ _BATCH_SPLIT_TOKENS = {
 _BATCH_LEGACY_GROUP = ("amount", "account")
 
 
+# Per-transaction columns a batch header may declare after
+# ``description``, in any order, each at most once: header token →
+# row key. ``cur`` is exactly ``cur`` — "currency" stays an unknown
+# token so the typo'd-split-column rejection ("currency2") holds.
+# ``num`` is the register's Num column (transactions.num, as
+# desktop's CSV importer writes it); ``link`` is the document link
+# (Transaction.cpp ``xaccTransSetDocLink``).
+_BATCH_FIXED_TOKENS = {
+    "notes": "notes",
+    "cur": "currency",
+    "num": "num",
+    "link": "link", "doclink": "link",
+}
+
+
 # The whole batch-TSV contract in one sentence, printed by EVERY
 # refusal on the way in (bookkeeper friction, 2026-09-30: four
 # rounds to the first success when only the last error showed it).
 _BATCH_CONTRACT = (
-    "columns are ref, date, description, notes, cur, then amt, acct, "
-    "memo, qty split groups (amt1, acct1, memo1, qty1, amt2, …); "
-    "tab-separated, one header row, one transaction per row"
+    "columns are ref, date, description, then any of notes, num, "
+    "link, cur, then amt, acct, memo, qty, act split groups (amt1, "
+    "acct1, memo1, qty1, amt2, …); tab-separated, one header row, "
+    "one transaction per row"
 )
 
 
 def _batch_tsv_layout(header_line: str) -> dict:
     """Column layout of a batch-entry TSV, derived from its header.
 
-    Fixed prefix ``ref, date, description``, an optional ``notes``
-    column, then split columns. The split-group field sequence is
-    whatever the header's FIRST group declares (``amt, acct`` pairs;
-    ``amt, acct, memo`` triples; ``amt, acct, qty``;
-    ``amt, acct, memo, qty`` — in any intra-group order): the header
-    is the schema, for field order too.
+    Fixed prefix ``ref, date, description``, then any of the
+    per-transaction columns in ``_BATCH_FIXED_TOKENS`` (``notes``,
+    ``num``, ``link``, ``cur``) in any order, then split columns.
+    The split-group field sequence is whatever the header's FIRST
+    group declares (``amt, acct`` pairs; ``amt, acct, memo``
+    triples; ``amt, acct, qty``; ``amt, acct, memo, qty`` — in any
+    intra-group order): the header is the schema, for field order
+    too.
 
     EVERY column name is validated. Now that the header is
     load-bearing, an unknown or typo'd token (``meno1``,
@@ -248,12 +266,12 @@ def _batch_tsv_layout(header_line: str) -> dict:
     decimal error on whatever landed in an amount slot (bookkeeper
     finding, 1.4.1 validation round).
 
-    Returns ``{"has_notes": bool, "has_cur": bool, "notes_idx":
-    int | None, "cur_idx": int | None, "fixed": int, "group":
-    tuple[str, ...]}`` with ``group`` in canonical names
-    (``amount`` / ``account`` / ``memo`` / ``quantity``).
-    ``fixed`` is the count of fixed-prefix columns; split cells
-    start there.
+    Returns ``{"fixed_idx": {row_key: column}, "fixed": int,
+    "group": tuple[str, ...]}`` with ``group`` in canonical names
+    (``amount`` / ``account`` / ``memo`` / ``quantity`` /
+    ``action``). ``fixed`` is the count of fixed-prefix columns;
+    split cells start there. Rows are read through
+    ``_batch_row_fixed`` and ``_batch_row_splits``.
 
     Raises ValueError naming the offending column on any unknown
     token, a wrong fixed prefix, or a first group missing
@@ -275,36 +293,18 @@ def _batch_tsv_layout(header_line: str) -> dict:
             f"— got {', '.join(raw_tokens[:3]) or '(empty header)'}. "
             + _BATCH_CONTRACT
         )
-    # Optional per-transaction fixed columns after description, in
-    # either order: ``notes`` and ``cur`` (row's transaction
-    # currency). Exactly ``cur`` — "currency" stays an unknown
-    # token so the typo'd-split-column rejection story
-    # ("currency2") is unchanged.
-    notes_idx: int | None = None
-    cur_idx: int | None = None
+    fixed_idx: dict[str, int] = {}
     start = 3
-    while start < len(tokens) and tokens[start] in ("notes", "cur"):
-        name = tokens[start]
-        if (name == "notes" and notes_idx is not None) or (
-            name == "cur" and cur_idx is not None
-        ):
+    while start < len(tokens) and tokens[start] in _BATCH_FIXED_TOKENS:
+        key = _BATCH_FIXED_TOKENS[tokens[start]]
+        if key in fixed_idx:
             raise ValueError(
-                f"duplicate {name!r} column in batch header"
+                f"duplicate {tokens[start]!r} column in batch header"
             )
-        if name == "notes":
-            notes_idx = start
-        else:
-            cur_idx = start
+        fixed_idx[key] = start
         start += 1
-    has_notes = notes_idx is not None
 
-    layout_fixed = {
-        "has_notes": has_notes,
-        "has_cur": cur_idx is not None,
-        "notes_idx": notes_idx,
-        "cur_idx": cur_idx,
-        "fixed": start,
-    }
+    layout_fixed = {"fixed_idx": fixed_idx, "fixed": start}
 
     canonical: list[str] = []
     for raw, token in zip(raw_tokens[start:], tokens[start:]):
@@ -336,6 +336,19 @@ def _batch_tsv_layout(header_line: str) -> dict:
             "account column"
         )
     return layout_fixed | {"group": tuple(group)}
+
+
+def _batch_row_fixed(fields: list[str], layout: dict) -> dict:
+    """A batch row's per-transaction cells, keyed as
+    ``_BATCH_FIXED_TOKENS`` names them; empty cells are left out.
+    The one reader of those columns, shared by the tool parse and
+    the audit log's display parse. ``currency`` is upper-cased."""
+    out: dict = {}
+    for key, idx in layout["fixed_idx"].items():
+        if len(fields) > idx and fields[idx].strip():
+            cell = fields[idx].strip()
+            out[key] = cell.upper() if key == "currency" else cell
+    return out
 
 
 def _batch_row_splits(rest: list[str], group: tuple[str, ...]) -> list[dict]:
@@ -452,6 +465,8 @@ _STATEMENT_FIXED_TOKENS = {
     "raw": "raw",
     "match": "match",
     "amount": "amount", "amt": "amount",
+    "num": "num",
+    "link": "link", "doclink": "link",
 }
 
 
@@ -461,8 +476,8 @@ def _statement_tsv_layout(header_line: str) -> dict:
     Same header-is-the-schema contract as ``_batch_tsv_layout``, with
     the statement dialect's fixed columns: ``ref, date`` first, then
     any order of ``description``/``desc``, ``notes``, ``raw``,
-    ``match``, ``amount`` (required — the self-consistency gate sums
-    it), then optional split-group columns for the COUNTER-side of
+    ``match``, ``num``, ``link``, ``amount`` (required — the
+    self-consistency gate sums it), then optional split-group columns for the COUNTER-side of
     created rows (``amt, acct, memo, qty, act`` — the statement
     account's own leg is synthesized by the server, never a column).
 
@@ -511,7 +526,8 @@ def _statement_tsv_layout(header_line: str) -> dict:
             raise ValueError(
                 f"unrecognized column {raw!r} in statement header — "
                 f"columns are ref, date, then "
-                f"description/notes/raw/match/amount in any order, "
+                f"description/notes/raw/match/num/link/amount in any "
+                f"order, "
                 f"then amt, acct, memo, qty counter-split groups "
                 f"(the statement account's own leg is synthesized — "
                 f"never a column)"
@@ -549,7 +565,8 @@ def _parse_statement_tsv(tsv: str) -> list[dict]:
     """Parse an ``enter_statement`` lines TSV into row dicts.
 
     Row shape: ``{ref, date (ISO string — the caller converts),
-    amount (string), description?, notes?, raw?, match?, splits}``.
+    amount (string), description?, notes?, raw?, match?, num?,
+    link?, splits}``.
     Optional fixed cells appear only when non-empty. ``date`` and
     ``amount`` cells are REQUIRED per row — a statement line without
     either isn't a transcription, and defaulting a date (as batch
@@ -1218,21 +1235,24 @@ def _paginate(
 
 # ── Batch transaction-update TSV ──────────────────────────────────
 
-_UPDATE_TSV_FIELDS = ("description", "notes", "date")
+_UPDATE_TSV_FIELDS = ("description", "notes", "date", "num", "link")
+# Every field but the posting date can be blanked through ``clear``.
+_UPDATE_CLEARABLE = ("description", "notes", "num", "link")
 
 
 def _parse_update_tsv(tsv: str) -> list[dict]:
     """``update_transactions`` TSV → row dicts.
 
     Header: ``guid`` then any of ``description``, ``notes``,
-    ``date`` (at least one, any order, no repeats), plus an
+    ``date``, ``num``, ``link`` (at least one, any order, no
+    repeats), plus an
     optional ``clear`` column; unknown tokens reject by name. An
     EMPTY cell leaves that field unchanged — the key is simply
     absent from the row dict.
 
     ``clear`` is the explicit opt-in that empty-cell-means-
     unchanged deliberately forecloses: its cell holds
-    comma-separated field names (``description`` and/or ``notes``)
+    comma-separated field names (any of ``_UPDATE_CLEARABLE``)
     to blank on that row, emitted as ``""`` values (the book layer
     already treats empty as clear). ``date`` is not clearable —
     transactions must have one. A row that both sets and clears
@@ -1257,7 +1277,7 @@ def _parse_update_tsv(tsv: str) -> list[dict]:
     if not fields:
         raise ValueError(
             "updates header needs at least one field column "
-            "(description, notes, date) or a clear column"
+            "(description, notes, date, num, link) or a clear column"
         )
     seen: set = set()
     for tok in fields:
@@ -1265,7 +1285,7 @@ def _parse_update_tsv(tsv: str) -> list[dict]:
             raise ValueError(
                 f"unrecognized column {tok!r} in updates header — "
                 f"columns are guid, then description, notes, date, "
-                f"and optionally clear"
+                f"num, link, and optionally clear"
             )
         if tok in seen:
             raise ValueError(f"duplicate {tok!r} column in updates header")
@@ -1306,10 +1326,11 @@ def _parse_update_tsv(tsv: str) -> list[dict]:
                     f"row {i}: 'date' is not clearable — every "
                     f"transaction needs a posting date"
                 )
-            if name not in ("description", "notes"):
+            if name not in _UPDATE_CLEARABLE:
                 raise ValueError(
                     f"row {i}: unknown field {name!r} in clear cell "
-                    f"— clearable fields are description, notes"
+                    f"— clearable fields are "
+                    f"{', '.join(_UPDATE_CLEARABLE)}"
                 )
             if name in row:
                 raise ValueError(

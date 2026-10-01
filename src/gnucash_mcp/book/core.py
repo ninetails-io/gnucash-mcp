@@ -4726,6 +4726,7 @@ class CoreMixin:
 
         Spec: specs/BATCH_TRANSACTION_ENTRY_SPEC.md. Each entry is
         ``{ref, date (date), description, notes (optional),
+        num (optional), link (optional — the document link),
         currency (optional ISO code — the row's transaction
         currency, defaulting to the book default),
         splits: [{account, amount, memo (optional),
@@ -4800,6 +4801,8 @@ class CoreMixin:
                         txn.get("description"), _TEXT_WIDTH, "description",
                     )
                     _check_text(txn.get("notes"), _SLOT_TEXT_WIDTH, "notes")
+                    _check_text(txn.get("num"), _TEXT_WIDTH, "num")
+                    _check_text(txn.get("link"), _SLOT_TEXT_WIDTH, "link")
                     try:
                         txn["date"] - timedelta(days=366)
                         txn["date"] + timedelta(days=366)
@@ -4865,6 +4868,8 @@ class CoreMixin:
                         "ref": ref,
                         "description": txn["description"],
                         "notes": txn.get("notes") or "",
+                        "num": txn.get("num") or "",
+                        "link": txn.get("link") or None,
                         "trans_date": txn["date"],
                         "currency": row_currency,
                         "validated": validated,
@@ -5109,13 +5114,19 @@ class CoreMixin:
                     )
                     for v in p["validated"]
                 ]
+                # The num goes to transactions.num as desktop's CSV
+                # importer puts it (GncPreTrans::create_trans,
+                # xaccTransSetNum) — a batch row has no register
+                # account whose split could carry it instead.
                 txn_obj = piecash.Transaction(
                     currency=p["currency"],
                     description=p["description"],
+                    num=p["num"],
                     notes=p["notes"] or None,
                     post_date=p["trans_date"],
                     splits=piecash_splits,
                 )
+                txn_obj.doc_link = p["link"]
                 built.append((p, txn_obj, dup_count, _max_conf))
 
             # Single flush for the whole batch — per the "don't flush
@@ -5352,6 +5363,11 @@ class CoreMixin:
                 )
                 if error:
                     raise error
+                _check_text(ln.get("num"), _TEXT_WIDTH, f"line {ln['ref']}: num")
+                _check_text(
+                    ln.get("link"), _SLOT_TEXT_WIDTH,
+                    f"line {ln['ref']}: link",
+                )
                 amounts[ln["ref"]] = amt
             for label, bal in (
                 ("opening_balance", opening),
@@ -6204,6 +6220,22 @@ class CoreMixin:
                 f"written."
             )
 
+        # The statement is the statement account's register: its
+        # Num goes where that register's Num cell puts it
+        # (gnc_set_num_action with the account's own split).
+        num_on_split = self._num_is_split_action(book)
+
+        def _num_of(split):
+            return (
+                split.action if num_on_split else split.transaction.num
+            ) or ""
+
+        def _set_num(split, num):
+            if num_on_split:
+                split.action = num
+            else:
+                split.transaction.num = num
+
         # Audit before-state: the claimed splits' prior annotations
         # and states, for the ENTER formatter's diffs.
         self._stage_audit_before({
@@ -6214,6 +6246,8 @@ class CoreMixin:
                     "state": s.reconcile_state,
                     "memo": s.memo or "",
                     "notes": s.transaction.notes or "",
+                    "num": _num_of(s),
+                    "link": s.transaction.doc_link or "",
                     "description": s.transaction.description or "",
                     "date": (
                         s.transaction.post_date.isoformat()
@@ -6232,6 +6266,10 @@ class CoreMixin:
                 s.memo = ln["raw"]
             if ln.get("notes"):
                 s.transaction.notes = ln["notes"]
+            if ln.get("num"):
+                _set_num(s, ln["num"])
+            if ln.get("link"):
+                s.transaction.doc_link = ln["link"]
             s.reconcile_state = "y"
             s.reconcile_date = rec_dt
 
@@ -6258,6 +6296,9 @@ class CoreMixin:
             # part of the statement, so it lands reconciled.
             piecash_splits[0].reconcile_state = "y"
             piecash_splits[0].reconcile_date = rec_dt
+            if ln.get("num"):
+                _set_num(piecash_splits[0], ln["num"])
+            txn_obj.doc_link = ln.get("link") or None
             built.append((ln, txn_obj, src))
 
         # A statement commit is a reconcile: record it the way
@@ -7126,6 +7167,8 @@ class CoreMixin:
         expected_description: str | None = None,
         expected_date: date | None = None,
         expected_notes: str | None = None,
+        expected_num: str | None = None,
+        expected_link: str | None = None,
         expected_splits: list[dict] | None = None,
     ) -> None:
         """Re-load the transaction from disk and verify expected
@@ -7166,6 +7209,16 @@ class CoreMixin:
                     f"Transaction write verification failed: "
                     f"notes on disk is {actual_notes!r}, "
                     f"expected {wanted!r}"
+                )
+
+        for what, actual, wanted in (
+            ("num", transaction.num or "", expected_num),
+            ("document link", transaction.doc_link or "", expected_link),
+        ):
+            if wanted is not None and actual != wanted:
+                raise RuntimeError(
+                    f"Transaction write verification failed: "
+                    f"{what} on disk is {actual!r}, expected {wanted!r}"
                 )
 
         if expected_splits is not None:
@@ -7345,7 +7398,8 @@ class CoreMixin:
         """Per-row transaction updates in one book-open / one save.
 
         Each entry: ``{guid, description (optional), notes
-        (optional), date (optional, datetime.date)}`` — absent keys
+        (optional), date (optional, datetime.date), num (optional),
+        link (optional — the document link)}`` — absent keys
         leave the field unchanged (the TSV's empty cells), while an
         explicit ``""`` clears (produced only by the TSV ``clear``
         column — an opt-in per-row declaration, so a sparse batch
@@ -7373,11 +7427,15 @@ class CoreMixin:
                 key = u["guid"]
                 try:
                     if not any(
-                        f in u for f in ("description", "notes", "date")
+                        f in u for f in (
+                            "description", "notes", "date", "num", "link",
+                        )
                     ):
                         raise ValueError(
                             "row changes nothing — every cell empty"
                         )
+                    _check_text(u.get("num"), _TEXT_WIDTH, "num")
+                    _check_text(u.get("link"), _SLOT_TEXT_WIDTH, "link")
                     txn = self._find_transaction(book, key)
                     if not txn:
                         raise ValueError(f"Transaction not found: {key}")
@@ -7427,6 +7485,13 @@ class CoreMixin:
                     txn.notes = u["notes"] or None
                 if "date" in u:
                     txn.post_date = u["date"]
+                # The register's T-Num cell: gnc_set_num_action(trans,
+                # NULL, num, NULL) is xaccTransSetNum whatever the
+                # book's num-source option says.
+                if "num" in u:
+                    txn.num = u["num"]
+                if "link" in u:
+                    txn.doc_link = u["link"] or None
 
             if prepared:
                 book.save()
@@ -7437,6 +7502,8 @@ class CoreMixin:
                     expected_description=u.get("description"),
                     expected_date=u.get("date"),
                     expected_notes=u.get("notes"),
+                    expected_num=u.get("num"),
+                    expected_link=u.get("link"),
                 )
                 by_key[u["guid"]] = {
                     "guid": u["guid"], "status": "updated",

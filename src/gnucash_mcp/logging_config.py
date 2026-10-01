@@ -874,6 +874,7 @@ def _parse_batch_submission(tsv: str) -> dict:
     """
     from gnucash_mcp._format import (
         _BATCH_LEGACY_GROUP,
+        _batch_row_fixed,
         _batch_row_splits,
         _batch_tsv_layout,
     )
@@ -888,9 +889,7 @@ def _parse_batch_submission(tsv: str) -> dict:
         # Malformed extension header — the write path rejected the
         # whole submission; render rows in the legacy shape.
         layout = {
-            "has_notes": False, "has_cur": False,
-            "notes_idx": None, "cur_idx": None, "fixed": 3,
-            "group": _BATCH_LEGACY_GROUP,
+            "fixed_idx": {}, "fixed": 3, "group": _BATCH_LEGACY_GROUP,
         }
     fixed = layout["fixed"]
     for ln in lines[1:]:
@@ -906,12 +905,7 @@ def _parse_batch_submission(tsv: str) -> dict:
         entry = {
             "description": f[2], "date": f[1].strip(), "splits": splits,
         }
-        ni = layout["notes_idx"]
-        if ni is not None and len(f) > ni and f[ni].strip():
-            entry["notes"] = f[ni].strip()
-        ci = layout["cur_idx"]
-        if ci is not None and len(f) > ci and f[ci].strip():
-            entry["currency"] = f[ci].strip().upper()
+        entry.update(_batch_row_fixed(f, layout))
         out[f[0].strip()] = entry
     return out
 
@@ -1059,11 +1053,14 @@ def _fmt_transaction_create_batch(entry: dict) -> list[str]:
         when = date_str
         if src.get("currency"):
             when = f"{date_str}, {src['currency']}"
+        num = f"#{src['num']}  " if src.get("num") else ""
         lines.append(
-            f'{_INDENT}CREATE  guid:{guid}  "{desc}" ({when})'
+            f'{_INDENT}CREATE  guid:{guid}  {num}"{desc}" ({when})'
         )
         if src.get("notes"):
             lines.append(f"{_INDENT_SPLITS}notes: {src['notes']}")
+        if src.get("link"):
+            lines.append(f"{_INDENT_SPLITS}link: {src['link']}")
         reason = r.get("reason", "")
         if reason.startswith("auto_filled_from:"):
             # Splitless submission — the source guid is the trail to
@@ -1118,6 +1115,12 @@ def _fmt_transaction_update_batch(entry: dict) -> list[str]:
         if "date" in r:
             old_dt = old.get("date", "")
             parts.append(f"Date: {old_dt} → {r['date']}")
+        if "num" in r:
+            old_num = old.get("num") or "(none)"
+            parts.append(f"Num: {old_num} → {r['num'] or '(none)'}")
+        if "link" in r:
+            old_l = old.get("doc_link") or "(none)"
+            parts.append(f"Link: {old_l} → {r['link'] or '(none)'}")
         lines.append(f"{_INDENT}{'  '.join(parts)}")
     if len(rows) > 15:
         lines.append(f"{_INDENT}... and {len(rows) - 15} more")
@@ -2749,12 +2752,15 @@ def _fmt_statement_enter(entry: dict) -> list[str]:
         guid = r.get("guid", "")
         if status == "created":
             desc = src.get("description") or src.get("raw") or ""
+            num = f"#{src['num']}  " if src.get("num") else ""
             lines.append(
-                f'{_INDENT}CREATE  guid:{guid}  "{desc}" '
+                f'{_INDENT}CREATE  guid:{guid}  {num}"{desc}" '
                 f'({src.get("date", "")}, {src.get("amount", "")})'
             )
             if src.get("notes"):
                 lines.append(f"{_INDENT_SPLITS}notes: {src['notes']}")
+            if src.get("link"):
+                lines.append(f"{_INDENT_SPLITS}link: {src['link']}")
             note = r.get("note", "")
             if note.startswith("auto_filled_from:"):
                 lines.append(
@@ -2781,13 +2787,15 @@ def _fmt_statement_enter(entry: dict) -> list[str]:
                     f"{_INDENT_SPLITS}memo: "
                     f"{old.get('memo', '') or '(empty)'} → {new_memo}"
                 )
-            new_notes = src.get("notes", "")
-            if new_notes and new_notes != old.get("notes", ""):
-                lines.append(
-                    f"{_INDENT_SPLITS}notes: "
-                    f"{old.get('notes', '') or '(empty)'} → "
-                    f"{new_notes}"
-                )
+            for field, key in (
+                ("notes", "notes"), ("num", "num"), ("link", "link"),
+            ):
+                new_val = src.get(key, "")
+                if new_val and new_val != old.get(key, ""):
+                    lines.append(
+                        f"{_INDENT_SPLITS}{field}: "
+                        f"{old.get(key, '') or '(empty)'} → {new_val}"
+                    )
         elif status == "skipped_duplicate":
             lines.append(
                 f"{_INDENT}SKIP  split:{guid}  already reconciled"

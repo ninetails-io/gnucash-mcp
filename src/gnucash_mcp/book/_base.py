@@ -289,6 +289,9 @@ _READ_ONLY_DAYS_KEY = (
     "options/Accounts/"
     "Day Threshold for Read-Only Transactions (red line)"
 )
+# qofbookslots.h OPTION_SECTION_ACCOUNTS / OPTION_NAME_NUM_FIELD_SOURCE.
+# A boolean book option, stored as the string "t" when on.
+_NUM_SOURCE_KEY = "options/Accounts/Use Split Action Field for Number"
 
 
 def _future_statement_warning(statement_date: date) -> str | None:
@@ -1291,8 +1294,12 @@ def _transaction_to_dict(
             for s in _ordered_splits(transaction)
         ],
     }
+    if transaction.num:
+        result["num"] = transaction.num
     if transaction.notes:
         result["notes"] = transaction.notes
+    if transaction.doc_link:
+        result["doc_link"] = transaction.doc_link
     return result
 
 
@@ -3404,6 +3411,30 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         if days <= 0:
             return None
         return date.today() - timedelta(days=days)
+
+    @staticmethod
+    def _num_is_split_action(book) -> bool:
+        """Whether the book's Num column is each split's action.
+
+        ``qof_book_use_split_action_for_num_field`` (qofbook.cpp):
+        true only when the option's string is exactly ``"t"``. With
+        it on, desktop's register writes what the user types in Num
+        to the register account's split action
+        (``gnc_set_num_action``, engine-helpers.c), and
+        ``transactions.num`` becomes the second-line T-Num."""
+        from sqlalchemy import text
+        try:
+            row = book.session.execute(
+                text(
+                    "SELECT string_val FROM slots "
+                    "WHERE name = :name AND slot_type = 4"
+                ),
+                {"name": _NUM_SOURCE_KEY},
+            ).fetchone()
+        except Exception:
+            _rollback_if_aborted(book.session)
+            raise
+        return row is not None and row[0] == "t"
 
     def _read_only_period_note(
         self, book, dates, action: str, threshold: "date | None" = None,

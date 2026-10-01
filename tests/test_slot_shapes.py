@@ -59,6 +59,7 @@ REGISTRY: dict[str, tuple[KVP_Type, str]] = {
     "date-posted": (K.KVP_TYPE_GDATE, "Transaction.cpp xaccTransSetDatePostedGDate"),
     "notes": (K.KVP_TYPE_STRING, "Transaction.cpp trans_notes_str; Account.cpp 'notes'; gnc-lot.cpp 'notes'"),
     "from-sched-xaction": (K.KVP_TYPE_GUID, "Transaction.cpp GNC_SX_FROM"),
+    "assoc_uri": (K.KVP_TYPE_STRING, "Transaction.cpp doclink_uri_str, xaccTransSetDocLink (empty removes)"),
     # Void — Transaction.cpp xaccTransVoid, Split.cpp xaccSplitVoid
     "void-reason": (K.KVP_TYPE_STRING, "Transaction.cpp void_reason_str"),
     "void-time": (K.KVP_TYPE_STRING, "Transaction.cpp void_time_str, gnc_time64_to_iso8601_buff"),
