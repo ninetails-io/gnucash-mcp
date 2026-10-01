@@ -1017,11 +1017,14 @@ Each item is a contract test in the house styles (grep-the-source, set-equality,
 
 ---
 
-## 10. Resolution log (branch `fix/v1.5-adversarial-blockers`, as of 2026-09-30 evening)
+## 10. Resolution log (branch `fix/v1.5-adversarial-blockers`, as of 2026-09-30, late night)
 
 Every fix has a test that fails on the pre-fix source. Full suite at
-the last commit: 2858 passed, 31 skipped. PostgreSQL gate: 87 passed.
-Desktop totals oracle: 0 differences.
+the last commit (`830bb27`): 2978 passed, 33 skipped, 2 expected
+failures (the two price scenarios awaiting a ruling, below).
+PostgreSQL gate: 88 passed. Desktop totals oracle: 0 differences.
+Engine twin: 24 scenarios, the server's rows equal to the engine's in
+every one it is meant to match.
 
 ### Ship-blockers: all seven fixed
 
@@ -1068,19 +1071,63 @@ SEC-11 (slow absurd price, `7fd61f5`), side-finding 2 (unvoid dropped
 a posting's read-only marker, `626287c`), a pre-existing flake in the
 real-driver database tests (`b6d54be`).
 
-### Serious: open, each a maintainer decision
+### Serious: fixed after the first log
 
-| Item | The decision |
+| Item | Fix | Commit |
+|---|---|---|
+| C9 credit-note migration flips a legitimate all-negative note | The converter keys on the pre-1.5 fingerprint (`i_disc_type = ''`) | `18c3330` |
+| C30 one-time conversion without its own snapshot | A labelled pre-upgrade snapshot before the first converting write | `17b29ab` |
+| C29 auto-backup never retried; once per process | Re-checked as stages come due; retried after a failure | `425392f` |
+| C31 shared `GNUCASH_LOG_DIR` keyed on the filename | The first book claims the folder; a second with the same name gets its own | `425392f` |
+| C22, C37, C49, C50 prepayments | `pay_document` gains `allow_prepayment`, `from_prepayment`, `payment_account_amount`; unpost keeps payments; the lists and the dashboard show unapplied payments | `26ddaa8` |
+| C48 document currency differs from the owner's | Refused by default, `force` to proceed (ruling 3, below) | `d1e5881` |
+| C10 storage half: no child bill term at post | `_billterm_return_child`; tax-table name lookups skip hidden copies | `830bb27` |
+| C3 voucher card lines | `_card_charges`: card lines and the extra post to the employee's card account | `830bb27` |
+
+### Serious: open, one ruling away
+
+| Item | State |
 |---|---|
-| C9 credit-note migration flips a legitimate all-negative note | Gate the flip on the pre-1.5 fingerprint (`i_disc_type = ''`)? One line; touches a converter. |
-| C30 one-time conversion without its own snapshot | Force a labelled pre-upgrade snapshot before the first converting write? |
-| C29 auto-backup never retried after one failure; once per process | Retry policy, and the wording in the restore doc and manifest. |
-| C31 shared `GNUCASH_LOG_DIR` keyed on the filename | How to scope: hash of the path, or refuse a collision. |
-| C10 storage half: no child tax table or bill term at post | Write desktop's hidden child copies at post (storage shape; needs the desktop gate). |
-| C3 voucher card lines | Read `b_paytype` and the employee's card account at post. |
-| C22, C37, C49, C50 prepayments | The server has no prepayment-lot concept; four findings hang on it. A feature, not a guard. |
-| C48 document currency differs from owner's | Refuse at create? Existing multi-currency tests create such documents. |
-| C24 several same-day prices per pair | Desktop keeps one per day; a test pins the current behavior. |
+| C24 several same-day prices per pair | The twin ruling 2 asked for has been run (`814851e`, `tests/test_parity_prices.py`). Result below. No behavior was changed. |
+
+### The engine twin
+
+Until this point "parity with desktop" needed a person at the screen.
+`tests/fixtures/engine_twin.py` removes that for anything the dialogs
+do through the engine: `gnucash-cli` loads a report whose renderer
+calls the engine function (`gncInvoicePostToAccount`,
+`gncInvoiceApplyPayment`, `gncInvoiceAutoApplyPayments`,
+`gncInvoiceUnpost`, `gnc_pricedb_add_price`,
+`gncOwnerGetBalanceInCurrency`), and GnuCash's own SQL backend saves
+the result. The same action runs through the server on a copy of the
+book, both are dumped with GUIDs replaced by roles, and the text must
+match. The engine's dumps are recorded for CI.
+
+It corrected this review three times:
+
+1. **C10, tax tables.** The review expected every posted line to
+   point at a hidden copy of its tax table. The engine makes the copy
+   and repoints the line in memory, and never saves the line. In a
+   book GnuCash has posted in, the entries still name the live table.
+   The server leaves them there. Only the bill term's copy is real on
+   disk, and that is what was ported.
+2. **C24, same-day prices.** "One price per pair per day" is half the
+   rule. See ruling 2 below.
+3. **C48, document currency.** The cross-examiner struck the claim
+   that desktop hides such a document. The engine's payment and
+   unpost code do handle it, row for row with the server's. But its
+   balance for the party leaves the document out. See ruling 3 below.
+
+Three things the engine leaves in a SQL book are debris by its own
+account, and the server does not copy them: an empty payment lot
+after every payment it moves into a document's lot (its scrub
+destroys them); stale `post_txn` / `post_lot` / `post_acc` on an
+unposted document (the SQL backend drops a NULL reference from its
+UPDATE); and the unreferenced tax-table copy above. Stored
+`refcount`s are not compared: the engine adds one per reference it
+loads and saves the sum. **Each of these four is a maintainer call
+flagged for review**, since the standing ruling is that parity means
+an empty diff.
 
 ### Moderate and minor: open
 
@@ -1096,7 +1143,12 @@ C63 (legacy date formats), C17 (declare a minimum GnuCash version:
 1. The desktop-open gate: unpost, the delete paths, and the posting
    math changed what is written. Post and unpost an invoice with a
    document link, delete an account with an OFX link, and open the
-   book in GnuCash.
+   book in GnuCash. Added by the later fixes, all engine-twinned but
+   not yet seen in the GUI: a book holding an overpayment's
+   pre-payment lot (Process Payment should list it for the
+   customer), a document unposted with its payment kept, a document
+   on a posted copy of its billing term (the Billing Terms editor
+   should show the term once), and a card voucher.
 2. The maintainer's calls flagged in each commit's summary (new
    response fields `total_note` and entry `discount`; `hidden`
    refused by the slot tools with no server alternative; budget
@@ -1174,3 +1226,79 @@ regenerated samples are frozen.
 
 *Signed, the bookkeeper. Nothing in this review was scrubbed; one
 filed doctrine was narrowed in response to it, above.*
+
+## What became of the three rulings below (2026-09-30, late night)
+
+*Written by the fixing session; the rulings themselves follow,
+unedited.*
+
+**Ruling 1, prepayments.** Overridden by the maintainer the same
+evening ("I think I changed my mind. We're fixing it tonight"). The
+full capability is in `26ddaa8`, with ten scenarios twinned against
+the engine. The narrow fix the ruling describes is contained in it:
+the advice text is corrected, the dashboard reads prepayment lots,
+and unpost no longer refuses.
+
+**Ruling 2, same-day prices.** The twin was run through the engine's
+`gnc_pricedb_add_price`, the function behind the Price Editor's OK
+button and a quote fetch. Neither reading was whole:
+
+- A new price whose source ranks equal to or better than the day's
+  existing price replaces it. The old row is deleted, whatever its
+  source, and in whichever direction of the pair it was quoted.
+- A new price whose source ranks worse is rejected in memory, but it
+  was committed before `add_price` was asked, so its row is already
+  in the table and stays. The next load reads both.
+
+So desktop does produce the two same-day rows the gate saw, and does
+collapse in the case the adversary described. `create_price` agrees
+with the engine in four of six scenarios. In the other two (a better
+source after a worse one; the opposite direction on the same day) it
+keeps a row the engine deletes. Those two are strict expected
+failures in `tests/test_parity_prices.py`. Per the ruling, nothing
+was changed; adopting the engine's rule is a patch awaiting the word.
+
+**Ruling 3, document currency.** The proof the ruling asked for came
+back against the dialect. Asked for Acme's balance with 220 of open
+USD invoices, the engine said 220. Asked again with an unpaid EUR 100
+invoice beside them, it said 220: `gncOwnerGetBalanceInCurrency`
+walks only the receivable accounts in the owner's currency. By the
+ruling's own terms that is a misread, so the mismatch is refused by
+default with `force` (`d1e5881`), and the forced response names the
+divergence. The GUI half of the twin (Find Invoice, Process Payment,
+Customer Report on a forced document) is still worth a look at the
+gate; the engine half is pinned.
+
+## Bookkeeper rulings — three questions from the fix cycle (2026-09-30, 21:12)
+
+**1. Prepayments.** Narrow fix in 1.5: correct the advice text (it
+misbooks — lies don't ship), teach the dashboard to read desktop's
+prepayment lots (invisible money is a lie by omission; read-side
+only), and unpost-with-payments refuses with the cure named in the
+error. The full capability — holding unmatched cash, new
+`pay_document` parameters — is the first post-release patch:
+additive and backwards-compatible, so legitimate under
+patches-only, with its own loop and gate. Missing capability may
+ship, named in the release notes; misleading output may not.
+
+**2. Same-day prices.** No change on this evidence. Today's desktop
+gate (C7) PASSED with two same-day EUR rows of different sources on
+screen, and desktop's own payment updated its dialog row in place
+rather than collapsing the pair — the claim's "one per pair per
+day" is contradicted by the oracle at the screen. Behavior pinned
+by a test, a ruling, and a passed gate does not move on static
+analysis. If the adversary stands by the claim: twin it (two
+same-pair prices, one day, desktop Price Editor, rows diffed). If
+the twin shows collapse, adopt desktop's rule as a patch.
+
+**3. Document currency.** Don't refuse — that breaks a real
+workflow and removes capability mid-fix-cycle. But the dialect
+isn't proven either: no gate has ever shown desktop READING an
+off-owner-currency document, and by the payment-currency
+precedent, dialect status requires exactly that proof. Keep the
+pick, warn on mismatch, and add to the fix-branch gate a twin: a
+server-made invoice in a currency its owner doesn't use, through
+Find Invoice, Process Payment, and Customer Report. Desktop reads
+it clean → dialect, warned and documented. Desktop misreads →
+refuse-by-default with force, because then it was never a
+capability.
