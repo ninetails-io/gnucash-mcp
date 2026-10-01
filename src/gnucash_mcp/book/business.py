@@ -7658,10 +7658,14 @@ class BusinessMixin:
             # to leave it on the live term, so editing the term
             # changed the terms of documents already posted under it
             # (adversarial review 2026-09-30, C10). The tax table on
-            # each line is NOT repointed: the engine does it in
-            # memory, but its SQL backend never saves the change —
-            # a desktop-posted book's entries still name the parent
-            # table (engine twin, 2026-09-30).
+            # each line is NOT repointed here, and that is OPEN: the
+            # source repoints it (gncTaxTableReturnChild), but in the
+            # headless engine run the line was never re-saved and the
+            # entries still named the parent table. Two oracles
+            # disagree, so the GUI gate decides (bookkeeper ruling,
+            # 2026-09-30 round 2, item 4). What a posted document
+            # totals does not depend on the answer: it is read from
+            # the posting (``_posted_total``).
             if term is not None:
                 child_term = self._billterm_return_child(book, term)
                 if child_term.guid != term.guid:

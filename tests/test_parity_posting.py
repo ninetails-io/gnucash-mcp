@@ -12,11 +12,17 @@ review (``specs/v1.5/testing/ADVERSARIAL_REVIEW_1.5.md``):
   the card account, one split per line, and come off what is owed to
   the employee. The server posted them to the payable.
 
-It also settled a third claim the other way. The review expected each
-posted line to point at a hidden copy of its TAX TABLE. The engine
-makes the copy and repoints the line in memory, but never saves the
-line: in a SQL book the entries still name the parent table. The
-server leaves them there too (see ``engine_twin.dump``).
+A third claim is OPEN. The review expected each posted line to point
+at a hidden copy of its TAX TABLE (``gncTaxTableReturnChild`` in the
+post path). In this headless run the engine makes the copy and
+repoints the line in memory, but the line's row is never re-saved:
+the entries still name the parent table, and the copy is referenced
+by nothing (``engine_twin.ENGINE_DEBRIS``, counted per scenario in
+the recording). The server leaves entries on the live table for now.
+The bookkeeper ruled (2026-09-30, round 2, item 4) that two oracles
+conflict here and the GUI gate decides: post a taxed invoice in the
+GUI on a SQL book, then read ``taxtables`` and the entries'
+``i_taxtable``.
 
 Regenerate after a GnuCash upgrade with
 ``uv run python tests/test_parity_posting.py record``.
@@ -37,7 +43,7 @@ _HERE = Path(__file__).resolve().parent
 _RECORDED = _HERE / "fixtures" / "parity_posting_engine.json"
 sys.path.insert(0, str(_HERE / "fixtures"))
 from engine_twin import (  # noqa: E402
-    dump, empty_lots, engine_run, find_gnucash_cli, guid_of,
+    debris_found, dump, engine_run, find_gnucash_cli, guid_of,
 )
 
 AR = "Assets:Accounts Receivable"
@@ -207,8 +213,8 @@ def _recorded() -> dict[str, str]:
 @pytest.mark.parametrize("scenario", sorted(SCENARIOS))
 def test_server_posts_what_the_engine_posts(base, scenario):
     SCENARIOS[scenario][1](GnuCashBook(str(base)))
-    assert dump(base, _SINCE) == _recorded()[scenario]
-    assert empty_lots(base) == 0
+    assert dump(base, _SINCE) == _recorded()[scenario]["dump"]
+    assert debris_found(base) == {}
 
 
 @pytest.mark.skipif(
@@ -217,7 +223,9 @@ def test_server_posts_what_the_engine_posts(base, scenario):
 @pytest.mark.parametrize("scenario", sorted(SCENARIOS))
 def test_recording_is_what_the_engine_writes_today(base, scenario):
     engine_run(base, SCENARIOS[scenario][2](base))
-    assert dump(base, _SINCE) == _recorded()[scenario]
+    recorded = _recorded()[scenario]
+    assert dump(base, _SINCE) == recorded["dump"]
+    assert debris_found(base) == recorded["engine_debris"]
 
 
 def record() -> None:
@@ -232,7 +240,10 @@ def record() -> None:
             path = conftest.business_book.__wrapped__(Path(tmp))
             setup(GnuCashBook(str(path)))
             engine_run(path, engine(path))
-            out[scenario] = dump(path, _SINCE)
+            out[scenario] = {
+                "dump": dump(path, _SINCE),
+                "engine_debris": debris_found(path),
+            }
         print(f"recorded {scenario}")
     _RECORDED.write_text(json.dumps(out, indent=1, sort_keys=True) + "\n")
 

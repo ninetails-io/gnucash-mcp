@@ -100,6 +100,75 @@ def guid_of(book: Path, sql: str, *params) -> str:
         con.close()
 
 
+# ── what the engine leaves that the server does not copy ────────────
+
+# A NAMED allowlist, by bookkeeper ruling (2026-09-30, fix-branch
+# round 2, item 3): each exception to "parity means an empty diff" is
+# listed here with what it is and why, ``dump`` filters only what is
+# named here, and ``debris_found`` counts each kind so a test can say
+# how much of it a book holds. Nothing is filtered silently. The GUI
+# gate's prepayment book is the backstop if desktop turns out to
+# depend on any of it.
+ENGINE_DEBRIS = {
+    "empty_lot": (
+        "A lot with no split. gncOwnerApplyPaymentSecs makes a payment "
+        "lot, moves its split into the document's lot, and leaves the "
+        "empty lot behind; the engine destroys such lots when it next "
+        "meets one (gncOwnerAutoApplyPaymentsWithLots, "
+        "gncScrubBusinessLot). The server never creates one."
+    ),
+    "stale_posting_refs": (
+        "post_txn / post_lot / post_acc still set on a document whose "
+        "date_posted is NULL. gncInvoiceUnpost clears all four, but the "
+        "SQL backend leaves a NULL object reference out of its UPDATE "
+        "(add_objectref_guid_to_query returns early), so the old GUIDs "
+        "stay. The server writes the NULLs the engine means."
+    ),
+    "unreferenced_taxtable_copy": (
+        "A hidden child tax table no entry row names. "
+        "gncInvoicePostToAccount makes the copy and repoints each line "
+        "at it in memory; in the headless engine run the line was never "
+        "re-saved, so the copy is referenced by nothing. ACCEPTED as "
+        "debris; whether a GUI post saves the line's move is a separate "
+        "question, OPEN until the gate (ruling item 4: post a taxed "
+        "invoice in the GUI on a SQL book, then SELECT invisible, "
+        "parent FROM taxtables and the entries' i_taxtable)."
+    ),
+    "refcount": (
+        "The stored refcount of a billing term (not compared, not "
+        "counted). The engine adds one for every reference it loads "
+        "and saves the sum, so the number grows with each session."
+    ),
+}
+
+
+def debris_found(book: Path) -> dict[str, int]:
+    """How much of each countable kind of ``ENGINE_DEBRIS`` a book
+    holds; kinds with none are left out. A server-written book
+    returns ``{}``."""
+    con = sqlite3.connect(f"file:{book}?mode=ro", uri=True)
+    try:
+        counts = {
+            "empty_lot": con.execute(
+                "select count(*) from lots where guid not in "
+                "(select lot_guid from splits where lot_guid is not null)"
+            ).fetchone()[0],
+            "stale_posting_refs": con.execute(
+                "select count(*) from invoices where date_posted is null "
+                "and (post_txn is not null or post_lot is not null "
+                "or post_acc is not null)"
+            ).fetchone()[0],
+            "unreferenced_taxtable_copy": con.execute(
+                "select count(*) from taxtables t where parent is not null "
+                "and not exists (select 1 from entries e where "
+                "e.i_taxtable = t.guid or e.b_taxtable = t.guid)"
+            ).fetchone()[0],
+        }
+    finally:
+        con.close()
+    return {kind: n for kind, n in counts.items() if n}
+
+
 # ── the dump ─────────────────────────────────────────────────────────
 
 _SLOT_COLUMNS = (
@@ -108,7 +177,10 @@ _SLOT_COLUMNS = (
 )
 
 
-def dump(book: Path, skip_transactions_before: str | None = None) -> str:
+def dump(
+    book: Path, skip_transactions_before: str | None = None,
+    debris=ENGINE_DEBRIS,
+) -> str:
     """Every transaction, split, lot, and document row of ``book`` as
     text, GUIDs replaced by roles:
 
@@ -122,26 +194,10 @@ def dump(book: Path, skip_transactions_before: str | None = None) -> str:
     ``enter_date`` is the wall clock and is left out. Slots are read
     through their frames, so a frame's own GUID never appears.
 
-    Three things the engine leaves in a SQL book are NOT part of the
-    comparison, and the dump leaves them out on both sides:
-
-    * EMPTY LOTS. ``gncOwnerApplyPaymentSecs`` makes a payment lot,
-      moves its split into the document's lot, and leaves the empty
-      lot behind; the engine destroys such lots when it next meets
-      them (``gncOwnerAutoApplyPaymentsWithLots``,
-      ``gncScrubBusinessLot``). Debris by desktop's own account; the
-      server never creates one. Counted by ``empty_lots``.
-    * HIDDEN TAX TABLE COPIES. ``gncInvoicePostToAccount`` makes a
-      child of each line's tax table and repoints the line at it —
-      in memory. The line's row is never re-saved, so in the SQL
-      book every entry still names the parent table and the child
-      is referenced by nothing. Tax tables are not dumped; each
-      ENTRY line shows which table its row names.
-    * STALE POSTING REFERENCES on an unposted document.
-      ``gncInvoiceUnpost`` clears the posted account, transaction,
-      and lot, but the SQL backend leaves a NULL object reference out
-      of its UPDATE, so the row keeps the old GUIDs beside a NULL
-      ``date_posted``. The server writes the NULLs the engine means.
+    What the engine leaves in a SQL book that the server does not
+    copy is left out of the text ONLY where ``debris`` names it — by
+    default the whole ``ENGINE_DEBRIS`` allowlist, each entry of which
+    says what it is and why. Pass ``debris=()`` to see everything.
     """
     con = sqlite3.connect(f"file:{book}?mode=ro", uri=True)
 
@@ -266,15 +322,19 @@ def dump(book: Path, skip_transactions_before: str | None = None) -> str:
             )
             out += slots(s["guid"], "    ")
     for lot in sorted(lot_rows, key=lambda r: names[r["guid"]]):
-        if not q("select 1 from splits where lot_guid = ?", lot["guid"]):
-            continue  # an empty lot: see the docstring
+        if "empty_lot" in debris and not q(
+            "select 1 from splits where lot_guid = ?", lot["guid"],
+        ):
+            continue
         out.append(
             f"LOT {names[lot['guid']]} account={n(lot['account_guid'])} "
             f"is_closed={lot['is_closed']}"
         )
         out += slots(lot["guid"], "  ")
     for inv in q("select * from invoices order by owner_type, id"):
-        unposted = inv["date_posted"] is None
+        unposted = (
+            "stale_posting_refs" in debris and inv["date_posted"] is None
+        )
         shown = " ".join(
             f"{k}={n(inv[k])!r}" for k in inv.keys()
             if k not in ("guid", "date_opened")
@@ -297,25 +357,22 @@ def dump(book: Path, skip_transactions_before: str | None = None) -> str:
     for term in sorted(
         q("select * from billterms"), key=lambda t: names[t["guid"]],
     ):
-        # ``refcount`` is left out: the engine adds one for every
-        # reference it loads and saves the sum, so the stored number
-        # grows with each session (2 references read 3 after two).
         shown = " ".join(
             f"{k}={n(term[k])!r}" for k in term.keys()
-            if k not in ("guid", "refcount")
+            if k != "guid" and not (k == "refcount" and "refcount" in debris)
         )
         out.append(f"TERM {names[term['guid']]} {shown}")
+    # Tax tables are listed only when asked for: the one kind of row
+    # that differs is the unreferenced copy.
+    if "unreferenced_taxtable_copy" not in debris:
+        for table in sorted(
+            q("select * from taxtables"), key=lambda t: names[t["guid"]],
+        ):
+            shown = " ".join(
+                f"{k}={n(table[k])!r}" for k in table.keys()
+                if k not in ("guid", "refcount")
+            )
+            out.append(f"TAXTABLE {names[table['guid']]} {shown}")
     con.close()
     return "\n".join(out) + "\n"
 
-
-def empty_lots(book: Path) -> int:
-    """How many lots hold no split (see ``dump``)."""
-    con = sqlite3.connect(f"file:{book}?mode=ro", uri=True)
-    try:
-        return con.execute(
-            "select count(*) from lots where guid not in "
-            "(select lot_guid from splits where lot_guid is not null)"
-        ).fetchone()[0]
-    finally:
-        con.close()

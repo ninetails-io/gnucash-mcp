@@ -42,7 +42,7 @@ _HERE = Path(__file__).resolve().parent
 _RECORDED = _HERE / "fixtures" / "parity_prepayment_engine.json"
 sys.path.insert(0, str(_HERE / "fixtures"))
 from engine_twin import (  # noqa: E402
-    dump, empty_lots, engine_run, find_gnucash_cli, guid_of,
+    debris_found, dump, engine_run, find_gnucash_cli, guid_of,
 )
 
 AR = "Assets:Accounts Receivable"
@@ -310,10 +310,10 @@ def _recorded() -> dict[str, str]:
 def test_server_writes_what_the_engine_writes(base, scenario):
     server = SCENARIOS[scenario][0]
     server(GnuCashBook(str(base)))
-    assert dump(base, _BASE_ENDS) == _recorded()[scenario]
-    # The server leaves no empty lot behind (the engine does; see
-    # engine_twin.dump).
-    assert empty_lots(base) == 0
+    assert dump(base, _BASE_ENDS) == _recorded()[scenario]["dump"]
+    # The server leaves none of what the allowlist excuses the engine
+    # for (engine_twin.ENGINE_DEBRIS).
+    assert debris_found(base) == {}
 
 
 @pytest.mark.skipif(
@@ -323,7 +323,11 @@ def test_server_writes_what_the_engine_writes(base, scenario):
 def test_recording_is_what_the_engine_writes_today(base, scenario):
     engine = SCENARIOS[scenario][1]
     engine_run(base, engine(_ids(base)))
-    assert dump(base, _BASE_ENDS) == _recorded()[scenario]
+    recorded = _recorded()[scenario]
+    assert dump(base, _BASE_ENDS) == recorded["dump"]
+    # How much it leaves behind is recorded too, kind by kind, so an
+    # exception is never silent.
+    assert debris_found(base) == recorded["engine_debris"]
 
 
 # ── C48: what desktop makes of a document in another currency ───────
@@ -382,7 +386,10 @@ def record() -> None:
             path = conftest.business_book.__wrapped__(Path(tmp))
             _build(path, scenario)
             engine_run(path, engine(_ids(path)))
-            out[scenario] = dump(path, _BASE_ENDS)
+            out[scenario] = {
+                "dump": dump(path, _BASE_ENDS),
+                "engine_debris": debris_found(path),
+            }
         print(f"recorded {scenario}")
     _RECORDED.write_text(json.dumps(out, indent=1, sort_keys=True) + "\n")
 
