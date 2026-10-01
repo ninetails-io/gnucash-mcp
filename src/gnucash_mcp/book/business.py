@@ -15,6 +15,7 @@ in the ORM). All raw inserts are paired with `_verify_write` /
 """
 
 import logging
+import re
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 
@@ -2925,9 +2926,7 @@ class BusinessMixin:
         from piecash.kvp import KVP_Type, Slot
         from sqlalchemy import text
 
-        stamp = datetime(
-            due.year, due.month, due.day, 10, 59, 0, tzinfo=timezone.utc,
-        )
+        stamp = _neutral_time(due)
         exists = book.session.execute(
             text(
                 "SELECT 1 FROM slots WHERE obj_guid = :o "
@@ -3445,7 +3444,12 @@ class BusinessMixin:
                 )
                 if as_utc.time() == time(10, 59):
                     continue
-                setattr(inv, col, _neutral_time(as_utc.astimezone().date()))
+                # Desktop's own stamp in a zone beyond UTC-10/UTC+13
+                # (11:59 or 09:59 UTC) is already right; leave it.
+                neutral = _neutral_time(as_utc.astimezone().date())
+                if as_utc == neutral:
+                    continue
+                setattr(inv, col, neutral)
                 changed = True
             if changed:
                 dated += 1
@@ -3733,7 +3737,14 @@ class BusinessMixin:
             "grand_total": grand_total,
             "amount_paid": grand_total - amount_due,
             "amount_due": amount_due,
-            "overpaid": amount_due < 0 and not is_credit_note,
+            # More was paid than was owed. A document whose own total
+            # is negative (lines that net to a refund) owes the party
+            # from the moment it posts: that is its balance, not an
+            # overpayment (adversarial review 2026-09-30, C44).
+            "overpaid": (
+                amount_due < 0 and not is_credit_note and grand_total >= 0
+            ),
+            "owed_to_party": grand_total < 0 and amount_due < 0,
             "sign": sign,
         }
 
@@ -3848,6 +3859,9 @@ class BusinessMixin:
             return "open", None
         settlement = self._document_settlement(book, inv, **known)
         if settlement is None or settlement["amount_due"] > 0:
+            return "posted", settlement
+        # A negative total still to be refunded is open, not paid.
+        if settlement.get("owed_to_party"):
             return "posted", settlement
         settled = "applied" if self._get_is_credit_note(inv) else "paid"
         return settled, settlement
@@ -4123,6 +4137,64 @@ class BusinessMixin:
         "counter_order": "counters/gncOrder",
     }
 
+    # A counter format as File > Properties > Counters stores it: a
+    # printf format with exactly one integer conversion (li / lli /
+    # I64i, GnuCash's PRIi64 spellings; ``%.6li`` is the default) and
+    # optional literal text either side
+    # (qof_book_validate_counter_format).
+    _COUNTER_FORMAT = re.compile(
+        r"(?P<prefix>(?:[^%]|%%)*)"
+        r"%(?P<flags>[-+ #0']*)(?P<width>[0-9]*)(?:\.(?P<precision>[0-9]+))?"
+        r"(?:lli|li|I64i|lld|ld|I64d|d|i)"
+        r"(?P<suffix>(?:[^%]|%%)*)"
+    )
+
+    @classmethod
+    def _counter_id(cls, book, counter_attr: str, value: int) -> str:
+        """The ID GnuCash would issue for a counter value: the book's
+        own format for that counter when it has one
+        (``counter_formats/gncInvoice`` and its siblings,
+        ``qof_book_increment_and_format_counter``), six zero-padded
+        digits otherwise. The server ignored the format, so a book
+        numbering its invoices ``INV-47`` got ``000048`` next and
+        carried two schemes (adversarial review 2026-09-30, FC-17).
+        """
+        from sqlalchemy import text
+
+        default = f"{int(value):06d}"
+        key = cls._COUNTER_SLOTS.get(counter_attr)
+        if not key:
+            return default
+        try:
+            row = book.session.execute(
+                text(
+                    "SELECT c.string_val FROM slots f "
+                    "JOIN slots c ON c.obj_guid = f.guid_val "
+                    "WHERE f.obj_guid = :book AND f.slot_type = 9 "
+                    "AND f.name = 'counter_formats' AND c.name = :name"
+                ),
+                {
+                    "book": book.guid,
+                    "name": "counter_formats/" + key.split("/", 1)[1],
+                },
+            ).first()
+        except Exception:
+            _rollback_if_aborted(book.session)
+            return default
+        fmt = row[0] if row else None
+        match = cls._COUNTER_FORMAT.fullmatch(fmt) if fmt else None
+        if match is None:
+            return default
+        spec = (
+            "%" + match["flags"].replace("'", "") + match["width"]
+            + (f".{match['precision']}" if match["precision"] else "") + "d"
+        )
+        return (
+            match["prefix"].replace("%%", "%")
+            + spec % int(value)
+            + match["suffix"].replace("%%", "%")
+        )
+
     @classmethod
     def _repair_double_counters(cls, book) -> int:
         """Rewrite any ID counter stored as a DOUBLE as the int64
@@ -4210,6 +4282,12 @@ class BusinessMixin:
             book=book,
             **extra_kwargs,
         )
+        # piecash issued six digits; the book's own format wins.
+        counter_attr = getattr(cls, "_counter_name", None)
+        if counter_attr:
+            entity.id = self._counter_id(
+                book, counter_attr, getattr(book, counter_attr),
+            )
         book.save()
 
         # Business-object ``guid`` is omitted from write
@@ -5873,7 +5951,7 @@ class BusinessMixin:
                         continue
                 cnt = max(book_counter, max_numeric) + 1
                 setattr(book, config["counter_attr"], cnt)
-                doc_id = f"{cnt:06d}"
+                doc_id = self._counter_id(book, config["counter_attr"], cnt)
 
             inv_guid = uuid.uuid4().hex
             book.session.execute(
@@ -8255,6 +8333,23 @@ class BusinessMixin:
             # post_invoice.
             is_credit_note = self._get_is_credit_note(inv)
             effective_is_bill = is_bill ^ is_credit_note
+            # So does a document whose own total is negative (lines
+            # that net to a refund): it posts on the other side, and
+            # settling it moves cash the other way. Nothing could
+            # settle one before (adversarial review 2026-09-30, C44).
+            posted_as = self._posted_total(
+                inv, lot_obj, -1 if effective_is_bill else 1,
+            )
+            negative_document = posted_as is not None and posted_as < 0
+            if negative_document:
+                if apply_discount:
+                    raise ValueError(
+                        f"apply_discount does not apply to "
+                        f"{self._doc_label_for(inv.owner_type)} "
+                        f"{invoice_id}: its total is negative, so "
+                        f"settling it is a refund, not a payment."
+                    )
+                effective_is_bill = not effective_is_bill
 
             # ── Overpayment guard ─────────────────────────────────
             # The lot balance is signed: positive for A/R invoices,
@@ -10075,6 +10170,8 @@ class BusinessMixin:
                 reference=reference,
                 active=1,
             )
+            # piecash issued six digits; the book's own format wins.
+            job.id = self._counter_id(book, "counter_job", book.counter_job)
 
             book.save()
 
@@ -10495,6 +10592,7 @@ class BusinessMixin:
                     if due_date is not None
                     and not is_credit_note
                     and not overpaid
+                    and amount_due > 0
                     else None
                 )
                 currency = (

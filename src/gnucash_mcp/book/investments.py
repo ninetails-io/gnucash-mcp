@@ -1193,6 +1193,40 @@ class InvestmentsMixin:
                 ),
                 None,
             )
+            # A pair is priced in whichever direction it was last
+            # quoted. USD/EUR 0.80 entered yesterday IS the latest
+            # EUR/USD rate (1.25), and it is the one valuation uses;
+            # this lookup read only its own direction and answered
+            # with a 2024 quote (adversarial review 2026-09-30, MM-9).
+            quote = self._find_commodity(book, currency, "CURRENCY")
+            reverse = None
+            if quote is not None and quote.guid != comm.guid:
+                reverse = next(
+                    (
+                        p for p in self._find_prices(
+                            book, commodity_guid=quote.guid,
+                        )
+                        if p.currency_guid == comm.guid and p.value
+                    ),
+                    None,
+                )
+            if reverse is not None and (
+                latest is None
+                or _to_date(reverse.date) > _to_date(latest.date)
+            ):
+                inverse = Decimal(1) / Decimal(str(reverse.value))
+                shown = f"{inverse:.8f}".rstrip("0").rstrip(".")
+                return {
+                    "date": _to_date(reverse.date).isoformat(),
+                    "value": shown,
+                    "currency": currency,
+                    "type": reverse.type,
+                    "source": reverse.source,
+                    "inverted_from": (
+                        f"{quote.mnemonic}/{comm.mnemonic} "
+                        f"{reverse.value}"
+                    ),
+                }
             if latest is None:
                 return None
             latest_date = _to_date(latest.date)

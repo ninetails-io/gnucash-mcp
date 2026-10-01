@@ -744,3 +744,205 @@ class TestC66ALookupMatchesTheNameItWasGiven:
         gb.delete_taxtable("Sales Tax")
 
         assert _q(business_book, "select name from taxtables") == [("SALES TAX",)]
+
+
+import time as _time  # noqa: E402
+
+from gnucash_mcp.book._base import _neutral_time  # noqa: E402
+
+
+@pytest.mark.skipif(not hasattr(_time, "tzset"), reason="needs tzset")
+class TestC25TheNeutralTimeInFarZones:
+    """``gnc_time64_get_day_neutral`` is 10:59 UTC, shifted outside
+    UTC-10..UTC+13 so the stamp is still the intended day locally."""
+
+    @pytest.fixture
+    def zone(self, monkeypatch):
+        def set_zone(name):
+            monkeypatch.setenv("TZ", name)
+            _time.tzset()
+        yield set_zone
+        monkeypatch.undo()
+        _time.tzset()
+
+    @pytest.mark.parametrize("name, utc_hour", [
+        ("UTC", 10), ("America/Los_Angeles", 10), ("Europe/Berlin", 10),
+        ("Pacific/Honolulu", 10),      # UTC-10: the edge, unshifted
+        ("Pacific/Auckland", 10),      # UTC+12/+13
+        ("Pacific/Pago_Pago", 11),     # UTC-11
+        ("Pacific/Kiritimati", 9),     # UTC+14
+    ])
+    def test_the_stamp(self, zone, name, utc_hour):
+        zone(name)
+        stamp = _neutral_time(date(2026, 9, 29))
+        assert (stamp.hour, stamp.minute) == (utc_hour, 59)
+        # …and it is the same calendar day where the user is.
+        assert stamp.astimezone().date() == date(2026, 9, 29)
+
+
+class TestFC17AutoIdsFollowTheBooksCounterFormat:
+    @staticmethod
+    def _set_format(path, counter, fmt):
+        book = _q(path, "select guid from books")[0][0]
+        frame = _q(
+            path, "select guid_val from slots where obj_guid = ? "
+            "and name = 'counter_formats'", (book,),
+        )
+        if frame:
+            frame = frame[0][0]
+        else:
+            frame = uuid.uuid4().hex
+            _q(
+                path, "insert into slots (obj_guid, name, slot_type, guid_val) "
+                "values (?, 'counter_formats', 9, ?)", (book, frame),
+            )
+        _q(
+            path, "insert into slots (obj_guid, name, slot_type, string_val) "
+            "values (?, ?, 4, ?)", (frame, f"counter_formats/{counter}", fmt),
+        )
+
+    def test_documents_parties_and_jobs(self, business_book):
+        self._set_format(business_book, "gncInvoice", "INV-%04li")
+        self._set_format(business_book, "gncCustomer", "C%.3li")
+        self._set_format(business_book, "gncJob", "%li/JOB")
+        gb = GnuCashBook(str(business_book))
+
+        customer = gb.create_customer(name="Acme Corp")
+        assert customer["id"] == "C001"
+        first = gb.create_invoice(customer_id="C001")
+        second = gb.create_invoice(customer_id="C001")
+        assert (first["id"], second["id"]) == ("INV-0001", "INV-0002")
+        job = gb.create_job(owner_id="C001", owner_type="customer", name="Refit")
+        assert job["id"] == "1/JOB"
+        # The IDs are usable handles.
+        gb.add_invoice_entry(
+            invoice_id="INV-0002", account="Income:Sales",
+            description="Work", quantity="1", price="10.00",
+        )
+        assert gb.get_invoice("INV-0002", owner_type="customer")["total"] == "10.00"
+        # A counter with no format of its own keeps six digits.
+        assert gb.create_vendor(name="Supplier Ltd")["id"] == "000001"
+
+    @pytest.mark.parametrize("fmt, expected", [
+        ("%.6li", "000007"), ("%li", "7"), ("%05lli", "00007"),
+        ("INV-%04I64i-A", "INV-0007-A"), ("100%%-%li", "100%-7"),
+        ("no conversion", "000007"), ("%s", "000007"), ("%li %li", "000007"),
+    ])
+    def test_formats(self, business_book, fmt, expected):
+        self._set_format(business_book, "gncInvoice", fmt)
+        gb = GnuCashBook(str(business_book))
+        with gb.open() as book:
+            assert gb._counter_id(book, "counter_invoice", 7) == expected
+
+
+class TestC44ADocumentWhoseTotalIsNegative:
+    @pytest.fixture
+    def refund_invoice(self, business_book):
+        """An invoice whose lines net to -70: a return larger than
+        the sale."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        inv = gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id=inv["id"], account="Income:Sales",
+            description="Sale", quantity="1", price="30.00",
+        )
+        gb.add_invoice_entry(
+            invoice_id=inv["id"], account="Income:Sales",
+            description="Return", quantity="-1", price="100.00",
+        )
+        gb.post_invoice(invoice_id=inv["id"], post_account=AR,
+                        post_date="2026-01-15")
+        return gb, business_book, inv["id"]
+
+    def test_it_reads_open_and_owed_to_the_customer(self, refund_invoice):
+        gb, _, doc = refund_invoice
+        got = gb.get_invoice(doc, owner_type="customer")
+        # It read: status paid, amount_paid 0.00, overpaid true.
+        assert got["status"] == "posted"
+        assert (got["total"], got["amount_paid"], got["amount_due"]) == (
+            "-70.00", "0.00", "-70.00",
+        )
+        assert "overpaid" not in got
+        row = gb.get_outstanding_invoices(compact=False)["invoices"][0]
+        assert row["amount_due"] == "-70.00"
+        assert row["days_past_due"] is None
+        assert "overpaid" not in row
+        assert "Past due" not in gb.get_book_summary()
+
+    def test_it_is_settled_by_refunding_the_customer(self, refund_invoice):
+        gb, path, doc = refund_invoice
+        bank = gb.get_balance("Assets:Checking", date(2026, 12, 31))
+        paid = gb.pay_invoice(
+            invoice_id=doc, payment_account="Assets:Checking",
+            amount="70.00", payment_date="2026-01-20",
+        )
+        assert paid["status"] == "paid"
+        assert paid["remaining_balance"] == "0.00"
+        # Cash went OUT.
+        assert gb.get_balance(
+            "Assets:Checking", date(2026, 12, 31),
+        ) - bank == Decimal("-70")
+        got = gb.get_invoice(doc, owner_type="customer")
+        assert (got["status"], got["amount_due"]) == ("paid", "0.00")
+        assert gb.get_outstanding_invoices(compact=False)["total"] == 0
+
+    def test_an_ordinary_overpaid_invoice_still_reads_overpaid(
+        self, business_book,
+    ):
+        """The flag keeps its meaning for books that already hold an
+        overpayment driven through the lot."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        inv = gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id=inv["id"], account="Income:Sales",
+            description="Work", quantity="1", price="100.00",
+        )
+        gb.post_invoice(invoice_id=inv["id"], post_account=AR,
+                        post_date="2026-01-15")
+        gb.pay_invoice(
+            invoice_id=inv["id"], payment_account="Assets:Checking",
+            amount="100.00", payment_date="2026-01-20",
+        )
+        # The state pre-1.4 servers could leave: the payment split
+        # larger than the invoice, in the invoice's own lot.
+        _q(
+            business_book,
+            "update splits set value_num = value_num * 13 / 10, "
+            "quantity_num = quantity_num * 13 / 10 where action = 'Payment'",
+        )
+        got = gb.get_invoice(inv["id"], owner_type="customer")
+        assert got["overpaid"] is True
+        assert (got["status"], got["amount_due"]) == ("paid", "-30.00")
+
+
+class TestMM9TheLatestPriceInEitherDirection:
+    def test_a_newer_quote_the_other_way_round_is_the_latest(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        gb.create_account(
+            name="Euro Cash", account_type="BANK", parent="Assets",
+            commodity="EUR",
+        )
+        gb.create_price(
+            commodity="EUR", namespace="CURRENCY", value="1.10",
+            currency="USD", price_date=date(2024, 6, 1),
+        )
+        assert gb.get_latest_price("EUR", "CURRENCY", "USD")["value"] in (
+            "1.10", "1.1",
+        )
+        gb.create_price(
+            commodity="USD", namespace="CURRENCY", value="0.80",
+            currency="EUR", price_date=date(2026, 6, 1),
+        )
+        got = gb.get_latest_price("EUR", "CURRENCY", "USD")
+        assert got["date"] == "2026-06-01"
+        assert Decimal(got["value"]) == Decimal("1.25")
+        assert got["inverted_from"].startswith("USD/EUR")
+        # A still newer direct quote wins again, undecorated.
+        gb.create_price(
+            commodity="EUR", namespace="CURRENCY", value="1.20",
+            currency="USD", price_date=date(2026, 7, 1),
+        )
+        got = gb.get_latest_price("EUR", "CURRENCY", "USD")
+        assert (got["date"], "inverted_from" in got) == ("2026-07-01", False)

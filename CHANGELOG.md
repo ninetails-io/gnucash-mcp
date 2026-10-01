@@ -105,6 +105,11 @@ Schedule recipes, invoice links, and budget signs are now stored the way GnuCash
   - `GNUCASH_REDACT_PATHS` handles folders with spaces, network paths, and `file://` URLs. A path stopped at its first space, so `/Users/x/Client Books/Acme Ltd.gnucash` left "Books/Acme Ltd.gnucash" in the message; a file URL came out as `filb.gnucash`. The book's own folder and the audit folder are removed wherever they appear (C56).
   - An audit folder removed while the server runs is recreated on the next entry. Every later write used to commit with no audit line (C33).
   - `create_backup` leaves a line in the audit trail naming the file (C60). `--noaudit` on the command line no longer creates the day's audit file at startup. A newline in an echoed value can no longer forge a debug-log record (SEC-18).
+- Business and pricing, from the same review:
+  - A document whose own total is negative (a return larger than the sale) reads as open and owed to the party, and `pay_document` settles it as a refund. It read `paid`, `overpaid`, with nothing able to settle it (C44).
+  - Auto-numbered IDs follow the book's own counter format (File > Properties > Counters in GnuCash). A book numbering its invoices `INV-0047` got `000048` next (FC-17).
+  - `get_latest_price` reads a pair in either direction: a newer USD/EUR quote is the latest EUR/USD rate, as valuation already treats it (MM-9).
+  - The neutral time of day GnuCash stamps on dates is ported exactly, including its shift in time zones beyond UTC-10 and UTC+13, where a flat 10:59 UTC dated a document a day early (C25).
 - Database books, from the same review:
   - Text is held to GnuCash's own column widths (2,048 characters for names, descriptions, memos, and notes; 4,096 for a transaction's notes; 50 for a tax-table name) and may not contain a NUL. A longer value was a raw database error on PostgreSQL and MySQL and unbounded on SQLite, where a 5 MB account name was accepted (C65, IV-19, IV-20).
   - Name and ID lookups compare exactly. A book GnuCash created in MariaDB compares text without regard to case, so `delete_taxtable("Sales Tax")` deleted `SALES TAX` and reported the name it was given (C66).

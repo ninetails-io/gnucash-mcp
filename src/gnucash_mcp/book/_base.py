@@ -250,14 +250,35 @@ def _day_end(d: date) -> datetime:
 
 
 def _neutral_time(d: date) -> datetime:
-    """GnuCash's neutral time of day for a date-valued timestamp:
-    10:59:00 UTC (``gnc_time64_get_day_neutral``), the convention
-    behind ``transactions.post_date`` and, on desktop, a document's
+    """GnuCash's neutral time of day for a date-valued timestamp
+    (``gnc_time64_get_day_neutral``), the convention behind
+    ``transactions.post_date`` and, on desktop, a document's
     ``date_opened`` / ``date_posted``. Timezone-aware so piecash's
-    local→UTC conversion is a no-op."""
-    from datetime import timezone
+    local→UTC conversion is a no-op.
 
-    return datetime(d.year, d.month, d.day, 10, 59, 0, tzinfo=timezone.utc)
+    10:59:00 UTC, which is the same calendar day in every zone from
+    UTC-10 to UTC+13 — and ported with the adjustment GnuCash makes
+    outside that band (gnc-datetime.cpp, ``LDT_from_date_daypart``):
+
+        auto offset = lt.local_time() - lt.utc_time();
+        if (offset < hours(-10)) lt -= hours(offset.hours() + 10);
+        if (offset > hours(13))  lt += hours(13 - offset.hours());
+
+    so the stamp still reads as the intended day locally: 11:59 UTC
+    in Pago Pago (UTC-11), 09:59 UTC on Kiritimati (UTC+14). A flat
+    10:59 there dated an invoice a day early and rewrote desktop's
+    own rows (adversarial review 2026-09-30, C25)."""
+    from datetime import timedelta, timezone
+
+    stamp = datetime(d.year, d.month, d.day, 10, 59, 0, tzinfo=timezone.utc)
+    offset = stamp.astimezone().utcoffset() or timedelta(0)
+    # boost's time_duration::hours() truncates toward zero.
+    hours = int(offset.total_seconds() / 3600)
+    if offset < timedelta(hours=-10):
+        stamp -= timedelta(hours=hours + 10)
+    if offset > timedelta(hours=13):
+        stamp += timedelta(hours=13 - hours)
+    return stamp
 
 
 def _future_statement_warning(statement_date: date) -> str | None:
