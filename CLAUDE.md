@@ -451,6 +451,22 @@ Established chokepoints and the rule each one owns:
   books on disk, and a fresh void. A new slot key goes in the
   registry first, with its citation — that is what stops the next
   "desktop can't read it" from shipping.
+- `_posted_total` — what a POSTED document came to: its posting
+  transaction's split in the document's lot, direction-normalized.
+  The posting is the record; the entries describe the document.
+  `_document_settlement` takes `grand_total` from it, so
+  `amount_paid` is always the sum of what the lot's other splits
+  settled, on every surface (`get_document`, the lists, outstanding,
+  `pay_document`'s `total_paid`, the job report). The total used to
+  be re-derived from the entries on every read: a tax table edited
+  after posting turned a paid 105 invoice into "total 110, paid
+  110", and a document desktop posted with a line discount read as
+  part-paid with no payment on file. `get_document` now carries
+  `total_note` when entries and posting disagree. Entries are summed
+  only for a draft, or when the posting can't be read (voided or
+  absent). This is also what lets the entry math change (the 1.5
+  tax-rounding port) without moving any document already posted.
+  Locked by `tests/test_posted_total.py`.
 - `_lot_split_amount` — what one split in a document's lot settles,
   in the DOCUMENT's currency: its quantity when the account is in
   that currency and the transaction is not (a payment booked in the

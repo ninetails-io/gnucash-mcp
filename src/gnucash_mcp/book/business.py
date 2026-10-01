@@ -1926,15 +1926,20 @@ class BusinessMixin:
         if job is not None:
             owner_name = f"{owner_name} (job:{job.id})"
 
-        # Total: sum of (quantity * price) across entries. Falls back
-        # to "?" when entries can't be loaded — keeps the row legible
+        # Total: what a posted document was booked at (the
+        # settlement's), the entries' sum for a draft. Falls back to
+        # "?" when entries can't be loaded — keeps the row legible
         # even on data-corruption edge cases.
-        known = {"is_bill": self._is_bill_side(effective_ot)}
+        status, settlement = self._document_status(
+            book, invoice, is_bill=self._is_bill_side(effective_ot),
+        )
         try:
-            grand_total = self._get_invoice_entries_and_total(
-                book, invoice,
-            )["grand_total"]
-            known["grand_total"] = grand_total
+            if settlement is not None:
+                grand_total = settlement["grand_total"]
+            else:
+                grand_total = self._get_invoice_entries_and_total(
+                    book, invoice,
+                )["grand_total"]
             ccy = (
                 invoice.currency.mnemonic
                 if invoice.currency else ""
@@ -1948,7 +1953,6 @@ class BusinessMixin:
             # a bare ``except Exception`` would swallow programming
             # errors (KeyError/NameError) silently too.
             amount_str = "?"
-        status, _ = self._document_status(book, invoice, **known)
 
         return (
             f"{invoice.id}\t{inv_type}\t{owner_name}\t{amount_str}\t"
@@ -2434,6 +2438,42 @@ class BusinessMixin:
         ):
             return Decimal(str(split.quantity))
         return Decimal(str(split.value))
+
+    @staticmethod
+    def _posted_total(inv, lot, sign: int) -> Decimal | None:
+        """What a POSTED document was booked at: its posting
+        transaction's split(s) in the document's lot, in the
+        document's currency, direction-normalized (``sign`` as in
+        ``_document_settlement``). The one reader of a posted total.
+
+        The posting is the record. A posted document's total used to
+        be re-derived from its entries on every read, so anything
+        that changed the derivation after posting — a tax table
+        edited, a rounding rule corrected, a discount this server did
+        not apply — moved the "total" away from what was booked and
+        showed the difference as money paid (adversarial review
+        2026-09-30, C10 / BL-14). Entries describe the document;
+        the posting says what it came to.
+
+        ``None`` when the posting can't be read — no posting
+        transaction, its split voided (the zeroed zombie is not a
+        total) or absent from the lot. Callers fall back to the
+        entries then.
+        """
+        post_txn_guid = inv.post_txn_guid
+        if not post_txn_guid:
+            return None
+        doc_currency_guid = inv.currency_guid
+        total = None
+        for split in lot.splits:
+            if split.transaction_guid != post_txn_guid:
+                continue
+            if split.reconcile_state == "v":
+                return None
+            total = (total or Decimal(0)) + BusinessMixin._lot_split_amount(
+                split, doc_currency_guid,
+            )
+        return None if total is None else sign * total
 
     @staticmethod
     def _calculate_lot_quantity(lot) -> Decimal:
@@ -2997,19 +3037,21 @@ class BusinessMixin:
 
     def _document_settlement(
         self, book, inv, *, is_bill=None, is_credit_note=None,
-        grand_total=None,
     ) -> dict | None:
         """Payment state of a POSTED document, read from its A/R or
         A/P lot. ``None`` when the document is unposted or its lot
         cannot be found.
 
-        This is the one place paid/due are derived. ``get_invoice``
-        and ``get_outstanding_invoices`` both read from here so the
-        two surfaces agree by construction; ``pay_invoice`` derives
-        ``total_paid`` from the same seam. Callers that already
-        resolved the side may pass ``is_bill`` / ``is_credit_note``
-        to save a Job query, and one that already summed the entries
-        may pass ``grand_total``.
+        This is the one place total/paid/due are derived.
+        ``get_invoice``, the document lists, and
+        ``get_outstanding_invoices`` all read from here so the
+        surfaces agree by construction; ``pay_invoice`` derives
+        ``total_paid`` from the same seam. ``grand_total`` is the
+        amount the document was POSTED at (``_posted_total``), so
+        ``amount_paid`` is always the sum of what the lot's other
+        splits settled; the entries are summed only when the posting
+        can't be read. Callers that already resolved the side may
+        pass ``is_bill`` / ``is_credit_note`` to save a Job query.
 
         Returns a dict of ``post_account``, ``lot``, ``balance``
         (signed lot balance), ``grand_total``, ``amount_paid``,
@@ -3043,6 +3085,7 @@ class BusinessMixin:
         quantum = _commodity_quantum(post_acct.commodity)
         sign = -1 if (is_bill ^ is_credit_note) else 1
         amount_due = (sign * balance).quantize(quantum)
+        grand_total = self._posted_total(inv, lot_obj, sign)
         if grand_total is not None:
             grand_total = grand_total.quantize(quantum)
         else:
@@ -3155,8 +3198,8 @@ class BusinessMixin:
         cash. The one rule every document surface speaks, read off
         ``_document_settlement``; a posted document whose lot can't be
         found reads posted with no settlement. ``known`` passes a
-        caller's already-resolved ``is_bill`` / ``grand_total``
-        through to the settlement.
+        caller's already-resolved ``is_bill`` through to the
+        settlement.
         """
         if not _is_invoice_posted(inv):
             return "open", None
@@ -6228,6 +6271,22 @@ class BusinessMixin:
             # list uses, so the surfaces agree by construction.
             result["status"], settlement = self._document_status(book, inv)
             if settlement is not None:
+                # A posted document's total is what it was posted at.
+                # When the entries no longer sum to that (a tax table
+                # edited since, or math this server did not apply at
+                # posting), say so rather than show the difference as
+                # a payment.
+                posted_total = settlement["grand_total"]
+                entries_total = total.quantize(posted_total)
+                result["total"] = str(posted_total)
+                if entries_total != posted_total:
+                    result["total_note"] = (
+                        f"Posted at {posted_total}; the entries now "
+                        f"compute to {entries_total}. The posted "
+                        f"amount is what was booked and what payments "
+                        f"settle. Unpost and re-post to rebook at the "
+                        f"entries' amount."
+                    )
                 result["amount_paid"] = str(settlement["amount_paid"])
                 result["amount_due"] = str(settlement["amount_due"])
                 if settlement["overpaid"]:
@@ -7604,17 +7663,16 @@ class BusinessMixin:
             remaining_directional = (
                 -remaining if effective_is_bill else remaining
             ).quantize(quantum)
-            # Cumulative, from the document total: a second partial
-            # payment must not read as the only one (the per-call
-            # amount is ``payment``).
-            try:
-                total_paid = (
-                    self._get_invoice_entries_and_total(
-                        book, inv,
-                    )["grand_total"] - remaining_directional
-                ).quantize(quantum)
-            except ValueError:
-                total_paid = None
+            # Cumulative, from the settlement chokepoint: a second
+            # partial payment must not read as the only one (the
+            # per-call amount is ``payment``), and it must agree with
+            # get_invoice's ``amount_paid`` — both measure from the
+            # POSTED total.
+            settlement = self._document_settlement(book, inv)
+            total_paid = (
+                settlement["amount_paid"] if settlement is not None
+                else None
+            )
 
             result = {
                 "id": inv.id,
@@ -9104,52 +9162,38 @@ class BusinessMixin:
 
             for inv in invoices:
                 ccy = inv.currency.mnemonic if inv.currency else "?"
-                # Face value falls back to 0 on entry-load failure
-                # rather than aborting the whole report.
-                try:
-                    billed = self._get_invoice_entries_and_total(
-                        book, inv,
-                    )["grand_total"]
-                except (ValueError, AttributeError):
-                    billed = Decimal("0")
+                # Posted: billed / paid / outstanding straight off
+                # the settlement chokepoint (billed is the POSTED
+                # amount; outstanding is direction-normalized, never
+                # abs()'d, so an overpaid invoice keeps ``paid``
+                # honest). This loop used to carry its own copy of
+                # the lot arithmetic, measured from the entries.
+                settlement = self._document_settlement(
+                    book, inv, is_bill=job_is_bill,
+                )
+                if settlement is not None:
+                    billed = settlement["grand_total"]
+                    outstanding = settlement["amount_due"]
+                    paid = settlement["amount_paid"]
+                else:
+                    # A draft — or a posted document whose lot is
+                    # missing: fully owed rather than a crash. Face
+                    # value falls back to 0 on entry-load failure
+                    # rather than aborting the whole report.
+                    try:
+                        billed = self._get_invoice_entries_and_total(
+                            book, inv,
+                        )["grand_total"]
+                    except (ValueError, AttributeError):
+                        billed = Decimal("0")
+                    outstanding = billed
+                    paid = Decimal("0")
 
                 if _is_invoice_posted(inv):
                     posted_count += 1
-                    # paid = billed − outstanding from the lot.
-                    # Direction-normalized, NOT abs()'d: an overpaid
-                    # invoice carries NEGATIVE outstanding, keeping
-                    # ``paid`` honest.
-                    post_acct_guid = inv.post_acc_guid
-                    post_acct = book.session.query(
-                        piecash.Account
-                    ).filter_by(guid=post_acct_guid).first()
-                    lot_obj = None
-                    if post_acct:
-                        for lot in post_acct.lots:
-                            if lot.guid == inv.post_lot_guid:
-                                lot_obj = lot
-                                break
-                    if lot_obj:
-                        lot_balance = self._calculate_lot_balance(
-                            lot_obj
-                        )
-                        flip = job_is_bill ^ self._get_is_credit_note(
-                            inv
-                        )
-                        outstanding = (
-                            -lot_balance if flip else lot_balance
-                        )
-                        paid = billed - outstanding
-                    else:
-                        # Lot missing despite posted state — treat
-                        # as fully owed rather than crash.
-                        outstanding = billed
-                        paid = Decimal("0")
                     status = "posted"
                 else:
                     open_count += 1
-                    paid = Decimal("0")
-                    outstanding = billed
                     status = "open"
 
                 posted_dt = _safe_invoice_date(inv, "date_posted")

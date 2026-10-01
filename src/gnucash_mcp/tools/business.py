@@ -813,7 +813,9 @@ def register(mcp, get_book) -> None:
         from the same lot arithmetic ``get_outstanding_documents``
         uses; ``overpaid: true`` marks a negative balance. A paid
         document keeps its amounts here after it leaves the unpaid
-        list.
+        list. A posted document's ``total`` is the amount it was
+        posted at; ``total_note`` appears when its entries no longer
+        add up to that (a tax table edited since posting).
 
         Once posted it also lists ``payments``, oldest first:
         ``{guid, date, amount, from}`` per settlement. ``guid`` is
