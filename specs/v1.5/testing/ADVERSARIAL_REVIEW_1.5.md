@@ -1020,7 +1020,7 @@ Each item is a contract test in the house styles (grep-the-source, set-equality,
 ## 10. Resolution log (branch `fix/v1.5-adversarial-blockers`, as of 2026-09-30, late night)
 
 Every fix has a test that fails on the pre-fix source. Full suite at
-the last commit (`830bb27`): 2978 passed, 33 skipped, 2 expected
+the last commit (`c6ac896`): 3087 passed, 33 skipped, 2 expected
 failures (the two price scenarios awaiting a ruling, below).
 PostgreSQL gate: 88 passed. Desktop totals oracle: 0 differences.
 Engine twin: 24 scenarios, the server's rows equal to the engine's in
@@ -1129,14 +1129,44 @@ loads and saves the sum. **Each of these four is a maintainer call
 flagged for review**, since the standing ruling is that parity means
 an empty diff.
 
-### Moderate and minor: open
+### Minor tier (sections 5, 7, 8): fixed
 
-The MINOR tier of section 5 and the list in section 8 are untouched
-except where noted above. Notable ones still open: C11 (no `gnclock`
-row taken), C27 (schedule instantiation commits twice), C56 (path
-redaction misses paths with spaces), C20 (three-decimal currencies),
-C63 (legacy date formats), C17 (declare a minimum GnuCash version:
-3.8), C66 (MariaDB collation), C65 (text caps wider than columns).
+Each has its test in `tests/test_review_minor.py` unless noted.
+
+| Commit | Items |
+|---|---|
+| `dab3481` | C27, C36, C38, C64, BL-22, side-findings 3 and 7 |
+| `9ae608f` | C39, C40 (rounding), C42, C51, C58, BL-23, BL-24, MM-11, MM-14, IV-18, IV-21 to IV-27 |
+| `6fdb606` | C23, C43, SS-15, MM-15, DS-13, DS-15, FC-13 |
+| `03a542a` | C33, C56, C60 (audit line), SEC-18, side-findings 5 and 6 |
+| `1a20ff6` | C17, C65, C66, IV-19, IV-20 |
+| `952d53b` | C25, C44, FC-17, MM-9 |
+| `c6ac896` | DS-12, FC-15, MM-10 |
+| `830bb27` | side-finding 1, SS-14 (with C10) |
+| earlier | C8 (iii), C29 (a), C52a, C52b, SS-13, SEC-11, side-findings 2, 4, 8, 10 |
+
+Narrower than the finding in four places: IV-20 refuses a NUL but not
+other control characters in free text; IV-21 does not look for
+zero-width or right-to-left characters; MM-10 covers the price list,
+not lot quantities; SEC-15 creates new files 0600 and does not
+re-mode audit files written before 1.5.
+
+### Minor tier: open, with the reason
+
+| Item | Why it is still open |
+|---|---|
+| C11 / FC-16 no `gnclock` row taken | A design decision: whether the server should lock a book it has open only for the length of one call. |
+| C46 early-payment window anchored on `date_opened` | A policy choice; the GnuCash function the finding cited does not exist. |
+| C60 (cap) manual backups are unlimited | The store is append-only by design; a rate limit is a product call. |
+| C62 `features/Credit Notes` not stamped | A feature stamp is the riskiest row this server can write; only GnuCash before 2.5.0 reads it. |
+| C67 "Use Split Action Field for Number" ignored | Needs the option set through desktop to twin; the engine call tried from Guile did not take. Metadata only. |
+| C69 read-only day threshold ignored | Desktop enforces it in the GUI only; whether the server should warn or refuse is a product call. |
+| C20 three-decimal currencies shown at two | Display only, across four modules. |
+| C63 date-range filters compare text | Needs a careful pass over `_query.py` with pre-2.6 date formats in hand. |
+| MM-12 budget report at one year-end rate | A semantics decision (flow vs. stock), like the one already ruled for the other reports. |
+| C26, C28, C32, C53, SS-17, DS-10, DS-11, DS-16, FC-14, SEC-17 | Low; none can lose or misstate money. |
+| FC-18, FC-19, FC-20 | Observations about the demo books and the test fixtures, not defects in a tool. |
+| Side-findings 9, 11, 12, 13 | 9: a rounding edge in implied prices. 11: void on a reconciled split still only warns. 12: emoji on desktop-created MySQL tables. 13: GnuCash's own Balance Sheet on the Alex demo is off by 644.57, not attributed. |
 
 ### Before this branch merges
 
