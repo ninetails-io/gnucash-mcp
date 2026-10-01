@@ -2730,3 +2730,73 @@ class TestAuditFileOpenedByPath:
         self._emit("AFTER DELETE")
         assert "AFTER DELETE" in live.read_text()
         assert stat.S_IMODE(live.stat().st_mode) == 0o600
+
+
+class TestAccountUpdateAuditListsOnlyWhatChanged:
+    """Review C41 / IV-15. ``after_state`` is the tool response,
+    which carries only the changed fields; the formatter read an
+    absent field as "" and logged a rename to nothing on every
+    description-only update. An audit trail that records edits that
+    did not happen is worse than one with gaps."""
+
+    BEFORE = {
+        "name": "Evil", "fullname": "Expenses:Evil",
+        "description": "keep me", "placeholder": False, "type": "EXPENSE",
+    }
+
+    def _lines(self, after):
+        from gnucash_mcp.logging_config import _fmt_account_update
+        return _fmt_account_update({
+            "timestamp": "2026-09-30T12:00:00+00:00",
+            "params": {"name": "Expenses:Evil"},
+            "before_state": dict(self.BEFORE),
+            "after_state": {"guid": "%abc1234", **after, "status": "updated"},
+        })
+
+    def test_description_only(self):
+        text = "\n".join(self._lines({"description": "x"}))
+        assert 'Description: "keep me" → "x"' in text
+        assert "Name:" not in text
+
+    def test_placeholder_only_logs_the_placeholder(self):
+        text = "\n".join(self._lines({"placeholder": True}))
+        assert "Placeholder: False → True" in text
+        assert "Name:" not in text and "Description:" not in text
+
+    def test_type_only(self):
+        text = "\n".join(self._lines({"type": "ASSET"}))
+        assert "Type: EXPENSE → ASSET" in text
+        assert "Name:" not in text and "Description:" not in text
+
+    def test_rename_only(self):
+        text = "\n".join(self._lines({"name": "Good"}))
+        assert 'Name: "Evil" → "Good"' in text
+        assert "Description:" not in text
+
+    def test_a_cleared_description_is_still_logged(self):
+        text = "\n".join(self._lines({"description": ""}))
+        assert 'Description: "keep me" → ""' in text
+
+    def test_through_the_real_tool(self, test_book, tmp_path, monkeypatch):
+        """End to end: the decorator, the staged before-state, the
+        response as after-state."""
+        from gnucash_mcp.book import GnuCashBook
+        from gnucash_mcp.logging_config import audit_log
+
+        monkeypatch.setenv("GNUCASH_LOG_DIR", str(tmp_path / "logs"))
+        gb = GnuCashBook(str(test_book))
+        setup_logging(str(test_book), audit=True, get_book=lambda: gb)
+
+        @audit_log(
+            classification="write", operation="update",
+            entity_type="account",
+        )
+        def update_account(**kwargs):
+            return json.dumps(gb.update_account(**kwargs))
+
+        update_account(name="Expenses:Groceries", description="weekly shop")
+        logged = "".join(
+            p.read_text() for p in (tmp_path / "logs").rglob("*.txt")
+        )
+        assert 'Description: "" → "weekly shop"' in logged
+        assert "Name:" not in logged

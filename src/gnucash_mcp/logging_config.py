@@ -1134,14 +1134,29 @@ def _fmt_account_update(entry: dict) -> list[str]:
         f"{_INDENT}{params.get('name', '')}",
     ]
     if before and after:
-        old_name = before.get("name", "")
-        new_name = after.get("name", "")
-        if old_name != new_name:
-            lines.append(f'{_INDENT}Name: "{old_name}" → "{new_name}"')
-        old_desc = before.get("description", "")
-        new_desc = after.get("description", "")
-        if old_desc != new_desc:
-            lines.append(f'{_INDENT}Description: "{old_desc}" → "{new_desc}"')
+        # ``after_state`` is the tool's response, which carries ONLY
+        # the fields the update changed. A field absent from it did
+        # not change — reading the absence as "" logged a rename to
+        # nothing on every description-only update, and a cleared
+        # description on every placeholder-only one, while the
+        # change that DID happen (placeholder, type) had no line.
+        if "name" in after and after["name"] != before.get("name"):
+            lines.append(
+                f'{_INDENT}Name: "{before.get("name", "")}" → '
+                f'"{after["name"]}"'
+            )
+        if "description" in after \
+                and after["description"] != before.get("description"):
+            lines.append(
+                f'{_INDENT}Description: '
+                f'"{before.get("description") or ""}" → '
+                f'"{after["description"] or ""}"'
+            )
+        for key, label in (("placeholder", "Placeholder"), ("type", "Type")):
+            if key in after and after[key] != before.get(key):
+                lines.append(
+                    f"{_INDENT}{label}: {before.get(key)} → {after[key]}"
+                )
         # ``notes`` is a diff-echo key: present in after_state only
         # when the update changed it ("" = cleared).
         if "notes" in after:
