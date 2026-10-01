@@ -451,6 +451,26 @@ Established chokepoints and the rule each one owns:
   books on disk, and a fresh void. A new slot key goes in the
   registry first, with its citation — that is what stops the next
   "desktop can't read it" from shipping.
+- `_entry_math` (`book/_entry_math.py`) — what a document line
+  comes to and what a document posts: GnuCash's own arithmetic,
+  ported from `gncEntryComputeValueInt`, `gncEntryRecomputeValues`,
+  and `gncInvoiceGetNetAndTaxesInternal` (5.12). Exact rationals
+  throughout; rounding happens in exactly the two places desktop
+  rounds — each line's NET half-up to the currency, and each tax
+  ACCOUNT's document total (the lines' unrounded taxes summed) half-up
+  once. A line's discount (which only desktop writes) is applied by
+  its type and its how (PRETAX / SAMETIME / POSTTAX); the bill side
+  never discounts; a credit note is computed from the stored
+  (negated) quantity and negated for the document view, as
+  `gncEntryGetDocValue` does. `_get_invoice_entries_and_total` is
+  its one caller. The server's own math (tax per line, half-to-even,
+  on a rounded pretax, a residual cent forced onto the largest rate,
+  discounts never read) disagreed with desktop on a third to nearly
+  half of multi-line taxed invoices — the 1.5 adversarial review's
+  C1/C2. Don't "tidy" a total that differs from the summed prices by
+  a cent on tax-included lines: desktop shows and posts that total.
+  Pinned by `tests/test_entry_math.py`, every figure worked from the
+  GnuCash source.
 - `_posted_total` — what a POSTED document came to: its posting
   transaction's split in the document's lot, direction-normalized.
   The posting is the record; the entries describe the document.

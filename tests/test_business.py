@@ -2382,13 +2382,44 @@ class TestTaxtableRefcount:
 
 
 class TestTaxtableMath:
-    """Tests for ``_compute_entry_tax`` — the per-quadrant tax
-    math helper. Pure function, no book fixture required."""
+    """One taxed line, quadrant by quadrant, through ``_entry_math``
+    (GnuCash's ``gncEntryComputeValueInt`` and
+    ``gncInvoiceGetNetAndTaxesInternal``, ported). Pure functions, no
+    book fixture required.
 
-    # The helper is a staticmethod on BusinessMixin; we reach
-    # through GnuCashBook (which mixes it in).
-    from gnucash_mcp.book import GnuCashBook as _GB
-    _fn = staticmethod(_GB._compute_entry_tax)
+    These cases were written against the server's own per-line math
+    (``_compute_entry_tax``, retired by the 1.5 adversarial review,
+    C1). Their subject — what one line comes to in each quadrant —
+    survives; they now ask it of the port, as a one-line document.
+    The cases that pinned the old rounding (half-to-even, and a
+    residual cent forced onto the largest rate so a tax-included
+    line's gross equalled its price) assert desktop's numbers
+    instead. The full parity table is ``tests/test_entry_math.py``.
+    """
+
+    @staticmethod
+    def _fn(quantity, price, taxable, tax_included, taxtable_entries,
+            quantum):
+        from fractions import Fraction
+        from gnucash_mcp.book import _entry_math as em
+        entries = [
+            em.TaxEntry(
+                em.AMT_PERCENT if e["type"] == "percentage"
+                else em.AMT_VALUE,
+                Fraction(e["amount"]), e["account_guid"],
+            )
+            for e in taxtable_entries
+        ] if taxable else None
+        values = em.entry_values(
+            Fraction(quantity), Fraction(price), entries, tax_included,
+        )
+        doc = em.document_totals([("income", values)], int(1 / quantum))
+        return {
+            "pretax": doc.net,
+            "tax_total": doc.tax,
+            "tax_by_acct": doc.tax_by_account,
+            "gross": doc.total,
+        }
 
     USD_QUANTUM = Decimal("0.01")
     JPY_QUANTUM = Decimal("1")
@@ -2543,78 +2574,48 @@ class TestTaxtableMath:
         assert r["gross"] == Decimal("112.00")
         assert r["pretax"] + r["tax_total"] == r["gross"]
 
-    def test_q3_residual_to_largest_rate(self):
-        # Gross $100 with GST 5% + PST 7% has no clean integer
-        # pretax. pretax = 100 / 1.12 = 89.2857... → 89.29.
-        # Per-entry independent rounding: 89.29 * 0.05 = 4.4645
-        # → 4.46, 89.29 * 0.07 = 6.2503 → 6.25.
-        # Sum: 4.46 + 6.25 = 10.71. Residual:
-        # 100.00 - 89.29 - 10.71 = 0.00 → no adjustment needed
-        # in this case. Let's pick numbers that DO show residual.
-        # Gross $100.07 with GST 5%: pretax = 100.07/1.05
-        # = 95.30476... → 95.30. tax = 95.30*0.05 = 4.765 → 4.77
-        # (with banker's; 4.765 → 4.76 because 6 is even).
-        # 95.30 + 4.76 = 100.06; residual = 100.07 - 100.06 = 0.01.
-        # Residual goes to the largest-rate (only) entry.
+    def test_q3_tax_included_rounds_net_and_tax_separately(self):
+        # Gross $100.07 with GST 5% included.
+        # pretax = 100.07 / 1.05 = 95.304761…  → net 95.30
+        # tax    = 95.304761… × 0.05 = 4.765238… → 4.77 (half-up,
+        # on the UNROUNDED pretax — the old math taxed the rounded
+        # 95.30, got 4.765, and banker's-rounded it to 4.76).
+        # 95.30 + 4.77 = 100.07: here the two roundings happen to
+        # add back to the price.
         r = self._fn(
             quantity=Decimal("1"), price=Decimal("100.07"),
             taxable=True, tax_included=True,
             taxtable_entries=[self._gst_5()],
             quantum=self.USD_QUANTUM,
         )
-        # The residual identity is the contract — the math may
-        # round either way under banker's, but the identity
-        # MUST hold.
-        assert r["pretax"] + r["tax_total"] == r["gross"]
-        # And the gross is preserved exactly.
+        assert r["pretax"] == Decimal("95.30")
+        assert r["tax_total"] == Decimal("4.77")
         assert r["gross"] == Decimal("100.07")
 
-    def test_q3_residual_routes_to_largest_percentage(self):
-        # Construct a case where the residual is non-zero and
-        # verify the per-account allocation puts the residual on
-        # the largest-rate entry. Pick numbers that produce a
-        # one-cent residual under banker's rounding.
-        # Gross $10.05 with GST 5% + PST 7%:
-        # pretax = 10.05 / 1.12 = 8.973214... → 8.97
-        # GST: 8.97 * 0.05 = 0.4485 → 0.45 (banker's: 5 even)
-        # PST: 8.97 * 0.07 = 0.6279 → 0.63
-        # Sum tax: 1.08. pretax + tax = 10.05 → no residual.
-        # Try gross $10.06:
-        # pretax = 10.06 / 1.12 = 8.982142... → 8.98
-        # GST: 8.98 * 0.05 = 0.449 → 0.45
-        # PST: 8.98 * 0.07 = 0.6286 → 0.63
-        # Sum: 1.08; pretax + tax = 10.06 → no residual.
-        # Try gross $10.13:
-        # pretax = 10.13 / 1.12 = 9.04464... → 9.04
-        # GST: 9.04 * 0.05 = 0.452 → 0.45
-        # PST: 9.04 * 0.07 = 0.6328 → 0.63
-        # Sum: 1.08; pretax + tax = 10.12 → residual 0.01.
-        # → PST is largest rate, gets the +0.01.
+    def test_q3_tax_included_total_can_differ_from_the_price(self):
+        # Gross $10.13 with GST 5% + PST 7% included.
+        # pretax = 10.13 / 1.12 = 9.044642…  → net 9.04
+        # GST    = 9.044642… × 0.05 = 0.452232… → 0.45
+        # PST    = 9.044642… × 0.07 = 0.633125  → 0.63
+        # total  = 9.04 + 0.45 + 0.63 = 10.12 — a cent under the
+        # line's price. GnuCash rounds the net and each tax account
+        # independently and adds them (gncInvoiceGetTotalInternal);
+        # it has no step that forces the sum back to the price. The
+        # server used to push the missing cent onto the largest
+        # rate (PST 0.64) so the gross read 10.13, and posted a
+        # different PST liability than desktop computes.
         r = self._fn(
             quantity=Decimal("1"), price=Decimal("10.13"),
             taxable=True, tax_included=True,
             taxtable_entries=[self._gst_5(), self._pst_7()],
             quantum=self.USD_QUANTUM,
         )
-        # Contract: identity holds, residual targets PST (the
-        # 7% entry, which has the higher rate).
+        assert r["pretax"] == Decimal("9.04")
+        assert r["tax_by_acct"][self.GST_GUID] == Decimal("0.45")
+        assert r["tax_by_acct"][self.PST_GUID] == Decimal("0.63")
+        assert r["gross"] == Decimal("10.12")
+        # What posts still balances: the A/R leg is the total.
         assert r["pretax"] + r["tax_total"] == r["gross"]
-        assert r["gross"] == Decimal("10.13")
-        # PST tax should be slightly more than the "clean"
-        # per-entry calculation; GST should be the clean amount.
-        gst = r["tax_by_acct"][self.GST_GUID]
-        pst = r["tax_by_acct"][self.PST_GUID]
-        # GST gets the clean 5% (4.5 mils → 0.45 under banker's,
-        # though either rounding direction is acceptable).
-        # PST absorbs the residual.
-        assert gst == Decimal("0.45")
-        # PST is "0.63 + residual", testing that the residual
-        # landed there: PST > pretax * 0.07 quantized.
-        pretax = r["pretax"]
-        pst_clean = (pretax * Decimal("7") / Decimal("100")).quantize(
-            self.USD_QUANTUM
-        )
-        assert pst >= pst_clean
 
     # ── Quadrant 4: tax-inclusive, mixed value + percentage ────
 

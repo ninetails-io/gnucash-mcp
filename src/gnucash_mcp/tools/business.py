@@ -320,8 +320,9 @@ def register(mcp, get_book) -> None:
         either a percentage rate or a flat-value surcharge routed to
         a specific GL account (ASSET for input-tax credit, LIABILITY
         for output sales tax payable). Multi-entry composites (e.g.,
-        GST 5% + PST 7%) produce multiple tax splits per line at
-        posting time.
+        GST 5% + PST 7%) post one tax split per tax account, each
+        the document's tax for that account rounded once, the way
+        GnuCash desktop totals an invoice.
 
         Args:
             name: Taxtable name, unique within the book
@@ -590,7 +591,7 @@ def register(mcp, get_book) -> None:
             party_type: Credit notes only — disambiguates when a
                 customer and vendor credit note share an ID.
             taxtable: Tax table name to apply. Optional.
-            tax_included: Whether price already includes tax.
+            tax_included: Whether price already includes tax. The net and each tax are then rounded separately, as in GnuCash, so the document total can differ from the summed prices by a cent.
             notes: Optional entry notes.
             action: Optional entry action label (e.g., "Hours").
         """

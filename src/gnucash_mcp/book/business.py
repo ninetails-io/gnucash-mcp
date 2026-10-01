@@ -20,6 +20,7 @@ from decimal import Decimal
 
 import piecash
 
+from gnucash_mcp.book import _entry_math
 from gnucash_mcp.book._base import (
     _lot_cache_flag,
     _LOT_CLOSED_UNKNOWN,
@@ -2019,6 +2020,24 @@ class BusinessMixin:
             "total": str(total),
         }
         # Conditional keys — plain entries keep their shape.
+        if not is_bill and (entry_row.i_discount_num or 0) != 0:
+            # Only desktop writes a line discount; the document total
+            # applies it (``_entry_math``), so the line must show it
+            # or ``total`` beside the document total reads as an error.
+            disc = Decimal(entry_row.i_discount_num) / Decimal(
+                entry_row.i_discount_denom or 1
+            )
+            result["discount"] = str(disc)
+            result["discount_type"] = (
+                "value" if entry_row.i_disc_type == _entry_math.AMT_VALUE
+                else "percent"
+            )
+            result["discount_how"] = (
+                entry_row.i_disc_how
+                if entry_row.i_disc_how in (
+                    _entry_math.DISC_SAMETIME, _entry_math.DISC_POSTTAX,
+                ) else _entry_math.DISC_PRETAX
+            ).lower()
         if entry_row.notes:
             result["notes"] = entry_row.notes
         if entry_row.action:
@@ -3210,8 +3229,17 @@ class BusinessMixin:
         return settled, settlement
 
     def _get_invoice_entries_and_total(self, book, inv):
-        """Query entries for an invoice/bill and compute totals,
-        absorbing per-line tax math (via ``_compute_entry_tax``).
+        """Query a document's entries and compute what it comes to —
+        GnuCash's arithmetic, via ``_entry_math`` (ports of
+        ``gncEntryComputeValueInt`` and
+        ``gncInvoiceGetNetAndTaxesInternal``).
+
+        Each line's net is rounded half-up to the document currency;
+        tax is summed UNROUNDED per tax account across the document
+        and rounded once; a line's discount (which only desktop
+        writes) is applied the way the line says. This is the entry
+        math for a DRAFT and for posting. A posted document's total
+        is read from its posting (``_posted_total``), not from here.
 
         Aggregates revenue/expense AND tax-payable amounts into one
         ``acct_totals`` dict so ``post_invoice`` emits one split per
@@ -3225,15 +3253,21 @@ class BusinessMixin:
               revenue/expense AND tax-payable accounts together.
             - ``grand_total``: gross customer-facing total
               (includes tax).
-            - ``subtotal``: sum of per-line pretax amounts.
+            - ``subtotal``: sum of per-line rounded net values.
             - ``tax_breakdown``: ``{account_guid: Decimal}`` —
-              tax-only portion, for display surfaces.
+              tax-only portion, as it posts.
             - ``tax_by_taxtable``: ``{taxtable_guid: Decimal}`` —
-              tax by source taxtable; zero-tax taxtables absent.
+              tax by source taxtable, for display; zero-tax
+              taxtables absent. Each is its own unrounded sum
+              rounded once, so when two tables share an account
+              these need not add up to ``tax_breakdown`` to the
+              cent; ``tax_breakdown`` is what posts.
 
         Raises:
             ValueError: when the invoice has no entries.
         """
+        from fractions import Fraction
+
         from sqlalchemy import text
         from piecash.business.tax import Taxtable
 
@@ -3257,7 +3291,7 @@ class BusinessMixin:
         # Taxtable resolution is cached so an invoice with many
         # lines sharing the same taxtable hits SQL once per
         # distinct taxtable, not once per line.
-        taxtable_cache: dict[str, list[dict]] = {}
+        taxtable_cache: dict[str, list] = {}
 
         def _resolve_taxtable_entries(taxtable_guid):
             if not taxtable_guid:
@@ -3275,94 +3309,52 @@ class BusinessMixin:
                 taxtable_cache[taxtable_guid] = []
                 return []
             resolved = [
-                {
-                    "type": e.type,
-                    "amount": e.amount,
-                    "account_guid": e.account_guid,
-                }
+                _entry_math.TaxEntry(
+                    kind=(
+                        _entry_math.AMT_PERCENT
+                        if e.type == "percentage"
+                        else _entry_math.AMT_VALUE
+                    ),
+                    amount=Fraction(e.amount),
+                    account=e.account_guid,
+                )
                 for e in tt.entries
             ]
             taxtable_cache[taxtable_guid] = resolved
             return resolved
 
-        quantum = _commodity_quantum(inv.currency)
-        acct_totals: dict[str, Decimal] = {}
-        tax_breakdown: dict[str, Decimal] = {}
-        tax_by_taxtable: dict[str, Decimal] = {}
-        grand_total = Decimal(0)
-        subtotal = Decimal(0)
-
+        fraction = inv.currency.fraction
         is_cn = self._get_is_credit_note(inv)
+        sign = -1 if is_cn else 1
+
+        lines = []
+        raw_by_taxtable: dict[str, Fraction] = {}
         for row in rows:
-            q_num = row.quantity_num or 0
-            q_denom = row.quantity_denom or 1
-            quantity = Decimal(q_num) / Decimal(q_denom)
-            if is_cn:
-                # Stored negated (gncEntryGetDocQuantity negates back).
-                quantity = -quantity
-
-            if is_bill:
-                p_num = row.b_price_num or 0
-                p_denom = row.b_price_denom or 1
-                acct_guid = row.b_acct
-                taxable = bool(row.b_taxable)
-                tax_included = bool(row.b_taxincluded)
-                taxtable_guid = row.b_taxtable
-            else:
-                p_num = row.i_price_num or 0
-                p_denom = row.i_price_denom or 1
-                acct_guid = row.i_acct
-                taxable = bool(row.i_taxable)
-                tax_included = bool(row.i_taxincluded)
-                taxtable_guid = row.i_taxtable
-
-            price = Decimal(p_num) / Decimal(p_denom)
-            taxtable_entries = _resolve_taxtable_entries(taxtable_guid)
-
-            tax_result = self._compute_entry_tax(
-                quantity=quantity,
-                price=price,
-                taxable=taxable,
-                tax_included=tax_included,
-                taxtable_entries=taxtable_entries,
-                quantum=quantum,
+            taxtable_guid = row.b_taxtable if is_bill else row.i_taxtable
+            account, values = self._entry_line_values(
+                row, is_bill, _resolve_taxtable_entries(taxtable_guid),
             )
-
-            # Revenue/expense account gets the pretax portion.
-            acct_totals[acct_guid] = (
-                acct_totals.get(acct_guid, Decimal(0))
-                + tax_result["pretax"]
-            )
-            # Tax-payable accounts get their per-entry components
-            # (same-account composites already collapse upstream).
-            for tax_acct, tax_amount in (
-                tax_result["tax_by_acct"].items()
-            ):
-                acct_totals[tax_acct] = (
-                    acct_totals.get(tax_acct, Decimal(0))
-                    + tax_amount
-                )
-                tax_breakdown[tax_acct] = (
-                    tax_breakdown.get(tax_acct, Decimal(0))
-                    + tax_amount
+            lines.append((account, values))
+            if taxtable_guid and values.taxes:
+                raw_by_taxtable[taxtable_guid] = (
+                    raw_by_taxtable.get(taxtable_guid, Fraction(0))
+                    + sign * values.tax_total
                 )
 
-            # Per-taxtable rollup for display surfaces.
-            if taxtable_guid and tax_result["tax_total"] != 0:
-                tax_by_taxtable[taxtable_guid] = (
-                    tax_by_taxtable.get(taxtable_guid, Decimal(0))
-                    + tax_result["tax_total"]
-                )
+        totals = _entry_math.document_totals(lines, fraction, is_cn)
 
-            grand_total += tax_result["gross"]
-            subtotal += tax_result["pretax"]
+        tax_by_taxtable = {}
+        for taxtable_guid, raw in raw_by_taxtable.items():
+            rounded = _entry_math.round_half_up(raw, fraction)
+            if rounded != 0:
+                tax_by_taxtable[taxtable_guid] = rounded
 
         return {
             "rows": rows,
-            "acct_totals": acct_totals,
-            "grand_total": grand_total,
-            "subtotal": subtotal,
-            "tax_breakdown": tax_breakdown,
+            "acct_totals": totals.by_account,
+            "grand_total": totals.total,
+            "subtotal": totals.net,
+            "tax_breakdown": totals.tax_by_account,
             "tax_by_taxtable": tax_by_taxtable,
         }
 
@@ -4079,10 +4071,10 @@ class BusinessMixin:
     # Taxtables route sales-tax math on document line entries. Each
     # ``TaxtableEntry`` contributes either a percentage rate (5.00 =
     # 5%) or a flat value routed to a specific GL account; a
-    # multi-entry taxtable (GST 5% + PST 7%) produces N tax splits
-    # per line at posting (math in ``_compute_entry_tax`` /
-    # ``_get_invoice_entries_and_total``; ``_add_entry`` wires
-    # entries to taxtables).
+    # multi-entry taxtable (GST 5% + PST 7%) produces one tax split
+    # per tax account at posting (math in ``_entry_math``, GnuCash's
+    # own, via ``_get_invoice_entries_and_total``; ``_add_entry``
+    # wires entries to taxtables).
     #
     # **Refcount discipline.** GnuCash desktop maintains
     # ``Taxtable.refcount``; piecash does not. We bump it manually
@@ -4218,167 +4210,58 @@ class BusinessMixin:
         return resolved
 
     @staticmethod
-    def _compute_entry_tax(
-        quantity: Decimal,
-        price: Decimal,
-        taxable: bool,
-        tax_included: bool,
-        taxtable_entries: list[dict],
-        quantum: Decimal,
-    ) -> dict:
-        """Per-line tax math. Pure function; no book access.
-
-        Caller resolves the taxtable to a list of
-        ``{type, amount, account_guid}`` dicts before invoking
-        (``type`` is ``'value'`` or ``'percentage'``; ``amount``
-        is ``Decimal``; ``account_guid`` is the FK to wherever the
-        tax component routes).
-
-        Four quadrants of behavior:
-
-        1. ``taxable=False``: no tax. ``pretax = Q × P``,
-           ``tax_total = 0``, ``tax_by_acct = {}``, ``gross = Q × P``.
-
-        2. ``taxable=True, tax_included=False`` (tax-exclusive):
-           Line value IS pre-tax; tax adds on top. For each entry,
-           percentage entries contribute ``pretax × rate / 100``,
-           value entries contribute their flat amount. Each is
-           quantized independently per the per-line rounding policy
-           (auditable line-by-line, matches GnuCash desktop).
-
-        3. ``taxable=True, tax_included=True``, all-percentage
-           taxtable: Line value is gross. Pretax extracted via
-           ``pretax = gross / (1 + Σ rate / 100)``. Per-entry tax
-           computed from extracted pretax.
-
-        4. ``taxable=True, tax_included=True``, mixed value +
-           percentage: Pretax extracted via
-           ``pretax = (gross − Σ value) / (1 + Σ rate / 100)``.
-           Value entries contribute their flat amount unchanged;
-           percentage entries contribute ``pretax × rate / 100``.
-
-        **Rounding residual policy** (Quadrants 3/4): after
-        independent per-entry quantization, ``gross == pretax +
-        Σ tax`` may differ by at most one quantum. The residual is
-        applied to the largest-rate percentage entry (or the first
-        value entry as fallback for all-value tax-inclusive — an
-        edge case that's algebraically degenerate but harmless).
-        Done this way to keep the dominant tax authority's bucket
-        carrying the rounding noise rather than smearing it across
-        all entries.
-
-        Args:
-            taxable: whether this line has a taxtable applied.
-            tax_included: whether ``Q × P`` is gross (tax-inclusive)
-                or pre-tax (tax-exclusive).
-            taxtable_entries: resolved ``{type, amount, account_guid}``
-                dicts.
-            quantum: smallest unit of the invoice currency (from
-                ``_commodity_quantum``).
-
-        Returns:
-            ``{pretax, tax_total, tax_by_acct, gross}`` — all
-            ``Decimal`` values; ``tax_by_acct`` is
-            ``{account_guid: Decimal}`` with one entry per distinct
-            payable account (composite taxtables routing to the
-            same account collapse to one entry by sum).
+    def _entry_line_values(row, is_bill: bool, tax_entries):
+        """One ``entries`` row through ``_entry_math.entry_values``
+        (GnuCash's ``gncEntryComputeValueInt``), the way
+        ``gncEntryRecomputeValues`` calls it: the invoice side with
+        the line's discount, the bill side with none, and the tax
+        table only when the line is flagged taxable. Returns
+        ``(account_guid, EntryValues)`` from the STORED quantity;
+        ``_entry_math.document_totals`` applies the credit-note sign.
         """
-        line_value = quantity * price
+        from fractions import Fraction
 
-        if not taxable or not taxtable_entries:
-            # Quadrant 1, or defensive no-entries fallback (the
-            # caller should have validated; behave as no-tax).
-            qv = line_value.quantize(quantum)
-            return {
-                "pretax": qv,
-                "tax_total": Decimal(0),
-                "tax_by_acct": {},
-                "gross": qv,
-            }
-
-        sum_values = sum(
-            (
-                e["amount"]
-                for e in taxtable_entries
-                if e["type"] == "value"
-            ),
-            Decimal(0),
-        )
-        sum_rates = sum(
-            (
-                e["amount"]
-                for e in taxtable_entries
-                if e["type"] == "percentage"
-            ),
-            Decimal(0),
-        )
-        rate_factor = sum_rates / Decimal(100)
-
-        if tax_included:
-            # Quadrants 3/4: extract pretax from gross.
-            gross = line_value.quantize(quantum)
-            if rate_factor == 0:
-                # All-value tax-inclusive: pretax = gross − values.
-                pretax = (gross - sum_values).quantize(quantum)
-            else:
-                pretax = (
-                    (gross - sum_values)
-                    / (Decimal(1) + rate_factor)
-                ).quantize(quantum)
+        qty = Fraction(row.quantity_num or 0, row.quantity_denom or 1)
+        if is_bill:
+            price = Fraction(row.b_price_num or 0, row.b_price_denom or 1)
+            taxable = bool(row.b_taxable)
+            tax_included = bool(row.b_taxincluded)
+            account = row.b_acct
+            # gncEntryRecomputeValues: the bill side is computed with
+            # gnc_numeric_zero(), GNC_AMT_TYPE_VALUE, GNC_DISC_PRETAX.
+            discount = Fraction(0)
+            disc_type = _entry_math.AMT_VALUE
+            disc_how = _entry_math.DISC_PRETAX
         else:
-            # Quadrant 2: line value IS pretax.
-            pretax = line_value.quantize(quantum)
-            gross = None  # computed after tax_total
-
-        tax_by_acct: dict[str, Decimal] = {}
-        for e in taxtable_entries:
-            acct_guid = e["account_guid"]
-            if e["type"] == "percentage":
-                tax_e = (
-                    pretax * e["amount"] / Decimal(100)
-                ).quantize(quantum)
-            else:
-                tax_e = e["amount"].quantize(quantum)
-            tax_by_acct[acct_guid] = (
-                tax_by_acct.get(acct_guid, Decimal(0)) + tax_e
+            price = Fraction(row.i_price_num or 0, row.i_price_denom or 1)
+            taxable = bool(row.i_taxable)
+            tax_included = bool(row.i_taxincluded)
+            account = row.i_acct
+            discount = Fraction(
+                row.i_discount_num or 0, row.i_discount_denom or 1,
             )
-
-        tax_total = sum(tax_by_acct.values(), Decimal(0))
-
-        if tax_included:
-            # Residual adjustment: enforce gross = pretax + tax_total
-            # exactly. The residual is at most ±1 quantum from the
-            # independent per-entry rounding.
-            residual = gross - pretax - tax_total
-            if residual != 0:
-                # Find largest-rate percentage entry; fall back to
-                # first value entry if no percentage entries exist.
-                target_acct = None
-                largest_rate = Decimal(0)
-                for e in taxtable_entries:
-                    if (
-                        e["type"] == "percentage"
-                        and e["amount"] > largest_rate
-                    ):
-                        largest_rate = e["amount"]
-                        target_acct = e["account_guid"]
-                if target_acct is None:
-                    target_acct = (
-                        taxtable_entries[0]["account_guid"]
-                    )
-                tax_by_acct[target_acct] = (
-                    tax_by_acct[target_acct] + residual
-                )
-                tax_total = tax_total + residual
-        else:
-            gross = pretax + tax_total
-
-        return {
-            "pretax": pretax,
-            "tax_total": tax_total,
-            "tax_by_acct": tax_by_acct,
-            "gross": gross,
-        }
+            # A string GnuCash does not recognize keeps gncEntryCreate's
+            # default (its loader warns and moves on); rows written by
+            # server 1.2-1.4 hold ''.
+            disc_type = (
+                row.i_disc_type
+                if row.i_disc_type in (
+                    _entry_math.AMT_VALUE, _entry_math.AMT_PERCENT,
+                ) else _entry_math.DEFAULT_DISC_TYPE
+            )
+            disc_how = (
+                row.i_disc_how
+                if row.i_disc_how in (
+                    _entry_math.DISC_PRETAX, _entry_math.DISC_SAMETIME,
+                    _entry_math.DISC_POSTTAX,
+                ) else _entry_math.DEFAULT_DISC_HOW
+            )
+        return account, _entry_math.entry_values(
+            qty, price,
+            tax_entries if taxable else None,
+            tax_included,
+            discount, disc_type, disc_how,
+        )
 
     def create_taxtable(
         self,
