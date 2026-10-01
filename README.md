@@ -837,6 +837,10 @@ A condensed changelog of major releases lives in
 
 - Confirm your book is in **SQLite** format, not XML.
 - Make sure GnuCash isn't open with the same book — file lock.
+  The server honors GnuCash's lock but deliberately takes none of
+  its own (it holds the book for one call at a time), so GnuCash
+  will open a book the server is using without a warning. Don't
+  edit in both at once.
 - Try opening the book in GnuCash itself to verify it isn't
   corrupted.
 

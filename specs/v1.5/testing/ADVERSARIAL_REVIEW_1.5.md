@@ -1150,6 +1150,8 @@ Each has its test in `tests/test_review_minor.py` unless noted.
 | `c6ac896` | DS-12, FC-15, MM-10 |
 | `830bb27` | side-finding 1, SS-14 (with C10) |
 | earlier | C8 (iii), C29 (a), C52a, C52b, SS-13, SEC-11, side-findings 2, 4, 8, 10 |
+| `c192c87` | G-1 (the GUI gate's finding); test in `tests/test_converter_false_positives.py` |
+| `86fb02f` | C69, as a warning |
 
 Narrower than the finding in four places: IV-20 refuses a NUL but not
 other control characters in free text; IV-21 does not look for
@@ -1157,22 +1159,30 @@ zero-width or right-to-left characters; MM-10 covers the price list,
 not lot quantities; SEC-15 creates new files 0600 and does not
 re-mode audit files written before 1.5.
 
-### Minor tier: open, with the reason
+### Minor tier: not fixed, and how each was closed
 
-| Item | Why it is still open |
+*Rewritten 2026-10-01 after the pre-tag triage. Nothing is left
+open: each row is closed by a ruling, or named in the Known
+limitations section of the 1.5 CHANGELOG entry by the amended
+ruling 6.*
+
+| Item | Disposition |
 |---|---|
-| C11 / FC-16 no `gnclock` row taken | A design decision: whether the server should lock a book it has open only for the length of one call. |
-| C46 early-payment window anchored on `date_opened` | A policy choice; the GnuCash function the finding cited does not exist. |
-| C60 (cap) manual backups are unlimited | The store is append-only by design; a rate limit is a product call. |
-| C62 `features/Credit Notes` not stamped | A feature stamp is the riskiest row this server can write; only GnuCash before 2.5.0 reads it. |
-| C67 "Use Split Action Field for Number" ignored | Needs the option set through desktop to twin; the engine call tried from Guile did not take. Metadata only. |
-| C69 read-only day threshold ignored | Desktop enforces it in the GUI only; whether the server should warn or refuse is a product call. |
-| C20 three-decimal currencies shown at two | Display only, across four modules. |
-| C63 date-range filters compare text | Needs a careful pass over `_query.py` with pre-2.6 date formats in hand. |
-| MM-12 budget report at one year-end rate | A semantics decision (flow vs. stock), like the one already ruled for the other reports. |
-| C26, C28, C32, C53, SS-17, DS-10, DS-11, DS-16, FC-14, SEC-17 | Low; none can lose or misstate money. |
-| FC-18, FC-19, FC-20 | Observations about the demo books and the test fixtures, not defects in a tool. |
-| Side-findings 9, 11, 12, 13 | 9: a rounding edge in implied prices. 11: void on a reconciled split still only warns. 12: emoji on desktop-created MySQL tables. 13: GnuCash's own Balance Sheet on the Alex demo is off by 644.57, not attributed. |
+| C11 / FC-16 no `gnclock` row taken | Closed as designed (triage ruling 3). The README's "Cannot open book" section says so; listed under Known limitations. |
+| C62 `features/Credit Notes` not stamped | Closed as designed (triage ruling 5). Listed. |
+| C63 date-range filters compare text | Verified, no code. GnuCash 5.12 stores `post_date` as 19-character ISO text at 10:59:00 (checked on the gate book and `parity-desktop.gnucash`), so text comparison is correct for every row GnuCash 3 or later wrote. Listed for rows written by 2.6 or older. |
+| C69 read-only day threshold | Fixed as a warning, `86fb02f`. |
+| C46 early-payment window anchored on `date_opened` | Listed. Fails safe; GnuCash has no logic to match. |
+| C60 (cap) manual backups are unlimited | Listed. |
+| C67 "Use Split Action Field for Number" ignored | Listed. Metadata only. |
+| C20 three-decimal currencies shown at two | Listed. Display only. |
+| MM-12 budget report at one period-end rate | Listed. |
+| C26, C28, C32, C53, SS-17, DS-10, DS-11, DS-16, FC-14, SEC-17 | Listed, one line apiece. |
+| FC-18, FC-19, FC-20 | Listed. FC-19 is narrower than it was: the engine twins, the converter's false-positive test, and the GUI gate now run against rows GnuCash wrote. |
+| Side-findings 9, 11, 12 | Listed. |
+| Side-finding 13 (the 644.57) | The bookkeeper's, during the generator top-up. Not a server defect as far as anyone has shown. |
+| IV-20, IV-21, MM-10, SEC-15 (the narrowed fixes) | Listed, in one line. |
+| `hidden` refused by the slot tools | Endorsed as built (triage ruling 4). Listed: no tool hides an account. |
 
 ### Before this branch merges
 
@@ -1192,7 +1202,8 @@ re-mode audit files written before 1.5.
 2. The maintainer's calls flagged in each commit's summary (new
    response fields `total_note` and entry `discount`; `hidden`
    refused by the slot tools with no server alternative; budget
-   sub-cent rounding left as is).
+   sub-cent rounding left as is). *Stale since `9ae608f`: a
+   sub-unit budget amount is refused, not rounded (C40).*
 
 *Scratch material for this review (wave-1 reports `wave1_*.md`, wave-2 verdicts `wave2_G*.md`, and every reproduction script) lives in the session scratchpad at `/private/tmp/claude-501/-Users-stephen-Projects-gnucash-mcp/60d9a729-9d7d-44e5-9095-692b003ba4ea/scratchpad/`. It is not committed.*
 
@@ -1462,3 +1473,257 @@ commit on this branch. The `git checkout --` slip is closed as ruled.
 `BOOKKEEPER_TEST_PLAN_FIX_BRANCH_GUI_GATE.md`, with the book built
 and placed in the bench folder. GnuCash's engine loads the book
 headlessly; the windows have not been opened on it.
+
+## GUI gate result (2026-10-01, 00:00 to 01:40)
+
+*Written by the gate session. The maintainer worked the windows; the
+gate session ran every SELECT and every server call. Book:
+`~/Projects/abe-bench/fix-branch-gate.gnucash`, built at `00ed9a7`;
+server at `f38c8cc`; GnuCash 5.12, SQLite backend.*
+
+**Verdict: PASS.** Every step of
+`BOOKKEEPER_TEST_PLAN_FIX_BRANCH_GUI_GATE.md` passed or recorded what
+it was asked to record. So did three steps the gate session added
+from this review's own list (§10, "Before this branch merges", item
+1, and the countersignature's expanded twin set): a document link
+through a server unpost, an OFX-linked account deleted by the server,
+and a taxed, discounted invoice posted both ways. One new MINOR
+finding (G-1, below). Nothing scrubbed.
+
+Snapshots kept beside the book: `fix-branch-gate.virgin.gnucash` (as
+built), `fix-branch-gate.after-pass1.gnucash` (after the first GUI
+session, before any server write), and the server's own
+`pre-1-5-upgrade` snapshot (see G-1).
+
+### Steps
+
+| Step | Result |
+|---|---|
+| 0 Book opens | PASS. No error, no feature refusal. "Process payments on posting" switched off for the gate, so no step auto-applied a payment. |
+| 1 Prepayment lot | PASS. Process Payment listed the 20.00 and 70.00 as Pre-Payment, in the Credit column, on their own rows. 000002 with the 20.00 at zero cash left 30.00 due. |
+| 2 Unposted, payment kept | PASS. 000003 opened unposted and editable; posted 2026-01-22; the 70.00 was offered and settled it in full. |
+| 3 Billing term copy | PASS. "Net 30" listed once. 000004's terms read Net 30. The window does not show a due date; the book holds 2026-02-17 on the posting transaction's `trans-date-due`. |
+| 4 Card voucher | PASS. Hotel and Dinner as Charge; Company Card 60.00 and 25.50; Dana's A/P 40.00. |
+| 5 Off-currency invoice | RECORDED. The window shows no currency, only amounts; its post account is Receivable EUR. Process Payment lets Receivable EUR be chosen as Post To and then lists 000006. The Customer Report shows 000006 in a separate EUR section. Viewing it and running the report changed nothing: 000006's invoice row, posting splits and slots hash identical to the as-built book. Ruling 3 (refuse by default) is unaffected: the engine's owner balance still leaves 000006 out. |
+| 6 Taxed GUI post | 000005 posted at 315.00 (A/R 315, Sales −300, GST −15). The GUI created a hidden copy of T5 (`invisible=1`, parent set), and 000005's line stays on the **live** table (`points_at_copy = 0`). By the manifest's rule, **leaving lines on the live table stands.** See the qualification below. |
+| 7 Price Editor, same day | PASS. The editor asked to replace the day's price; afterwards one 2026-06-01 row, `user:price-editor`, 23/20. Desktop's rank-replacement, as the server now does it. |
+| 8 Document link through unpost (added) | PASS. Link `https://example.com/inv4.pdf` attached to 000004 in the GUI; the server unposted 000004; `assoc_uri` and `credit-note` both survived (C5). Back in the GUI the link was present; 000004 reposted 2026-01-22 (due 2026-02-21); "Net 30" still listed once. |
+| 9 OFX-linked account deleted (added) | PASS. GUI created an empty Assets:Old Bank and gave Income:Sales a note and a color. The gate session then wrote a desktop-shaped `ofx` frame on Old Bank with `ofx/associated-income-account` pointing at Sales (raw SQL; only an OFX investment import makes it in the GUI). The server deleted Old Bank: Sales kept `notes`, `color` and `balance-limit`, and no frame rows were orphaned (C7). The GUI agreed. |
+| 10 Tax and discount twin (added) | PASS. 000007 drafted in the GUI: three lines 1 × 0.10 and one line 1 × 100.00 with a 10% pretax discount, all taxable on T5. The invoice window computed subtotal 90.30, tax 4.52. Duplicated as 000009 and posted in the GUI: A/R 94.82, GST −4.52, Sales −90.30. The server posted 000007: the same three splits to the cent. Before 1.5's fixes the server would have posted 105.30 (C1, C2). |
+| After the gate | PASS. The server's reads on the GnuCash-written book raised nothing. A/R 824.94 = 30 + 200 + 315 + 90.30 + 94.82 + 94.82; Receivable EUR 100 (USD 115.00 at the new 1.15); A/P 40.00; Company Card 85.50; GST 24.04; no prepayment left over. All agree with the windows. No `gnclock` row left behind. |
+
+### Qualification to step 6
+
+000009's lines DO point at the hidden copy. GnuCash moves a posted
+line to the copy in memory and saves the move only when it writes
+that line for some other reason; the duplicated lines were freshly
+written, 000005's were loaded and untouched. Desktop therefore writes
+both shapes and reads both. The server's choice (live table) is the
+common desktop case and posts correctly either way; it found and
+skipped the hidden copy when posting 000007. The
+`unreferenced_taxtable_copy` entry in `ENGINE_DEBRIS` stays, but its
+comment should say the copy is sometimes referenced.
+
+### New finding
+
+**G-1 (MINOR): the converter rewrites line dates written by
+desktop's Duplicate Invoice, and takes a pre-1.5 snapshot on a 1.5
+book.** The server's first write after the first GUI session (the
+step 8 unpost) returned `pre_upgrade_backup`, `entries_normalized: 8`
+and `billterm_refcounts_recomputed: 1`. The 8 rows were the lines of
+000008 and 000009. Desktop's duplicate path stored their `date` at
+10:59:00 UTC (neutral time); the converter rewrote them to 19:00:00
+UTC (local noon, the entry-ledger convention). Lines typed into the
+register (000007's) were already stored at 19:00 by desktop itself.
+So both are desktop shapes, and the converter took one for a
+pre-1.5 server shape: the false positive §9, item 8 asked a test
+for. No money moved; the GUI still shows 10/01/2026 on those lines.
+Cost: rewritten desktop rows and a needless "pre-1.5 upgrade"
+snapshot on any book where an invoice has been duplicated.
+
+### Observations, not findings
+
+- An unposted invoice shows a posted date of 31-Dec-1969 in the
+  invoice window. 000003 (unposted by the server) and 000005 (never
+  posted) both store NULL and both show it; it is how the window
+  draws an empty date.
+- GnuCash left one entry row with no invoice (date_entered at the
+  epoch), most likely the invoice editor's blank row. The server
+  reads around it.
+- A no-terms invoice posted in the GUI defaults its due date to
+  today (000003, 000008, 000009), not to the post date.
+- An accidental GUI post and unpost of 000007 left GnuCash's own
+  stale `post_txn`, `post_lot` and `post_acc` (the `ENGINE_DEBRIS`
+  item). The server posted over them cleanly, so desktop debris
+  of that kind is now tested at the screen as well as in the twin.
+- Process Payment's Transfer Account list commits a payment on
+  double-click. Step 1 was restored from the as-built snapshot and
+  redone after one; the first attempt left nothing behind.
+- The countersignature's desktop-drafted credit note was not walked
+  in the GUI; `tests/test_parity_credit_note.py` covers it against
+  the engine.
+
+### Open for the maintainer
+
+1. G-1: fix before tag, or carry it on the open list.
+2. The step 6 comment change in `ENGINE_DEBRIS`.
+3. §10, item 2: the new `total_note` and entry `discount` response
+   fields; `hidden` refused by the slot tools with no server
+   alternative; budget sub-cent rounding left as is.
+
+## Bookkeeper rulings — pre-tag triage (2026-10-01, 02:00)
+
+**1. C10 tax tables: CLOSED by the gate.** Desktop writes both
+shapes (live-table on lines it loaded, hidden-copy on lines it
+rewrote), reads both, and the server posted correctly against each.
+Live-table stands. Amend the `ENGINE_DEBRIS` comment as the gate
+session proposed ("sometimes referenced").
+
+**2. G-1: FIX BEFORE TAG.** This is C9's bug class recurring — the
+converter inferring provenance from content (a 10:59 entry date)
+and rewriting rows desktop made. The cure is already on the branch:
+gate `entries_normalized` on the same pre-1.5 fingerprint C9's fix
+uses (`i_disc_type = ''`), which desktop's duplicate path never
+writes. A final version whose converter rewrites desktop rows and
+takes "pre-1.5 upgrade" snapshots of 1.5 books contradicts the
+release's core claim; the fix is one gate on an existing pass plus
+the §9-item-8 test. Small, and it should not ship wrong.
+
+**3. C11 gnclock: CLOSED AS DESIGNED.** The server does not take a
+gnclock row. A call-length lock that survives a crash wedges
+desktop with a stale "book is locked" the user must override —
+worse than the thing it prevents. The existing etiquette (refuse a
+desktop-locked book cleanly; database-level integrity inside a
+call) is the safer asymmetry. One line in the docs saying so.
+
+**4. The three maintainer calls: ENDORSED AS BUILT.** `total_note`
+and entry `discount` response fields (additive; name them in the
+release notes); `hidden` refused by the slot tools with no server
+alternative (safe for 1.5; an alternative is patch material);
+budget sub-cent rounding left as is.
+
+**5. C62 feature stamp: CLOSED AS DESIGNED** — concur; a feature
+stamp is the riskiest row this server could write and only
+pre-2.5.0 GnuCash reads it. Conservatism doctrine applies.
+
+**6. Everything else on the open list is post-tag patch material**,
+with two priorities for the first patch cycle: C63 (text date
+comparison can misstate query results — money-adjacent) and C69
+(warn inside desktop's read-only window). C46, C20, C67, MM-12 and
+the low tier follow. Side-finding 13 (the 644.57) stays claimed by
+the bookkeeper for the generator top-up. MM-12 gets a proper
+semantics ruling when the patch cycle asks for it.
+
+**Final clearance condition:** G-1's fix lands with its test and
+the suite stays green. On that, `fix/v1.5-adversarial-blockers` is
+cleared by the bookkeeper for merge and tag.
+
+### Amendment to ruling 6 (2026-10-01, 02:05)
+
+The maintainer advises no post-tag development period should be
+assumed. Ruling 6's "first patch cycle" framing is therefore
+retired and the open list re-ranked by a harsher test: safe to
+leave forever, or not.
+
+- **Before tag, budget permitting:** C63 (first VERIFY: if stored
+  dates are ISO, text comparison is correct and a Known-Limitations
+  line about pre-2.6 books closes it at zero code); C69 as a warn.
+- **Before the samples freeze:** side-finding 13 (the 644.57),
+  chased by the bookkeeper during the generator top-up.
+- **Abandoned formally:** everything else open, each named in a
+  KNOWN LIMITATIONS section of the 1.5 release notes, one line
+  apiece. Documented boundaries, not silent gaps. G-1 is confirmed
+  fixed; the final clearance condition in the pre-tag triage is
+  met once the suite is green on that commit.
+
+## Fix-branch response to the pre-tag triage (2026-10-01, morning)
+
+*Written by the fix session. Branch at `86fb02f` plus the docs
+commit that carries this section.*
+
+**Ruling 1 (C10 tax tables).** Closed. The `ENGINE_DEBRIS` comment
+for `unreferenced_taxtable_copy` says the copy is sometimes
+referenced and records what the gate saw (in `c192c87`).
+
+**Ruling 2 (G-1).** Fixed in `c192c87`, and wider than the one gate
+the ruling asked for. Every pass of `_migrate_business_shapes` now
+keys on a mark the old server left, read once at the top:
+
+| Rows | The old server's mark |
+|---|---|
+| Entries | `i_disc_type` empty. Desktop always writes `VALUE` or `PERCENT`. |
+| Documents | Holds an old entry, or `billto_type = 0` with no `billto_guid`. |
+| Slots | piecash's filler columns: `double_val = 0` on a non-double slot, or a NULL `timespec_val` on a non-timespec slot. GnuCash leaves the first NULL and the second at the epoch. |
+| Payments | A `P` or `L` transaction whose `date-posted` slot carries those fillers. |
+| Lots | An empty `notes` slot carrying those fillers. |
+
+A row with no mark is not read as old, whatever its values. The
+billing-term refcount pass now only raises a count that is too low
+and skips hidden copies, so desktop's own inflated counts are left
+alone. A converting write that finds nothing to convert withdraws
+the snapshot it took, so a 1.5 book no longer collects a
+`pre-1-5-upgrade` file.
+
+The §9-item-8 test is `tests/test_converter_false_positives.py`:
+a 1.5-written book, hand-built desktop shapes (a duplicated
+invoice's 10:59 line dates among them), a live engine run when
+`gnucash-cli` is installed, and an old-fingerprint control that
+must still convert. Each "untouched" case compares every row of
+every table before and after. On the gate's own after-pass-1
+snapshot the converter reports nothing and changes no row; the
+three committed pre-1.5 sample books still convert in full (54, 29
+and 12 entries).
+
+**Ruling 3 (C11).** The line is in the README's "Cannot open book"
+section and under Known limitations.
+
+**Ruling 4 (maintainer calls).** The release notes name
+`total_note` and `discount` in a new "New response fields, all
+additive" line under Changed, with the others this branch added.
+One correction to the ruling's text: "budget sub-cent rounding left
+as is" was true when §10 was first written and stopped being true
+at `9ae608f`. `set_budget_amount` now REFUSES an amount finer than
+the currency's unit (C40). Nothing rounds silently. If the
+bookkeeper would rather it rounded, that is a one-line change; the
+refusal matches `reconcile_account` and `apply_credit_note`.
+
+**Ruling 5 (C62).** Closed; listed under Known limitations.
+
+**Ruling 6 as amended.**
+
+- *C63, verified first.* GnuCash 5.12 writes `post_date` as
+  `YYYY-MM-DD HH:MM:SS` at 10:59:00, on the gate book and on
+  `parity-desktop.gnucash`. Text comparison is correct for those
+  rows. Closed at zero code with a Known limitations line. One
+  correction to the ruling's wording: the compact form belongs to
+  rows GnuCash 2.6 or older wrote (3.0 began writing ISO text;
+  2.6.20 was the first release able to read it), so the line says
+  "2.6 or older", not "pre-2.6".
+- *C69, as a warning.* `86fb02f`. The option is the book slot
+  `options/Accounts/Day Threshold for Read-Only Transactions (red
+  line)`, a double. Both facts were put to GnuCash 5.12's engine
+  rather than read off the source: a book with that slot at 30.0
+  answers 30 from `qof_book_get_num_days_autoreadonly`, the same
+  number stored as an int64 answers 0, and
+  `xaccTransIsReadonlyByPostedDate` says yes to a transaction 40
+  days old and no to one exactly 30 days old. The server therefore
+  reads only the double and warns strictly before the date. The
+  warning rides create, batch create, `enter_statement` (dry run
+  and commit), the three update forms, `replace_splits`, void,
+  unvoid, and both deletes. Business postings and scheduled
+  instantiation do not warn: desktop's post and payment dialogs and
+  its since-last-run do not check the option either. Fourteen tests
+  in `TestC69TheReadOnlyPeriodIsNamed`.
+- *Abandoned formally.* The CHANGELOG's 1.5 entry has a Known
+  limitations section, one line for each item in the table at
+  "Minor tier: not fixed, and how each was closed" above.
+- *Side-finding 13* stays with the bookkeeper.
+
+**Verification at `86fb02f`.** Full suite 3119 passed, 32 skipped.
+PostgreSQL gate 88 passed, 16 skipped. MySQL gate (local MariaDB,
+scratch database) 88 passed, 16 skipped. Nothing is pushed: the branch is 18 commits ahead
+of `origin/fix/v1.5-adversarial-blockers`, plus the docs commit.
+
+**The final clearance condition** (G-1's fix lands with its test,
+suite green) is met at `c192c87` and still holds at `86fb02f`.
+
