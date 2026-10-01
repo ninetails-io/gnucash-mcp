@@ -256,6 +256,9 @@ def register(mcp, get_book) -> None:
           ``DATE<TAB>guid<TAB>±Amount<TAB>Description<TAB>other splits``
           Column 3 is the signed impact on the filtered account; that
           account is dropped from the splits column.
+        - Either form then adds the notes when present, and a
+          labeled ``num:<number>`` cell when the transaction has a
+          Num.
 
         Transactions with more than 4 splits collapse to the top 3 by
         |value| plus ``+N more`` — call ``get_transaction`` for the
@@ -662,10 +665,13 @@ def register(mcp, get_book) -> None:
         offset: int = 0,
         verbose: bool = False,
     ) -> str:
-        """Search transactions by description, memo, notes, or amount.
+        """Search transactions by description, memo, notes, num, or
+        amount.
 
         Compact format (default):
-        ``DATE<TAB>guid<TAB>Description<TAB>splits``
+        ``DATE<TAB>guid<TAB>Description<TAB>splits``, then the notes
+        when present and a labeled ``num:<number>`` cell when the
+        transaction has a Num.
         Transactions with more than 4 splits collapse to the top 3 by
         |value| plus ``+N more`` — call ``get_transaction`` for the
         full breakdown. Leads with a ``Showing X-Y of Z transactions``
@@ -673,7 +679,10 @@ def register(mcp, get_book) -> None:
 
         Args:
             query: Search query string. For amount, supports: exact ("100"), greater (">100"), less ("<100"), range ("100-200")
-            field: Field to search: 'description', 'memo', 'notes', or 'amount'
+            field: Field to search: 'description', 'memo', 'notes',
+                'num', or 'amount'. 'num' is GnuCash's Num column (a
+                check number, invoice or receipt reference) —
+                substring match, like the text fields.
             limit: Page size (default 50, max 250). 0 = count only.
             offset: 0-indexed first row to return (default 0).
             verbose: If false (default), compact text output — optimized

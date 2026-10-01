@@ -286,3 +286,36 @@ def test_option_key_is_desktops():
     assert _NUM_SOURCE_KEY == (
         "options/Accounts/Use Split Action Field for Number"
     )
+
+
+class TestSearch:
+    def test_finds_by_num(self, test_book):
+        gc = GnuCashBook(str(test_book))
+        gc.create_transactions(_parse_transactions_tsv(_BATCH))
+        out = gc.search_transactions("er 26", field="num")
+        assert "Office chairs" in out
+        assert out.splitlines()[1].endswith("\tnum:ER 2658")
+        assert "Office chairs" not in gc.search_transactions(
+            "AR", field="num",
+        )
+
+    def test_split_action_counts_when_option_on(self, statement_book):
+        """Desktop's Find "Number/Action": with the option on, a
+        split's action is the Num; with it off, an action is not."""
+        b = piecash.open_book(
+            str(statement_book), readonly=False, open_if_lock=True,
+        )
+        (rent,) = [t for t in b.transactions if t.description == "July Rent"]
+        rent.splits[0].action = "EFT 88"
+        b.save()
+        b.close()
+        gc = GnuCashBook(str(statement_book))
+        assert "July Rent" not in gc.search_transactions("EFT", field="num")
+        _num_on_split_action(statement_book)
+        assert "July Rent" in gc.search_transactions("EFT", field="num")
+
+    def test_unknown_field_still_rejects(self, test_book):
+        with pytest.raises(ValueError):
+            GnuCashBook(str(test_book)).search_transactions(
+                "x", field="number",
+            )

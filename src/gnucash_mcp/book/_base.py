@@ -1421,6 +1421,10 @@ def _transaction_to_compact_line(
 
           YYYY-MM-DD<TAB>guid<TAB>±Amount<TAB>Description<TAB>Other splits[, +N more]
 
+    Either shape then carries the notes cell when the transaction
+    has notes, and a labeled ``num:<number>`` cell when it has a
+    number.
+
       The checking-register view: column 3 is the signed impact on
       the filtered account (what a reconciler reads), whose own
       splits are summed into it and dropped from the split list.
@@ -1468,6 +1472,11 @@ def _transaction_to_compact_line(
 
     if transaction.notes:
         line += f"\t{_tsv_cell(transaction.notes)}"
+    # Labeled, not positional: notes is already an optional trailing
+    # cell, and the number must never ride inside the description
+    # (auto-fill matches on description).
+    if transaction.num:
+        line += f"\tnum:{_tsv_cell(transaction.num)}"
     return line
 
 

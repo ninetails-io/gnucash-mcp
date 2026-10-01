@@ -6391,7 +6391,12 @@ class CoreMixin:
         Args:
             query: Search string. For 'amount': exact ("100.00"),
                 ">100", "<100", or range "100-200".
-            field: 'description', 'memo', 'notes', or 'amount'.
+            field: 'description', 'memo', 'notes', 'num', or
+                'amount'. 'num' matches what the book's register
+                calls Num: the transaction number, and — in a book
+                that keeps Num on split actions ("Use Split Action
+                Field for Number") — any split's action as well,
+                desktop's Find "Number/Action".
             limit: Page size. Capped at 250. ``0`` = count only.
             offset: 0-indexed first row to return.
             compact: One line per transaction (default) or a verbose
@@ -6400,10 +6405,13 @@ class CoreMixin:
         Raises:
             ValueError: If field is not valid.
         """
-        if field not in ("description", "memo", "notes", "amount"):
+        if field not in ("description", "memo", "notes", "num", "amount"):
             raise ValueError(f"Invalid search field: {field}")
 
         with self.open(readonly=True) as book:
+            num_on_split = (
+                field == "num" and self._num_is_split_action(book)
+            )
             # Whole-book scan: the template filter reads every
             # transaction's splits, the memo and amount modes every
             # split, the notes mode every transaction's slots — one
@@ -6435,6 +6443,16 @@ class CoreMixin:
                         if split.memo and query.lower() in split.memo.lower():
                             matched.append(transaction)
                             break
+
+                elif field == "num":
+                    q = query.lower()
+                    if q in (transaction.num or "").lower() or (
+                        num_on_split and any(
+                            q in (s.action or "").lower()
+                            for s in transaction.splits
+                        )
+                    ):
+                        matched.append(transaction)
 
                 elif field == "amount":
                     if self._match_amount(transaction, query):
