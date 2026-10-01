@@ -5521,8 +5521,7 @@ class CoreMixin:
             def _book_amount(ln) -> Decimal:
                 return (sign * amounts[ln["ref"]]).quantize(quantum)
 
-            # A candidate's Num is what this account's register shows
-            # in the Num column (gnc_get_num_action with its split).
+            # A candidate's numbers: _statement_cand_nums.
             num_on_split = self._num_is_split_action(book)
 
             def _candidates_for(ln) -> list[dict]:
@@ -5560,7 +5559,7 @@ class CoreMixin:
                     )
                     num_char = _num_signal(
                         ln.get("num"),
-                        [s.action if num_on_split else s.transaction.num],
+                        self._statement_cand_nums(s, num_on_split),
                     )
                     if not (
                         amount_match or (desc_match and date_match)
@@ -5612,6 +5611,19 @@ class CoreMixin:
                 force_base, force_duplicates, default_currency,
                 warn_rows=warn_rows,
             )
+
+    @staticmethod
+    def _statement_cand_nums(split, num_on_split: bool) -> list[str]:
+        """The numbers a statement candidate carries: the
+        transaction's Num, plus, when the book keeps the register's
+        Num on split actions, this account's split action. With the
+        option on, the transaction's Num is desktop's T-Num, where
+        batch entry writes a number as desktop's CSV importer does;
+        the batch screen reads both, so the statement screen must
+        too, or a check entered by batch shows no number here."""
+        return [split.transaction.num] + (
+            [split.action] if num_on_split else []
+        )
 
     def _statement_prep_create(
         self, book, account, ln, book_amount, default_currency,
@@ -5934,9 +5946,11 @@ class CoreMixin:
                     ),
                     "desc_old": txn.description or "",
                     "num_new": ln.get("num", ""),
-                    "num_old": (
-                        s.action if num_on_split else txn.num
-                    ) or "",
+                    "num_old": " / ".join(dict.fromkeys(
+                        n for n in reversed(
+                            self._statement_cand_nums(s, num_on_split)
+                        ) if n
+                    )),
                     "notes_old": txn.notes or "",
                     "memo_old": s.memo or "",
                     "cat_new": (

@@ -442,6 +442,43 @@ class TestStatementScan:
         out_lines = self._run(statement_book, "")["lines"]
         assert out_lines.splitlines()[1].split("\t")[1] == "MATCH"
 
+    def test_option_on_sees_the_transaction_num(self, statement_book):
+        """With "Use Split Action Field for Number" on, batch entry
+        still writes transactions.num (desktop's T-Num). The
+        statement screen read only the split action, so a check
+        entered by batch had no number there and a different-numbered
+        twin was offered as its MATCH (bookkeeper report N-1)."""
+        self._number_rent(statement_book, "1041")
+        _num_on_split_action(statement_book)
+        same = self._run(statement_book, "1041")
+        assert same["lines"].splitlines()[1].split("\t")[1] == "MATCH"
+        (cand,) = _table(same["candidates"])
+        assert (cand["signals"], cand["num_old"]) == ("-ADN", "1041")
+        other = self._run(statement_book, "1042")
+        assert other["lines"].splitlines()[1].split("\t")[1] == "NEW"
+        (cand,) = _table(other["candidates"])
+        assert (cand["signals"], cand["confidence"]) == ("-ADx", "MEDIUM")
+        out = self._run(statement_book, "1042", dry_run=False)
+        assert "\tcreated\t" in out["results"]
+
+    def test_option_on_num_old_shows_register_num_first(
+        self, statement_book,
+    ):
+        """Both numbers present and different: the register's Num
+        (the split action) leads, the transaction's Num follows."""
+        self._number_rent(statement_book, "INV 7")
+        b = piecash.open_book(
+            str(statement_book), readonly=False, open_if_lock=True,
+        )
+        (rent,) = [t for t in b.transactions if t.description == "July Rent"]
+        (leg,) = [s for s in rent.splits if s.account.name == "Checking"]
+        leg.action = "1041"
+        b.save()
+        b.close()
+        _num_on_split_action(statement_book)
+        (cand,) = _table(self._run(statement_book, "1041")["candidates"])
+        assert (cand["signals"], cand["num_old"]) == ("-ADN", "1041 / INV 7")
+
 
 def test_signals_are_read_through_the_helpers():
     """Counting lit characters by hand read a Num conflict ("x") as
