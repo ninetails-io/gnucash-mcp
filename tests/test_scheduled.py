@@ -2181,3 +2181,81 @@ class TestLegacyRecipeWarning:
         assert "crashes" in line and "update_scheduled_transaction" in line
         gb.update_scheduled_transaction(a["guid"])
         assert "on the 1.4 recipe" not in gb.get_book_summary()
+
+
+class TestDesktopFormulaAmounts:
+    """Review C19. GnuCash's formula parser stores "100/3" as the
+    exact rational 100 over 3, and "1234/12" reduced to 617 over 6.
+    The reader quantized to 1/denominator, which has no decimal form:
+    ``decimal.InvalidOperation``, raised all the way through
+    ``get_book_summary`` — the first call an assistant makes."""
+
+    def _thirds(self, scheduled_book, num, denom, enabled=True):
+        import sqlite3
+        gb = GnuCashBook(str(scheduled_book))
+        made = gb.create_scheduled_transaction(
+            name="Shared rent", description="Rent share",
+            splits=[
+                {"account": "Expenses:Rent", "amount": "33.33"},
+                {"account": "Assets:Checking", "amount": "-33.33"},
+            ],
+            start_date=date.today().isoformat(), frequency="monthly",
+        )
+        if not enabled:
+            gb.update_scheduled_transaction(made["guid"], enabled=False)
+        con = sqlite3.connect(str(scheduled_book))
+        changed = con.execute(
+            "UPDATE slots SET numeric_val_num = ?, numeric_val_denom = ? "
+            "WHERE name LIKE 'sched-xaction/%-numeric' "
+            "AND numeric_val_num = 3333",
+            (num, denom),
+        ).rowcount
+        con.commit()
+        con.close()
+        assert changed == 2
+        return gb, made["guid"]
+
+    @pytest.mark.parametrize("num,denom,expected", [
+        (100, 3, "33.33"), (617, 6, "102.83"), (200, 3, "66.67"),
+    ])
+    def test_every_reader_survives(self, scheduled_book, num, denom, expected):
+        gb, guid = self._thirds(scheduled_book, num, denom)
+
+        summary = gb.get_book_summary()
+        assert "check failed" not in summary
+        assert expected in str(gb.get_upcoming_transactions(days=40))
+        assert expected in str(gb.list_scheduled_transactions(compact=False))
+        # Both legs round the same way, so the instance balances.
+        made = gb.create_transaction_from_scheduled(guid=guid)
+        assert made["status"] == "created"
+
+    def test_a_disabled_schedule_does_not_take_the_dashboard_down(
+        self, scheduled_book,
+    ):
+        """The dashboard reads every recipe before checking
+        ``enabled``."""
+        gb, _ = self._thirds(scheduled_book, 100, 3, enabled=False)
+        assert "check failed" not in gb.get_book_summary()
+
+    def test_decimal_denominators_keep_their_precision(self):
+        from gnucash_mcp.book.scheduling import SchedulingMixin
+        amount = SchedulingMixin._rational_amount
+        assert str(amount(4250, 100, 100)) == "42.50"
+        assert str(amount(25, 1, 100)) == "25"
+        assert str(amount(-185000, 100, 100)) == "-1850.00"
+        assert str(amount(1, 3, 1)) == "0"          # a zero-decimal currency
+        assert str(amount(-100, 3, 100)) == "-33.33"
+
+    def test_a_reader_failure_costs_one_line_not_the_summary(
+        self, scheduled_book, monkeypatch,
+    ):
+        gb, _ = self._thirds(scheduled_book, 4250, 100)
+
+        def boom(self, book, days):
+            raise RuntimeError("recipe unreadable")
+
+        monkeypatch.setattr(type(gb), "_upcoming_within_days", boom)
+        summary = gb.get_book_summary()
+        assert "Upcoming-schedule check failed" in summary
+        assert "recipe unreadable" in summary
+        assert "Scheduled:" in summary

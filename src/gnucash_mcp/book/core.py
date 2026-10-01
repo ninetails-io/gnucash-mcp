@@ -3078,8 +3078,24 @@ class CoreMixin:
             # contradiction; "further" tells the reader where the
             # bucket begins.
             further = "further " if overdue_count > 0 else ""
+            upcoming = None
+            failed = None
             if hasattr(self, "_upcoming_within_days"):
-                upcoming = self._upcoming_within_days(book, days=7)
+                try:
+                    upcoming = self._upcoming_within_days(book, days=7)
+                except Exception as exc:
+                    # This read walks every schedule's recipe. One
+                    # it cannot parse must cost the dashboard one
+                    # line, not the whole summary (a desktop formula
+                    # of "100/3" once did exactly that).
+                    failed = self._check_failed(
+                        book, "Upcoming-schedule", exc,
+                    )
+            if failed is not None:
+                lines.append(line)
+                lines.append(f"⚠ {failed}")
+                return lines
+            if upcoming is not None:
                 if upcoming["count"] > 0:
                     plural = (
                         "s" if upcoming["count"] != 1 else ""

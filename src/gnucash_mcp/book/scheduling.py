@@ -432,17 +432,45 @@ class SchedulingMixin:
         return {r[0]: tuple(r[1:]) for r in rows}
 
     @staticmethod
-    def _slot_amount(children, numeric_key, formula_key):
+    def _rational_amount(num: int, denom: int, fraction: int) -> Decimal:
+        """A stored ``num/denom`` as a Decimal.
+
+        A decimal denominator keeps its precision as typed (4250/100
+        is 42.50, not 42.5), exactly, at any magnitude. Any OTHER
+        denominator is a formula desktop evaluated and stored as the
+        exact rational — "100/3" is 100 over 3, "1234/12" is 617 over
+        6 (gnc-exp-parser divides with GNC_HOW_DENOM_EXACT and
+        reduces) — and has no finite decimal form: it is rounded
+        half-up to ``fraction``, the template currency's, which is
+        what GnuCash's split setters do when Since-Last-Run turns
+        the template into a transaction. Quantizing to ``1/denom``
+        instead raised ``decimal.InvalidOperation`` (a third needs
+        more digits than the context has) and took ``get_book_
+        summary`` down with it, on any book holding such a schedule,
+        enabled or not (adversarial review 2026-09-30, C19).
+        """
+        from fractions import Fraction
+
+        from gnucash_mcp.book import _entry_math
+
+        places = len(str(denom)) - 1
+        if denom == 10 ** places:
+            return Decimal(num).scaleb(-places)
+        return _entry_math.round_half_up(Fraction(num, denom), fraction)
+
+    @staticmethod
+    def _slot_amount(children, numeric_key, formula_key, fraction=100):
         """Debit or credit side of a template split: the numeric when
         present and non-zero (what Since-Last-Run prefers), else the
         formula parsed as a plain number, else None (a formula with
-        variables — GnuCash prompts; we refuse)."""
+        variables — GnuCash prompts; we refuse). ``fraction`` is the
+        template currency's, for a numeric with no decimal form
+        (``_rational_amount``)."""
         num = children.get(numeric_key)
         if num and num[3] is not None and num[4] and num[3] != 0:
-            value = Decimal(num[3]) / Decimal(num[4])
-            # 4250/100 is 42.50, not 42.5 — keep the fraction's
-            # precision so amounts round-trip as typed.
-            return value.quantize(Decimal(1) / Decimal(num[4]))
+            return SchedulingMixin._rational_amount(
+                int(num[3]), int(num[4]), fraction,
+            )
         formula = children.get(formula_key)
         text_val = (formula[1] or "").strip() if formula else ""
         if not text_val:
@@ -514,9 +542,11 @@ class SchedulingMixin:
                     continue
                 debit = self._slot_amount(
                     ch, self._SX_DEBIT_NUMERIC, self._SX_DEBIT_FORMULA,
+                    txn.currency.fraction,
                 )
                 credit = self._slot_amount(
                     ch, self._SX_CREDIT_NUMERIC, self._SX_CREDIT_FORMULA,
+                    txn.currency.fraction,
                 )
                 if debit is None or credit is None:
                     bad = (ch.get(self._SX_DEBIT_FORMULA) or ch.get(
@@ -537,11 +567,9 @@ class SchedulingMixin:
                     book, split_guid, self._MCP_FRAME,
                 ).get(self._MCP_QUANTITY)
                 if q and q[4]:
-                    leg["quantity"] = str(
-                        (Decimal(q[3]) / Decimal(q[4])).quantize(
-                            Decimal(1) / Decimal(q[4])
-                        )
-                    )
+                    leg["quantity"] = str(self._rational_amount(
+                        int(q[3]), int(q[4]), int(q[4]),
+                    ))
                 recipe["splits"].append(leg)
             # The splits table has no sequence column, so the
             # caller's order is not recoverable; ledger order
