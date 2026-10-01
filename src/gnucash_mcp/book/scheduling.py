@@ -15,7 +15,7 @@ Depends on shared helpers from BaseGnuCashBook:
 """
 
 from datetime import date, datetime, timedelta
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 import uuid
 
 import piecash
@@ -1464,28 +1464,66 @@ class SchedulingMixin:
             # quantity (GnuCash asks for the rate at Since-Last-Run).
             # Answer the one variable we can: the rate on file at
             # the instance date. No rate → refuse, naming the leg.
-            rates = None
+            #
+            # The rate goes into a stored quantity, so it is chosen
+            # the way a POSTING chooses one, not the way a report
+            # values a holding: from quotes somebody entered or
+            # fetched (never a transaction's own implied rate — an
+            # instance priced off the last instance's echo refreshes
+            # that echo forever and the stale-price warning goes
+            # quiet), and within the staleness window. This read used
+            # ``_rates_as_of``, which has no age limit and counts
+            # implied and forecast rows: a schedule booked 100 EUR at
+            # a 984-day-old rate without a word while post_document
+            # on the same book refused (adversarial review
+            # 2026-09-30, C18).
+            from gnucash_mcp.book._currency import (
+                _fx_guard_days,
+                _fx_staleness_days,
+            )
+
+            rate_notes: list[str] = []
             for s in splits:
                 if s.get("quantity") is not None:
                     continue
                 acct = self._resolve_account(book, s["account"])
                 if acct is None or acct.commodity == txn_currency:
                     continue
-                if rates is None:
-                    rates = self._rates_as_of(book, txn_date, txn_currency)
-                rate = rates.get(acct.commodity.guid)
-                if not rate:
+                pair = (
+                    f"{acct.commodity.mnemonic}/{txn_currency.mnemonic}"
+                )
+                with self._market_prices_only(book):
+                    aged = self._find_exchange_rate_aged(
+                        book, acct.commodity, txn_currency, txn_date,
+                    )
+                if aged is None:
+                    cap = _fx_staleness_days()
+                    window = f" within {cap} days of" if cap > 0 else " for"
                     raise ValueError(
                         f"Cannot instantiate '{sx.name}': the leg on "
                         f"{acct.fullname} is in {acct.commodity.mnemonic} "
-                        f"and no {acct.commodity.mnemonic}/"
-                        f"{txn_currency.mnemonic} rate is on file for "
-                        f"{txn_date.isoformat()}. create_price, or run "
-                        f"it from GnuCash desktop."
+                        f"and no {pair} quote is on file{window} "
+                        f"{txn_date.isoformat()}. Add one with "
+                        f"create_price(commodity="
+                        f"'{acct.commodity.mnemonic}', "
+                        f"namespace='{acct.commodity.namespace}', "
+                        f"currency='{txn_currency.mnemonic}', "
+                        f"value='...', date='{txn_date.isoformat()}'), "
+                        f"or run it from GnuCash desktop, which asks "
+                        f"for the rate."
+                    )
+                rate, age_days, price_date = aged
+                guard = _fx_guard_days()
+                if guard > 0 and age_days > guard:
+                    rate_notes.append(
+                        f"{acct.fullname}: converted at the {pair} "
+                        f"quote of {price_date.isoformat()}, "
+                        f"{age_days} days from the transaction date"
                     )
                 s["quantity"] = str(
                     (_to_decimal(s["amount"]) / rate).quantize(
-                        _commodity_quantum(acct.commodity)
+                        _commodity_quantum(acct.commodity),
+                        rounding=ROUND_HALF_UP,
                     )
                 )
 
@@ -1564,6 +1602,8 @@ class SchedulingMixin:
         }
         if remaining is not None:
             response["remaining_occurrences"] = remaining
+        if rate_notes:
+            response["warnings"] = rate_notes
         response.update(shapes)
         if txn_result.get("status") == "rejected":
             # Evidence that the rejection is the CORRECT outcome —

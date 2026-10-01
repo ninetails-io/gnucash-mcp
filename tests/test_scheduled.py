@@ -1918,7 +1918,7 @@ class TestNativeTemplatesFX:
                 "DELETE FROM slots WHERE name IN ('gnc-mcp', 'gnc-mcp/quantity')"
             ))
             book.save()
-        with pytest.raises(ValueError, match="Euro Savings.*EUR/USD rate"):
+        with pytest.raises(ValueError, match="Euro Savings.*EUR/USD quote"):
             gb.create_transaction_from_scheduled(guid=sx["guid"])
         gb.create_price(commodity="EUR", namespace="CURRENCY", value="1.10", currency="USD",
                         price_date=date.today())
@@ -1926,6 +1926,78 @@ class TestNativeTemplatesFX:
         txn = gb.get_transaction(r["transaction_guid"])
         eur = next(s for s in txn["splits"] if s["account"] == "Assets:Euro Savings")
         assert Decimal(eur["quantity"]) == Decimal("-100.00")
+        assert "warnings" not in r
+
+    def _desktop_shaped(self, gb):
+        """A schedule whose EUR leg carries no stored quantity, as
+        desktop writes one."""
+        from sqlalchemy import text
+        sx = self._eur_schedule(gb)
+        with gb.open(readonly=False) as book:
+            book.session.execute(text(
+                "DELETE FROM slots WHERE name IN ('gnc-mcp', 'gnc-mcp/quantity')"
+            ))
+            book.save()
+        return sx
+
+    def test_a_transactions_own_implied_rate_is_not_a_quote(
+        self, multi_currency_book,
+    ):
+        """Review C18. The fixture's only EUR/USD row is the implied
+        rate of a 2024 transaction. The instance used to book 100 EUR
+        at it, years stale, without a word — while post_document on
+        the same book refused — and then left a fresh implied row
+        dated today that silenced the stale-price warning."""
+        from sqlalchemy import text
+        gb = GnuCashBook(str(multi_currency_book))
+        sx = self._desktop_shaped(gb)
+        with gb.open(readonly=True) as book:
+            kinds = {r[0] for r in book.session.execute(
+                text("SELECT type FROM prices")
+            )}
+        assert kinds == {"transaction"}
+
+        with pytest.raises(ValueError, match="no EUR/USD quote is on file"):
+            gb.create_transaction_from_scheduled(guid=sx["guid"])
+
+    def test_an_old_quote_is_used_and_named(self, multi_currency_book):
+        gb = GnuCashBook(str(multi_currency_book))
+        sx = self._desktop_shaped(gb)
+        quoted = date.today() - timedelta(days=20)
+        gb.create_price(commodity="EUR", namespace="CURRENCY", value="1.10",
+                        currency="USD", price_date=quoted)
+        r = gb.create_transaction_from_scheduled(guid=sx["guid"])
+        assert r["status"] == "created"
+        note = " ".join(r["warnings"])
+        assert quoted.isoformat() in note and "20 days" in note
+
+    def test_a_quote_past_the_staleness_window_is_refused(
+        self, multi_currency_book,
+    ):
+        gb = GnuCashBook(str(multi_currency_book))
+        sx = self._desktop_shaped(gb)
+        gb.create_price(commodity="EUR", namespace="CURRENCY", value="1.10",
+                        currency="USD",
+                        price_date=date.today() - timedelta(days=200))
+        with pytest.raises(ValueError, match="within 90 days"):
+            gb.create_transaction_from_scheduled(guid=sx["guid"])
+
+    def test_the_refusal_names_a_call_that_fixes_it(self, multi_currency_book):
+        import re
+        gb = GnuCashBook(str(multi_currency_book))
+        sx = self._desktop_shaped(gb)
+        with pytest.raises(ValueError) as refusal:
+            gb.create_transaction_from_scheduled(guid=sx["guid"])
+        call = re.search(r"create_price\((.*?)\)", str(refusal.value)).group(1)
+        args = dict(re.findall(r"(\w+)='([^']*)'", call))
+        gb.create_price(
+            commodity=args["commodity"], namespace=args["namespace"],
+            currency=args["currency"], value="1.10",
+            price_date=date.fromisoformat(args["date"]),
+        )
+        assert gb.create_transaction_from_scheduled(
+            guid=sx["guid"],
+        )["status"] == "created"
 
 
 
