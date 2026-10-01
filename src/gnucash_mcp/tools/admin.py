@@ -10,6 +10,7 @@ from gnucash_mcp.logging_config import (
     audit_log,
     get_log_dir,
 )
+from gnucash_mcp._format import _book_display_name
 from gnucash_mcp.tools._helpers import _json, safe_tool
 
 
@@ -198,6 +199,16 @@ def register(mcp, get_book) -> None:
                     header = "\n".join(header_lines[:i]).rstrip()
                     blocks.insert(0, "\n".join(header_lines[i:]))
                     break
+
+        if header:
+            # Day files written before 1.5 carry the book's absolute
+            # path in their header (it is baked in when the file is
+            # created). Name the book as everything else names it.
+            header = re.sub(
+                r"(?m)^Book: (.*)$",
+                lambda m: f"Book: {_book_display_name(m.group(1).strip())}",
+                header,
+            )
 
         total = len(blocks)
         # Recency-anchored window: offset counts back from the newest

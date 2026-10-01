@@ -19,6 +19,7 @@ from typing import Callable
 from gnucash_mcp._env import _env_errors, _parse_env_toggle
 from gnucash_mcp._format import (
     _URI_IN_TEXT_RE as _DB_URI_IN_TEXT_RE,
+    _book_display_name,
     _scrub_credentials,
 )
 
@@ -508,8 +509,14 @@ def setup_logging(
         audit_logger.propagate = False
 
         # Opened by path per entry (see _DailyFileHandler); the
-        # header names the book the way a human knows it.
-        book_label = display_name or book_path
+        # header names the book the way a human knows it — its
+        # filename, never its directory. ``get_audit_log`` returns
+        # this header to the model on every call, and a file book
+        # arrived here as its full path (only a database book passed
+        # a display name), so the user's home layout and client
+        # folder names went out with it whatever the redaction flag
+        # said.
+        book_label = display_name or _book_display_name(book_path)
         audit_handler = _DailyFileHandler(
             audit_dir, ".txt",
             header_fn=lambda day: _format_text_header(

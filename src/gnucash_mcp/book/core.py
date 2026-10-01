@@ -22,7 +22,6 @@ import piecash
 
 from gnucash_mcp.logging_config import DEBUG_LOGGER_NAME
 from gnucash_mcp._format import (
-    _scrub_credentials,
     _candidate_comparison_tsv,
     _dry_run_summary,
     _format_number,
@@ -44,16 +43,19 @@ def _describe_check_failure(check: str, exc: BaseException) -> str:
     ``"<Check> check failed: <ExceptionType>: <first line of message>"``.
     First line only — SQLAlchemy appends the statement, its
     parameters, and a docs link on later lines, none of which belong
-    on a dashboard. Any connection string in the text has its
-    credentials masked by ``_scrub_credentials`` (a connection error
-    can quote the DSN). Truncated with an ellipsis past
-    ``_CHECK_FAILURE_REASON_CHARS``.
+    on a dashboard. The text passes ``redact_paths``: a connection
+    string's credentials are masked always (a connection error can
+    quote the DSN), absolute paths when the user asked for that.
+    Truncated with an ellipsis past ``_CHECK_FAILURE_REASON_CHARS``.
 
     The reason travels inline because the debug log is opt-in and
     the users this reaches are the ones who never turned it on.
     """
     first = (str(exc).strip().splitlines() or [""])[0].strip()
-    first = _scrub_credentials(first)
+    # Credentials always; paths when GNUCASH_REDACT_PATHS is on — an
+    # OSError's text is mostly path, and this line goes to the model.
+    from gnucash_mcp.logging_config import redact_paths
+    first = redact_paths(first)
     if len(first) > _CHECK_FAILURE_REASON_CHARS:
         first = first[: _CHECK_FAILURE_REASON_CHARS - 1] + "…"
     reason = f"{type(exc).__name__}: {first}" if first else type(exc).__name__
@@ -1531,7 +1533,11 @@ class CoreMixin:
                         f"{age.days} day{'s' if age.days != 1 else ''} ago"
                         if age.days >= 1 else "today"
                     )
-                    reason = attempt.get("reason") or "unknown"
+                    from gnucash_mcp.logging_config import redact_paths
+                    # The stored reason is raw exception text.
+                    reason = redact_paths(
+                        attempt.get("reason") or "unknown"
+                    )
                     backup_health.append(
                         f"Auto-backup failing: {reason} "
                         f"(last attempt {age_str})"

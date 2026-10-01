@@ -213,7 +213,10 @@ class TestTextFormat:
         content = txt_file.read_text()
 
         assert "GNUCASH MCP AUDIT LOG" in content
-        assert str(temp_book_path) in content
+        # The filename, never the directory: get_audit_log returns
+        # this header to the model (review C54).
+        assert f"Book: {temp_book_path.name}" in content
+        assert str(temp_book_path.parent) not in content
 
     def test_text_format_logs_write_operations(self, temp_book_path, temp_log_dir):
         """Verify text format logs write operations in human-readable form."""
@@ -2800,3 +2803,101 @@ class TestAccountUpdateAuditListsOnlyWhatChanged:
         )
         assert 'Description: "" → "weekly shop"' in logged
         assert "Name:" not in logged
+
+
+class TestBookPathStaysOutOfModelFacingText:
+    """Review C54 / C55. The server names a book by its filename; the
+    directory (username, client folder names) is the private part.
+    Two surfaces carried the whole path to the model: the audit day
+    file's header, returned by every ``get_audit_log`` call, and the
+    dashboard's failed-check lines, which quote raw ``OSError`` text.
+    """
+
+    @pytest.fixture
+    def audit_tool_and_dir(self, tmp_path):
+        from gnucash_mcp.server import (
+            _apply_module_filter,
+            _reset_lazy_load_state,
+            mcp,
+        )
+
+        private = tmp_path / "Jane Doe Clients" / "Acme Holdings LLC"
+        private.mkdir(parents=True)
+        book_path = private / "ledger.gnucash"
+        book_path.touch()
+        setup_logging(book_path=str(book_path), debug=False)
+        log_dir = private / "ledger.gnucash.mcp" / "audit"
+
+        original = dict(mcp._tool_manager._tools)
+        try:
+            mcp._tool_manager._tools.clear()
+            _reset_lazy_load_state()
+            _apply_module_filter("audit")
+            yield mcp._tool_manager._tools["get_audit_log"], log_dir, book_path
+        finally:
+            mcp._tool_manager._tools.clear()
+            mcp._tool_manager._tools.update(original)
+            _reset_lazy_load_state()
+
+    def test_a_new_day_file_names_the_book_by_filename(
+        self, audit_tool_and_dir,
+    ):
+        tool, log_dir, book_path = audit_tool_and_dir
+        header = next(log_dir.glob("*.txt")).read_text()
+        assert "Book: ledger.gnucash" in header
+        assert "Acme Holdings LLC" not in header
+        assert "Jane Doe" not in header
+
+    def test_get_audit_log_never_returns_the_directory(
+        self, audit_tool_and_dir,
+    ):
+        tool, log_dir, book_path = audit_tool_and_dir
+        out = tool.fn()
+        assert "Acme Holdings LLC" not in out and "Jane Doe" not in out
+
+    def test_a_day_file_written_before_1_5_is_cleaned_on_read(
+        self, audit_tool_and_dir,
+    ):
+        """The path is baked into the file when it is created."""
+        tool, log_dir, book_path = audit_tool_and_dir
+        banner = "═" * 64
+        (log_dir / "2026-07-21.txt").write_text(
+            f"{banner}\nGNUCASH MCP AUDIT LOG — 2026-07-21\n"
+            f"Book: {book_path}\nTimezone: PDT\n{banner}\n\n"
+            '10:00:00  UPDATE TRANSACTION  guid:aaaaaaaa\n'
+            '          Notes: (none) → "first entry"\n'
+        )
+        for kwargs in ({"log_date": "2026-07-21"},
+                       {"log_date": "2026-07-21", "limit": 0}):
+            out = tool.fn(**kwargs)
+            assert "Book: ledger.gnucash" in out
+            assert "Acme Holdings LLC" not in out
+            assert "Jane Doe" not in out
+
+    def test_a_database_book_header_is_still_masked(
+        self, audit_tool_and_dir,
+    ):
+        tool, log_dir, _ = audit_tool_and_dir
+        banner = "═" * 64
+        (log_dir / "2026-07-22.txt").write_text(
+            f"{banner}\nGNUCASH MCP AUDIT LOG — 2026-07-22\n"
+            f"Book: postgresql://u:S3CRET@h/db?password=S3CRET\n{banner}\n\n"
+            '10:00:00  UPDATE TRANSACTION  guid:aaaaaaaa\n'
+        )
+        out = tool.fn(log_date="2026-07-22")
+        assert "S3CRET" not in out and "postgresql://u:***@h/db" in out
+
+    def test_failed_check_line_honors_path_redaction(self, monkeypatch):
+        from gnucash_mcp.book.core import _describe_check_failure
+
+        error = NotADirectoryError(
+            20, "Not a directory",
+            "/Users/jane/Finance/book.gnucash.mcp/backups",
+        )
+        monkeypatch.delenv("GNUCASH_REDACT_PATHS", raising=False)
+        assert "/Users/jane/Finance" in _describe_check_failure("Backup-health", error)
+        monkeypatch.setenv("GNUCASH_REDACT_PATHS", "1")
+        line = _describe_check_failure("Backup-health", error)
+        assert "/Users/jane" not in line
+        assert "Backup-health check failed: NotADirectoryError" in line
+        assert "backups" in line
