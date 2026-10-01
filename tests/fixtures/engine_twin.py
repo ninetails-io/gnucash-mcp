@@ -51,8 +51,9 @@ def find_gnucash_cli() -> str | None:
 
 def engine_run(book: Path, actions: list[str]) -> list[str]:
     """Run ``actions`` (see ``engine_act.scm``) on ``book`` IN PLACE
-    through GnuCash's engine. Returns each action's result word;
-    raises unless every one is ``ok``."""
+    through GnuCash's engine. Returns each action's result word —
+    ``ok``, or ``rejected`` where the engine declined (a price it
+    would not take); raises on anything else."""
     cli = find_gnucash_cli()
     if cli is None:
         raise RuntimeError("gnucash-cli not found (set GNUCASH_CLI)")
@@ -81,7 +82,7 @@ def engine_run(book: Path, actions: list[str]) -> list[str]:
                 f"{run.stdout[-2000:]}\n{run.stderr[-2000:]}"
             )
         results = re.findall(r"ACT\|([a-z]+)\|", out.read_text())
-    if len(results) != len(actions) or set(results) != {"ok"}:
+    if len(results) != len(actions) or set(results) - {"ok", "rejected"}:
         raise RuntimeError(f"engine actions did not all run: {results}")
     return results
 

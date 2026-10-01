@@ -11,6 +11,10 @@
 ;;       gncInvoiceUnpost (tax tables left as they are).
 ;;   autoapply|<invoice guid>
 ;;       gncInvoiceAutoApplyPayments — the "auto pay when posting" pass.
+;;   price|<namespace>|<mnemonic>|<currency mnemonic>|<d>|<m>|<y>|<value>|<source>|<type>
+;;       gnc_pricedb_add_price — what the Price Editor's OK button and
+;;       a Finance::Quote fetch both call. Result "ok" when the price
+;;       went in, "rejected" when the database kept what it had.
 ;;
 ;; gnucash-cli opens a report's book with SESSION_READ_ONLY, which for
 ;; the SQL backend only skips the lock: every commit_edit still writes.
@@ -62,6 +66,31 @@
         (if (null? inv)
             "missing"
             (begin (gncInvoiceAutoApplyPayments inv) "ok"))))
+     ((string=? verb "price")
+      (let* ((table (gnc-commodity-table-get-table book))
+             (commodity (gnc-commodity-table-lookup
+                         table (list-ref fields 1) (list-ref fields 2)))
+             (currency (gnc-commodity-table-lookup
+                        table "CURRENCY" (list-ref fields 3)))
+             (date (gnc-dmy2time64-neutral
+                    (string->number (list-ref fields 4))
+                    (string->number (list-ref fields 5))
+                    (string->number (list-ref fields 6)))))
+        (if (or (null? commodity) (null? currency))
+            "missing"
+            (let ((price (gnc-price-create book)))
+              (gnc-price-begin-edit price)
+              (gnc-price-set-commodity price commodity)
+              (gnc-price-set-currency price currency)
+              (gnc-price-set-time64 price date)
+              (gnc-price-set-source-string price (list-ref fields 8))
+              (gnc-price-set-typestr price (list-ref fields 9))
+              (gnc-price-set-value price (string->number (list-ref fields 7)))
+              (gnc-price-commit-edit price)
+              (let ((added (gnc-pricedb-add-price
+                            (gnc-pricedb-get-db book) price)))
+                (gnc-price-unref price)
+                (if added "ok" "rejected"))))))
      (else "unknown"))))
 
 (define (renderer report-obj)
