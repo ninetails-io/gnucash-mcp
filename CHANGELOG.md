@@ -110,6 +110,10 @@ Schedule recipes, invoice links, and budget signs are now stored the way GnuCash
   - Auto-numbered IDs follow the book's own counter format (File > Properties > Counters in GnuCash). A book numbering its invoices `INV-0047` got `000048` next (FC-17).
   - `get_latest_price` reads a pair in either direction: a newer USD/EUR quote is the latest EUR/USD rate, as valuation already treats it (MM-9).
   - The neutral time of day GnuCash stamps on dates is ported exactly, including its shift in time zones beyond UTC-10 and UTC+13, where a flat 10:59 UTC dated a document a day early (C25).
+- Working beside GnuCash desktop, from the same review:
+  - Reading a document no longer takes SQLite's write lock. Every lookup ran a repair statement that held GnuCash out of the file for the length of the read; it now runs only when there is something to repair (DS-12).
+  - A locked book's error says who holds the lock, read from the lock row: the machine and process, and whether that process is still running. A crash leaves the row behind, and "close GnuCash and try again" was no help with GnuCash not open (FC-15).
+  - `get_prices` keeps the digits of a small rate: 0.0000613 read 0.0001 (MM-10).
 - Database books, from the same review:
   - Text is held to GnuCash's own column widths (2,048 characters for names, descriptions, memos, and notes; 4,096 for a transaction's notes; 50 for a tax-table name) and may not contain a NUL. A longer value was a raw database error on PostgreSQL and MySQL and unbounded on SQLite, where a 5 MB account name was accepted (C65, IV-19, IV-20).
   - Name and ID lookups compare exactly. A book GnuCash created in MariaDB compares text without regard to case, so `delete_taxtable("Sales Tax")` deleted `SALES TAX` and reported the name it was given (C66).

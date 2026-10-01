@@ -1617,13 +1617,26 @@ class BusinessMixin:
         # 10xtechnology fork.
         if _dialect_name(book) == "sqlite":
             try:
-                book.session.execute(
+                # Look before writing. The UPDATE ran on every lookup,
+                # in read-only sessions too, and an UPDATE takes
+                # SQLite's RESERVED lock whether or not a row matches:
+                # every document READ held GnuCash desktop out of the
+                # file until it finished (adversarial review
+                # 2026-09-30, DS-12).
+                stale = book.session.execute(
                     text(
-                        "UPDATE invoices SET date_posted = NULL "
-                        "WHERE date_posted = ''"
+                        "SELECT 1 FROM invoices WHERE date_posted = '' "
+                        "LIMIT 1"
                     )
-                )
-                book.session.flush()
+                ).first()
+                if stale is not None:
+                    book.session.execute(
+                        text(
+                            "UPDATE invoices SET date_posted = NULL "
+                            "WHERE date_posted = ''"
+                        )
+                    )
+                    book.session.flush()
             except Exception:
                 # Best-effort heal — readonly sessions, locked
                 # connections, and other rare failures fall through;

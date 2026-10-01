@@ -1104,7 +1104,18 @@ class InvestmentsMixin:
 
                 prices.append({
                     "date": p_date.isoformat(),
-                    "value": _format_number(p.value, decimals=4, strip_trailing=True),
+                    # Four places, and more for a rate that needs
+                    # them: an IDR/USD rate of 0.0000613 read 0.0001
+                    # (adversarial review 2026-09-30, MM-10).
+                    "value": _format_number(
+                        p.value,
+                        decimals=max(
+                            4,
+                            min(12, 3 - Decimal(str(p.value)).adjusted())
+                            if p.value else 4,
+                        ),
+                        strip_trailing=True,
+                    ),
                     "currency": p.currency.mnemonic,
                     "type": p.type,
                     "source": p.source,

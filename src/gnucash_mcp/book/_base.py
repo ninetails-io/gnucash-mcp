@@ -1916,7 +1916,8 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
                         continue
                     raise GnuCashLockError(
                         f"GnuCash book is locked (possibly by GnuCash or another process). "
-                        f"Close GnuCash and try again. Details: {e}"
+                        f"Close GnuCash and try again."
+                        f"{self._lock_holder_note()} Details: {e}"
                     ) from e
                 raise
 
@@ -1942,6 +1943,57 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
             book.session.get_bind().dispose()
             close_elapsed = (time.time() - close_start) * 1000
             debug_logger.debug(f"Book closed in {close_elapsed:.0f}ms")
+
+    def _lock_holder_note(self) -> str:
+        """Who holds a file book's lock, read from its ``gnclock``
+        row: the host and process GnuCash recorded, and whether that
+        process is still running when it is this machine's. A crash
+        leaves the row behind, and "close GnuCash and try again" is
+        no help when GnuCash is not open (adversarial review
+        2026-09-30, FC-15). Empty for a database book, or when the
+        row cannot be read. Nothing is changed: clearing a stale
+        lock is the user's call, in GnuCash ("Open Anyway")."""
+        if not self.source.is_file:
+            return ""
+        import os
+        import socket
+
+        try:
+            con = sqlite3.connect(
+                f"file:{self.book_path}?mode=ro", uri=True, timeout=1,
+            )
+            try:
+                rows = con.execute("SELECT * FROM gnclock").fetchall()
+            finally:
+                con.close()
+        except Exception:
+            return ""
+        if not rows:
+            return ""
+        host, pid = str(rows[0][0]), rows[0][1]
+        note = f" The lock was taken on {host}, process {pid}"
+        try:
+            local = host.split(".")[0].lower() == (
+                socket.gethostname().split(".")[0].lower()
+            )
+            if local:
+                try:
+                    os.kill(int(pid), 0)
+                    note += ", which is still running."
+                except ProcessLookupError:
+                    note += (
+                        ", which is no longer running: a stale lock "
+                        "left by a crash. Open the book in GnuCash, "
+                        "choose \"Open Anyway\", and close it again "
+                        "to clear it."
+                    )
+                except (PermissionError, ValueError, OverflowError):
+                    note += "."
+            else:
+                note += " (another machine)."
+        except Exception:
+            note += "."
+        return note
 
     def source_open_kwargs(self) -> dict:
         """The piecash ``open_book`` argument naming this book.

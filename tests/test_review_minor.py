@@ -946,3 +946,73 @@ class TestMM9TheLatestPriceInEitherDirection:
         )
         got = gb.get_latest_price("EUR", "CURRENCY", "USD")
         assert (got["date"], "inverted_from" in got) == ("2026-07-01", False)
+
+
+class TestFC15AStaleLockSaysWhoseItIs:
+    def test_a_dead_local_process_is_named_as_stale(self, test_book):
+        import socket
+
+        gb = GnuCashBook(str(test_book))
+        # A PID that is not running: one past the largest in use is
+        # not guaranteed, so take a process we started and reaped.
+        import subprocess
+        import sys as _sys
+        child = subprocess.Popen([_sys.executable, "-c", "pass"])
+        child.wait()
+        _q(
+            test_book, "insert into gnclock values (?, ?)",
+            (socket.gethostname(), child.pid),
+        )
+        note = gb._lock_holder_note()
+        assert f"process {child.pid}" in note
+        assert "no longer running" in note and "Open Anyway" in note
+
+    def test_a_live_process_and_another_machine(self, test_book):
+        import socket
+
+        gb = GnuCashBook(str(test_book))
+        _q(
+            test_book, "insert into gnclock values (?, ?)",
+            (socket.gethostname(), os.getpid()),
+        )
+        assert "still running" in gb._lock_holder_note()
+        _q(test_book, "delete from gnclock")
+        _q(test_book, "insert into gnclock values ('elsewhere', 4242)")
+        assert "another machine" in gb._lock_holder_note()
+
+    def test_no_lock_row_no_note(self, test_book):
+        assert GnuCashBook(str(test_book))._lock_holder_note() == ""
+
+
+class TestMM10ASmallRateKeepsItsDigits:
+    def test_the_price_list(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        gb.create_account(
+            name="Rupiah Cash", account_type="BANK", parent="Assets",
+            commodity="IDR",
+        )
+        gb.create_price(
+            commodity="IDR", namespace="CURRENCY", value="0.0000613",
+            currency="USD", price_date=date(2026, 6, 1),
+        )
+        listed = gb.get_prices("IDR", "CURRENCY", compact=False)
+        values = [p["value"] for p in listed["prices"]]
+        assert values == ["0.0000613"]
+
+
+class TestDS12ADocumentReadTakesNoWriteLock:
+    def test_another_connection_can_write_during_the_read(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        with gb.open() as book:
+            assert gb._find_invoice(book, "000001") is not None
+            # The lookup's session is still open. A second connection
+            # must be able to take the write lock — as GnuCash does
+            # when it inserts its gnclock row.
+            other = sqlite3.connect(str(business_book), timeout=0.2)
+            try:
+                other.execute("insert into gnclock values ('host', 1)")
+                other.rollback()
+            finally:
+                other.close()

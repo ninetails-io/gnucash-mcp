@@ -12658,19 +12658,46 @@ class TestFindInvoiceDialectGuard:
             Engine, "before_cursor_execute", _on_execute
         )
 
-    def test_heal_runs_on_sqlite(self, business_book):
+    def test_heal_runs_on_sqlite_when_there_is_a_row_to_heal(
+        self, business_book,
+    ):
+        """The repair is looked for before it is written: the UPDATE
+        used to run on every lookup, and an UPDATE takes SQLite's
+        write lock whether or not a row matches (adversarial review
+        2026-09-30, DS-12)."""
+        import sqlite3
+
         gb = GnuCashBook(str(business_book))
         gb.create_customer(name="Heal Co")
         inv = gb.create_invoice(customer_id="000001")
+        heal = "UPDATE invoices SET date_posted = NULL"
 
         seen, stop = self._record_statements()
         try:
             gb.get_invoice(inv["id"], owner_type="customer")
         finally:
             stop()
-        assert any(
-            "UPDATE invoices SET date_posted = NULL" in s for s in seen
-        )
+        assert not any(heal in s for s in seen)
+        assert any("WHERE date_posted = ''" in s for s in seen)
+
+        con = sqlite3.connect(str(business_book))
+        con.execute("update invoices set date_posted = ''")
+        con.commit()
+        con.close()
+        seen, stop = self._record_statements()
+        try:
+            gb.add_invoice_entry(
+                invoice_id=inv["id"], account="Income:Sales",
+                description="x", quantity="1", price="1.00",
+            )
+        finally:
+            stop()
+        assert any(heal in s for s in seen)
+        con = sqlite3.connect(str(business_book))
+        assert con.execute("select date_posted from invoices").fetchall() == [
+            (None,)
+        ]
+        con.close()
 
     def test_heal_skipped_on_non_sqlite(self, business_book, monkeypatch):
         """Under a PostgreSQL dialect the heal must not be emitted at
