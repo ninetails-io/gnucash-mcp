@@ -15,6 +15,10 @@
 ;;       gnc_pricedb_add_price — what the Price Editor's OK button and
 ;;       a Finance::Quote fetch both call. Result "ok" when the price
 ;;       went in, "rejected" when the database kept what it had.
+;;   balance|<customer guid>
+;;       gncOwnerGetBalanceInCurrency, in the customer's own currency —
+;;       the figure behind the Customers Overview balance column.
+;;       Changes nothing; the result is "balance=<number>".
 ;;
 ;; gnucash-cli opens a report's book with SESSION_READ_ONLY, which for
 ;; the SQL backend only skips the lock: every commit_edit still writes.
@@ -66,6 +70,16 @@
         (if (null? inv)
             "missing"
             (begin (gncInvoiceAutoApplyPayments inv) "ok"))))
+     ((string=? verb "balance")
+      (let ((customer (gncCustomerLookupFlip (list-ref fields 1) book))
+            (owner (gncOwnerNew)))
+        (if (null? customer)
+            "missing"
+            (begin
+              (gncOwnerInitCustomer owner customer)
+              (string-append
+               "balance="
+               (number->string (gncOwnerGetBalanceInCurrency owner '())))))))
      ((string=? verb "price")
       (let* ((table (gnc-commodity-table-get-table book))
              (commodity (gnc-commodity-table-lookup

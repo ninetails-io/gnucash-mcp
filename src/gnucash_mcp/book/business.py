@@ -5459,6 +5459,7 @@ class BusinessMixin:
         doc_id: str | None = None,
         extra_slots: dict | None = None,
         job_id: str | None = None,
+        force: bool = False,
     ) -> dict:
         """Shared create path for invoices, bills, and vouchers.
 
@@ -5540,9 +5541,60 @@ class BusinessMixin:
                         f"customer/vendor."
                     )
 
+            currency_warning = None
             if currency:
                 currency_obj = self._document_currency(book, currency)
                 currency_guid = currency_obj.guid
+                # Desktop has no such document. Its invoice window
+                # takes the currency from the owner
+                # (dialog-invoice.c, gncInvoiceSetCurrency(invoice,
+                # gncOwnerGetCurrency(owner)), bug 728074) and sets
+                # it back when the document is saved there; and its
+                # party balance (gncOwnerGetBalanceInCurrency) counts
+                # only receivable/payable accounts in the OWNER's
+                # currency, so the document is left out of what the
+                # party owes — the engine answered 220 for a customer
+                # with 220 in USD invoices and an unpaid EUR 100 one
+                # (engine twin, 2026-09-30). The ruling on finding
+                # C48 of the adversarial review was: warn, and refuse
+                # by default if desktop is shown to misread it. It
+                # was. ``force`` keeps the door open for a party
+                # really billed in a second currency.
+                owner_currency = getattr(owner, "currency", None)
+                if (
+                    owner_currency is not None
+                    and owner_currency.guid != currency_guid
+                ):
+                    owner_label = getattr(owner, "name", owner_id)
+                    divergence = (
+                        f"GnuCash desktop only creates a document in "
+                        f"its owner's currency: its invoice window "
+                        f"sets the currency back to the owner's when "
+                        f"the document is saved there, and its "
+                        f"balance for {owner_label} counts only "
+                        f"{owner_currency.mnemonic} receivables and "
+                        f"payables, so this document would be left "
+                        f"out of it."
+                    )
+                    if not force:
+                        raise ValueError(
+                            f"currency={currency_obj.mnemonic!r} is not "
+                            f"{owner_label}'s currency "
+                            f"({owner_currency.mnemonic}). {divergence} "
+                            f"Omit currency to bill in "
+                            f"{owner_currency.mnemonic}; or, if this "
+                            f"party is billed in "
+                            f"{currency_obj.mnemonic}, give it a party "
+                            f"record in that currency (create_party "
+                            f"with currency="
+                            f"{currency_obj.mnemonic!r}). force=true "
+                            f"creates the document as asked."
+                        )
+                    currency_warning = (
+                        f"This document is in {currency_obj.mnemonic}, "
+                        f"but {owner_label}'s currency is "
+                        f"{owner_currency.mnemonic}. {divergence}"
+                    )
             else:
                 # Owner currency first, book default as defensive
                 # fallback (see docstring). Falling back to the book
@@ -5667,7 +5719,7 @@ class BusinessMixin:
 
             # ``guid`` omitted — invoices/bills/vouchers/
             # credit notes addressed by ``id``.
-            return {
+            result = {
                 "id": doc_id,
                 config["owner_id_key"]: owner_id,
                 # The audit CREATE line renders ``Name (id)`` from this.
@@ -5675,6 +5727,9 @@ class BusinessMixin:
                 "date_opened": str(open_date.date()),
                 "status": "created",
             }
+            if currency_warning is not None:
+                result["warnings"] = [currency_warning]
+            return result
 
     def create_invoice(
         self,
@@ -5685,6 +5740,7 @@ class BusinessMixin:
         term: str | None = None,
         invoice_id: str | None = None,
         job_id: str | None = None,
+        force: bool = False,
     ) -> dict:
         """Create a customer invoice.
 
@@ -5713,6 +5769,7 @@ class BusinessMixin:
             term=term,
             doc_id=invoice_id,
             job_id=job_id,
+            force=force,
         )
 
     def create_bill(
@@ -5724,6 +5781,7 @@ class BusinessMixin:
         term: str | None = None,
         bill_id: str | None = None,
         job_id: str | None = None,
+        force: bool = False,
     ) -> dict:
         """Create a vendor bill.
 
@@ -5749,6 +5807,7 @@ class BusinessMixin:
             term=term,
             doc_id=bill_id,
             job_id=job_id,
+            force=force,
         )
 
     def create_voucher(
@@ -5759,6 +5818,7 @@ class BusinessMixin:
         currency: str | None = None,
         term: str | None = None,
         voucher_id: str | None = None,
+        force: bool = False,
     ) -> dict:
         """Create an employee expense voucher.
 
@@ -5786,6 +5846,7 @@ class BusinessMixin:
             currency=currency,
             term=term,
             doc_id=voucher_id,
+            force=force,
         )
 
     # ── Credit-note resolution ─────────────────────────────────
@@ -5854,6 +5915,7 @@ class BusinessMixin:
         currency: str | None = None,
         term: str | None = None,
         credit_note_id: str | None = None,
+        force: bool = False,
     ) -> dict:
         """Create a credit note against a customer invoice or
         vendor bill.
@@ -5982,6 +6044,10 @@ class BusinessMixin:
                 )
             if currency is None and source_currency_mnemonic:
                 currency = source_currency_mnemonic
+            # A credit note takes its source's currency, whatever the
+            # party's own is: the source was already created in it.
+            if currency and currency == source_currency_mnemonic:
+                force = True
 
             extra_slots[self._APPLIES_TO_SLOT_KEY] = source_guid
             applies_to_dict = {
@@ -6000,6 +6066,7 @@ class BusinessMixin:
             term=term,
             doc_id=credit_note_id,
             extra_slots=extra_slots,
+            force=force,
         )
 
         # Augment with credit-note keys; the customer_id/vendor_id

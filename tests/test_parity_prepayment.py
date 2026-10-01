@@ -146,6 +146,30 @@ def _euro_invoice(gb: GnuCashBook) -> None:
     )
 
 
+def _off_owner_currency_invoice(gb: GnuCashBook) -> None:
+    """A EUR 100 invoice for Acme, whose own currency is USD — a
+    document desktop's invoice window cannot create and the server
+    can (finding C48). Posted to a EUR receivable at 1.10."""
+    gb.create_account(
+        name="Receivable EUR", account_type="RECEIVABLE", parent="Assets",
+        commodity="EUR",
+    )
+    gb.create_price(
+        commodity="EUR", namespace="CURRENCY", value="1.10",
+        price_date=date(2026, 1, 15),
+    )
+    inv = gb.create_invoice(customer_id="000001", currency="EUR", force=True)
+    assert "currency is USD" in inv["warnings"][0]
+    gb.add_invoice_entry(
+        invoice_id=inv["id"], account="Income:Sales",
+        description="Work", quantity="1", price="100.00",
+    )
+    gb.post_invoice(
+        invoice_id=inv["id"], post_account="Assets:Receivable EUR",
+        post_date="2026-01-15",
+    )
+
+
 # scenario → (what the server does, what the engine does[, extra base])
 SCENARIOS = {
     "overpay": (
@@ -221,6 +245,34 @@ SCENARIOS = {
         lambda i: [f"pay|{i['eur']}|{i['chk']}|120|11/10|20|1|2026|chk 12|"],
         _euro_invoice,
     ),
+    # C48, ruling 3: the engine half of "does desktop read a document
+    # in a currency its owner doesn't use". Its payment code does —
+    # the same rows as the server's.
+    "off_owner_currency_invoice_paid": (
+        lambda gb: gb.pay_invoice(
+            invoice_id="000004", payment_account=CHECKING, amount="100.00",
+            payment_account_amount="110.00", payment_date="2026-01-20",
+            memo="chk 12", owner_type="customer",
+        ),
+        lambda i: [f"pay|{i['eur']}|{i['chk']}|100|11/10|20|1|2026|chk 12|"],
+        _off_owner_currency_invoice,
+    ),
+    "off_owner_currency_invoice_unposted_after_payment": (
+        lambda gb: (
+            gb.pay_invoice(
+                invoice_id="000004", payment_account=CHECKING,
+                amount="100.00", payment_account_amount="110.00",
+                payment_date="2026-01-20", memo="chk 12",
+                owner_type="customer",
+            ),
+            gb.unpost_invoice(invoice_id="000004", owner_type="customer"),
+        ),
+        lambda i: [
+            f"pay|{i['eur']}|{i['chk']}|100|11/10|20|1|2026|chk 12|",
+            f"unpost|{i['eur']}",
+        ],
+        _off_owner_currency_invoice,
+    ),
     "unposted_payment_settles_another": (
         lambda gb: (
             _pay(gb, "000001", "100.00", owner_type="customer"),
@@ -272,6 +324,50 @@ def test_recording_is_what_the_engine_writes_today(base, scenario):
     engine = SCENARIOS[scenario][1]
     engine_run(base, engine(_ids(base)))
     assert dump(base, _BASE_ENDS) == _recorded()[scenario]
+
+
+# ── C48: what desktop makes of a document in another currency ───────
+
+# What GnuCash 5.12's engine answered, recorded 2026-09-30: Acme's
+# balance with 220 of open USD invoices, and with an unpaid EUR 100
+# invoice beside them.
+_ENGINE_BALANCE = {"usd_only": "balance=220", "with_eur_invoice": "balance=220"}
+
+
+def test_the_reason_a_foreign_currency_document_is_refused():
+    """``gncOwnerGetBalanceInCurrency`` walks only the receivable
+    accounts in the OWNER's currency, so a document in another
+    currency is not in the party's balance at all. That is the
+    misread ruling 3 on finding C48 asked for proof of, and why
+    ``create_document`` refuses the mismatch unless forced."""
+    assert _ENGINE_BALANCE["with_eur_invoice"] == _ENGINE_BALANCE["usd_only"]
+
+
+@pytest.mark.skipif(
+    find_gnucash_cli() is None, reason="gnucash-cli not on this machine",
+)
+@pytest.mark.parametrize("case, scenario", [
+    ("usd_only", "overpay"),
+    ("with_eur_invoice", "off_owner_currency_invoice_paid"),
+])
+def test_the_engine_still_leaves_it_out_of_the_balance(
+    business_book, case, scenario,
+):
+    _build(business_book, scenario)  # the base; nothing paid yet
+    acme = guid_of(
+        business_book, "select guid from customers where name = 'Acme Corp'",
+    )
+    assert engine_run(business_book, [f"balance|{acme}"]) == [
+        _ENGINE_BALANCE[case]
+    ]
+    # The server lists the EUR invoice as owed; desktop's balance
+    # does not count it.
+    owed = GnuCashBook(str(business_book)).get_outstanding_invoices(
+        compact=False, customer_id="000001",
+    )["invoices"]
+    assert ("EUR" in {d["currency"] for d in owed}) == (
+        case == "with_eur_invoice"
+    )
 
 
 def record() -> None:

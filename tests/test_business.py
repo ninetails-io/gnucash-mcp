@@ -827,6 +827,7 @@ class TestGetJobReport:
         # EUR invoice
         inv_eur = gb.create_invoice(
             customer_id="000001", job_id=job["id"], currency="EUR",
+            force=True,  # not the party's currency (review C48)
         )
         gb.add_invoice_entry(
             invoice_id=inv_eur["id"], account="Income:Sales",
@@ -3583,6 +3584,7 @@ class TestTaxtableCrossCurrency:
         gb.create_customer(name="EUR Client")
         gb.create_invoice(
             customer_id="000001", currency="EUR",
+            force=True,  # not the party's currency (review C48)
         )
         return gb
 
@@ -3679,7 +3681,10 @@ class TestTaxtableCrossCurrency:
                       "account": "Liabilities:GST Payable"}],
         )
         gb.create_customer(name="EUR Client")
-        gb.create_invoice(customer_id="000001", currency="EUR")
+        gb.create_invoice(
+            customer_id="000001", currency="EUR",
+            force=True,  # not the party's currency (review C48)
+        )
         gb.add_invoice_entry(
             invoice_id="000001",
             account="Income:Sales",
@@ -3962,23 +3967,65 @@ class TestCreateInvoice:
         inv = gb.get_invoice(result["id"])
         assert inv["currency"] == "EUR"
 
-    def test_explicit_currency_overrides_customer_currency(
+    def test_a_currency_that_is_not_the_customers_is_refused_unless_forced(
         self, business_book,
     ):
-        """An explicit ``currency`` parameter wins over the
-        customer's currency. Edge case but supported — callers
-        sometimes record cross-currency invoices intentionally."""
+        """GnuCash keeps a document in its owner's currency, and
+        leaves one that isn't out of the party's balance: asked what
+        a USD customer owed with 220 in USD invoices and an unpaid
+        EUR 100 one, the engine said 220 (adversarial review
+        2026-09-30, C48). The explicit pick used to win silently. It
+        is refused now, naming the two ordinary ways to bill in
+        another currency; ``force`` still creates it, with the
+        divergence in the response."""
         import piecash
         gb = GnuCashBook(str(business_book))
         with gb.open(readonly=False) as book:
             book.session.add(piecash.factories.create_currency_from_ISO("EUR"))
             book.save()
         gb.create_customer(name="Berlin Digital", currency="EUR")
+
+        with pytest.raises(ValueError) as refusal:
+            gb.create_invoice(customer_id="000001", currency="USD")
+        message = str(refusal.value)
+        assert "not Berlin Digital's currency (EUR)" in message
+        assert "left out of it" in message
+        assert "create_party" in message and "force=true" in message
+        # Nothing was created.
+        assert gb.list_invoices(compact=False)["invoices"] == []
+
         result = gb.create_invoice(
-            customer_id="000001", currency="USD",
+            customer_id="000001", currency="USD", force=True,
         )
+        assert "Berlin Digital's currency is EUR" in result["warnings"][0]
         inv = gb.get_invoice(result["id"])
         assert inv["currency"] == "USD"
+
+    def test_the_customers_own_currency_named_explicitly_is_fine(
+        self, business_book,
+    ):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Berlin Digital", currency="EUR")
+        result = gb.create_invoice(customer_id="000001", currency="EUR")
+        assert "warnings" not in result
+
+    def test_a_credit_note_follows_a_forced_documents_currency(
+        self, business_book,
+    ):
+        """The source was created in that currency on purpose; its
+        credit note needs no second ``force``."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        src = gb.create_invoice(
+            customer_id="000001", currency="EUR", force=True,
+        )
+        cn = gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+            applies_to_invoice_id=src["id"],
+        )
+        assert gb.get_invoice(
+            cn["id"], owner_type="customer",
+        )["currency"] == "EUR"
 
 
 class TestCreateBill:
@@ -4249,19 +4296,22 @@ class TestCreateBill:
         bill = gb.get_invoice(result["id"])
         assert bill["currency"] == "USD"
 
-    def test_explicit_currency_overrides_vendor_currency(
+    def test_a_currency_that_is_not_the_vendors_is_refused_unless_forced(
         self, business_book,
     ):
-        """Explicit ``currency`` wins over the vendor's currency."""
+        """The bill side of the same rule (review C48)."""
         import piecash
         gb = GnuCashBook(str(business_book))
         with gb.open(readonly=False) as book:
             book.session.add(piecash.factories.create_currency_from_ISO("EUR"))
             book.save()
         gb.create_vendor(name="JetBrains", currency="USD")
+        with pytest.raises(ValueError, match="not JetBrains's currency"):
+            gb.create_bill(vendor_id="000001", currency="EUR")
         result = gb.create_bill(
-            vendor_id="000001", currency="EUR",
+            vendor_id="000001", currency="EUR", force=True,
         )
+        assert "warnings" in result
         bill = gb.get_invoice(result["id"])
         assert bill["currency"] == "EUR"
 
@@ -5817,7 +5867,10 @@ class TestCreditNotePr87ReviewFollowups:
         gb.create_customer(name="Berlin GmbH", currency="EUR")
         # Post both documents matched (USD invoice → USD A/R) —
         # the only door the current code leaves open…
-        src = gb.create_invoice(customer_id="000001", currency="USD")
+        src = gb.create_invoice(
+            customer_id="000001", currency="USD",
+            force=True,  # not the party's currency (review C48)
+        )
         gb.add_invoice_entry(
             invoice_id=src["id"], account="Income:Sales",
             description="x", quantity="1", price="500",
@@ -8759,6 +8812,7 @@ class TestPayInvoice:
         gb.create_invoice(
             customer_id="000001", currency="USD",
             date_opened="2026-03-10",
+            force=True,  # not the party's currency (review C48)
         )
         gb.add_invoice_entry(
             invoice_id="000001",
@@ -11372,6 +11426,7 @@ class TestCrossCommodityArRelief:
         gb.create_invoice(
             customer_id="000001", currency="USD",
             date_opened="2026-03-10",
+            force=True,  # not the party's currency (review C48)
         )
         gb.add_invoice_entry(
             invoice_id="000001",

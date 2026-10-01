@@ -458,6 +458,7 @@ def register(mcp, get_book) -> None:
         id: str | None = None,
         job_id: str | None = None,
         applies_to_id: str | None = None,
+        force: bool = False,
     ) -> str:
         """Create a customer invoice, vendor bill, employee expense
         voucher, or credit note.
@@ -482,7 +483,11 @@ def register(mcp, get_book) -> None:
                 response).
             notes: Optional notes (max 4096 characters).
             currency: ISO code. Defaults to the owner's currency,
-                then the book default.
+                then the book default. Normally omitted: GnuCash
+                keeps a document in its owner's currency, and a
+                currency other than the owner's is refused unless
+                ``force`` is set. To bill a party in another
+                currency, create a party record in that currency.
             term: Billterm name (e.g., "Net 30"). Optional.
             id: Custom document number; auto-generated when omitted.
             job_id: Optional Job to group under (invoices and bills;
@@ -493,6 +498,11 @@ def register(mcp, get_book) -> None:
                 against any open document from the same owner (its
                 response notes the divergence when the applied
                 target differs from this link).
+            force: Create the document in ``currency`` even though
+                it is not the owner's. GnuCash desktop leaves such a
+                document out of the party's balance and resets its
+                currency when the document is saved there; the
+                response carries a warning saying so.
         """
         # Type-scoped parameters refuse loudly when inapplicable.
         # These are DECLARED parameters, so extra="forbid" can't
@@ -532,24 +542,25 @@ def register(mcp, get_book) -> None:
                 applies_to_invoice_id=applies_to_id,
                 date_opened=date_opened, notes=notes,
                 currency=currency, term=term, credit_note_id=id,
+                force=force,
             )
         elif document_type == "bill":
             result = book.create_bill(
                 vendor_id=owner_id, date_opened=date_opened,
                 notes=notes, currency=currency, term=term,
-                bill_id=id, job_id=job_id,
+                bill_id=id, job_id=job_id, force=force,
             )
         elif document_type == "voucher":
             result = book.create_voucher(
                 employee_id=owner_id, date_opened=date_opened,
                 notes=notes, currency=currency, term=term,
-                voucher_id=id,
+                voucher_id=id, force=force,
             )
         else:
             result = book.create_invoice(
                 customer_id=owner_id, date_opened=date_opened,
                 notes=notes, currency=currency, term=term,
-                invoice_id=id, job_id=job_id,
+                invoice_id=id, job_id=job_id, force=force,
             )
         result["type"] = document_type
         return _json(result)

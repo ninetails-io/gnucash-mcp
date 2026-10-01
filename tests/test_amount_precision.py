@@ -249,5 +249,8 @@ class TestCurrencyDefinitions:
     ):
         gb = GnuCashBook(str(business_book))
         gb.create_customer(name="Acme Corp")
-        gb.create_invoice(customer_id="000001", currency="JPY")
+        gb.create_invoice(
+            customer_id="000001", currency="JPY",
+            force=True,  # not the party's currency (review C48)
+        )
         assert _currency_row(business_book, "JPY") == (1, 1)
