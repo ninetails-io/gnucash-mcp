@@ -31,6 +31,7 @@ from gnucash_mcp.book._base import (
     _is_voided,
     _lot_to_compact_line,
     _neutral_time,
+    _verify_delete,
     _verify_none_remaining,
     _to_date,
     _to_decimal,
@@ -561,46 +562,112 @@ class InvestmentsMixin:
             )
 
     @staticmethod
+    def _price_plan(book, comm, resolved_currency, price_date, source):
+        """What ``gnc_pricedb_add_price`` would do with a price for
+        this pair on this day — ``(action, existing_row)``.
+
+        GnuCash keeps one price per pair per day. Its ``add_price``
+        (gnc-pricedb.cpp) looks up the day's price for the pair, in
+        EITHER direction (``gnc_pricedb_lookup_day_t64``), and then:
+
+            if (p->source > old_price->source) return FALSE;
+            gnc_pricedb_remove_price (db, old_price);
+
+        a new price whose source ranks worse is turned away ("Better
+        price already in DB"); one that ranks equal or better takes
+        the day. ``action`` is ``created`` (no price that day),
+        ``updated`` (same source, same direction), ``replaced`` (a
+        lower-ranked or opposite-direction row gives way), or
+        ``kept`` (the existing row outranks the new one, which is not
+        written). No mutation; the dry run and the write share it.
+
+        The engine twin (``tests/test_parity_prices.py``) found one
+        more thing desktop does: the price it turns away was saved to
+        the SQL file before ``add_price`` was asked, so the row stays
+        on disk, unreferenced in memory until the next load. The
+        server does not write that row (bookkeeper ruling,
+        2026-09-30: "fidelity means desktop-readable, not
+        litter-compatible").
+        """
+        from gnucash_mcp.book._piecash_shapes import (
+            _same_day_price,
+            _source_rank,
+        )
+
+        old = _same_day_price(
+            book.session, comm.guid, resolved_currency.guid,
+            _neutral_time(price_date),
+        )
+        if old is None:
+            return "created", None
+        _guid, old_comm, _curr, _stored, old_source, _value = old
+        if _source_rank(source) > _source_rank(old_source):
+            return "kept", old
+        if old_comm == comm.guid and old_source == source:
+            return "updated", old
+        return "replaced", old
+
+    @staticmethod
     def _upsert_price(
         book, comm, resolved_currency, price_date,
         value: str, price_type: str, source: str,
     ) -> str:
-        """Create or update-in-place one price row; NO save.
+        """Write one price the way ``gnc_pricedb_add_price`` admits
+        it (``_price_plan``); NO save.
 
-        Single chokepoint for the same-(commodity, currency, date,
-        source)-updates-in-place semantic, shared by ``create_price``
-        and ``create_prices`` so single and batch entry can't
-        diverge. The caller owns ``book.save()`` — batch saves once
-        for the whole set.
+        Single chokepoint shared by ``create_price`` and
+        ``create_prices`` so single and batch entry can't diverge.
+        The caller owns ``book.save()`` — batch saves once for the
+        whole set.
 
-        Returns ``"updated"`` or ``"created"``.
+        Returns ``"created"``, ``"updated"``, ``"replaced"``, or
+        ``"kept"`` (nothing written: the day's existing price
+        outranks this one).
         """
+        from sqlalchemy.orm.util import identity_key
+
         source = InvestmentsMixin._gnc_price_source(source)
         price_type = InvestmentsMixin._gnc_price_type(price_type)
-        # Indexed query, not a full book.prices walk.
-        candidates = book.session.query(Price).filter_by(
-            commodity_guid=comm.guid,
-            currency_guid=resolved_currency.guid,
-            source=source,
-        ).all()
-        existing = None
-        for p in candidates:
-            if _to_date(p.date) == price_date:
-                existing = p
-                break
+        book.flush()
+        action, old = InvestmentsMixin._price_plan(
+            book, comm, resolved_currency, price_date, source,
+        )
+        if action == "kept":
+            return action
 
         # Desktop stores a price's date at the neutral time (10:59:00
         # UTC) and its value reduced; piecash binds a bare date at
         # local midnight and keeps the typed denominator (price twin,
         # 2026-09-29), so the row is flushed and re-stamped.
-        if existing:
+        if old is not None and old[1] == comm.guid:
+            # Same direction: the row is rewritten where it stands.
+            existing = book.session.query(Price).filter_by(guid=old[0]).first()
+            existing.source = source
             existing.type = price_type
             book.flush()
             InvestmentsMixin._stamp_price_row(
                 book, existing.guid, price_date=price_date,
                 value=_to_decimal(value),
             )
-            return "updated"
+            return action
+        if old is not None:
+            # Quoted the other way round: the old row goes
+            # (gnc_pricedb_remove_price) and the new one is inserted.
+            # Raw SQL — a price row carries no slots to cascade.
+            book.session.execute(
+                Price.__table__.delete().where(
+                    Price.__table__.c.guid == old[0]
+                )
+            )
+            _verify_delete(
+                book.session, Price.__table__, {"guid": old[0]},
+                f"superseded price {old[0][:8]}",
+            )
+            loaded = book.session.identity_map.get(
+                identity_key(Price, old[0])
+            )
+            if loaded is not None:
+                book.session.expunge(loaded)
         created = piecash.Price(
             commodity=comm,
             currency=resolved_currency,
@@ -613,7 +680,19 @@ class InvestmentsMixin:
         InvestmentsMixin._stamp_price_row(
             book, created.guid, price_date=price_date, value=_to_decimal(value),
         )
-        return "created"
+        return action
+
+    @staticmethod
+    def _kept_price_reason(old, source: str) -> str:
+        """Why a price was not written, for the caller."""
+        return (
+            f"not written: the {old[4]!r} price already recorded for "
+            f"this date outranks {source!r}, and GnuCash keeps one "
+            f"price per pair per day (its own add_price turns this "
+            f"one away). To replace it, record the price with "
+            f"source='user:price-editor', or delete_price the "
+            f"existing one first."
+        )
 
     @staticmethod
     def _same_date_outranker(
@@ -766,30 +845,30 @@ class InvestmentsMixin:
                         "reason": str(e),
                     }
 
-            # Two rows sharing one canonical price identity
-            # (commodity, currency, date, source) would race the
-            # upsert against piecash's commit-time uniqueness
-            # validation: the second row creates a duplicate the
-            # save then rejects with an internals-leaking error,
-            # while dry_run (each row checked against the original
-            # book state) reports both as would_create. Rejecting
-            # the duplicate up front keeps dry-run and live
-            # agreeing and turns the failure into a per-row reason.
+            # GnuCash keeps one price per pair per day
+            # (``_price_plan``), so two rows of one batch for the
+            # same pair and date — in either direction, from any
+            # source — cannot both stand: the second would replace
+            # the first or be turned away by it, while dry_run (each
+            # row checked against the original book state) would
+            # report both as would_create. Rejecting the second up
+            # front keeps dry-run and live agreeing and makes the
+            # caller say which price they mean.
             seen_identity: dict = {}
             deduped = []
             for row in prepared:
                 identity = (
-                    row["comm"].guid, row["currency"].guid,
-                    row["date"], row["source"],
+                    frozenset((row["comm"].guid, row["currency"].guid)),
+                    row["date"],
                 )
                 first_ref = seen_identity.get(identity)
                 if first_ref is not None:
                     by_ref[row["ref"]] = {
                         "ref": row["ref"], "status": "rejected",
                         "reason": (
-                            f"duplicate price identity — same "
-                            f"commodity/currency/date/source as "
-                            f"ref '{first_ref}'"
+                            f"duplicate price — same pair and date as "
+                            f"ref '{first_ref}'; GnuCash keeps one "
+                            f"price per pair per day"
                         ),
                     }
                     continue
@@ -807,25 +886,26 @@ class InvestmentsMixin:
 
             wrote = False
             for row in prepared:
+                # The same decision either way (``_price_plan``); the
+                # dry run only skips the write.
+                action, old = self._price_plan(
+                    book, row["comm"], row["currency"], row["date"],
+                    row["source"],
+                )
                 if dry_run:
-                    # Same detection as the upsert, no mutation.
-                    candidates = book.session.query(Price).filter_by(
-                        commodity_guid=row["comm"].guid,
-                        currency_guid=row["currency"].guid,
-                        source=row["source"],
-                    ).all()
-                    exists = any(
-                        _to_date(c.date) == row["date"]
-                        for c in candidates
-                    )
-                    status = "would_update" if exists else "would_create"
+                    status = {
+                        "created": "would_create",
+                        "updated": "would_update",
+                        "replaced": "would_replace",
+                        "kept": "would_keep",
+                    }[action]
                 else:
                     status = self._upsert_price(
                         book, row["comm"], row["currency"],
                         row["date"], row["value"], row["type"],
                         row["source"],
                     )
-                    wrote = True
+                    wrote = wrote or status != "kept"
                 by_ref[row["ref"]] = {
                     "ref": row["ref"], "status": status,
                     "commodity": row["comm"].mnemonic,
@@ -833,6 +913,11 @@ class InvestmentsMixin:
                     "value": row["value"],
                     "currency": row["currency"].mnemonic,
                 }
+                if action == "kept":
+                    by_ref[row["ref"]]["reason"] = self._kept_price_reason(
+                        old, row["source"],
+                    )
+                    continue
                 # Same-date tie loss surfaces in the reason column
                 # — dry run projects it identically (the outranker
                 # ignores the not-yet-written row either way).
@@ -930,11 +1015,14 @@ class InvestmentsMixin:
             # dates) so this row and the existing ones share one
             # convention.
             shapes = self._upgrade_book_shapes(book)
+            plan, old = self._price_plan(
+                book, comm, resolved_currency, price_date,
+                self._gnc_price_source(source),
+            )
             status = self._upsert_price(
                 book, comm, resolved_currency, price_date,
                 value, price_type, source,
             )
-            existing = status == "updated"
 
             book.save()
             self._invalidate_price_caches(book)
@@ -947,9 +1035,35 @@ class InvestmentsMixin:
                 "date": price_date.isoformat(),
                 "value": value,
                 "type": price_type,
-                "status": "updated" if existing else "created",
+                # created / updated (same source) / replaced (another
+                # source's or the opposite direction's row gave way)
+                # / kept (nothing written).
+                "status": status,
                 **shapes,
             }
+            if status == "kept":
+                result["note"] = self._kept_price_reason(
+                    old, self._gnc_price_source(source),
+                )
+                result["existing"] = {
+                    "source": old[4],
+                    "value": str(
+                        (Decimal(old[5].numerator) / Decimal(old[5].denominator))
+                    ),
+                    "quoted": (
+                        "same direction" if old[1] == comm.guid
+                        else "opposite direction"
+                    ),
+                }
+                return result
+            if status == "replaced":
+                result["replaced"] = {
+                    "source": old[4],
+                    "quoted": (
+                        "same direction" if old[1] == comm.guid
+                        else "opposite direction"
+                    ),
+                }
             outranked_by = self._same_date_outranker(
                 book, comm, resolved_currency, price_date, source,
             )

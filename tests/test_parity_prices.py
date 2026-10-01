@@ -15,14 +15,14 @@ the engine (``fixtures/engine_twin.py``) and reading the SQL table:
   was committed before ``add_price`` was asked, so its row is already
   in the SQL table and stays there. The next load reads both.
 
-So a desktop-written SQL book does hold several same-day prices for a
-pair, and never holds a worse-ranked price that was entered FIRST.
-
-``create_price`` replaces within a source only. Where that leaves
-different rows than the engine, the scenario is marked: the ruling is
-that the server's rule does not move until this twin has been read
-and ruled on, so those cases are strict expected-failures — visible
-here, and red the day someone changes the rule without saying so.
+Ruling on that result (bookkeeper, 2026-09-30, fix-branch round 2,
+item 1): **adopt rank-replacement; do not reproduce the leak.** The
+server replaces as the engine replaces, and does not write the row
+the engine's own memory rejected — "fidelity means desktop-readable,
+not litter-compatible", by the precedent of ``temporary`` prices. So
+in every scenario the server's rows are the engine's rows MINUS the
+ones the engine itself turned away, and that subtraction is done
+here in the open (``_without_rejected``), not hidden in a filter.
 
 Regenerate after a GnuCash upgrade with
 ``uv run python tests/test_parity_prices.py record``.
@@ -80,14 +80,21 @@ SCENARIOS = {
     ],
 }
 
-# Where create_price leaves different rows than the engine today, and
-# what the difference is.
-SERVER_DIFFERS = {
-    "better_source_after_worse":
-        "the engine deletes the worse-ranked row; the server keeps both",
-    "other_direction_same_day":
-        "the engine deletes the opposite-direction row; the server keeps both",
-}
+def _without_rejected(scenario: str) -> list[list]:
+    """The engine's recorded rows, less the ones its own price
+    database rejected — the documented, intentional divergence."""
+    recorded = _recorded()[scenario]
+    leaked = {
+        (c, q, source, kind, str(Fraction(value)))
+        for (c, q, _day, value, source, kind), result in zip(
+            SCENARIOS[scenario], recorded["results"],
+        )
+        if result == "rejected"
+    }
+    return [
+        row for row in recorded["rows"]
+        if (row[0], row[1], row[3], row[4], row[5]) not in leaked
+    ]
 
 
 def _book(path: Path) -> GnuCashBook:
@@ -128,28 +135,22 @@ def _recorded() -> dict:
     return json.loads(_RECORDED.read_text())
 
 
-def _server_params():
-    for scenario in sorted(SCENARIOS):
-        marks = []
-        if scenario in SERVER_DIFFERS:
-            marks.append(pytest.mark.xfail(
-                strict=True,
-                reason=f"C24, ruling 2 pending: {SERVER_DIFFERS[scenario]}",
-            ))
-        yield pytest.param(scenario, marks=marks)
-
-
-@pytest.mark.parametrize("scenario", _server_params())
-def test_create_price_leaves_the_rows_the_engine_leaves(
+@pytest.mark.parametrize("scenario", sorted(SCENARIOS))
+def test_create_price_leaves_the_rows_the_engine_admits(
     business_book, scenario,
 ):
     gb = _book(business_book)
+    statuses = []
     for c, q, day, value, source, kind in SCENARIOS[scenario]:
-        gb.create_price(
+        statuses.append(gb.create_price(
             commodity=c, namespace="CURRENCY", value=value, currency=q,
             price_date=date(2026, 6, day), price_type=kind, source=source,
-        )
-    assert _rows(business_book) == _recorded()[scenario]["rows"]
+        )["status"])
+    assert _rows(business_book) == _without_rejected(scenario)
+    # The server says no where the engine says no.
+    assert [s == "kept" for s in statuses] == [
+        r == "rejected" for r in _recorded()[scenario]["results"]
+    ]
 
 
 @pytest.mark.skipif(
@@ -164,13 +165,17 @@ def test_recording_is_what_the_engine_writes_today(business_book, scenario):
     )
 
 
-def test_a_rejected_price_is_still_in_the_table():
+def test_a_rejected_price_is_still_in_the_engines_table():
     """The finding itself, read off the recording: the engine said no
-    to the worse-ranked price, and its row is there anyway."""
+    to the worse-ranked price, and its row is there anyway. That row
+    is the one the server does not write."""
     got = _recorded()["worse_source_after_better"]
     assert got["results"] == ["ok", "rejected"]
     assert [r[3] for r in got["rows"]] == [QUOTE, USER]
     # …while a better-ranked one takes the day.
+    assert [r[3] for r in _without_rejected("worse_source_after_better")] == [
+        QUOTE
+    ]
     got = _recorded()["better_source_after_worse"]
     assert got["results"] == ["ok", "ok"]
     assert [r[3] for r in got["rows"]] == [QUOTE]

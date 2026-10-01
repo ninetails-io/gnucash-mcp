@@ -49,6 +49,44 @@ def void_posting_record(gb, txn_guid: str, reason: str = "test setup"):
         return gb.void_transaction(txn_guid, reason)
 
 
+def leak_same_day_price(book_path, value: str, source: str) -> str:
+    """Give the pair of the book's NEWEST price row a second price on
+    the same day, and return the new row's GUID.
+
+    ``create_price`` keeps one price per pair per day since the 1.5
+    adversarial review (GnuCash's own ``add_price`` rule), so it can
+    no longer make this state — but real books hold it: GnuCash's SQL
+    backend saves a price its price database then turns away (the
+    engine twin, ``tests/test_parity_prices.py``), and servers before
+    1.5 wrote one row per source. Tests whose subject is the
+    multi-row day build it here, byte for byte the way those rows
+    sit: same pair, same stored time, another source.
+    """
+    import sqlite3
+    import uuid
+    from fractions import Fraction
+
+    amount = Fraction(value)
+    guid = uuid.uuid4().hex
+    con = sqlite3.connect(str(book_path))
+    try:
+        commodity, currency, stored, kind = con.execute(
+            "select commodity_guid, currency_guid, date, type from prices "
+            "order by rowid desc limit 1"
+        ).fetchone()
+        con.execute(
+            "insert into prices (guid, commodity_guid, currency_guid, date, "
+            "source, type, value_num, value_denom) "
+            "values (?, ?, ?, ?, ?, ?, ?, ?)",
+            (guid, commodity, currency, stored, source, kind,
+             amount.numerator, amount.denominator),
+        )
+        con.commit()
+    finally:
+        con.close()
+    return guid
+
+
 def drop_transaction_prices(book_path) -> int:
     """Delete every ``type='transaction'`` price row from the book at
     ``book_path`` and return how many went.

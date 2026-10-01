@@ -201,12 +201,17 @@ def register(mcp, get_book) -> None:
         - ``source``: where the quote came from (provenance —
           default "user:price"); ``type``: nav/last/bid/ask.
 
-        Per-row semantics are ``create_price``'s exactly: an existing
-        price with the same commodity/currency/date/source is UPDATED
-        in place (``status: updated``), never duplicated. One book
-        open, one save, ``on_error="abort"`` (default) sinks the
-        whole batch on any bad row; ``dry_run=true`` previews as
-        ``would_create`` / ``would_update``.
+        Per-row semantics are ``create_price``'s exactly: GnuCash
+        keeps ONE price per pair per day. A row whose source ranks
+        equal to or better than the day's existing price takes its
+        place (``updated`` for the same source, ``replaced``
+        otherwise); one that ranks worse is not written (``kept``,
+        with the reason). Two rows of one batch for the same pair and
+        date are a duplicate; the second is rejected. One book open,
+        one save, ``on_error="abort"`` (default) sinks the whole
+        batch on any bad row; ``dry_run=true`` previews as
+        ``would_create`` / ``would_update`` / ``would_replace`` /
+        ``would_keep``.
 
         The companion work list: ``list_commodities(stale_days=30,
         held_only=true)``.
@@ -233,8 +238,18 @@ def register(mcp, get_book) -> None:
     ) -> str:
         """Record a price for a commodity (stock, NAV, exchange rate).
 
-        An existing price with the same commodity/currency/date/source
-        is updated rather than duplicated.
+        GnuCash keeps ONE price per pair per day, and so does this
+        tool. ``status`` says what happened: ``created``; ``updated``
+        (the same source, rewritten); ``replaced`` (the day's price
+        from a lower-ranked source, or quoted the other way round,
+        gave way); or ``kept`` — NOTHING WAS WRITTEN, because the
+        day already has a price from a source that outranks this one
+        (``note`` and ``existing`` say which). Sources rank in the
+        order listed under ``source`` below: a feed quote
+        ("Finance::Quote") outranks the default "user:price", and
+        "user:price-editor" outranks both. To override a feed quote
+        with a figure you trust more, pass
+        ``source="user:price-editor"``.
 
         Args:
             commodity: Symbol (e.g., "VTSAX").
@@ -249,8 +264,9 @@ def register(mcp, get_book) -> None:
             price_type: "last" (default, as desktop's price editor), "nav" (mutual funds), "bid",
                 "ask", or "unknown".
             source: Where the price came from, one of the strings GnuCash's
-                price editor recognizes: "user:price" (default, a price you
-                typed), "Finance::Quote" (a quote feed), "user:price-editor",
+                price editor recognizes, here in GnuCash's own rank order,
+                best first: "user:price-editor", "Finance::Quote" (a quote
+                feed), "user:price" (default, a price you typed),
                 "user:xfer-dialog", "user:split-register", "user:split-import",
                 "user:stock-split", "user:stock-transaction",
                 "user:invoice-post", "temporary". Anything else would show as

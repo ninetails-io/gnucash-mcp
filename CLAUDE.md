@@ -314,7 +314,18 @@ Established chokepoints and the rule each one owns:
   by dashboards and detail tools so counts agree by construction.
 - `_slot_bool` — tri-state boolean slot parsing (the third private
   parsing convention was the trigger to consolidate).
-- `_upsert_price` — single/batch price writes can't diverge.
+- `_upsert_price` / `_price_plan` — single/batch price writes can't
+  diverge, and both keep GnuCash's rule: ONE price per pair per day
+  (`gnc_pricedb_add_price`). A source that ranks equal or better
+  than the day's price (in either direction of the pair) replaces
+  it; a worse-ranked one is not written (`kept`). The engine twin
+  showed desktop's SQL backend still saves the row its price
+  database turned away; the server does not copy that (ruling
+  2026-09-30: "desktop-readable, not litter-compatible"). Books
+  still hold multi-row days — tests build one with
+  `tests/conftest.py::leak_same_day_price` — and `_price_tie_rank`
+  remains how such a day is read. Pinned by
+  `tests/test_parity_prices.py`.
 - `_classify_reconciliation` — dashboard aggregates and the
   drill-down table bucket rows identically.
 - `_find_invoice_owner_by_guid` / `_document_owner_clause` — who a
@@ -613,18 +624,19 @@ Established chokepoints and the rule each one owns:
   the engine's dumps are recorded for CI. A new business write path
   whose desktop side is an engine call gets a scenario in
   `tests/test_parity_prepayment.py` (or a sibling) before it merges.
-  Three things the engine leaves in a SQL book are excluded by ruling
-  of the dump, not copied: the EMPTY payment lot it abandons after
-  every payment it moves into a document's lot (its own scrub
-  destroys them); the stale `post_txn` / `post_lot` / `post_acc` on
-  an unposted document (its SQL backend drops a NULL reference from
-  the UPDATE); and the hidden child TAX TABLE it makes at post, which
-  no saved row ever references (the line is repointed in memory and
-  not re-saved). `_payment_lots` skips empty lots, nothing reads
-  those columns on an unposted document, and `_find_taxtable` /
-  `list_taxtables` see live tables only. Stored `refcount`s are not
-  compared either: the engine adds one per reference it loads and
-  saves the sum.
+  What the engine leaves in a SQL book that the server does not
+  copy is a NAMED allowlist, `engine_twin.ENGINE_DEBRIS`, each entry
+  saying what it is and why (bookkeeper ruling 2026-09-30, round 2):
+  the empty payment lot abandoned after every payment moved into a
+  document's lot; stale `post_txn` / `post_lot` / `post_acc` on an
+  unposted document; the hidden child tax table no saved row
+  references; stored refcounts. `dump` filters only what the list
+  names, `debris_found` counts each kind, and every recording keeps
+  the engine's counts beside its dump — never a silent filter. A new
+  exception is added to the list with its reason, or it is a diff.
+  OPEN, not settled by the list: whether a posted line should point
+  at its tax table's copy (the source says yes; the headless engine
+  did not save it). The GUI gate decides.
 - `_billterm_return_child` — `gncBillTermReturnChild`: a posted
   document points at a hidden copy of its billing term (same name,
   `invisible` 1, `parent` the term, refcount 0), reused while it

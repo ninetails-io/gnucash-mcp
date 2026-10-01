@@ -1869,8 +1869,26 @@ def _fmt_price_create(entry: dict) -> list[str]:
     ns = after.get("namespace", params.get("namespace", ""))
     comm = after.get("commodity", params.get("commodity", ""))
     status = after.get("status", "")
-    verb = "UPDATE" if status == "updated" else "CREATE"
-    lines = [f"{time_part}  {verb} PRICE  {ns}:{comm}"]
+    # ``kept``: GnuCash's one-price-per-day rule turned the price
+    # away, and nothing was written — the line must not read as a
+    # write.
+    verb = {"updated": "UPDATE", "replaced": "REPLACE"}.get(status, "CREATE")
+    lines = [
+        f"{time_part}  {verb} PRICE  {ns}:{comm}" if status != "kept"
+        else f"{time_part}  PRICE NOT WRITTEN  {ns}:{comm}"
+    ]
+    if status == "kept":
+        existing = after.get("existing") or {}
+        lines.append(
+            f"{_INDENT}outranked by the day's {existing.get('source', '')} "
+            f"price ({existing.get('value', '')})"
+        )
+        return lines
+    if status == "replaced":
+        gone = after.get("replaced") or {}
+        lines.append(
+            f"{_INDENT}replaced the day's {gone.get('source', '')} price"
+        )
     date_str = after.get("date", params.get("price_date", "") or "")
     value = after.get("value", params.get("value", ""))
     currency = after.get("currency", params.get("currency", "") or "")

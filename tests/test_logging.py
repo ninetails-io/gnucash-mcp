@@ -1226,6 +1226,43 @@ class TestPayDryRunAuditRendering:
         assert "paid: 500.00" in rendered
 
 
+class TestPriceAuditLines:
+    """A price GnuCash's one-per-day rule turned away was not
+    written, and the audit line must not read as a write (review
+    item C24, bookkeeper ruling 2026-09-30)."""
+
+    def _entry(self, after):
+        return {
+            "classification": "write", "entity_type": "price",
+            "operation": "create", "timestamp": "2026-09-30T23:30:00",
+            "params": {"commodity": "EUR", "namespace": "CURRENCY"},
+            "after_state": {
+                "commodity": "EUR", "namespace": "CURRENCY",
+                "date": "2026-06-01", "value": "1.10", "currency": "USD",
+                **after,
+            },
+        }
+
+    def test_kept(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        rendered = _format_audit_entry_text(self._entry({
+            "status": "kept",
+            "existing": {"source": "Finance::Quote", "value": "1.11"},
+        }))
+        assert "PRICE NOT WRITTEN  CURRENCY:EUR" in rendered
+        assert "outranked by the day's Finance::Quote price (1.11)" in rendered
+        assert "CREATE PRICE" not in rendered
+
+    def test_replaced(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        rendered = _format_audit_entry_text(self._entry({
+            "status": "replaced", "replaced": {"source": "user:price"},
+        }))
+        assert "REPLACE PRICE  CURRENCY:EUR" in rendered
+        assert "replaced the day's user:price price" in rendered
+        assert "value: 1.10 USD" in rendered
+
+
 class TestPrepaymentAuditLines:
     """A document settled from an earlier payment paid nothing new;
     the audit line must not read as a payment from an account

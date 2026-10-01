@@ -26,7 +26,7 @@ import pytest
 from piecash import factories
 
 from gnucash_mcp.book import GnuCashBook
-from tests.conftest import drop_transaction_prices
+from tests.conftest import drop_transaction_prices, leak_same_day_price
 
 
 # --------------------------------------------------------------------------
@@ -727,9 +727,13 @@ class TestSameDatePriceTieBreak:
         d = date(2026, 3, 31)
         gc.create_price("EUR", "CURRENCY", "1.30", price_date=d,
                         source="Finance::Quote")
-        gc.create_price("EUR", "CURRENCY", "1.10", price_date=d,
-                        source="user:price")
-        by_value = self._guids(gc, source_by_value=None)
+        # A second row for the day, as desktop's SQL backend leaves
+        # one and older servers wrote one (see leak_same_day_price).
+        leak_same_day_price(multi_currency_book, "1.10", "user:price")
+        by_value = {
+            v: g for v, g in self._guids(gc, source_by_value=None).items()
+            if v in (Decimal("1.30"), Decimal("1.10"))
+        }
         winner = min(by_value, key=lambda v: by_value[v])
         with gc.open(readonly=True) as book:
             eur = book.commodities(mnemonic="EUR")
@@ -752,8 +756,7 @@ class TestSameDatePriceTieBreak:
         d = date(2026, 3, 31)
         gc.create_price("EUR", "CURRENCY", "1.30", price_date=d,
                         source="Finance::Quote")
-        gc.create_price("EUR", "CURRENCY", "1.10", price_date=d,
-                        source="user:price-editor")
+        leak_same_day_price(multi_currency_book, "1.10", "user:price-editor")
         with gc.open(readonly=False) as book:
             book.session.execute(text(
                 "UPDATE prices SET date = '2026-03-31 20:44:14' "
@@ -766,33 +769,128 @@ class TestSameDatePriceTieBreak:
             assert gc._find_exchange_rate(book, eur, usd, d) == Decimal("1.10")
             assert gc._rates_as_of(book, d)[eur.guid] == Decimal("1.10")
 
-    def test_create_price_notes_when_outranked(
+    @staticmethod
+    def _day_rows(path, day="2026-03-31"):
+        import sqlite3
+        con = sqlite3.connect(str(path))
+        try:
+            return sorted(
+                (source, Decimal(n) / Decimal(d))
+                for source, n, d in con.execute(
+                    "select source, value_num, value_denom from prices "
+                    "where date like ?", (day + "%",),
+                )
+            )
+        finally:
+            con.close()
+
+    def test_one_price_per_pair_per_day_by_source_rank(
         self, multi_currency_book,
     ):
-        """An operator who just wrote a price and can't see it
-        winning has been misled by silence — the losing write says
-        so and names the row desktop will use; the winning write
-        carries no note. Which of two neutral-time rows wins is
-        the GUID draw, so the assertion follows the draw."""
+        """``gnc_pricedb_add_price``: a price whose source ranks equal
+        or better takes the day; one that ranks worse is turned away.
+        The server wrote one row per source, and which won was the
+        GUID draw (adversarial review 2026-09-30, C24; bookkeeper
+        ruling the same night)."""
         from datetime import date
         gc = GnuCashBook(str(multi_currency_book))
         d = date(2026, 3, 31)
         first = gc.create_price(
-            "EUR", "CURRENCY", "1.10", price_date=d,
-            source="user:price",
+            "EUR", "CURRENCY", "1.10", price_date=d, source="user:price",
         )
-        assert "note" not in first
+        assert (first["status"], "note" in first) == ("created", False)
+
+        # A feed quote outranks a typed ``user:price``: it takes the day.
         second = gc.create_price(
-            "EUR", "CURRENCY", "1.30", price_date=d,
-            source="Finance::Quote",
+            "EUR", "CURRENCY", "1.30", price_date=d, source="Finance::Quote",
         )
-        by_value = self._guids(gc, source_by_value=None)
-        first_wins = by_value[Decimal("1.10")] < by_value[Decimal("1.30")]
-        if first_wins:
-            assert "outranks it as the effective rate" in second["note"]
-            assert "user:price" in second["note"]
-        else:
-            assert "note" not in second
+        assert second["status"] == "replaced"
+        assert second["replaced"]["source"] == "user:price"
+        assert self._day_rows(multi_currency_book) == [
+            ("Finance::Quote", Decimal("1.30")),
+        ]
+
+        # The typed price again: turned away, nothing written, and
+        # the caller is told why and how to override.
+        third = gc.create_price(
+            "EUR", "CURRENCY", "1.15", price_date=d, source="user:price",
+        )
+        assert third["status"] == "kept"
+        assert third["existing"]["source"] == "Finance::Quote"
+        assert "user:price-editor" in third["note"]
+        assert self._day_rows(multi_currency_book) == [
+            ("Finance::Quote", Decimal("1.30")),
+        ]
+
+        # The Price Editor's rank beats the feed.
+        fourth = gc.create_price(
+            "EUR", "CURRENCY", "1.15", price_date=d,
+            source="user:price-editor",
+        )
+        assert fourth["status"] == "replaced"
+        assert self._day_rows(multi_currency_book) == [
+            ("user:price-editor", Decimal("1.15")),
+        ]
+        # The same source again updates in place.
+        fifth = gc.create_price(
+            "EUR", "CURRENCY", "1.16", price_date=d,
+            source="user:price-editor",
+        )
+        assert fifth["status"] == "updated"
+        assert self._day_rows(multi_currency_book) == [
+            ("user:price-editor", Decimal("1.16")),
+        ]
+
+    def test_a_quote_the_other_way_round_replaces_the_days_price(
+        self, multi_currency_book,
+    ):
+        from datetime import date
+        gc = GnuCashBook(str(multi_currency_book))
+        d = date(2026, 3, 31)
+        gc.create_price("EUR", "CURRENCY", "1.25", price_date=d,
+                        source="user:price-editor")
+        result = gc.create_price(
+            "USD", "CURRENCY", "0.80", currency="EUR", price_date=d,
+            source="user:price-editor",
+        )
+        assert result["status"] == "replaced"
+        assert result["replaced"]["quoted"] == "opposite direction"
+        assert self._day_rows(multi_currency_book) == [
+            ("user:price-editor", Decimal("0.80")),
+        ]
+
+    def test_create_price_notes_when_outranked(
+        self, multi_currency_book,
+    ):
+        """A book can still hold several rows for a day (desktop's
+        SQL backend leaves the ones its price database turned away).
+        When a written row is not the one desktop will use — the
+        later stored time, then the smaller GUID — the write says
+        so."""
+        from datetime import date
+        from sqlalchemy import text
+        gc = GnuCashBook(str(multi_currency_book))
+        d = date(2026, 3, 31)
+        gc.create_price(
+            "EUR", "CURRENCY", "1.10", price_date=d, source="user:price",
+        )
+        leaked = leak_same_day_price(
+            multi_currency_book, "1.30", "user:split-register",
+        )
+        # Stamp the leaked row later in the day, so it is the one
+        # desktop reads whatever the GUIDs are.
+        with gc.open(readonly=False) as book:
+            book.session.execute(
+                text("UPDATE prices SET date = '2026-03-31 20:44:14' "
+                     "WHERE guid = :g"), {"g": leaked},
+            )
+            book.save()
+        again = gc.create_price(
+            "EUR", "CURRENCY", "1.12", price_date=d, source="user:price",
+        )
+        if again["status"] != "kept":
+            assert "outranks it as the effective rate" in again["note"]
+            assert "user:split-register" in again["note"]
 
     def test_create_prices_batch_notes_outranked_in_reason(
         self, multi_currency_book,
@@ -802,17 +900,27 @@ class TestSameDatePriceTieBreak:
         from datetime import date
         gc = GnuCashBook(str(multi_currency_book))
         d = date(2026, 3, 31)
-        gc.create_price("EUR", "CURRENCY", "1.10", price_date=d,
-                        source="user:price")
-        out = gc.create_prices([{
+        gc.create_price("EUR", "CURRENCY", "1.30", price_date=d,
+                        source="Finance::Quote")
+        rows = [{
             "ref": "1", "commodity": "EUR", "date": d,
-            "value": "1.30", "source": "Finance::Quote",
-        }])["results"]
-        row = out.splitlines()[1]
-        assert "created" in row
-        by_value = self._guids(gc, source_by_value=None)
-        first_wins = by_value[Decimal("1.10")] < by_value[Decimal("1.30")]
-        assert ("outranked by 'user:price'" in row) is first_wins
+            "value": "1.10", "source": "user:price",
+        }]
+        dry = gc.create_prices(rows, dry_run=True)["results"].splitlines()[1]
+        assert "would_keep" in dry and "outranks 'user:price'" in dry
+        live = gc.create_prices(rows)["results"].splitlines()[1]
+        assert "\tkept\t" in live and "outranks 'user:price'" in live
+        assert self._day_rows(multi_currency_book) == [
+            ("Finance::Quote", Decimal("1.30")),
+        ]
+        better = [{
+            "ref": "2", "commodity": "EUR", "date": d,
+            "value": "1.20", "source": "user:price-editor",
+        }]
+        assert "would_replace" in gc.create_prices(
+            better, dry_run=True,
+        )["results"]
+        assert "\treplaced\t" in gc.create_prices(better)["results"]
 
 
 class TestPriceLookupMemo:
@@ -831,8 +939,7 @@ class TestPriceLookupMemo:
         d = date(2026, 3, 31)
         gc.create_price("EUR", "CURRENCY", "1.30", price_date=d,
                         source="Finance::Quote")
-        gc.create_price("EUR", "CURRENCY", "1.10", price_date=d,
-                        source="user:price")
+        leak_same_day_price(multi_currency_book, "1.10", "user:price")
 
         with gc.open(readonly=True) as book:
             eur = book.commodities(mnemonic="EUR")

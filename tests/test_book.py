@@ -8,6 +8,8 @@ import piecash
 from piecash import factories
 import pytest
 
+from tests.conftest import leak_same_day_price
+
 from gnucash_mcp.book import GnuCashBook, GnuCashLockError
 
 
@@ -13254,11 +13256,8 @@ class TestDeletePrice:
             currency="USD", price_date=date(2026, 2, 7),
             source="user:price",
         )
-        gc_book.create_price(
-            commodity="VTSAX", namespace="FUND", value="127.99",
-            currency="USD", price_date=date(2026, 2, 7),
-            source="Finance::Quote",
-        )
+        # A second same-day row, as older books hold them.
+        leak_same_day_price(test_book, "127.99", "Finance::Quote")
 
         with pytest.raises(ValueError) as exc_info:
             gc_book.delete_price(
@@ -13286,11 +13285,8 @@ class TestDeletePrice:
             currency="USD", price_date=date(2026, 2, 7),
             source="user:price",
         )
-        gc_book.create_price(
-            commodity="VTSAX", namespace="FUND", value="127.99",
-            currency="USD", price_date=date(2026, 2, 7),
-            source="Finance::Quote",
-        )
+        # A second same-day row, as older books hold them.
+        leak_same_day_price(test_book, "127.99", "Finance::Quote")
 
         result = gc_book.delete_price(
             commodity="VTSAX", namespace="FUND",
@@ -14151,13 +14147,13 @@ class TestBatchPrices:
         dry = {r["ref"]: r for r in _parse_results_tsv(env["results"])}
         assert dry["a"]["status"] == "would_create"
         assert dry["b"]["status"] == "rejected"
-        assert "duplicate price identity" in dry["b"]["reason"]
+        assert "same pair and date as ref 'a'" in dry["b"]["reason"]
 
         env = gc.create_prices(rows, on_error="skip")
         live = {r["ref"]: r for r in _parse_results_tsv(env["results"])}
         assert live["a"]["status"] == "created"
         assert live["b"]["status"] == "rejected"
-        assert "duplicate price identity" in live["b"]["reason"]
+        assert "same pair and date as ref 'a'" in live["b"]["reason"]
 
         # First row won; exactly one price landed.
         latest = gc.get_latest_price(commodity="VTSAX", namespace="FUND")
@@ -14176,14 +14172,19 @@ class TestBatchPrices:
         ])
         parsed = {r["ref"]: r for r in _parse_results_tsv(env["results"])}
         assert parsed["a"]["reason"] == "batch_aborted"
-        assert "duplicate price identity" in parsed["b"]["reason"]
+        assert "one price per pair per day" in parsed["b"]["reason"]
         assert gc.get_latest_price(
             commodity="VTSAX", namespace="FUND",
         ) is None
 
-    def test_distinct_source_is_not_a_duplicate(self, test_book: Path):
-        """Identity includes source — a feed quote and a manual
-        quote on the same date are both legitimate."""
+    def test_a_second_source_for_the_same_day_is_a_duplicate_too(
+        self, test_book: Path,
+    ):
+        """GnuCash keeps one price per pair per day, whatever its
+        source (``gnc_pricedb_add_price``; bookkeeper ruling
+        2026-09-30 on review item C24). Two rows of one batch for the
+        same day cannot both stand, so the second is refused and the
+        caller says which they mean."""
         gc = GnuCashBook(str(test_book))
         self._setup(gc)
         env = gc.create_prices([
@@ -14192,10 +14193,11 @@ class TestBatchPrices:
             {"ref": "b", "commodity": "VTSAX",
              "date": date(2026, 7, 21), "value": "101",
              "source": "user:market_data"},
-        ])
+        ], on_error="skip")
         parsed = {r["ref"]: r for r in _parse_results_tsv(env["results"])}
         assert parsed["a"]["status"] == "created"
-        assert parsed["b"]["status"] == "created"
+        assert parsed["b"]["status"] == "rejected"
+        assert "one price per pair per day" in parsed["b"]["reason"]
 
     def test_ambiguous_symbol_requires_ns(self, test_book: Path):
         gc = GnuCashBook(str(test_book))
