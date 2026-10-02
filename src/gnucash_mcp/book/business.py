@@ -1122,15 +1122,13 @@ class BusinessMixin:
         if discount_days <= 0 or discount_pct <= 0:
             return None
 
-        # Use date_opened as the discount-window anchor — that's the
-        # invoice issuance date (what's printed on the invoice the
-        # customer received). date_posted is when it hit A/R, often
-        # the same day but not guaranteed; the customer's discount
-        # eligibility is measured from when they got the invoice.
-        anchor = inv.date_opened
-        if isinstance(anchor, datetime):
-            anchor = anchor.date()
-        eligible_until = anchor + timedelta(days=discount_days)
+        # The window runs from the posting date, by the same rule as
+        # the due date (C46): a window anchored on date_opened could
+        # close before the document was even posted.
+        posted = inv.date_posted
+        if isinstance(posted, datetime):
+            posted = posted.date()
+        eligible_until = self._billterm_discount_date(bt, posted)
 
         # Pre-tax principal for discount calculation. Catch the rare
         # corrupted-entries case the same way other callers do.
@@ -3120,16 +3118,46 @@ class BusinessMixin:
 
     @staticmethod
     def _billterm_due_date(term, post_date: date) -> date:
-        """``gncBillTermComputeDueDate``, ported verbatim from
+        """``gncBillTermComputeDueDate``: ``compute_time`` over the
+        term's due days. See ``_billterm_compute_time``."""
+        if term is None:
+            return post_date
+        return BusinessMixin._billterm_compute_time(
+            term, post_date, int(term.duedays or 0),
+        )
+
+    @staticmethod
+    def _billterm_discount_date(term, post_date: date) -> date:
+        """The last day of a term's early-payment window: the same
+        ``compute_time`` over the term's DISCOUNT days, from the same
+        posting date. GnuCash 5.12 computes no discount date (the
+        engine exports only ``gncBillTermComputeDueDate``), so this
+        is the server's rule, chosen to mean what the due date
+        means: a "2/10 net 30" window closes ten days after posting
+        as the due date falls thirty after, and on a proximo term the
+        discount days name a day of the month as the due days do.
+        Anchoring on ``date_opened`` let the window close before the
+        document was posted (review C46)."""
+        if term is None:
+            return post_date
+        return BusinessMixin._billterm_compute_time(
+            term, post_date, int(term.discountdays or 0),
+        )
+
+    @staticmethod
+    def _billterm_compute_time(term, post_date: date, days: int) -> date:
+        """``compute_time`` / ``compute_monthyear``, ported verbatim from
         GnuCash ``libgnucash/engine/gncBillTerm.c`` (stable, read
         2026-09-28): ``compute_time`` / ``compute_monthyear``. A
         port, not a reinterpretation — like ``_recurrence_next``
         and Recurrence.cpp — so the server and desktop's Due Bills
         Reminder name the same day.
 
-        - ``None`` terms: the posting date
-          (``if (!term) return post_date;``).
-        - **DAYS**: posting date + ``due_days``.
+        ``days`` is the term's due days or discount days; the
+        callers handle ``None`` terms (``if (!term) return
+        post_date;``).
+
+        - **DAYS**: posting date + ``days``.
         - **PROXIMO** (``compute_monthyear``): a ``cutoff`` of 0 or
           below is relative to the posting month's end (``cutoff +=
           gnc_date_get_last_mday(...)``: -3 is the 25th in February,
@@ -3149,9 +3177,7 @@ class BusinessMixin:
         """
         import calendar
 
-        if term is None:
-            return post_date
-        due_days = int(term.duedays or 0)
+        due_days = days
         term_type = term.type
         if term_type == BusinessMixin._TERM_TYPE_DAYS:
             return post_date + timedelta(days=due_days)
@@ -8591,14 +8617,15 @@ class BusinessMixin:
 
                 eligible_until = disc_summary["eligible_until"]
                 if parsed_date > eligible_until:
-                    anchor = inv.date_opened
-                    if isinstance(anchor, datetime):
-                        anchor = anchor.date()
+                    posted = inv.date_posted
+                    if isinstance(posted, datetime):
+                        posted = posted.date()
                     raise ValueError(
                         f"Payment date {parsed_date.isoformat()} is "
                         f"beyond the billterm discount window "
-                        f"({disc_summary['discount_days']} days "
-                        f"from {anchor.isoformat()}; deadline was "
+                        f"(posted {posted.isoformat()}, "
+                        f"{disc_summary['discount_days']} discount "
+                        f"days; deadline was "
                         f"{eligible_until.isoformat()}). Pay without "
                         f"apply_discount for a normal late payment, "
                         f"or issue a credit note to formally write "
