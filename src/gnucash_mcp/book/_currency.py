@@ -1072,23 +1072,26 @@ class CurrencyMixin:
         """
         if account.commodity == default_currency:
             return quantity, None
+        from gnucash_mcp.book._base import _format_account_amount
+
         sym = account.commodity.mnemonic
+        shown = _format_account_amount(quantity, account)
         rate = rates.get(account.commodity.guid)
         if rate is not None:
-            note = f"{quantity} {sym} @ {_format_rate(rate)}"
+            note = f"{shown} {sym} @ {_format_rate(rate)}"
             via = (provenance or {}).get(account.commodity.guid)
             if via:
                 note += f" ({via})"
             return quantity * rate, note
         if not with_cost_fallback:
-            return Decimal("0"), f"{quantity} {sym} — no price data"
+            return Decimal("0"), f"{shown} {sym} — no price data"
         # No market price for the holding: its remaining cost basis
         # in the book default (see ``_unpriced_cost_basis``).
         cost_basis = self._unpriced_cost_basis(
             book, account.splits,
             default_currency=default_currency, as_of=today,
         )
-        return cost_basis, f"{quantity} {sym} — no price data"
+        return cost_basis, f"{shown} {sym} — no price data"
 
     def _leg_value_in_default(
         self,

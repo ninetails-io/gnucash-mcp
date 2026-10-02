@@ -48,6 +48,8 @@ from gnucash_mcp.book._base import (
 from gnucash_mcp._format import (
     _GROUP_BY_VALUES,
     _enumerate_periods,
+    _format_amount,
+    _format_exact,
     _format_grouped_tsv,
     _format_number,
     _paginate,
@@ -142,7 +144,7 @@ def _format_vendor_spending_compact(
         d = Decimal(s)
         if d == d.to_integral_value():
             return f"{currency} {int(d):,}"
-        return f"{currency} {d:,.2f}"
+        return f"{currency} {_format_exact(d)}"
 
     billed_strs = [_money(v["total_billed"]) for v in vendors_list]
     paid_strs = [_money(v["total_paid"]) for v in vendors_list]
@@ -210,7 +212,7 @@ def _format_outstanding_invoices_compact(rows: list[dict]) -> str:
         ccy = r.get("currency") or ""
         # Strip trailing zeros for compact display: "4200.00" → "4,200".
         amount_dec = Decimal(r.get("amount_due") or "0")
-        amount_str = f"{int(amount_dec):,}" if amount_dec == int(amount_dec) else f"{amount_dec:,.2f}"
+        amount_str = f"{int(amount_dec):,}" if amount_dec == int(amount_dec) else _format_exact(amount_dec)
         posted = r.get("date_posted") or "?"
         # Credit notes have no due date — they sit as available
         # credit until applied or refunded.
@@ -2051,7 +2053,10 @@ class BusinessMixin:
             if grand_total == int(grand_total):
                 amount_str = f"{ccy} {int(grand_total):,}".strip()
             else:
-                amount_str = f"{ccy} {grand_total:,.2f}".strip()
+                amount_str = (
+                    f"{ccy} "
+                    f"{_format_amount(grand_total, invoice.currency, separators=True)}"
+                ).strip()
         except (ValueError, AttributeError, TypeError):
             # Limited to the predictable shapes "?" is right for —
             # a bare ``except Exception`` would swallow programming
@@ -11153,6 +11158,7 @@ class BusinessMixin:
             partial_labels=_partial_period_labels(
                 start_date, end_date, group_by,
             ),
+            currency=default_currency,
         )
         if unconverted:
             mnem = default_currency.mnemonic

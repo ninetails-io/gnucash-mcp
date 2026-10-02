@@ -44,6 +44,7 @@ from gnucash_mcp.book import _piecash_shapes  # noqa: F401,E402
 from gnucash_mcp.book._query import QueryMixin
 from gnucash_mcp._format import (
     _book_display_name,
+    _format_amount,
     _one_line,
     _parse_book_url,
     _tsv_cell,
@@ -411,6 +412,17 @@ def _commodity_quantum(commodity) -> Decimal:
     if fraction <= 1:
         return Decimal(1)
     return Decimal(1) / Decimal(fraction)
+
+
+def _format_account_amount(value, account, *, separators: bool = False) -> str:
+    """An amount in an account's own commodity, printed as GnuCash's
+    ``gnc_account_print_info`` prints it: the account's unit
+    (``xaccAccountGetCommoditySCU``) sets the places."""
+    unit = _account_unit(account)
+    return _format_amount(
+        value, account.commodity,
+        fraction=int(Decimal(1) / unit), separators=separators,
+    )
 
 
 def _account_unit(account) -> Decimal:

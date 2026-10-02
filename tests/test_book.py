@@ -263,7 +263,7 @@ class TestGetBookSummary:
 
         result = gc_book.get_book_summary()
         # 1000 EUR × 1.20 = $1200. Decimal("1.20") stringifies as "1.2".
-        assert "1000 EUR @ 1.2" in result
+        assert "1000.00 EUR @ 1.2" in result
         assert "(USD 1200.00)" in result
 
     def test_investment_no_price_falls_back_to_cost_basis(
@@ -284,7 +284,7 @@ class TestGetBookSummary:
         assert drop_transaction_prices(multi_currency_book) > 0
         gc_book = GnuCashBook(str(multi_currency_book))
         result = gc_book.get_book_summary()
-        assert "1000 EUR — no price data" in result
+        assert "1000.00 EUR — no price data" in result
         assert "(USD 1100.00)" in result or "(USD 1100)" in result
 
     def test_business_entities_line(self, business_book: Path):
@@ -3426,7 +3426,7 @@ class TestStalePriceReadsValuationRate:
         result = GnuCashBook(str(tmp_path / "eur.gnucash")).get_book_summary()
         assert self._stale_lines(result) == [], result
         # ... and the account values through that inverse rate.
-        assert "USD Account: 1080 USD @ 0.925" in result and "(EUR 1000.00)" in result, result
+        assert "USD Account: 1080.00 USD @ 0.925" in result and "(EUR 1000.00)" in result, result
 
     def test_inverse_only_rate_goes_stale_by_its_own_date(self, tmp_path):
         from tests.conftest import drop_transaction_prices

@@ -20,6 +20,7 @@ from gnucash_mcp._env import _env_errors, _parse_env_toggle
 from gnucash_mcp._format import (
     _URI_IN_TEXT_RE as _DB_URI_IN_TEXT_RE,
     _book_display_name,
+    _format_exact,
     _scrub_credentials,
 )
 
@@ -716,17 +717,19 @@ Book: {book_path}{tz_line}
 
 
 def _format_amount(amount: str | None) -> str:
-    """Format an amount string with commas and alignment."""
+    """Format an amount string with commas, never rounded.
+
+    The log sees an amount without its commodity, so it cannot know
+    the places GnuCash would print; what it can do is never drop a
+    digit the book holds. A BHD 10.125 printed at two places read
+    10.12 here and 10.13 on the balance sheet (review C20). At least
+    two places, as before, for the common case."""
     if amount is None:
         return "0.00"
     try:
         from decimal import Decimal
         val = Decimal(amount)
-        # Format with commas and 2 decimal places
-        sign = "-" if val < 0 else ""
-        abs_val = abs(val)
-        formatted = f"{abs_val:,.2f}"
-        return f"{sign}{formatted}"
+        return _format_exact(val)
     except Exception:
         return str(amount)
 

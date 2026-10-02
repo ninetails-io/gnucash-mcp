@@ -20,7 +20,7 @@ import calendar
 import os
 import re
 from datetime import date, datetime, timedelta
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN, ROUND_HALF_UP
 from typing import TypeVar
 
 
@@ -150,6 +150,7 @@ def _format_grouped_tsv(
     excluded: list[tuple[str, Decimal]],
     label: str,
     partial_labels: set[str] | None = None,
+    currency=None,
 ) -> str:
     """Render an entity × sub-period breakdown as a TSV table.
 
@@ -171,16 +172,28 @@ def _format_grouped_tsv(
     for name, leaf in zip(displayed_names, leaves):
         per = totals.get(name, {})
         cells = [leaf]
-        cells += [f"{per.get(pl, Decimal('0')):.2f}" for pl in period_labels]
+        cells += [
+            _format_converted(per.get(pl, Decimal('0')), currency)
+            for pl in period_labels
+        ]
         tot = row_totals[name]
         avg = tot / num_periods if num_periods else Decimal("0")
-        cells += [f"{tot:.2f}", f"{avg:.2f}"]
+        cells += [
+            _format_converted(tot, currency),
+            _format_converted(avg, currency),
+        ]
         lines.append("\t".join(cells))
 
     avg_total = grand_total / num_periods if num_periods else Decimal("0")
     total_cells = ["TOTAL"]
-    total_cells += [f"{period_totals[pl]:.2f}" for pl in period_labels]
-    total_cells += [f"{grand_total:.2f}", f"{avg_total:.2f}"]
+    total_cells += [
+        _format_converted(period_totals[pl], currency)
+        for pl in period_labels
+    ]
+    total_cells += [
+        _format_converted(grand_total, currency),
+        _format_converted(avg_total, currency),
+    ]
     lines.append("\t".join(total_cells))
 
     out = "\n".join(lines)
@@ -188,7 +201,7 @@ def _format_grouped_tsv(
         out += f"\n{_PARTIAL_FOOTNOTE}"
     if excluded:
         netted = ", ".join(
-            f"{n} {t:,.2f}"
+            f"{n} {_format_converted(t, currency, separators=True)}"
             for n, t in sorted(excluded, key=lambda x: x[1])
         )
         out += (
@@ -891,6 +904,133 @@ def _format_number(
         return s or "0"
 
     return format(rounded, "f")
+
+
+# ── Amount display: GnuCash's rules ────────────────────────────────
+#
+# Two rules from GnuCash 5.12, one per job (review C20):
+#
+# - DISPLAY is ``xaccPrintAmount`` with the commodity's print info
+#   (``gnc_commodity_print_info`` / ``gnc_account_print_info``,
+#   app-utils/gnc-ui-util.cpp): as many decimal places as the
+#   commodity's fraction has (``is_decimal_fraction``), all of them
+#   for an ISO currency (``min_decimal_places = max``), trailing zeros
+#   dropped for anything else (``min_decimal_places = 0``). A stored
+#   amount is exact at that unit and is never rounded; where the
+#   printer must round it adds 5 at the next place and truncates the
+#   magnitude (``PrintAmountInternal``): half-up, away from zero.
+# - CONVERSION is ``convert_amount_at_date`` (engine/gnc-pricedb.cpp):
+#   the product is rounded to the target currency's fraction with
+#   ``GNC_HOW_RND_ROUND``, which gnc-numeric.h defines as banker's
+#   rounding, half-even.
+#
+# A BHD 10.125 read 10.13, 10.12, and 10.12 on three surfaces while
+# every one of them assumed two places and they disagreed on how to
+# round a half.
+
+
+def _decimal_places(fraction) -> int | None:
+    """``is_decimal_fraction``: the places a power-of-ten fraction
+    gives (100 → 2, 1000 → 3, 1 → 0); None for any other fraction."""
+    fraction = int(fraction or 1)
+    places = 0
+    while fraction > 1 and fraction % 10 == 0:
+        fraction //= 10
+        places += 1
+    return places if fraction == 1 else None
+
+
+def _is_iso(commodity) -> bool:
+    """``gnc_commodity_is_iso``: the currency namespace."""
+    return getattr(commodity, "namespace", "CURRENCY") in (
+        "CURRENCY", "ISO4217",
+    )
+
+
+def _commodity_display(commodity):
+    """What the formatters read from a commodity (mnemonic, fraction,
+    namespace), detached from the session, for figures rendered after
+    the book closes."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        mnemonic=commodity.mnemonic,
+        fraction=commodity.fraction,
+        namespace=commodity.namespace,
+    )
+
+
+def _round_converted(value, commodity) -> Decimal:
+    """An amount converted into ``commodity``, rounded as GnuCash's
+    price database rounds a conversion: to the commodity's fraction,
+    half-even."""
+    fraction = int(getattr(commodity, "fraction", 100) or 1)
+    quantum = Decimal(1) / Decimal(fraction) if fraction > 1 else Decimal(1)
+    return Decimal(str(value)).quantize(quantum, rounding=ROUND_HALF_EVEN)
+
+
+def _format_amount(
+    value,
+    commodity=None,
+    *,
+    fraction: int | None = None,
+    separators: bool = False,
+) -> str:
+    """An amount the way GnuCash prints it in ``commodity`` (see the
+    block comment above). ``fraction`` overrides the commodity's (an
+    account's non-standard SCU, ``gnc_account_print_info``). With no
+    commodity, the book-agnostic default: two places, as GnuCash's
+    locale default for a currency."""
+    if value is None or value == "":
+        value = 0
+    try:
+        d = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return str(value)
+    if fraction is None:
+        fraction = getattr(commodity, "fraction", 100) if commodity is not None else 100
+    places = _decimal_places(fraction)
+    iso = commodity is None or _is_iso(commodity)
+    if places is None:
+        # A non-decimal fraction (1/8 shares): GnuCash prints the
+        # exact value; a decimal rendering of it is exact at six.
+        places, iso = 6, False
+    rounded = d.quantize(Decimal(1).scaleb(-places), rounding=ROUND_HALF_UP)
+    s = format(rounded, ",f" if separators else "f")
+    if not iso and "." in s:
+        s = s.rstrip("0").rstrip(".")
+    if s in ("-0", "") or (rounded == 0 and s.startswith("-")):
+        s = s.lstrip("-") or "0"
+    return s
+
+
+def _format_price(value, currency) -> str:
+    """A price per unit in ``currency``, as ``gnc_price_print_info``
+    prints it: the currency's places plus two (four for USD, five for
+    BHD, two for JPY), half-up where it must round."""
+    places = (_decimal_places(getattr(currency, "fraction", 100)) or 0) + 2
+    d = Decimal(str(value if value not in (None, "") else 0))
+    return format(
+        d.quantize(Decimal(1).scaleb(-places), rounding=ROUND_HALF_UP), "f",
+    )
+
+
+def _format_exact(value, *, separators: bool = True) -> str:
+    """An exact amount whose commodity the caller does not hold:
+    every digit kept, never rounded, at least two places."""
+    d = Decimal(str(value))
+    places = max(2, -d.as_tuple().exponent) if d.is_finite() else 2
+    return format(d, f"{',' if separators else ''}.{places}f")
+
+
+def _format_converted(value, commodity=None, *, separators: bool = False) -> str:
+    """A report figure valued into ``commodity`` (the book's default
+    currency): rounded as a conversion, printed as an amount."""
+    if commodity is None:
+        return _format_amount(value, separators=separators)
+    return _format_amount(
+        _round_converted(value, commodity), commodity, separators=separators,
+    )
 
 
 # ── Path display ───────────────────────────────────────────────────

@@ -34,7 +34,12 @@ from gnucash_mcp.book._base import (
     _verify_composite_write,
     _verify_write,
 )
-from gnucash_mcp._format import _paginate, _period_label
+from gnucash_mcp._format import (
+    _format_exact,
+    _paginate,
+    _period_label,
+    _round_converted,
+)
 
 
 def _collapse_period_runs(
@@ -150,7 +155,7 @@ def _format_budget_report_compact(report: dict) -> str:
         # Whole-dollar values render simpler.
         if d == d.to_integral_value():
             return f"{int(d):,}"
-        return f"{d:,.2f}"
+        return _format_exact(d)
 
     budget_strs = [_fmt(r["budgeted"]) for r in accounts]
     actual_strs = [_fmt(r["actual"]) for r in accounts]
@@ -1004,6 +1009,19 @@ class BudgetsMixin:
                     actuals[rollup_target] = actuals.get(
                         rollup_target, Decimal("0")
                     ) + (-amount)
+
+            # Each account's figures are values in the book currency:
+            # rounded as GnuCash rounds a conversion (review C20), so
+            # the rows, the side sums, and the TOTAL are exact sums of
+            # what is shown.
+            budgeted = {
+                k: _round_converted(v, default_currency)
+                for k, v in budgeted.items()
+            }
+            actuals = {
+                k: _round_converted(v, default_currency)
+                for k, v in actuals.items()
+            }
 
             accounts_result = []
             # Income and expense targets are tallied on their own

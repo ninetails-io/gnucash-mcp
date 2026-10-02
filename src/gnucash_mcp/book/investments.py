@@ -21,6 +21,7 @@ from piecash.core.transaction import Lot
 
 from gnucash_mcp.book._currency import _price_row_utc, _price_tie_rank
 from gnucash_mcp.book._base import (
+    _format_account_amount,
     _lot_cache_flag,
     _LOT_CLOSED,
     _LOT_CLOSED_UNKNOWN,
@@ -37,7 +38,12 @@ from gnucash_mcp.book._base import (
     _to_decimal,
     _unique_prefix,
 )
-from gnucash_mcp._format import _format_number, _paginate
+from gnucash_mcp._format import (
+    _format_converted,
+    _format_number,
+    _format_price,
+    _paginate,
+)
 
 
 class InvestmentsMixin:
@@ -1467,25 +1473,25 @@ class InvestmentsMixin:
         ``cost_basis`` key keeps existing callers working.
         """
         raw = self._lot_decimals(lot, book, default_ccy)
-        remaining_cb = _format_number(
-            raw["remaining_cost_basis"], decimals=2,
+        # Cost basis is a value in the book currency; the quantity is
+        # in the lot account's commodity, at its places (review C20,
+        # MM-10: 0.00004321 BTC read 0.0000); cost per share is a
+        # price (``_format_price``).
+        remaining_cb = _format_converted(
+            raw["remaining_cost_basis"], default_ccy,
         )
-        original_cb = _format_number(
-            raw["purchase_value"], decimals=2,
+        original_cb = _format_converted(
+            raw["purchase_value"], default_ccy,
         )
         return {
-            # Quantity is shares (or other commodity units): 4 decimals
-            # is a good default for funds and stocks. Crypto callers
-            # who need finer granularity get the same _format_number
-            # logic at decimals=6 in their own paths.
-            "quantity": _format_number(raw["remaining"], decimals=4),
+            "quantity": _format_account_amount(raw["remaining"], lot.account),
             # Legacy: ``cost_basis`` returns the remaining (post-sale)
             # value, same as before the rename. New callers should
             # use ``remaining_cost_basis`` for clarity.
             "cost_basis": remaining_cb,
             "remaining_cost_basis": remaining_cb,
             "original_cost_basis": original_cb,
-            "cost_per_share": _format_number(raw["cost_per_share"], decimals=4),
+            "cost_per_share": _format_price(raw["cost_per_share"], default_ccy),
             "is_closed": _lot_is_closed(lot),
         }
 
@@ -1865,10 +1871,10 @@ class InvestmentsMixin:
             gain_pct = (gain / cost_basis * 100) if cost_basis else Decimal(0)
 
             return {
-                "shares": _format_number(shares_to_sell, decimals=4),
-                "cost_basis": _format_number(cost_basis, decimals=2),
-                "sale_proceeds": _format_number(proceeds, decimals=2),
-                "capital_gain": _format_number(gain, decimals=2),
+                "shares": _format_account_amount(shares_to_sell, lot.account),
+                "cost_basis": _format_converted(cost_basis, default_ccy),
+                "sale_proceeds": _format_converted(proceeds, default_ccy),
+                "capital_gain": _format_converted(gain, default_ccy),
                 "gain_percent": _format_number(gain_pct, decimals=2),
             }
 
@@ -1904,7 +1910,7 @@ class InvestmentsMixin:
             if balance != 0:
                 raise ValueError(
                     f"Cannot close lot: it still holds "
-                    f"{_format_number(balance, decimals=4)} "
+                    f"{_format_account_amount(balance, lot.account)} "
                     f"{lot.account.commodity.mnemonic}. GnuCash defines "
                     f"a closed lot as zero balance; assign the sale "
                     f"split(s) first (assign_split_to_lot)."

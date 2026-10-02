@@ -25,9 +25,9 @@ from gnucash_mcp.logging_config import DEBUG_LOGGER_NAME
 from gnucash_mcp._format import (
     _candidate_comparison_tsv,
     _dry_run_summary,
-    _format_number,
     _num_signal,
     _paginate,
+    _round_converted,
     _signal_confidence,
     _signal_strength,
     _split_match_verdict,
@@ -84,6 +84,7 @@ from gnucash_mcp.book._base import (
     _is_voided,
     _lot_forget_flag,
     _money_precision_error,
+    _format_account_amount,
     _new_split,
     _no_price_if_rounded,
     _set_split_amounts,
@@ -140,8 +141,8 @@ class _SummaryData:
     ``get_book_summary``, populated in one walk over ``book.accounts``
     by ``_collect_summary_balance_sheet``.
 
-    Totals are pre-rounded to 2 dp; per-leaf balances stay at native
-    precision so renderers can re-round. Internal — no caller outside
+    Every figure is pre-rounded to the book currency's unit (see
+    ``_collect_summary_balance_sheet``); renderers print as given. Internal — no caller outside
     get_book_summary and its renderers should depend on the shape.
     """
 
@@ -152,7 +153,7 @@ class _SummaryData:
     receivable_accts: list[tuple[str, Decimal]] = field(default_factory=list)
     payable_accts: list[tuple[str, Decimal]] = field(default_factory=list)
 
-    # Totals (pre-rounded to 2dp).
+    # Totals (pre-rounded to the currency's unit).
     assets_total: Decimal = Decimal("0")
     liabilities_total: Decimal = Decimal("0")
     receivables_total: Decimal = Decimal("0")
@@ -645,7 +646,7 @@ class CoreMixin:
             if outstanding_count:
                 outstanding = {
                     "outstanding_count": outstanding_count,
-                    "outstanding_value": str(outstanding_value),
+                    "outstanding_value": _format_account_amount(outstanding_value, account),
                     "outstanding_oldest_date":
                         outstanding_oldest_date.isoformat(),
                     "commodity": account.commodity.mnemonic,
@@ -693,7 +694,7 @@ class CoreMixin:
                         "status": f"through {latest_y_date.isoformat()}",
                         "days_behind": days_behind,
                         "unreconciled_count": unreconciled_count,
-                        "unreconciled_value": str(unreconciled_value),
+                        "unreconciled_value": _format_account_amount(unreconciled_value, account),
                         "commodity": account.commodity.mnemonic,
                         "latest_y_date": latest_y_date.isoformat(),
                         "oldest_unreconciled_date":
@@ -2494,10 +2495,9 @@ class CoreMixin:
                 # dashboard review, 2026-08-21).
                 value_part = ""
                 if "unreconciled_value" in entry:
-                    amt = Decimal(entry["unreconciled_value"])
+                    amt = entry["unreconciled_value"].lstrip("-")
                     value_part = (
-                        f" / {entry['commodity']} "
-                        f"{_format_number(abs(amt))} net"
+                        f" / {entry['commodity']} {amt} net"
                     )
                 out.append(
                     f"  {leaf}: {n} split{plural}{value_part} "
@@ -2518,12 +2518,12 @@ class CoreMixin:
                 continue
             leaf = entry["account"].split(":")[-1]
             n = entry["outstanding_count"]
-            amt = Decimal(entry["outstanding_value"])
+            amt = entry["outstanding_value"].lstrip("-")
             out.append(
                 f"  {leaf}: {n} outstanding item{'s' if n != 1 else ''} "
                 f"older than last reconcile (oldest "
                 f"{entry['outstanding_oldest_date']}, "
-                f"{entry['commodity']} {_format_number(abs(amt))} net)"
+                f"{entry['commodity']} {amt} net)"
             )
         if current_count:
             plural = "s" if current_count != 1 else ""
@@ -2745,9 +2745,25 @@ class CoreMixin:
                 if has_activity:
                     data.expense_active += 1
 
-        # Pre-round all totals once so renderers format directly.
+        # Every figure is a value in the book's currency: round each
+        # account's as GnuCash rounds a conversion (half-even, to the
+        # currency's unit; ``_round_converted``), and total the
+        # rounded figures as desktop's account tree does — so the
+        # renderers print what they are given, at the currency's own
+        # places (review C20: a BHD book read at two).
         def _r2(v: Decimal) -> Decimal:
-            return v.quantize(Decimal("0.01"))
+            return _round_converted(v, default_currency)
+
+        data.asset_leaves = [
+            (n, _r2(v), note) for n, v, note in data.asset_leaves
+        ]
+        for attr in (
+            "credit_cards", "other_liab_accts",
+            "receivable_accts", "payable_accts",
+        ):
+            setattr(data, attr, [
+                (n, _r2(v)) for n, v in getattr(data, attr)
+            ])
 
         data.receivables_total = _r2(
             sum((b for _, b in data.receivable_accts), Decimal("0"))
@@ -2976,7 +2992,7 @@ class CoreMixin:
         for name, usd_value, note in sorted(
             data.asset_leaves, key=lambda x: x[1], reverse=True
         ):
-            rounded = usd_value.quantize(Decimal("0.01"))
+            rounded = usd_value
             if note is None:
                 lines.append(f"  {name}: {currency} {rounded}")
             else:
@@ -3021,7 +3037,7 @@ class CoreMixin:
             all_liab_leaves.sort(key=lambda x: x[1], reverse=True)
             top_n = all_liab_leaves[:3]
             top_parts = [
-                f"{n} {currency} {b.quantize(Decimal('0.01'))}"
+                f"{n} {currency} {b}"
                 for n, b in top_n
             ]
             lines.append(
@@ -3066,7 +3082,7 @@ class CoreMixin:
             ):
                 lines.append(
                     f"  {name}: {currency} "
-                    f"{bal.quantize(Decimal('0.01'))}"
+                    f"{bal}"
                 )
         if data.payable_accts:
             bill_n = biz_counts["open_bills"]
@@ -3088,7 +3104,7 @@ class CoreMixin:
             ):
                 lines.append(
                     f"  {name}: {currency} "
-                    f"{bal.quantize(Decimal('0.01'))}"
+                    f"{bal}"
                 )
         return lines
 
