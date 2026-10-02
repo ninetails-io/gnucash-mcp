@@ -464,6 +464,30 @@ def _new_split(account, value, quantity, currency, **fields):
     )
 
 
+def _split_from_validated(v: dict, currency, **fields):
+    """``_new_split`` for one dict from ``_validate_transaction_splits``,
+    carrying its rounding forward: see ``_no_price_if_rounded``."""
+    split = _new_split(
+        v["account"], v["value"], v["quantity"], currency, **fields,
+    )
+    _no_price_if_rounded(split, v)
+    return split
+
+
+def _no_price_if_rounded(split, v: dict) -> None:
+    """A split whose quantity was rounded to its commodity's unit
+    implies no price. 0.00005 BTC on a four-decimal commodity is
+    stored as 0.0001, and the price the stored row implies is half
+    the rate the caller paid (side-finding 9: 20000 for a 40000
+    coin), which valuation would then count. The rounding is
+    reported (``quantity_rounded``); the day's rate is left to a
+    quote or a split that states it exactly."""
+    if v.get("quantity_as_entered") is not None:
+        from gnucash_mcp.book._piecash_shapes import SKIP_IMPLIED_PRICE_ATTR
+
+        setattr(split, SKIP_IMPLIED_PRICE_ATTR, True)
+
+
 def _set_split_amounts(split, value, quantity) -> None:
     """The one writer of an existing split's amounts — GnuCash's
     ``xaccSplitSetValue`` / ``xaccSplitSetAmount`` together: round

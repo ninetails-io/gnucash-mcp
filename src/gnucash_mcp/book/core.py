@@ -85,7 +85,9 @@ from gnucash_mcp.book._base import (
     _lot_forget_flag,
     _money_precision_error,
     _new_split,
+    _no_price_if_rounded,
     _set_split_amounts,
+    _split_from_validated,
     _split_amounts,
     _slot_bool,
     _slot_value_str,
@@ -4650,9 +4652,8 @@ class CoreMixin:
                 # never call book.save().
                 if not readonly:
                     piecash_splits.append(
-                        _new_split(
-                            account, v["value"], v["quantity"],
-                            trans_currency,
+                        _split_from_validated(
+                            v, trans_currency,
                             memo=v["memo"] or "",
                             action=v["action"] or "",
                         )
@@ -5134,9 +5135,8 @@ class CoreMixin:
             built = []
             for p, dup_count, _max_conf in accepted:
                 piecash_splits = [
-                    _new_split(
-                        v["account"], v["value"], v["quantity"],
-                        p["currency"], memo=v["memo"] or "",
+                    _split_from_validated(
+                        v, p["currency"], memo=v["memo"] or "",
                         action=v["action"] or "",
                     )
                     for v in p["validated"]
@@ -6349,9 +6349,8 @@ class CoreMixin:
         built = []
         for ln, validated, src in prepared:
             piecash_splits = [
-                _new_split(
-                    v["account"], v["value"], v["quantity"],
-                    default_currency, memo=v["memo"] or "",
+                _split_from_validated(
+                    v, default_currency, memo=v["memo"] or "",
                     action=v["action"] or "",
                 )
                 for v in validated
@@ -7361,6 +7360,15 @@ class CoreMixin:
                     _to_decimal(expected["quantity"])
                     if "quantity" in expected else None
                 )
+                if eq is not None:
+                    # Compare with what GnuCash stores: a share
+                    # quantity finer than the commodity's unit is
+                    # rounded on write (and reported). Comparing the
+                    # typed figure reported a committed update as a
+                    # failed one.
+                    eq = Decimal(str(_split_amounts(
+                        ev, eq, transaction.currency, resolved,
+                    )[1]))
                 # Consume the first split matching value (and quantity,
                 # when the caller specified it).
                 match_idx = next(
@@ -7797,6 +7805,7 @@ class CoreMixin:
                     account_name = split.account.fullname
                     if account_name in split_updates:
                         v = split_updates[account_name]
+                        _no_price_if_rounded(split, v)
                         _set_split_amounts(
                             split, v["value"], v["quantity"],
                         )
@@ -8027,9 +8036,8 @@ class CoreMixin:
                 match = _claim(
                     carryover, v["account"].guid, v["value"], v["quantity"],
                 )
-                new_split = _new_split(
-                    v["account"], v["value"], v["quantity"],
-                    transaction.currency,
+                new_split = _split_from_validated(
+                    v, transaction.currency,
                     memo=v["memo"] or (match["memo"] if match else ""),
                     action=v["action"] or (match["action"] if match else ""),
                     transaction=transaction,

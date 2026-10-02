@@ -141,3 +141,87 @@ class TestShareQuantityThatRoundsAway:
             ],
         )
         assert made["status"] == "created"
+
+
+class TestRoundedQuantityImpliesNoPrice:
+    """Side-finding 9: 0.00005 BTC paid 2.00 for is stored as 0.0001,
+    and the stored row implies 20000 for a 40000 coin. A rounded
+    split records no price; an exact one still does. Every path that
+    builds splits from the shared validator is covered."""
+
+    _btc = TestShareQuantityThatRoundsAway._btc
+
+    def _btc_prices(self, path):
+        return _q(
+            path,
+            "SELECT p.value_num, p.value_denom FROM prices p "
+            "JOIN commodities c ON c.guid = p.commodity_guid "
+            "WHERE c.mnemonic = 'BTC'",
+        )
+
+    def _legs(self, quantity, amount="2.00"):
+        return [
+            {"account": "Assets:BTC", "amount": amount,
+             "quantity": quantity},
+            {"account": "Assets:Checking", "amount": f"-{amount}"},
+        ]
+
+    def test_create(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        self._btc(gb)
+        made = gb.create_transaction(
+            description="Buy", trans_date=D, splits=self._legs("0.00005"),
+        )
+        assert "quantity_rounded" in str(made.get("warnings"))
+        assert self._btc_prices(test_book) == []
+
+    def test_an_exact_quantity_still_records_its_price(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        self._btc(gb)
+        gb.create_transaction(
+            description="Buy", trans_date=D, splits=self._legs("0.0001"),
+        )
+        [(num, denom)] = self._btc_prices(test_book)
+        assert num / denom == 20000
+
+    def test_batch(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        self._btc(gb)
+        result = gb.create_transactions([{
+            "ref": "a", "date": D, "description": "Buy",
+            "splits": self._legs("0.00005"),
+        }], dry_run=False)
+        assert "created" in result["results"]
+        assert self._btc_prices(test_book) == []
+
+    def test_replace_splits(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        self._btc(gb)
+        made = gb.create_transaction(
+            description="Buy", trans_date=D,
+            splits=self._legs("0.0001"),
+        )
+        con = sqlite3.connect(str(test_book))
+        con.execute("DELETE FROM prices")
+        con.commit()
+        con.close()
+        gb.replace_splits(
+            guid=made["guid"], splits=self._legs("0.00015", amount="4.00"),
+        )
+        assert self._btc_prices(test_book) == []
+
+    def test_update(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        self._btc(gb)
+        made = gb.create_transaction(
+            description="Buy", trans_date=D,
+            splits=self._legs("0.0001"),
+        )
+        con = sqlite3.connect(str(test_book))
+        con.execute("DELETE FROM prices")
+        con.commit()
+        con.close()
+        gb.update_transaction(
+            guid=made["guid"], splits=self._legs("0.00015", amount="4.00"),
+        )
+        assert self._btc_prices(test_book) == []

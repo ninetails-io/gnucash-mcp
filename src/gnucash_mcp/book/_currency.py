@@ -982,7 +982,10 @@ class CurrencyMixin:
                         f"{entered} stored as {v['quantity']} — "
                         f"{account.commodity.mnemonic} is counted in "
                         f"units of "
-                        f"{_commodity_quantum(account.commodity)}."
+                        f"{_commodity_quantum(account.commodity)}. "
+                        f"No price was recorded from this split: "
+                        f"the stored amounts imply a rate the "
+                        f"entry did not state."
                     ),
                 })
             value = abs(Decimal(str(v["value"])))
