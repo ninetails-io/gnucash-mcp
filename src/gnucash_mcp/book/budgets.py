@@ -34,7 +34,7 @@ from gnucash_mcp.book._base import (
     _verify_composite_write,
     _verify_write,
 )
-from gnucash_mcp._format import _paginate
+from gnucash_mcp._format import _paginate, _period_label
 
 
 def _collapse_period_runs(
@@ -898,11 +898,24 @@ class BudgetsMixin:
             else:
                 target_accounts = None
 
-            # One factors map, period-end-anchored, used for BOTH
-            # targets and actuals — converting only the actuals
-            # leaves targets in raw account commodities and makes
-            # used_pct meaningless on multi-currency budgets.
-            factors = self._account_conversion_factors(book, last_end)
+            # A budget report is a FLOW report (MM-12 ruling,
+            # 2026-10-02): every actual converts at its own month's
+            # close, as spending_by_category / income_by_source do,
+            # so the two agree on the same data. Targets convert too
+            # — converting only the actuals leaves targets in raw
+            # account commodities and makes used_pct meaningless on
+            # multi-currency budgets — each at the close of the month
+            # its period ends in.
+            monthly_factors = self._monthly_conversion_factors(
+                book, first_start, last_end,
+            )
+            period_end_month = {
+                p: _period_label(
+                    min(self._period_to_date_range(budget, p)[1], last_end),
+                    "month",
+                )
+                for p in report_periods
+            }
             default_currency = self._require_default_currency(book)
             # Currencies of budgeted accounts folded in raw for lack of
             # an FX rate — surfaced as a warning so the converted totals
@@ -924,7 +937,9 @@ class BudgetsMixin:
                 # _split_in_default_currency. Record the currency so a
                 # foreign fold isn't silent (it stays in the totals —
                 # a caveated budget line beats a dropped one).
-                factor = factors.get(ba.account.guid)
+                factor = monthly_factors.get(
+                    period_end_month[ba.period_num], {}
+                ).get(ba.account.guid)
                 ba_amount = magnitude
                 if factor is not None:
                     target_in_default = ba_amount * factor
@@ -974,7 +989,7 @@ class BudgetsMixin:
                     continue
                 amount = self._split_in_default_currency(
                     split, account,
-                    factors.get(account.guid),
+                    self._monthly_factor(monthly_factors, _txn, account),
                 )
                 # SIGNED accumulation so contra splits net — same
                 # convention as spending_by_category /

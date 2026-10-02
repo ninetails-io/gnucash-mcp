@@ -1040,3 +1040,72 @@ class TestPriceLookupMemo:
                         price_date=date(2026, 5, 2),
                         source="user:price")
         assert calls, "delete_price must invalidate after its save"
+
+
+# --------------------------------------------------------------------------
+# MM-12 — a budget report is a flow report: monthly-close valuation
+# --------------------------------------------------------------------------
+
+def test_budget_report_actuals_agree_with_spending_by_category(tmp_path):
+    """Actuals convert at each split's month close, as the spending
+    report does; one period-end rate made the two disagree on the same
+    data (the review's 260.0 against 240.0)."""
+    path = tmp_path / "budget_fx.gnucash"
+    book = piecash.create_book(str(path), currency="USD", overwrite=True)
+    usd = book.default_currency
+    eur = factories.create_currency_from_ISO("EUR")
+    assets = piecash.Account(
+        name="Assets", type="ASSET", commodity=usd,
+        parent=book.root_account, placeholder=True,
+    )
+    cash = piecash.Account(
+        name="EUR Cash", type="CASH", commodity=eur, parent=assets,
+    )
+    expenses = piecash.Account(
+        name="Expenses", type="EXPENSE", commodity=usd,
+        parent=book.root_account, placeholder=True,
+    )
+    travel = piecash.Account(
+        name="EU Travel", type="EXPENSE", commodity=eur, parent=expenses,
+    )
+    for d in (date(2026, 1, 10), date(2026, 2, 10)):
+        piecash.Transaction(
+            currency=eur, description="Trip", post_date=d,
+            splits=[
+                piecash.Split(account=travel, value=Decimal("100")),
+                piecash.Split(account=cash, value=Decimal("-100")),
+            ],
+        )
+    book.save()
+    book.close()
+
+    gb = GnuCashBook(str(path))
+    for d, rate in (
+        (date(2026, 1, 15), "1.0"),
+        (date(2026, 2, 15), "1.4"),
+        (date(2026, 3, 15), "2.0"),
+    ):
+        gb.create_price(
+            commodity="EUR", namespace="CURRENCY", value=rate,
+            currency="USD", price_date=d,
+        )
+    gb.create_budget(
+        name="2026", num_periods=12, period_type="monthly",
+        start_date="2026-01-01",
+    )
+    gb.set_budget_amount(
+        budget_name="2026", account="Expenses:EU Travel",
+        amount="100", period="all",
+    )
+
+    res = gb.get_budget_report(budget_name="2026", period="all", compact=False)
+    spend = gb.spending_by_category(
+        start_date=date(2026, 1, 1), end_date=date(2026, 12, 31),
+        depth=2, compact=False,
+    )
+    row = next(a for a in res["accounts"] if a["account"] == "Expenses:EU Travel")
+    assert Decimal(row["actual"]) == Decimal("240")
+    assert Decimal(row["actual"]) == Decimal(spend["total"])
+    # Targets: each month's 100 EUR at that month's close (Mar's 2.0
+    # carries through December).
+    assert Decimal(row["budgeted"]) == Decimal("2240")
