@@ -848,3 +848,70 @@ class TestC28ABookMovedBetweenCommitAndResponse:
             ("Moved Under Us",),
         )
         assert rows == [(1,)]
+
+
+class TestConvertedBalancesAreRoundedPerAccount:
+    """A converted balance is rounded to the currency's unit once per
+    account, as GnuCash rounds a conversion, and totals are sums of
+    those. Three EUR accounts of 1.00 at 1.005 are 1.00 each (half to
+    even) and 3.00 together; rounding the unrounded sum gave 3.02,
+    two cents more than the lines beside it."""
+
+    AS_OF = date(2026, 6, 30)
+
+    def _book(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        for name in ("Euro A", "Euro B", "Euro C"):
+            gb.create_account(
+                name=name, account_type="BANK", parent="Assets",
+                commodity="EUR",
+            )
+            gb.create_transaction(
+                description=f"Fund {name}",
+                splits=[
+                    {"account": f"Assets:{name}", "amount": "1.00",
+                     "quantity": "1.00"},
+                    {"account": "Assets:Checking", "amount": "-1.00"},
+                ],
+                trans_date=date(2026, 6, 1), check_duplicates=False,
+            )
+        from tests.conftest import drop_transaction_prices
+        drop_transaction_prices(test_book)
+        gb.create_price(
+            commodity="EUR", namespace="CURRENCY", value="1.005",
+            price_date=date(2026, 6, 15),
+        )
+        return gb
+
+    def test_lines_add_up_and_the_surfaces_agree(self, test_book):
+        from tests.test_multicurrency_audit import _three_surfaces
+
+        gb = self._book(test_book)
+        sheet = gb.balance_sheet(as_of_date=self.AS_OF)
+        euro = [
+            Decimal(row["default_currency_value"])
+            for row in sheet["assets"]["accounts"]
+            if row["account"].startswith("Assets:Euro")
+        ]
+        assert euro == [Decimal("1.00")] * 3
+        for section in ("assets", "liabilities", "equity"):
+            lines = sum(
+                Decimal(row.get("default_currency_value", row["balance"]))
+                for row in sheet[section]["accounts"]
+            )
+            assert lines == Decimal(sheet[section]["total"]), section
+        assert Decimal(sheet["assets"]["total"]) == (
+            Decimal(sheet["liabilities"]["total"])
+            + Decimal(sheet["equity"]["total"])
+        )
+        a_minus_l, net_worth, dashboard = _three_surfaces(gb, self.AS_OF)
+        assert a_minus_l == net_worth == dashboard
+
+    def test_the_series_ends_on_the_point_in_time_figure(self, test_book):
+        gb = self._book(test_book)
+        point = gb.net_worth(end_date=self.AS_OF)["net_worth"]
+        series = gb.net_worth(
+            start_date=date(2026, 5, 31), end_date=self.AS_OF,
+            interval="month",
+        )["series"]
+        assert series[-1]["net_worth"] == point

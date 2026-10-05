@@ -732,6 +732,16 @@ class ReportingMixin:
                     default_currency=default_currency, as_of=as_of_date,
                 )
 
+            # Each account's converted balance is rounded to the
+            # currency's unit once, here, as GnuCash rounds a
+            # conversion, and every total below is a sum of rounded
+            # lines: the sheet's lines add up to its totals, and
+            # assets minus liabilities is net_worth's figure exactly
+            # (``_market_value`` rounds per account the same way).
+            for info in balances.values():
+                info["usd"] = _round_converted(info["usd"], default_currency)
+            net_income = _round_converted(net_income, default_currency)
+
             # Display rates anchored to the report date, market
             # prices only (see _rates_as_of).
             latest_rates = self._rates_as_of(book, as_of_date)
@@ -745,7 +755,9 @@ class ReportingMixin:
             equity: dict[str, dict] = {}
             for name, info in balances.items():
                 bal = info["usd"]
-                if bal == 0:
+                # A holding worth less than half a unit still shows,
+                # at zero, while any of it is held.
+                if bal == 0 and info["quantity"] == 0:
                     continue
                 if info["type"] in _ASSET_TYPES:
                     assets[name] = info
@@ -898,7 +910,10 @@ class ReportingMixin:
                     end_date=end_date,
                     account_types=nw_types,
                 )
-                total = Decimal("0")
+                # Per account, each rounded to the currency's unit
+                # once and then summed: the figure balance_sheet's
+                # lines add up to (see the note there).
+                per_account: dict[str, Decimal] = {}
                 # Unpriced holdings: legs collected, valued at
                 # remaining cost basis below — the same rule as
                 # balance_sheet and the dashboard (#185).
@@ -912,14 +927,23 @@ class ReportingMixin:
                         continue
                     # Liabilities are stored negative, so a direct
                     # sum gives assets minus liabilities.
-                    total += self._split_in_default_currency(
+                    per_account[account.guid] = per_account.get(
+                        account.guid, Decimal("0"),
+                    ) + self._split_in_default_currency(
                         split, account, factor
                     )
-                for legs in unpriced.values():
-                    total += self._unpriced_cost_basis(
+                for guid, legs in unpriced.items():
+                    per_account[guid] = self._unpriced_cost_basis(
                         book, legs,
                         default_currency=default_currency, as_of=end_date,
                     )
+                total = sum(
+                    (
+                        _round_converted(v, default_currency)
+                        for v in per_account.values()
+                    ),
+                    Decimal("0"),
+                )
                 return {
                     "as_of_date": end_date.isoformat(),
                     "net_worth": _format_converted(total, default_currency),
@@ -983,9 +1007,11 @@ class ReportingMixin:
                 for acct_guid, qty in running_qty.items():
                     factor = factors_here.get(acct_guid)
                     if factor is not None:
-                        total += qty * factor
+                        value = qty * factor
                     else:
-                        total += running_pool[acct_guid].basis
+                        value = running_pool[acct_guid].basis
+                    # Per account, as the point-in-time figure is.
+                    total += _round_converted(value, default_currency)
                 return total
 
             series: list[dict] = []
