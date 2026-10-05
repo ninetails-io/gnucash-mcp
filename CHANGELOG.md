@@ -166,6 +166,7 @@ Schedule recipes, invoice links, and budget signs are now stored the way GnuCash
 - `assign_split_to_lot` saves once, after everything that can fail. A failure after the assignment used to leave the split in the lot while the tool reported an error and the retry answered "already assigned". Review item C32.
 - **A write the server did not live to log is reported.** The audit entry is rendered from a write's result, so it is written after the commit; a server killed in between left a committed write with no line. Each write now leaves a small intent file beside the audit log before it runs and removes it once its entry is written. An intent found at the next startup or the next write, whose process is gone, becomes an `INTERRUPTED` line naming the tool, when it started, and what it was asked to do. Review item DS-11.
 - A failure while rendering an audit entry can no longer turn a committed write into an error response: the result is returned, and the trail gets one line saying the entry could not be rendered and why (DS-16). A `switch_book` whose target and whose fallback both fail to open an audit log now sends the trail to the server's stderr and says so in its error, where it used to leave the session with no audit log at all (DS-10).
+- A `GNUCASH_LOG_DIR` override keeps the per-book folder checks: the `{book}.mcp` folder inside it is refused if it is a symlink or belongs to another user, as it is beside the book. The small state files under the log folder are written through an exclusively created temp file that does not follow a link, mode 0600; a symlink planted at the temp name used to be followed and its target overwritten. Review item C53.
 
 ### Known limitations
 Found by the pre-release review and left as they are in 1.5, each by a recorded decision. None changes a stored amount. They are listed so that a boundary is a documented one. Item numbers refer to `specs/v1.5/testing/ADVERSARIAL_REVIEW_1.5.md`.
@@ -175,7 +176,6 @@ Found by the pre-release review and left as they are in 1.5, each by a recorded 
 - **The read-only period is a warning, not a refusal** (C69, above).
 - **Credit notes do not stamp the `Credit Notes` feature flag.** Only GnuCash older than 2.5.0 reads it (C62).
 - A book file renamed or removed between a write's commit and its response: the write is reported as failed though it committed, and an empty file can appear at the old path (C28).
-- A `GNUCASH_LOG_DIR` override skips the symlink and ownership checks the default log location gets (C53).
 - A 1.4.x server is not stopped from writing to a book 1.5 has converted. Do not point both at one book (FC-20).
 - A MySQL or MariaDB book created by GnuCash desktop has `utf8mb3` tables: an emoji in any text field is refused by the database, or stored as `?` (side-finding 12).
 - The Docker image runs as root (SEC-17).

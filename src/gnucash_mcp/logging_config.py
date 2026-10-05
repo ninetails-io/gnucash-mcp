@@ -335,6 +335,59 @@ def _log_dir_identity(book_path: Path | str, identity: str | None) -> str:
         return str(book_path)
 
 
+def write_private_file(path: Path, text: str) -> None:
+    """Write a small state file under the log directory: to a temp
+    file created exclusively and without following a link, mode
+    0600, then renamed into place. ``open(tmp, "w")`` followed a
+    symlink planted at the temp name and overwrote whatever it
+    pointed at (adversarial review 2026-09-30, C53). A stale temp
+    file from a crashed write is removed first; the exclusive create
+    then fails loudly if something reappears in between."""
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        os.unlink(tmp)  # the link itself, never its target
+    except FileNotFoundError:
+        pass
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(tmp, flags, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def _check_mcp_dir_entry(mcp_dir: Path, alternative: str) -> None:
+    """An existing ``.mcp`` entry must be a real directory owned by
+    the current user: not a symlink, not another owner's. POSIX
+    only. ``alternative`` ends the refusal with what to do instead."""
+    if os.name != "posix":
+        return
+    try:
+        if not (mcp_dir.exists() or mcp_dir.is_symlink()):
+            return
+        if mcp_dir.is_symlink():
+            raise ValueError(
+                f"Refusing to use {mcp_dir}: path is a "
+                f"symlink. Logs/backups must live in a "
+                f"real directory you own; a symlink "
+                f"could redirect writes elsewhere. "
+                f"Remove or replace it, or {alternative}."
+            )
+        st = mcp_dir.stat()
+        if st.st_uid != os.geteuid():
+            raise ValueError(
+                f"Refusing to use {mcp_dir}: directory "
+                f"is owned by uid={st.st_uid}, not the "
+                f"current user (uid={os.geteuid()}). "
+                f"Logs/backups go to a directory you "
+                f"own; mismatched ownership suggests an "
+                f"earlier symlink/hijack attempt."
+            )
+    except FileNotFoundError:
+        pass
+
+
 def _read_log_dir_owner(mcp_dir: Path) -> str | None:
     try:
         return (mcp_dir / _LOG_DIR_OWNER_FILE).read_text(
@@ -358,8 +411,8 @@ def claim_log_dir(mcp_dir: Path, book_path: Path | str,
         if owner_file.exists():
             return
         mcp_dir.mkdir(parents=True, exist_ok=True)
-        owner_file.write_text(
-            _log_dir_identity(book_path, identity) + "\n", encoding="utf-8",
+        write_private_file(
+            owner_file, _log_dir_identity(book_path, identity) + "\n",
         )
     except OSError:
         pass
@@ -381,8 +434,9 @@ def resolve_mcp_dir(
     match and the interleave would persist. v1.4.0-and-earlier flat
     files (``{GNUCASH_LOG_DIR}/audit`` …) stay on disk untouched;
     move them into the book's subdir manually to keep old history
-    attached. Permission checks are bypassed under the override
-    (explicit user opt-in), as before.
+    attached. The parent-permission check is not made under the
+    override (the folder is the user's explicit choice); the per-book
+    entry inside it is still checked (no symlink, owned by you).
 
     The filename alone is not the book. Two servers sharing one
     ``GNUCASH_LOG_DIR`` — ``2026/ledger.gnucash`` and
@@ -429,10 +483,18 @@ def resolve_mcp_dir(
         owner = _read_log_dir_owner(plain)
         mine = _log_dir_identity(book_path, identity)
         if owner is None or owner == mine:
-            return plain
-        import hashlib
-        tag = hashlib.sha256(mine.encode("utf-8")).hexdigest()[:8]
-        return base / f"{name}-{tag}.mcp"
+            chosen = plain
+        else:
+            import hashlib
+            tag = hashlib.sha256(mine.encode("utf-8")).hexdigest()[:8]
+            chosen = base / f"{name}-{tag}.mcp"
+        # The override picks the folder; it does not waive what the
+        # per-book entry inside it must be (review C53). The parent's
+        # own mode is the user's choice here and is not checked.
+        _check_mcp_dir_entry(
+            chosen, "point GNUCASH_LOG_DIR at a different folder",
+        )
+        return chosen
 
     book_path = Path(book_path)
     parent = book_path.parent
@@ -473,29 +535,9 @@ def resolve_mcp_dir(
         # by the current user. Catches the case where an earlier
         # attack already pre-created the symlink and the parent
         # has since been re-tightened.
-        try:
-            if mcp_dir.exists() or mcp_dir.is_symlink():
-                if mcp_dir.is_symlink():
-                    raise ValueError(
-                        f"Refusing to use {mcp_dir}: path is a "
-                        f"symlink. Logs/backups must live in a "
-                        f"real directory you own; a symlink "
-                        f"could redirect writes elsewhere. "
-                        f"Remove or replace it, or set "
-                        f"GNUCASH_LOG_DIR to a different path."
-                    )
-                st = mcp_dir.stat()
-                if st.st_uid != os.geteuid():
-                    raise ValueError(
-                        f"Refusing to use {mcp_dir}: directory "
-                        f"is owned by uid={st.st_uid}, not the "
-                        f"current user (uid={os.geteuid()}). "
-                        f"Logs/backups go to a directory you "
-                        f"own; mismatched ownership suggests an "
-                        f"earlier symlink/hijack attempt."
-                    )
-        except FileNotFoundError:
-            pass
+        _check_mcp_dir_entry(
+            mcp_dir, "set GNUCASH_LOG_DIR to a different path",
+        )
 
     return mcp_dir
 
@@ -3238,9 +3280,7 @@ def _write_intent(tool: str, params, timestamp: str) -> "Path | None":
                 json.dumps(params, default=str)
             )[:_INTENT_PARAMS_MAX],
         })
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as f:
-            f.write(payload)
+        write_private_file(path, payload)
         return path
     except Exception as e:  # noqa: BLE001 — must swallow
         logging.getLogger(DEBUG_LOGGER_NAME).warning(

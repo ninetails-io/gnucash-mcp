@@ -563,3 +563,50 @@ class TestDS11AWriteLeavesAnIntentUntilItsEntryIsWritten:
         lc.setup_logging(book_path=str(test_book), audit=True)
         assert "INTERRUPTED" not in trail()
         assert (directory / lc._INTENT_NAME).exists()
+
+
+@pytest.mark.skipif(
+    __import__("os").name != "posix", reason="POSIX ownership and links",
+)
+class TestC53TheLogDirOverrideKeepsThePerBookChecks:
+    def test_a_symlinked_book_folder_is_refused(
+        self, test_book, tmp_path, monkeypatch,
+    ):
+        from gnucash_mcp.logging_config import resolve_mcp_dir
+
+        logs = tmp_path / "logs"
+        elsewhere = tmp_path / "elsewhere"
+        logs.mkdir()
+        elsewhere.mkdir()
+        (logs / f"{test_book.name}.mcp").symlink_to(elsewhere)
+        monkeypatch.setenv("GNUCASH_LOG_DIR", str(logs))
+        with pytest.raises(ValueError, match="symlink"):
+            resolve_mcp_dir(test_book)
+
+    def test_a_real_folder_is_used(self, test_book, tmp_path, monkeypatch):
+        from gnucash_mcp.logging_config import resolve_mcp_dir
+
+        logs = tmp_path / "logs"
+        (logs / f"{test_book.name}.mcp").mkdir(parents=True)
+        monkeypatch.setenv("GNUCASH_LOG_DIR", str(logs))
+        assert resolve_mcp_dir(test_book) == logs / f"{test_book.name}.mcp"
+
+    def test_a_link_planted_at_the_temp_name_is_not_followed(self, tmp_path):
+        from gnucash_mcp.logging_config import write_private_file
+
+        victim = tmp_path / "victim.txt"
+        victim.write_text("precious")
+        state = tmp_path / ".state-book.json"
+        (tmp_path / ".state-book.json.tmp").symlink_to(victim)
+        write_private_file(state, '{"ok": true}')
+        assert victim.read_text() == "precious"
+        assert state.read_text() == '{"ok": true}'
+        assert not state.is_symlink()
+        assert (state.stat().st_mode & 0o777) == 0o600
+
+    def test_backup_state_goes_through_it(self, test_book, tmp_path):
+        gb = GnuCashBook(str(test_book))
+        gb.create_backup(skip_unchanged=True)
+        anchors = list(gb._backups_dir().glob(".manual-*.json"))
+        assert len(anchors) == 1
+        assert (anchors[0].stat().st_mode & 0o777) == 0o600

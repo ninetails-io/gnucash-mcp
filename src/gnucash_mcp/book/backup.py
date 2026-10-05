@@ -39,7 +39,7 @@ from pathlib import Path
 
 import piecash
 
-from gnucash_mcp.logging_config import redact_paths
+from gnucash_mcp.logging_config import redact_paths, write_private_file
 
 debug_logger = logging.getLogger("gnucash_mcp.debug")
 
@@ -248,12 +248,11 @@ def _write_state(
     if book_sha256 is not None:
         payload["book_sha256"] = book_sha256
     path = _state_path(backups_dir, stem)
-    # Write via a temp + rename so a partial write never leaves a
-    # corrupted state file.
-    tmp = path.with_suffix(".json.tmp")
-    with tmp.open("w") as f:
-        json.dump(payload, f, indent=2, sort_keys=True)
-    tmp.replace(path)
+    # Temp + rename, so a partial write never leaves a corrupted
+    # state file; exclusive and link-safe (write_private_file).
+    write_private_file(
+        path, json.dumps(payload, indent=2, sort_keys=True),
+    )
 
 
 # ── Manual-backup anchor (separate file) ─────────────────────────────
@@ -281,10 +280,9 @@ def _write_manual_anchor(
     backups_dir: Path, stem: str, book_sha256: str, filename: str,
 ) -> None:
     path = _manual_anchor_path(backups_dir, stem)
-    tmp = path.with_suffix(".json.tmp")
-    with tmp.open("w") as f:
-        json.dump({"book_sha256": book_sha256, "file": filename}, f)
-    tmp.replace(path)
+    write_private_file(
+        path, json.dumps({"book_sha256": book_sha256, "file": filename}),
+    )
 
 
 # ── Auto-backup attempt status (separate file) ───────────────────────
@@ -354,10 +352,9 @@ def _write_attempt_status(
         "at": at.astimezone(timezone.utc).isoformat(),
     }
     path = _attempt_path_scoped(backups_dir, stem)
-    tmp = path.with_suffix(".json.tmp")
-    with tmp.open("w") as f:
-        json.dump(payload, f, indent=2, sort_keys=True)
-    tmp.replace(path)
+    write_private_file(
+        path, json.dumps(payload, indent=2, sort_keys=True),
+    )
 
 
 # ── Filename inspection ──────────────────────────────────────────────
