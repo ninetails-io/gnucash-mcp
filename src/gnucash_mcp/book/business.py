@@ -7722,7 +7722,15 @@ class BusinessMixin:
             # commodity differs from the transaction currency —
             # brokerage vocabulary on a client bill. Forward-only:
             # existing transactions are never rewritten to conform.
-            doc_action = type_string
+            #
+            # gnc_set_num_action (engine-helpers.c), which every one
+            # of these legs and the transaction's number go through
+            # in gncInvoicePostToAccount: with the book option "Use
+            # Split Action Field for Number" on, the document's ID is
+            # each split's action and the type is the transaction's
+            # number; off, the other way round (review C67).
+            num_on_split = self._num_is_split_action(book)
+            doc_action = inv.id if num_on_split else type_string
             ar_ap_split = _new_split(
                 post_acct, ar_ap_value,
                 _qty_for_split(post_acct, ar_ap_value), inv.currency,
@@ -7794,12 +7802,12 @@ class BusinessMixin:
                     if (term.refcount or 0) > 0:
                         term.refcount = term.refcount - 1
 
-            # num = invoice ID, matching GnuCash UI behavior
+            # num = invoice ID (the type, with Num on split actions).
             txn = piecash.Transaction(
                 currency=inv.currency,
                 description=txn_desc,
                 post_date=parsed_date,
-                num=inv.id,
+                num=type_string if num_on_split else inv.id,
                 splits=piecash_splits,
             )
 
@@ -9009,11 +9017,18 @@ class BusinessMixin:
                 memo=memo,  # desktop puts the memo on both legs
                 action="Payment",
             )
+            # gncOwnerCreatePaymentLotSecs sends the transfer split
+            # alone through gnc_set_num_action(NULL, xfer_split, num,
+            # "Payment"): with Num on split actions its action is the
+            # payment's number, which this tool never has, so it is
+            # empty. The post-account split is "Payment" either way.
             bank_split = _new_split(
                 pay_acct, proposed[1]["value"], proposed[1]["quantity"],
                 txn_currency,
                 memo=memo,
-                action="Payment",
+                action=(
+                    "" if self._num_is_split_action(book) else "Payment"
+                ),
             )
             splits = [ar_ap_split, bank_split]
             if discount_split is not None:

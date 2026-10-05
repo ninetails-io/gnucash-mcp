@@ -291,3 +291,65 @@ class TestC69BusinessAndScheduleWritesNameTheReadOnlyPeriod:
         )
         assert applied["apply_date"] == self.INSIDE
         assert "Process Payment dialog" in applied["read_only_period"]
+
+
+def _num_on_split_actions(path):
+    """The book option as desktop stores it (pinned in
+    tests/test_transaction_num_link.py)."""
+    import piecash
+
+    with piecash.open_book(
+        str(path), readonly=False, do_backup=False, open_if_lock=True,
+    ) as b:
+        b["options"] = {"Accounts": {"Use Split Action Field for Number": "t"}}
+        b.save()
+
+
+class TestC67BusinessPostingsFollowTheNumOption:
+    """gnc_set_num_action: with "Use Split Action Field for Number"
+    on, a posting's splits carry the document ID as their action and
+    the transaction's number is the document type; a payment's
+    transfer split carries the payment number (none here)."""
+
+    def _post_and_pay(self, path):
+        gb = GnuCashBook(str(path))
+        gb.create_customer(name="Acme")
+        inv = gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id=inv["id"], account="Income:Sales",
+            description="Work", quantity="1", price="100.00",
+        )
+        gb.post_invoice(inv["id"], AR)
+        gb.pay_invoice(
+            invoice_id=inv["id"], payment_account="Assets:Checking",
+            amount="100.00",
+        )
+        rows = _q(
+            path,
+            "select t.num, a.name, s.action from transactions t "
+            "join splits s on s.tx_guid = t.guid "
+            "join accounts a on a.guid = s.account_guid "
+            "join slots k on k.obj_guid = t.guid "
+            "and k.name = 'trans-txn-type' "
+            "order by k.string_val, a.name",
+        )
+        return inv["id"], rows
+
+    def test_option_off(self, business_book):
+        inv, rows = self._post_and_pay(business_book)
+        assert rows == [
+            (inv, "Accounts Receivable", "Invoice"),
+            (inv, "Sales", "Invoice"),
+            ("", "Accounts Receivable", "Payment"),
+            ("", "Checking", "Payment"),
+        ]
+
+    def test_option_on(self, business_book):
+        _num_on_split_actions(business_book)
+        inv, rows = self._post_and_pay(business_book)
+        assert rows == [
+            ("Invoice", "Accounts Receivable", inv),
+            ("Invoice", "Sales", inv),
+            ("", "Accounts Receivable", "Payment"),
+            ("", "Checking", ""),
+        ]

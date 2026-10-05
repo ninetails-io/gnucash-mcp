@@ -93,6 +93,31 @@ def _plain(gb: GnuCashBook) -> None:
     )
 
 
+def _plain_with_num_on_split_actions(gb: GnuCashBook) -> None:
+    """The same drafts in a book with "Use Split Action Field for
+    Number" on, stored as desktop stores it. ``gnc_set_num_action``
+    then swaps what posting and payment put in a transaction's number
+    and a split's action (review C67)."""
+    import piecash
+
+    _plain(gb)
+    with piecash.open_book(
+        str(gb.book_path), readonly=False, do_backup=False,
+        open_if_lock=True,
+    ) as b:
+        b["options"] = {"Accounts": {"Use Split Action Field for Number": "t"}}
+        b.save()
+
+
+def _engine_pay(path: Path, doc: str, amount: str) -> str:
+    inv = guid_of(
+        path, "select guid from invoices where id = ? and owner_type = 2",
+        doc,
+    )
+    acct = guid_of(path, "select guid from accounts where name = 'Checking'")
+    return f"pay|{inv}|{acct}|{amount}|1|20|1|2026|chk 12|"
+
+
 def _bill(gb: GnuCashBook) -> None:
     _tax_and_terms(gb)
     gb.create_vendor(name="Supplier Ltd")
@@ -165,6 +190,21 @@ SCENARIOS = {
         _plain,
         lambda gb: _post(gb, "000002", AR, owner_type="customer"),
         lambda p: [_engine_post(p, "000002", 2, "Accounts Receivable")],
+    ),
+    "invoice_posted_and_paid_with_num_on_split_actions": (
+        _plain_with_num_on_split_actions,
+        lambda gb: (
+            _post(gb, "000001", AR, owner_type="customer"),
+            gb.pay_invoice(
+                invoice_id="000001", payment_account="Assets:Checking",
+                amount="100.00", payment_date="2026-01-20", memo="chk 12",
+                owner_type="customer",
+            ),
+        ),
+        lambda p: [
+            _engine_post(p, "000001", 2, "Accounts Receivable"),
+            _engine_pay(p, "000001", "100"),
+        ],
     ),
     "invoice_with_terms_and_tax": (
         _invoices,
