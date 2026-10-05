@@ -136,12 +136,28 @@ ENGINE_DEBRIS = {
         "both; the server leaves lines on the live table (the common "
         "case) and posts correctly against either. CLOSED by the gate."
     ),
+    "iso_date_feature": (
+        "The book-level feature flag 'ISO-8601 formatted date strings "
+        "in SQLite3 databases.' GnuCash stamps it on any SQLite book "
+        "it saves (2.6.20 and later); the twin's base book is made by "
+        "piecash and has never been saved by GnuCash, so the engine's "
+        "first commit adds it. It belongs to the fixture, not to the "
+        "action under test: a book GnuCash created already carries "
+        "it, and the server writes no feature flag it was not asked "
+        "to (found when the dump began to cover the book's own slots, "
+        "2026-10-05)."
+    ),
     "refcount": (
         "The stored refcount of a billing term (not compared, not "
         "counted). The engine adds one for every reference it loads "
         "and saves the sum, so the number grows with each session."
     ),
 }
+
+
+_ISO_DATE_FEATURE = (
+    "features/ISO-8601 formatted date strings in SQLite3 databases."
+)
 
 
 def debris_found(book: Path) -> dict[str, int]:
@@ -164,6 +180,10 @@ def debris_found(book: Path) -> dict[str, int]:
                 "select count(*) from taxtables t where parent is not null "
                 "and not exists (select 1 from entries e where "
                 "e.i_taxtable = t.guid or e.b_taxtable = t.guid)"
+            ).fetchone()[0],
+            "iso_date_feature": con.execute(
+                "select count(*) from slots where name = ?",
+                (_ISO_DATE_FEATURE,),
             ).fetchone()[0],
         }
     finally:
@@ -375,6 +395,30 @@ def dump(
                 if k not in ("guid", "refcount")
             )
             out.append(f"TAXTABLE {names[table['guid']]} {shown}")
+    # The book's own slots: options, counters, feature flags. A write
+    # that leaves one desktop does not (or the reverse) is invisible
+    # in every row above (adversarial review 2026-09-30, section 9
+    # item 6; C62 was found by reading code, not by a twin).
+    for book_row in q("select guid from books"):
+        out.append("BOOK")
+        lines = slots(book_row[0], "  ")
+        if "iso_date_feature" in debris:
+            lines = [
+                line for line in lines
+                if f"SLOT {_ISO_DATE_FEATURE} " not in line
+            ]
+            # A features frame left with nothing in it goes too.
+            lines = [
+                line for i, line in enumerate(lines)
+                if not (
+                    line == "  SLOT features frame"
+                    and not (
+                        i + 1 < len(lines)
+                        and lines[i + 1].startswith("    ")
+                    )
+                )
+            ]
+        out += lines
     con.close()
     return "\n".join(out) + "\n"
 
