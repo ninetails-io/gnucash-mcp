@@ -98,6 +98,8 @@ from gnucash_mcp.book._base import (
     _transaction_to_compact_line,
     _transaction_to_dict,
     _unique_prefix,
+    _INVISIBLE_NAME_CHARS,
+    _name_skeleton,
 )
 
 
@@ -6645,6 +6647,22 @@ class CoreMixin:
     }
 
     @staticmethod
+    def _refuse_lookalike_name(name: str, existing: str, parent: str) -> None:
+        """Refuse a name that reads exactly like a sibling's and is
+        stored differently (a zero-width joiner, a direction mark, a
+        decomposed accent): two "Groceries" lines nobody can tell
+        apart. Names already in a book are never touched."""
+        if name != existing and _name_skeleton(name) == _name_skeleton(
+            existing
+        ):
+            raise ValueError(
+                f"Account name {name!r} looks the same as "
+                f"{existing!r}, which already exists under "
+                f"'{parent}'; they differ only in invisible "
+                f"characters or in how an accent is encoded."
+            )
+
+    @staticmethod
     def _validate_account_name(name: str) -> None:
         """Validate a user-supplied account name.
 
@@ -6682,6 +6700,16 @@ class CoreMixin:
             raise ValueError(
                 f"Account name {name!r} begins or ends with whitespace."
             )
+        hidden = sorted({
+            f"U+{ord(ch):04X}" for ch in name if ch in _INVISIBLE_NAME_CHARS
+        })
+        if hidden:
+            raise ValueError(
+                f"Account name {name!r} contains invisible or "
+                f"direction-changing characters ({', '.join(hidden)})."
+            )
+        if not _name_skeleton(name).strip():
+            raise ValueError("Account name has no visible characters")
         if len(name) > _TEXT_WIDTH:
             raise ValueError(
                 f"Account name is {len(name)} characters; GnuCash "
@@ -6770,6 +6798,7 @@ class CoreMixin:
                     raise ValueError(
                         f"Account '{name}' already exists under '{parent_label}'"
                     )
+                self._refuse_lookalike_name(name, child.name, parent_label)
 
             # Determine commodity
             if commodity is None:
@@ -6890,11 +6919,17 @@ class CoreMixin:
                 self._validate_account_name(new_name)
                 if account.parent:
                     for sibling in account.parent.children:
-                        if sibling.name == new_name and sibling.guid != account.guid:
+                        if sibling.guid == account.guid:
+                            continue
+                        if sibling.name == new_name:
                             raise ValueError(
                                 f"Account '{new_name}' already exists under "
                                 f"'{account.parent.fullname}'"
                             )
+                        self._refuse_lookalike_name(
+                            new_name, sibling.name,
+                            account.parent.fullname or "root",
+                        )
                 account.name = new_name
                 changed["name"] = new_name
 

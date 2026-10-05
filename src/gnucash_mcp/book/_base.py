@@ -697,11 +697,48 @@ def _check_text(value, width: int, what: str) -> None:
         return
     if "\x00" in value:
         raise ValueError(f"{what} contains a NUL character")
+    # The other control characters: nothing a person types, and a
+    # terminal escape or a backspace in a description rewrites what
+    # the next reader of the register or the audit log sees. Tab,
+    # newline and carriage return stay: notes are multi-line, and the
+    # row builders escape them (IV-20, the remainder).
+    for ch in value:
+        code = ord(ch)
+        if (code < 0x20 and ch not in "\t\n\r") or 0x7F <= code <= 0x9F:
+            raise ValueError(
+                f"{what} contains a control character (U+{code:04X})"
+            )
     if len(value) > width:
         raise ValueError(
             f"{what} is {len(value)} characters; GnuCash stores at "
             f"most {width}"
         )
+
+
+# Characters that are invisible or reorder the text around them and
+# have no use in a name: zero-width space, word joiner, BOM, and the
+# bidirectional embedding / override / isolate controls. ZWNJ and ZWJ
+# are NOT here (Persian and Indic spelling, and emoji sequences, need
+# them), nor the LRM / RLM marks; ``_name_skeleton`` catches a name
+# that differs from its sibling only by those.
+_INVISIBLE_NAME_CHARS = frozenset(
+    "\u200b\u2060\ufeff"
+    "\u202a\u202b\u202c\u202d\u202e"
+    "\u2066\u2067\u2068\u2069"
+)
+
+
+def _name_skeleton(name: str) -> str:
+    """What a name looks like: every format character (Unicode
+    category Cf: zero-width joiners, direction marks) dropped, then
+    NFC. Two names with one skeleton are indistinguishable on screen
+    (IV-21, the remainder)."""
+    import unicodedata
+
+    return unicodedata.normalize(
+        "NFC",
+        "".join(ch for ch in name if unicodedata.category(ch) != "Cf"),
+    )
 
 
 _PLAIN_NUMBER = re.compile(

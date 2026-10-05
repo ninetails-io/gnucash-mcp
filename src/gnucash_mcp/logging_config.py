@@ -9,6 +9,7 @@ Logs are stored alongside the GnuCash book file:
 import json
 import logging
 import os
+import stat
 import re
 import time
 from datetime import datetime, timezone
@@ -623,6 +624,33 @@ class _DailyFileHandler(logging.Handler):
             self.handleError(record)
 
 
+def _tighten_existing_files(log_dir: Path) -> None:
+    """Audit logs, debug logs, and backups written before 1.5 were
+    created with the default umask, usually 0644: a full ledger
+    history, and whole copies of the book, readable by every local
+    account. New files are created 0600; this brings the ones already
+    there into line, once per logging setup (adversarial review
+    2026-09-30, SEC-15). Only regular files this user owns are
+    touched; links are not followed. Best-effort and POSIX-only."""
+    if os.name != "posix":
+        return
+    try:
+        uid = os.geteuid()
+        for root, _dirs, files in os.walk(log_dir, followlinks=False):
+            for name in files:
+                path = os.path.join(root, name)
+                try:
+                    st = os.lstat(path)
+                    if not stat.S_ISREG(st.st_mode) or st.st_uid != uid:
+                        continue
+                    if st.st_mode & 0o077:
+                        os.chmod(path, st.st_mode & 0o700 & 0o600)
+                except OSError:
+                    continue
+    except OSError:
+        pass
+
+
 def setup_logging(
     book_path: str | None = None,
     debug: bool = False,
@@ -677,6 +705,7 @@ def setup_logging(
     # also runs the symlink-hijack sanity checks.
     log_dir = resolve_mcp_dir(book_path, identity=display_name)
     _log_dir = log_dir
+    _tighten_existing_files(log_dir)
     # Under GNUCASH_LOG_DIR, record whose folder this is, so a
     # different book with the same filename gets its own.
     claim_log_dir(log_dir, book_path, identity=display_name)

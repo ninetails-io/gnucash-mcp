@@ -610,3 +610,113 @@ class TestC53TheLogDirOverrideKeepsThePerBookChecks:
         anchors = list(gb._backups_dir().glob(".manual-*.json"))
         assert len(anchors) == 1
         assert (anchors[0].stat().st_mode & 0o777) == 0o600
+
+
+@pytest.mark.skipif(
+    __import__("os").name != "posix", reason="POSIX file modes",
+)
+class TestSEC15FilesFromBefore15AreTightened:
+    def test_old_audit_logs_and_backups_become_owner_only(
+        self, test_book, tmp_path, monkeypatch,
+    ):
+        import os
+
+        from gnucash_mcp import logging_config as lc
+
+        monkeypatch.setenv("GNUCASH_LOG_DIR", str(tmp_path / "logs"))
+        folder = lc.resolve_mcp_dir(test_book)
+        old = [
+            folder / "audit" / "2026-08-01.txt",
+            folder / "backups" / "book-20260801T000000-manual.gnucash",
+        ]
+        for f in old:
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text("old")
+            os.chmod(f, 0o644)
+        outside = tmp_path / "outside.txt"
+        outside.write_text("not ours to touch")
+        os.chmod(outside, 0o644)
+        (folder / "audit" / "link.txt").symlink_to(outside)
+        try:
+            lc.setup_logging(book_path=str(test_book), audit=True)
+        finally:
+            lc.setup_logging(book_path=None, audit=False, debug=False)
+        for f in old:
+            assert (f.stat().st_mode & 0o777) == 0o600, f
+        assert (outside.stat().st_mode & 0o777) == 0o644
+
+
+class TestIV20ControlCharactersInFreeText:
+    @pytest.mark.parametrize("bad", ["\x1b[2J", "a\x08b", "x\x7f", "y\x85z"])
+    def test_refused_in_description_memo_and_notes(self, test_book, bad):
+        gb = GnuCashBook(str(test_book))
+        for field in ("description", "notes", "memo"):
+            kw = {"description": "Probe", "notes": None}
+            splits = [
+                {"account": "Assets:Checking", "amount": "-1"},
+                {"account": "Expenses:Groceries", "amount": "1"},
+            ]
+            if field == "memo":
+                splits[0]["memo"] = bad
+            else:
+                kw[field] = bad
+            with pytest.raises(ValueError, match="control character"):
+                gb.create_transaction(
+                    splits=splits, trans_date=date(2026, 5, 1), **kw,
+                )
+
+    def test_tabs_and_line_breaks_in_notes_still_pass(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        made = gb.create_transaction(
+            description="Probe", notes="line one\nline two\ttabbed\r\n",
+            splits=[
+                {"account": "Assets:Checking", "amount": "-1"},
+                {"account": "Expenses:Groceries", "amount": "1"},
+            ],
+            trans_date=date(2026, 5, 1),
+        )
+        assert made["guid"]
+
+
+class TestIV21AccountNamesNobodyCanTellApart:
+    @pytest.mark.parametrize("name", [
+        "Gro​ceries", "‮seirecorG", "Dining﻿", "A⁦b⁩",
+    ])
+    def test_invisible_and_direction_characters_are_refused(
+        self, test_book, name,
+    ):
+        gb = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match="invisible or direction"):
+            gb.create_account(
+                name=name, account_type="EXPENSE", parent="Expenses",
+            )
+
+    def test_a_lookalike_of_a_sibling_is_refused(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        # A zero-width joiner, which names in some scripts need.
+        with pytest.raises(ValueError, match="looks the same as"):
+            gb.create_account(
+                name="Gro‍ceries", account_type="EXPENSE",
+                parent="Expenses",
+            )
+        gb.create_account(name="Café", account_type="EXPENSE", parent="Expenses")
+        with pytest.raises(ValueError, match="looks the same as"):
+            gb.create_account(
+                name="Café", account_type="EXPENSE", parent="Expenses",
+            )
+        with pytest.raises(ValueError, match="looks the same as"):
+            gb.update_account("Expenses:Café", new_name="Gro‍ceries")
+
+    def test_scripts_that_need_joiners_keep_them(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        made = gb.create_account(
+            name="می‌خواهم", account_type="EXPENSE", parent="Expenses",
+        )
+        assert made["status"] == "created"
+
+    def test_only_format_characters_is_not_a_name(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match="no visible characters"):
+            gb.create_account(
+                name="‍‌", account_type="EXPENSE", parent="Expenses",
+            )

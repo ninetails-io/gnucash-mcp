@@ -167,6 +167,10 @@ Schedule recipes, invoice links, and budget signs are now stored the way GnuCash
 - **A write the server did not live to log is reported.** The audit entry is rendered from a write's result, so it is written after the commit; a server killed in between left a committed write with no line. Each write now leaves a small intent file beside the audit log before it runs and removes it once its entry is written. An intent found at the next startup or the next write, whose process is gone, becomes an `INTERRUPTED` line naming the tool, when it started, and what it was asked to do. Review item DS-11.
 - A failure while rendering an audit entry can no longer turn a committed write into an error response: the result is returned, and the trail gets one line saying the entry could not be rendered and why (DS-16). A `switch_book` whose target and whose fallback both fail to open an audit log now sends the trail to the server's stderr and says so in its error, where it used to leave the session with no audit log at all (DS-10).
 - A `GNUCASH_LOG_DIR` override keeps the per-book folder checks: the `{book}.mcp` folder inside it is refused if it is a symlink or belongs to another user, as it is beside the book. The small state files under the log folder are written through an exclusively created temp file that does not follow a link, mode 0600; a symlink planted at the temp name used to be followed and its target overwritten. Review item C53.
+- Free text refuses control characters, not only a NUL: an escape sequence or a backspace in a description, memo, note, number, or link is refused with the character named. Tabs and line breaks still pass. Review item IV-20.
+- Account names refuse the invisible and direction-changing characters that have no use in a name (zero-width space, word joiner, byte-order mark, bidirectional overrides and isolates), and a new or renamed account is refused when it would read exactly like a sibling: the same letters with a zero-width joiner added, or an accent encoded another way. Joiners that Persian, Indic, and emoji spellings need are still accepted. Names already in a book are untouched. Review item IV-21.
+- Audit logs, debug logs, and backups written before 1.5 are set to owner-only (0600) the next time the server starts on the book; they were created world-readable. Review item SEC-15.
+- The Docker image runs as an ordinary user instead of root, and starts the server from its virtualenv directly. To serve a book mounted from the host, run the container as the user who owns the file (`--user "$(id -u):$(id -g)"`). Review item SEC-17.
 
 ### Known limitations
 Found by the pre-release review and left as they are in 1.5, each by a recorded decision. None changes a stored amount. They are listed so that a boundary is a documented one. Item numbers refer to `specs/v1.5/testing/ADVERSARIAL_REVIEW_1.5.md`.
@@ -178,9 +182,7 @@ Found by the pre-release review and left as they are in 1.5, each by a recorded 
 - A book file renamed or removed between a write's commit and its response: the write is reported as failed though it committed, and an empty file can appear at the old path (C28).
 - A 1.4.x server is not stopped from writing to a book 1.5 has converted. Do not point both at one book (FC-20).
 - A MySQL or MariaDB book created by GnuCash desktop has `utf8mb3` tables: an emoji in any text field is refused by the database, or stored as `?` (side-finding 12).
-- The Docker image runs as root (SEC-17).
 - The bundled demo books and the suite's fixture books are created by piecash, not by GnuCash, and their table definitions differ in small ways. The engine twins and the desktop gate are the checks against GnuCash-written rows (FC-18, FC-19).
-- Three fixes are narrower than their findings: free text refuses a NUL but not other control characters (IV-20); account names are not checked for zero-width or right-to-left characters (IV-21); audit files written before 1.5 keep the permissions they had (SEC-15).
 
 ### Credits
 - @DrSkippy — the closed-position valuation bug and its regression test (#184).
