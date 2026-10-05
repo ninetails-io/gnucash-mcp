@@ -734,3 +734,80 @@ class TestSideFinding12FourByteCharactersAreFound:
         assert f([{"a": "ok"}, {"a": "\U0001F600"}]) == "\U0001F600"
         assert f({"a": "Café 日本語 €", "n": 3, "b": b"\xf0"}) is None
         assert f(None) is None
+
+
+class TestC63DateRangesAreDecidedOnTheDecodedDate:
+    """A row stored anywhere but 10:59:00 in the dashed form used to
+    be compared as stored: on the wrong side of a report boundary."""
+
+    def _march_first(self, gb, amount):
+        return gb.create_transaction(
+            description=f"Boundary {amount}",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": amount},
+                {"account": "Assets:Checking", "amount": f"-{amount}"},
+            ],
+            trans_date=date(2025, 3, 1), check_duplicates=False,
+        )["guid"]
+
+    def _restamp(self, path, guid_prefix, stored):
+        _q(
+            path,
+            "update transactions set post_date = ? where guid like ?",
+            (stored, guid_prefix + "%"),
+        )
+
+    def _march_spend(self, gb):
+        report = gb.spending_by_category(
+            start_date=date(2025, 3, 1), end_date=date(2025, 3, 31),
+            compact=False,
+        )
+        return Decimal(str(report["total"]))
+
+    def _february_spend(self, gb):
+        report = gb.spending_by_category(
+            start_date=date(2025, 2, 1), end_date=date(2025, 2, 28),
+            compact=False,
+        )
+        return Decimal(str(report["total"]))
+
+    def test_a_row_stamped_at_local_midnight(self, test_book):
+        from datetime import datetime, timezone
+
+        gb = GnuCashBook(str(test_book))
+        before = self._march_spend(gb), self._february_spend(gb)
+        guid = self._march_first(gb, "17.00")
+        # What a local-midnight writer stores for 2025-03-01, here.
+        local_midnight = datetime(2025, 3, 1).astimezone()
+        stored = local_midnight.astimezone(timezone.utc).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+        self._restamp(test_book, guid.lstrip("%"), stored)
+        assert gb.get_transaction(guid)["date"][:10] == "2025-03-01"
+        assert self._march_spend(gb) - before[0] == Decimal("17.00")
+        assert self._february_spend(gb) == before[1]
+
+    def test_a_row_in_the_compact_form(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        before = self._march_spend(gb), self._february_spend(gb)
+        guid = self._march_first(gb, "23.00")
+        self._restamp(test_book, guid.lstrip("%"), "20250301105900")
+        assert gb.get_transaction(guid)["date"][:10] == "2025-03-01"
+        assert self._march_spend(gb) - before[0] == Decimal("23.00")
+        # A compact string sorts after every dashed date of its year:
+        # it used to be missing from March and present nowhere, or
+        # counted in a later range of the same year.
+        assert self._february_spend(gb) == before[1]
+        later = gb.spending_by_category(
+            start_date=date(2025, 6, 1), end_date=date(2025, 6, 30),
+            compact=False,
+        )
+        assert Decimal(str(later["total"])) == 0
+
+    def test_a_book_without_compact_rows_is_not_scanned_twice(
+        self, test_book,
+    ):
+        gb = GnuCashBook(str(test_book))
+        with gb.open(readonly=True) as book:
+            assert gb._has_compact_post_dates(book) is False
+            assert gb._compact_dates_cache[1] is False
