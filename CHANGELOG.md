@@ -171,6 +171,7 @@ Schedule recipes, invoice links, and budget signs are now stored the way GnuCash
 - Account names refuse the invisible and direction-changing characters that have no use in a name (zero-width space, word joiner, byte-order mark, bidirectional overrides and isolates), and a new or renamed account is refused when it would read exactly like a sibling: the same letters with a zero-width joiner added, or an accent encoded another way. Joiners that Persian, Indic, and emoji spellings need are still accepted. Names already in a book are untouched. Review item IV-21.
 - Audit logs, debug logs, and backups written before 1.5 are set to owner-only (0600) the next time the server starts on the book; they were created world-readable. Review item SEC-15.
 - The Docker image runs as an ordinary user instead of root, and starts the server from its virtualenv directly. To serve a book mounted from the host, run the container as the user who owns the file (`--user "$(id -u):$(id -g)"`). Review item SEC-17.
+- An emoji written to a MySQL or MariaDB book that GnuCash desktop created is refused with the character and the table named, and nothing is written. Desktop creates those tables `utf8mb3`, which cannot hold a four-byte character: the database answered with a raw "Incorrect string value" error, or without strict mode stored `?` and reported success. A book whose tables are `utf8mb4` is unaffected. Checked against a real MariaDB server. Side-finding 12.
 
 ### Known limitations
 Found by the pre-release review and left as they are in 1.5, each by a recorded decision. None changes a stored amount. They are listed so that a boundary is a documented one. Item numbers refer to `specs/v1.5/testing/ADVERSARIAL_REVIEW_1.5.md`.
@@ -181,7 +182,6 @@ Found by the pre-release review and left as they are in 1.5, each by a recorded 
 - **Credit notes do not stamp the `Credit Notes` feature flag.** Only GnuCash older than 2.5.0 reads it (C62).
 - A book file renamed or removed between a write's commit and its response: the write is reported as failed though it committed, and an empty file can appear at the old path (C28).
 - A 1.4.x server is not stopped from writing to a book 1.5 has converted. Do not point both at one book (FC-20).
-- A MySQL or MariaDB book created by GnuCash desktop has `utf8mb3` tables: an emoji in any text field is refused by the database, or stored as `?` (side-finding 12).
 - The bundled demo books and the suite's fixture books are created by piecash, not by GnuCash, and their table definitions differ in small ways. The engine twins and the desktop gate are the checks against GnuCash-written rows (FC-18, FC-19).
 
 ### Credits

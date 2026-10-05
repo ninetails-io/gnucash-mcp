@@ -637,6 +637,35 @@ def _dialect_name(book) -> str:
     return book.session.get_bind().dialect.name
 
 
+# The table an INSERT or UPDATE writes to.
+_WRITE_TARGET = re.compile(
+    r"\s*(?:INSERT\s+(?:IGNORE\s+)?INTO|UPDATE)\s+`?([A-Za-z_]+)`?",
+    re.IGNORECASE,
+)
+
+
+def _first_four_byte_character(parameters) -> "str | None":
+    """The first character outside the Basic Multilingual Plane in a
+    statement's bound parameters (a dict, a sequence, or a list of
+    either for executemany), or None."""
+    if isinstance(parameters, str):
+        for ch in parameters:
+            if ord(ch) > 0xFFFF:
+                return ch
+        return None
+    if isinstance(parameters, dict):
+        parameters = parameters.values()
+    if isinstance(parameters, (list, tuple)) or hasattr(
+        parameters, "__iter__"
+    ) and not isinstance(parameters, (bytes, bytearray)):
+        for item in parameters:
+            if isinstance(item, (str, dict, list, tuple)):
+                found = _first_four_byte_character(item)
+                if found is not None:
+                    return found
+    return None
+
+
 def _rollback_if_aborted(session) -> bool:
     """Clear an aborted PostgreSQL transaction after a swallowed error.
 
@@ -2072,6 +2101,8 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
             raise ValueError("max_retries must be at least 1")
 
         try:
+            if not readonly:
+                self._guard_three_byte_text(book)
             yield book
         finally:
             close_start = time.time()
@@ -2086,6 +2117,66 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
             book.session.get_bind().dispose()
             close_elapsed = (time.time() - close_start) * 1000
             debug_logger.debug(f"Book closed in {close_elapsed:.0f}ms")
+
+    def _guard_three_byte_text(self, book) -> None:
+        """On a MySQL/MariaDB book whose tables are ``utf8mb3``,
+        refuse a write carrying a character outside the Basic
+        Multilingual Plane, by name, before the database sees it.
+
+        GnuCash desktop creates its MySQL tables ``utf8mb3`` (three
+        bytes per character). An emoji is four: strict mode answers
+        with a raw "Incorrect string value" DataError, and without
+        strict mode the character is stored as ``?`` and the write
+        reports success. piecash's own tables are ``utf8mb4``, so the
+        suite's fixtures never see it (adversarial review 2026-09-30,
+        side-finding 12). Checked at the cursor, the one place every
+        ORM and raw-SQL write passes. The charset is read once per
+        book instance."""
+        if _dialect_name(book) != "mysql":
+            return
+        from sqlalchemy import event, text
+
+        narrow = getattr(self, "_mysql_three_byte", None)
+        if narrow is None:
+            try:
+                row = book.session.execute(
+                    text(
+                        "SELECT DISTINCT table_name "
+                        "FROM information_schema.columns "
+                        "WHERE table_schema = DATABASE() "
+                        "AND character_set_name IN ('utf8', 'utf8mb3')"
+                    )
+                ).fetchall()
+                # Per table: one book can hold both kinds (desktop's
+                # tables beside ones made later), and a write to a
+                # four-byte table is none of this guard's business.
+                narrow = frozenset(str(r[0]).lower() for r in row)
+            except Exception as e:
+                _rollback_if_aborted(book.session)
+                debug_logger.warning(
+                    f"MySQL charset check failed: {type(e).__name__}: {e}"
+                )
+                narrow = frozenset()
+            self._mysql_three_byte = narrow
+        if not narrow:
+            return
+
+        def refuse(conn, cursor, statement, parameters, context, many):
+            target = _WRITE_TARGET.match(statement)
+            if target is None or target.group(1).lower() not in narrow:
+                return
+            found = _first_four_byte_character(parameters)
+            if found is not None:
+                raise ValueError(
+                    f"This book's `{target.group(1)}` table is utf8mb3 "
+                    f"(as GnuCash desktop creates it) and cannot store the "
+                    f"character {found!r} (U+{ord(found):04X}). Remove "
+                    f"it and retry; nothing was written."
+                )
+
+        event.listen(
+            book.session.get_bind(), "before_cursor_execute", refuse,
+        )
 
     def _lock_holder_note(self) -> str:
         """Who holds a file book's lock, read from its ``gnclock``

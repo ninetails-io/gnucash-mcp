@@ -720,3 +720,17 @@ class TestIV21AccountNamesNobodyCanTellApart:
             gb.create_account(
                 name="‍‌", account_type="EXPENSE", parent="Expenses",
             )
+
+
+class TestSideFinding12FourByteCharactersAreFound:
+    """The scan behind the utf8mb3 refusal; the refusal itself runs
+    against a real MySQL server in tests/test_db_backend.py."""
+
+    def test_in_every_parameter_shape(self):
+        from gnucash_mcp.book._base import _first_four_byte_character as f
+
+        assert f({"a": "plain", "b": "ramen \U0001F35C"}) == "\U0001F35C"
+        assert f(("x", 3, None, "\U0001F600")) == "\U0001F600"
+        assert f([{"a": "ok"}, {"a": "\U0001F600"}]) == "\U0001F600"
+        assert f({"a": "Café 日本語 €", "n": 3, "b": b"\xf0"}) is None
+        assert f(None) is None
