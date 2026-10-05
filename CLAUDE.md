@@ -551,7 +551,9 @@ Established chokepoints and the rule each one owns:
   A new transaction-changing path goes in the `ATTEMPTS` table in
   `tests/test_posting_record_guard.py`. Tests that need the old
   voided-posting state build it with
-  `tests/conftest.py::void_posting_record`.
+  `tests/conftest.py::void_posting_record`. `void_transaction` also
+  takes `force` for a reconciled split, as delete and
+  `replace_splits` do (side-finding 11).
 - `_read_only_before` / `_read_only_period_note` (`book/_base.py`)
   — the book's read-only date (today minus the book option "Day
   Threshold for Read-Only Transactions", a double under
@@ -676,6 +678,66 @@ Established chokepoints and the rule each one owns:
   `_market_prices_only` — the quotes-only re-derivation the
   dashboard warning compares against valuation to name a stale
   implied rate; nothing values inside it.
+- **From the 1.5 close-out (`fix/1.5.0-numbers`, 2026-10-05)**,
+  each the one place its rule lives; status of every item is in
+  `specs/v1.5.1/README.md`:
+  - `_query_filtered_splits` decides a date range on the DECODED
+    date. SQL takes the range with two days of slack (plus, on a
+    SQLite book that holds them, every row in GnuCash 2.6's compact
+    date form); Python keeps the rows whose `post_date`, as piecash
+    decodes it, is inside. It returns a list, not a Query. A row
+    stamped at local midnight or in the compact form used to fall on
+    the wrong side of a boundary (C63). Don't add a second SQL-side
+    date comparison anywhere.
+  - A converted balance is rounded to the currency's unit once per
+    ACCOUNT (`_market_value`, and per account in `balance_sheet` and
+    `net_worth`), and totals are sums of those. Lines add up to
+    their total, and assets minus liabilities, `net_worth`, and the
+    dashboard are one figure. Locked by
+    `TestConvertedBalancesAreRoundedPerAccount`.
+  - `source_open_kwargs` gives a file book ONE connection for the
+    life of an `open()` (StaticPool, nothing reset on return).
+    piecash's NullPool reconnected by path after every commit, so a
+    book renamed between commit and response got an empty twin at
+    its old path and its write was reported as failed (C28). Don't
+    open a second connection on the book's engine inside a session.
+  - `write_private_file` (`logging_config.py`) is how any small
+    state file under the log folder is written: exclusive, no link
+    followed, 0600. `_check_mcp_dir_entry` is the per-book folder
+    check, applied under `GNUCASH_LOG_DIR` too (C53).
+  - The write intent (`_write_intent` / `_report_interrupted_write`):
+    a file beside the audit log from before a write tool runs until
+    its entry is written; a leftover whose process is gone becomes
+    an `INTERRUPTED` line (DS-11). After the tool returns, nothing in
+    `audit_log` may replace its result (DS-16).
+  - `_guard_three_byte_text`: a four-byte character headed for a
+    `utf8mb3` MySQL table is refused at the cursor, by name
+    (side-finding 12). GnuCash desktop creates those tables; piecash
+    and CI's fixture create `utf8mb4`.
+  - `_check_text` refuses control characters other than tab and
+    line breaks; `_validate_account_name` refuses invisible and
+    bidi characters; `_refuse_lookalike_name` (via `_name_skeleton`)
+    refuses a name that reads like a sibling's. ZWJ and ZWNJ stay
+    legal: Persian, Indic and emoji spellings need them.
+  - `_book_tables_error` (`server.py`): the startup check makes
+    piecash's own `versions` comparison, so a book piecash would
+    refuse is named at startup with what to do (FC-14).
+  - `tests/fixtures/gnucash_made.py`: a book GnuCash CREATED, made
+    headless through `gnucash-cli` and Guile's FFI (the Guile
+    bindings do not wrap `qof_session_begin`). `tests/
+    test_gnucash_created_book.py` sweeps the server's write paths on
+    it and has GnuCash load and pay against the result: the headless
+    half of the desktop-open gate. A new write path gets a line in
+    its `_sweep`.
+  - The engine twin's `dump` ends with the book's own slots
+    (options, counters, feature flags). `iso_date_feature` is the
+    one named difference there.
+- **Trading-accounts books are NOT at parity** (found 2026-10-05).
+  piecash writes the trading splits, at a denominator GnuCash does
+  not use, and finds the tree by the English name; `pay_invoice`
+  books a realized FX split where GnuCash books none. Open in
+  `specs/v1.5.1/README.md`. Don't describe cross-currency writes in
+  such a book as desktop's rows until an engine twin says so.
 
 Working rules:
 
