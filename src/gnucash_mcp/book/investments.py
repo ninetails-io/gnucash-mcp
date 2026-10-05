@@ -1752,11 +1752,17 @@ class InvestmentsMixin:
                     f"Split is already assigned to lot: {split.lot.guid}"
                 )
 
+            # Everything that can fail runs before the ONE save. The
+            # assignment used to be saved first; a failure after it
+            # (a root account with no currency) left the split in the
+            # lot, the tool reporting an error, the retry answering
+            # "already assigned", and a lot the assignment had zeroed
+            # still flagged open (adversarial review 2026-09-30, C32).
+            default_ccy = self._require_default_currency(book)
+
             _lot_cache_flag(lot)
             split.lot = lot
-            book.save()
-
-            default_ccy = self._require_default_currency(book)
+            book.flush()
             summary = self._lot_summary(lot, book, default_ccy)
 
             # Auto-close at zero quantity — the value GnuCash itself
@@ -1764,8 +1770,8 @@ class InvestmentsMixin:
             auto_closed = False
             if Decimal(summary["quantity"]) == 0 and len(lot.splits) > 0:
                 lot.is_closed = _LOT_CLOSED
-                book.save()
                 auto_closed = True
+            book.save()
 
             # Input GUIDs are echoes — dropped. ``is_closed`` is
             # surfaced because the auto-close is what the caller

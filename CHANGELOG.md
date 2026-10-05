@@ -163,6 +163,7 @@ Schedule recipes, invoice links, and budget signs are now stored the way GnuCash
 - The read-only-period warning covers business and schedule writes too: `post_document`, `unpost_document`, `pay_document`, `apply_credit_note`, and `create_transaction_from_scheduled` attach `read_only_period` when the date they write falls before the book's read-only date. GnuCash's own Post, Process Payment, and Since Last Run windows do not check the option, so nothing is refused; the note says so, and that the register will show the transaction read-only. Review item C69.
 - Business postings follow the book option "Use Split Action Field for Number", as GnuCash's `gnc_set_num_action` does. With it on, a posted document's splits carry the document ID as their action and the transaction's number is the document type, and a payment's transfer split carries no action; with it off nothing changes. Checked row for row against GnuCash 5.12's engine. Review item C67.
 - The startup check reads a SQLite book's `versions` table as well as its file header. A SQLite file that is not a GnuCash book, a book last saved by GnuCash 2.6 or older, and a book with table versions the server does not read are each named at startup with what to do; they used to start and then fail every call with "Unsupported table versions". Review item FC-14.
+- `assign_split_to_lot` saves once, after everything that can fail. A failure after the assignment used to leave the split in the lot while the tool reported an error and the retry answered "already assigned". Review item C32.
 
 ### Known limitations
 Found by the pre-release review and left as they are in 1.5, each by a recorded decision. None changes a stored amount. They are listed so that a boundary is a documented one. Item numbers refer to `specs/v1.5/testing/ADVERSARIAL_REVIEW_1.5.md`.
@@ -172,7 +173,6 @@ Found by the pre-release review and left as they are in 1.5, each by a recorded 
 - **The read-only period is a warning, not a refusal** (C69, above).
 - **Credit notes do not stamp the `Credit Notes` feature flag.** Only GnuCash older than 2.5.0 reads it (C62).
 - A book file renamed or removed between a write's commit and its response: the write is reported as failed though it committed, and an empty file can appear at the old path (C28).
-- `assign_split_to_lot` can commit and then report an error on a book whose root account has no currency (C32).
 - A `GNUCASH_LOG_DIR` override skips the symlink and ownership checks the default log location gets (C53).
 - The audit line for a write is written after the write commits. A server killed in between leaves the write without its line (DS-11); a failure while rendering the line would report a committed write as an error, though no input is known to cause one (DS-16); a `switch_book` that fails twice over can leave the session without an audit file (DS-10).
 - A 1.4.x server is not stopped from writing to a book 1.5 has converted. Do not point both at one book (FC-20).

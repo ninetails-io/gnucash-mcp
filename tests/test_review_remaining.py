@@ -406,3 +406,49 @@ class TestFC14StartupReadsTheVersionsTable:
         ):
             if (samples / name).exists():
                 assert _book_format_error(samples / name) is None, name
+
+
+class TestC32AssignSplitToLotSavesOnceOrNotAtAll:
+    def _setup(self, path):
+        from tests.test_lots import _buy_shares
+
+        gb = GnuCashBook(str(path))
+        lot = gb.create_lot(account="Assets:Investments:VTSAX", title="Lot")
+        split = _buy_shares(gb, 8, Decimal("125"), date(2026, 1, 15))
+        return gb, lot["guid"], split
+
+    def _assigned(self, path):
+        return _q(path, "select count(*) from splits where lot_guid is not null")[0][0]
+
+    def test_a_failure_after_the_assignment_leaves_nothing(
+        self, investment_book, monkeypatch,
+    ):
+        gb, lot, split = self._setup(investment_book)
+
+        def boom(*a, **kw):
+            raise ValueError("summary failed")
+
+        monkeypatch.setattr(type(gb), "_lot_summary", boom)
+        with pytest.raises(ValueError, match="summary failed"):
+            gb.assign_split_to_lot(split_guid=split, lot_guid=lot)
+        assert self._assigned(investment_book) == 0
+        monkeypatch.undo()
+        # The retry is clean, not "already assigned".
+        done = gb.assign_split_to_lot(split_guid=split, lot_guid=lot)
+        assert done["status"] == "assigned"
+        assert self._assigned(investment_book) == 1
+
+    def test_no_default_currency_is_refused_before_anything_is_written(
+        self, investment_book, monkeypatch,
+    ):
+        gb, lot, split = self._setup(investment_book)
+
+        def none(book):
+            raise ValueError("Book has no default currency set.")
+
+        monkeypatch.setattr(
+            type(gb), "_require_default_currency", staticmethod(none),
+        )
+        with pytest.raises(ValueError, match="no default currency"):
+            gb.assign_split_to_lot(split_guid=split, lot_guid=lot)
+        assert self._assigned(investment_book) == 0
