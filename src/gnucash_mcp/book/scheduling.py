@@ -1595,8 +1595,13 @@ class SchedulingMixin:
         # Re-find by guid — the phase-1 ORM object detached when
         # its session closed.
         shapes: dict = {}
+        closed = None
         try:
             with self.open(readonly=False) as book:
+                closed = self._read_only_period_note(
+                    book, [txn_date], "",
+                    dialog="Since Last Run assistant",
+                )
                 sx = self._find_scheduled_transaction(book, guid)
                 if not sx:
                     # SX deleted concurrently between phases — the
@@ -1685,6 +1690,8 @@ class SchedulingMixin:
         if rate_notes:
             response["warnings"] = rate_notes
         response.update(shapes)
+        if closed and response["status"] != "rejected":
+            response["read_only_period"] = closed
         if txn_result.get("status") == "rejected":
             # Evidence that the rejection is the CORRECT outcome —
             # without it, the natural retry instinct re-triggers the

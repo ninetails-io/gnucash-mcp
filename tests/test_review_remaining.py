@@ -190,3 +190,104 @@ class TestC60ManualBackupsOfOneStateAreOneFile:
         gb.create_backup(label="a")
         assert gb.create_backup(label="b")["status"] == "created"
         assert len(self._files(gb)) == 2
+
+
+from tests.test_review_minor import _set_read_only_days  # noqa: E402
+
+AR = "Assets:Accounts Receivable"
+
+
+class TestC69BusinessAndScheduleWritesNameTheReadOnlyPeriod:
+    """The other half of C69. Desktop's Post Invoice, Process Payment
+    and Since Last Run do not check the read-only option, so nothing
+    is refused; the server says the date is inside the closed period
+    and that desktop's register will show the result read-only."""
+
+    INSIDE = (date.today() - timedelta(days=40)).isoformat()
+    OUTSIDE = (date.today() - timedelta(days=5)).isoformat()
+
+    def _invoice(self, gb, opened):
+        gb.create_customer(name="Acme")
+        inv = gb.create_invoice(customer_id="000001", date_opened=opened)
+        gb.add_invoice_entry(
+            invoice_id=inv["id"], account="Income:Sales",
+            description="Work", quantity="1", price="100.00",
+        )
+        return inv["id"]
+
+    def test_post_pay_and_unpost_inside_the_period(self, business_book):
+        _set_read_only_days(business_book, 30)
+        gb = GnuCashBook(str(business_book))
+        inv = self._invoice(gb, self.INSIDE)
+        posted = gb.post_invoice(inv, AR, post_date=self.INSIDE)
+        assert self.INSIDE in posted["read_only_period"]
+        assert "Post Invoice dialog does not check" in posted["read_only_period"]
+        paid = gb.pay_invoice(
+            invoice_id=inv, payment_account="Assets:Checking",
+            amount="40.00", payment_date=self.INSIDE,
+        )
+        assert "Process Payment dialog" in paid["read_only_period"]
+        unposted = gb.unpost_invoice(inv)
+        assert "Unpost command" in unposted["read_only_period"]
+
+    def test_outside_the_period_nothing_is_said(self, business_book):
+        _set_read_only_days(business_book, 30)
+        gb = GnuCashBook(str(business_book))
+        inv = self._invoice(gb, self.OUTSIDE)
+        posted = gb.post_invoice(inv, AR, post_date=self.OUTSIDE)
+        paid = gb.pay_invoice(
+            invoice_id=inv, payment_account="Assets:Checking",
+            amount="40.00", payment_date=self.OUTSIDE,
+        )
+        assert "read_only_period" not in posted
+        assert "read_only_period" not in paid
+        assert "read_only_period" not in gb.unpost_invoice(inv)
+
+    def test_no_option_nothing_is_said(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        inv = self._invoice(gb, self.INSIDE)
+        posted = gb.post_invoice(inv, AR, post_date=self.INSIDE)
+        assert "read_only_period" not in posted
+
+    def test_a_schedule_instance_inside_the_period(self, test_book):
+        _set_read_only_days(test_book, 30)
+        gb = GnuCashBook(str(test_book))
+        start = (date.today() - timedelta(days=90)).isoformat()
+        sx = gb.create_scheduled_transaction(
+            name="Rent", description="Rent",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "100.00"},
+                {"account": "Assets:Checking", "amount": "-100.00"},
+            ],
+            start_date=start, frequency="monthly",
+        )
+        made = gb.create_transaction_from_scheduled(
+            sx["guid"], transaction_date=self.INSIDE,
+        )
+        assert made["status"] == "created"
+        assert "Since Last Run assistant" in made["read_only_period"]
+        later = gb.create_transaction_from_scheduled(
+            sx["guid"], transaction_date=self.OUTSIDE,
+        )
+        assert "read_only_period" not in later
+
+    def test_a_credit_note_applied_inside_the_period(self, business_book):
+        _set_read_only_days(business_book, 30)
+        gb = GnuCashBook(str(business_book))
+        inv = self._invoice(gb, self.INSIDE)
+        gb.post_invoice(inv, AR, post_date=self.INSIDE)
+        cn = gb.create_credit_note(owner_id="000001", owner_type="customer")
+        gb.add_credit_note_entry(
+            credit_note_id=cn["id"], account="Income:Sales",
+            description="Refund", quantity="1", price="30.00",
+        )
+        gb.post_invoice(
+            invoice_id=cn["id"], post_account=AR,
+            post_date=self.INSIDE, owner_type="customer",
+        )
+        applied = gb.apply_credit_note(
+            credit_note_id=cn["id"], applies_to_invoice_id=inv,
+            owner_type="customer",
+        )
+        assert applied["apply_date"] == self.INSIDE
+        assert "Process Payment dialog" in applied["read_only_period"]

@@ -7876,6 +7876,11 @@ class BusinessMixin:
                 result["fx_stale"] = max(
                     fx_stale_overrides, key=lambda m: m["age_days"]
                 )
+            closed = self._read_only_period_note(
+                book, [parsed_date], "", dialog="Post Invoice dialog",
+            )
+            if closed:
+                result["read_only_period"] = closed
         result.update(shapes)
         return result
 
@@ -8126,6 +8131,13 @@ class BusinessMixin:
                 )
             if link_txns:
                 result["links_removed"] = len(link_txns)
+            closed = self._read_only_period_note(
+                book,
+                [prev_post_date.date() if prev_post_date else None],
+                "", dialog="Unpost command",
+            )
+            if closed:
+                result["read_only_period"] = closed
             return result
 
     def pay_invoice(
@@ -9120,6 +9132,12 @@ class BusinessMixin:
             if total_paid is not None:
                 result["total_paid"] = str(total_paid)
             _attach_extras(result)
+            closed = self._read_only_period_note(
+                book, [parsed_date], "",
+                dialog="Process Payment dialog",
+            )
+            if closed:
+                result["read_only_period"] = closed
 
         result.update(shapes)
         return result
@@ -9318,6 +9336,13 @@ class BusinessMixin:
                 "currency": ccy,
                 "from_payments": used,
             }
+            closed = self._read_only_period_note(
+                book,
+                [date.fromisoformat(u["date"]) for u in used if u["date"]],
+                "", dialog="Process Payment dialog",
+            )
+            if closed:
+                result["read_only_period"] = closed
         result.update(shapes)
         return result
 
@@ -9755,6 +9780,12 @@ class BusinessMixin:
                 "apply_date": str(link_date),
                 "status": "applied",
             }
+            closed = self._read_only_period_note(
+                book, [link_date], "",
+                dialog="Process Payment dialog",
+            )
+            if closed:
+                result["read_only_period"] = closed
             # The stored applies-to link is provenance, not a
             # constraint — netting against whatever's open next is
             # the normal flow. When the applied target diverges

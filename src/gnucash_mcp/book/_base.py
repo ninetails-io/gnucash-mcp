@@ -3527,6 +3527,7 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
 
     def _read_only_period_note(
         self, book, dates, action: str, threshold: "date | None" = None,
+        dialog: "str | None" = None,
     ) -> "str | None":
         """The one sentence every transaction write attaches when it
         touches the book's read-only period (review C69, ruled a
@@ -3541,7 +3542,13 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         moves a date passes both); ``action`` is the verb phrase
         ("entering a transaction", "voiding this transaction").
         Pass ``threshold`` when the caller read it once for a batch.
-        None when the book has no threshold or no date is before it."""
+        None when the book has no threshold or no date is before it.
+
+        ``dialog`` names the desktop window that does the same thing
+        WITHOUT checking the option (Post Invoice, Process Payment,
+        Since Last Run): the sentence then says that desktop would
+        have written it too, and that its register will show the
+        result read-only. ``action`` is unused in that form."""
         if threshold is None:
             threshold = self._read_only_before(book)
         if threshold is None:
@@ -3556,6 +3563,16 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         if not early:
             return None
         days = (date.today() - threshold).days
+        if dialog is not None:
+            return (
+                f"dated {early[0].isoformat()}, before the book's "
+                f"read-only date {threshold.isoformat()} (the book "
+                f"option \"Day Threshold for Read-Only Transactions\" "
+                f"is {days} days). GnuCash's {dialog} does not check "
+                f"the option either; its register will show this "
+                f"transaction as read-only. Check that the closed "
+                f"period was meant to change"
+            )
         return (
             f"dated {early[0].isoformat()}, before the book's "
             f"read-only date {threshold.isoformat()} (the book option "
