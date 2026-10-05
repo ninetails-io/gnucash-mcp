@@ -256,6 +256,37 @@ def _write_state(
     tmp.replace(path)
 
 
+# ── Manual-backup anchor (separate file) ─────────────────────────────
+#
+# Which snapshot holds the book as it stands: the book file's sha256
+# when the last manual backup was taken, and that backup's filename.
+# Kept apart from the auto-backup state so neither rewrites the
+# other, and keyed on the stem like everything else in this folder.
+
+
+def _manual_anchor_path(backups_dir: Path, stem: str) -> Path:
+    return backups_dir / f".manual-{stem}.json"
+
+
+def _read_manual_anchor(backups_dir: Path, stem: str) -> dict:
+    try:
+        with _manual_anchor_path(backups_dir, stem).open() as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _write_manual_anchor(
+    backups_dir: Path, stem: str, book_sha256: str, filename: str,
+) -> None:
+    path = _manual_anchor_path(backups_dir, stem)
+    tmp = path.with_suffix(".json.tmp")
+    with tmp.open("w") as f:
+        json.dump({"book_sha256": book_sha256, "file": filename}, f)
+    tmp.replace(path)
+
+
 # ── Auto-backup attempt status (separate file) ───────────────────────
 #
 # Decoupled from .state.json: the per-stage file advances only on
@@ -621,6 +652,7 @@ class BackupMixin:
         stage: str = _MANUAL_STAGE_NAME,
         label: str | None = None,
         _committed_state: bool = False,
+        skip_unchanged: bool = False,
     ) -> dict:
         """Write a fresh snapshot via SQLite's online backup API and
         verify it with PRAGMA integrity_check.
@@ -631,6 +663,14 @@ class BackupMixin:
                 retention).
             label: Optional marker (sanitized to ``[A-Za-z0-9_-]``)
                 appended to the filename — "pre-big-reorg" style.
+            skip_unchanged: Manual stage only. When the book's bytes
+                are what they were at the last manual backup and that
+                file is still there, write nothing and answer with
+                the existing file (``status: unchanged``). This is
+                the cap on manual backups: nothing is ever deleted,
+                and a caller in a loop cannot fill the disk with
+                copies of one state (adversarial review 2026-09-30,
+                C60: 1,363 copies, 3.0 GB, in 20 seconds).
 
         Returns:
             ``{status, stage, path, size_bytes, integrity,
@@ -657,6 +697,26 @@ class BackupMixin:
         backups_dir.mkdir(parents=True, exist_ok=True)
 
         stem = self.book_path.stem
+        book_hash = None
+        if stage == _MANUAL_STAGE_NAME and not _committed_state:
+            book_hash = self._current_book_hash()
+        if skip_unchanged and book_hash is not None:
+            anchor = _read_manual_anchor(backups_dir, stem)
+            held = backups_dir / Path(str(anchor.get("file") or "-")).name
+            if anchor.get("book_sha256") == book_hash and held.is_file():
+                return {
+                    "status": "unchanged",
+                    "stage": stage,
+                    "path": redact_paths(str(held)),
+                    "size_bytes": held.stat().st_size,
+                    "note": (
+                        "The book has not changed since this backup "
+                        "was taken; no new copy was written."
+                    ),
+                    "restore_hint": redact_paths(
+                        self._restore_hint(held)
+                    ),
+                }
         ts_part = _format_ts(ts)
         filename = f"{stem}-{ts_part}-{stage}"
         if safe_label:
@@ -746,13 +806,16 @@ class BackupMixin:
         # spaces/metachars break the command, and an unquoted
         # f-string is a latent injection if a future path component
         # is user-influenced.
-        restore_hint = (
-            "Restore by stopping the server, then: "
-            f"mv {shlex.quote(str(self.book_path))} "
-            f"{shlex.quote(str(self.book_path) + '.broken')} && "
-            f"cp {shlex.quote(str(backup_path))} "
-            f"{shlex.quote(str(self.book_path))}"
-        )
+        restore_hint = self._restore_hint(backup_path)
+        if book_hash is not None:
+            try:
+                _write_manual_anchor(
+                    backups_dir, stem, book_hash, backup_path.name,
+                )
+            except OSError as e:
+                # The backup itself is good; the next call just
+                # writes another.
+                debug_logger.warning(f"Manual backup anchor not saved: {e}")
         return {
             "status": "created",
             "stage": stage,
@@ -761,6 +824,15 @@ class BackupMixin:
             "integrity": integrity,
             "restore_hint": redact_paths(restore_hint),
         }
+
+    def _restore_hint(self, backup_path: Path) -> str:
+        return (
+            "Restore by stopping the server, then: "
+            f"mv {shlex.quote(str(self.book_path))} "
+            f"{shlex.quote(str(self.book_path) + '.broken')} && "
+            f"cp {shlex.quote(str(backup_path))} "
+            f"{shlex.quote(str(self.book_path))}"
+        )
 
     # ── Listing ──────────────────────────────────────────────────
 

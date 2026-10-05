@@ -149,3 +149,44 @@ class TestHiddenIsWrittenTheWayDesktopWritesIt:
         gb = GnuCashBook(str(test_book))
         with pytest.raises(ValueError, match=r"update_account\(hidden"):
             gb.set_account_slot(self.ACCT, "hidden", "true")
+
+
+class TestC60ManualBackupsOfOneStateAreOneFile:
+    """The cap on manual backups: a call made while the book is
+    unchanged answers with the copy that already holds it. Nothing
+    is deleted, and a book that has changed is always copied."""
+
+    def _files(self, gb):
+        return sorted(p.name for p in gb._backups_dir().glob("*.gnucash"))
+
+    def test_a_repeat_on_an_unchanged_book_writes_nothing(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        first = gb.create_backup(label="one", skip_unchanged=True)
+        assert first["status"] == "created"
+        for _ in range(5):
+            again = gb.create_backup(label="two", skip_unchanged=True)
+            assert again["status"] == "unchanged"
+            assert again["path"] == first["path"]
+            assert "restore_hint" in again
+        assert len(self._files(gb)) == 1
+
+    def test_a_changed_book_is_copied_again(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        gb.create_backup(skip_unchanged=True)
+        _spend(gb)
+        assert gb.create_backup(skip_unchanged=True)["status"] == "created"
+        assert len(self._files(gb)) == 2
+
+    def test_a_removed_backup_is_not_answered_with(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        gb.create_backup(skip_unchanged=True)
+        for p in gb._backups_dir().glob("*.gnucash"):
+            p.unlink()
+        assert gb.create_backup(skip_unchanged=True)["status"] == "created"
+        assert len(self._files(gb)) == 1
+
+    def test_the_book_method_still_copies_on_every_call(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        gb.create_backup(label="a")
+        assert gb.create_backup(label="b")["status"] == "created"
+        assert len(self._files(gb)) == 2
