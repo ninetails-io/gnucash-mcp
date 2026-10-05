@@ -1727,3 +1727,39 @@ of `origin/fix/v1.5-adversarial-blockers`, plus the docs commit.
 **The final clearance condition** (G-1's fix lands with its test,
 suite green) is met at `c192c87` and still holds at `86fb02f`.
 
+
+## Bookkeeper rulings — close-out decisions (2026-10-05)
+
+**Side-finding 13: CLOSED, attributed.** The 644.57 = 352.73 (old
+server's zero-value FX legs, valued at value x report rate by the
+no-trading-accounts Balance Sheet) + 291.84 (revenue legs GnuCash's
+own invoice post writes — a pure-desktop book gaps the same way).
+Sums to the cent. Credit: the engine-twin instrument.
+
+**1. Old cross-currency payments: LEAVE AND DOCUMENT.** Conversion
+rewrites real, reconciled payment transactions to half-close a
+one-report cosmetic gap that desktop-native books share, and would
+need its own twin and screen session. The Known Limitations entry
+says the gap is inherent without trading accounts, names trading
+accounts as GnuCash's answer, and notes 1.5 payments add nothing
+to it.
+
+**2. FC-20 guard: APPROVED as proposed.** gnc-mcp slot on the root
+at conversion; on later finding an old-server shape in a marked
+book, WARN (response + dashboard) that 1.4.4 budget signs need
+review — never rewrite. C9/G-1 doctrine forward: no fingerprint,
+no flip. Staying out of GnuCash's features frame is C62 holding.
+
+**3. Trading-accounts books: REFUSE cross-currency payments (and
+any posting that writes trading splits) until the correct shape is
+built.** This is wrong rows, not missing capability: a realized
+gain GnuCash's model doesn't book there, trading splits at a
+non-GnuCash denominator. Balancing is not the bar. Error names the
+limitation and the desktop workaround; one Known Limitations line.
+A refusal is a boundary; a wrong row is a defect.
+
+**Concurrences:** unvoid keeping "Voided transaction" notes
+(parity beats tidiness); capture-rig cent moves from per-account
+rounding; backup cap returning the existing copy on an unchanged
+book. The bookkeeper stands ready to run
+`BOOKKEEPER_TEST_PLAN_CLOSE_OUT.md` on the maintainer's word.
