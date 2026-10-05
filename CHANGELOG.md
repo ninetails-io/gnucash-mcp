@@ -183,7 +183,7 @@ Found by the pre-release review and left as they are in 1.5, each by a recorded 
 - **The read-only period is a warning, not a refusal** (C69, above).
 - **Credit notes do not stamp the `Credit Notes` feature flag.** Only GnuCash older than 2.5.0 reads it (C62).
 - A 1.4.x server is not stopped from writing to a book 1.5 has converted. Do not point both at one book (FC-20).
-- The bundled demo books and the suite's fixture books are created by piecash, not by GnuCash, and their table definitions differ in small ways. The engine twins and the desktop gate are the checks against GnuCash-written rows (FC-18, FC-19).
+- The bundled demo books are created by piecash, not by GnuCash, and their table definitions differ from GnuCash's in small ways (FC-18). The suite now also runs on a book GnuCash creates: `gnucash-cli` makes a fresh book through the engine, the server runs a sweep of its write paths on it, and `gnucash-cli` loads the result and pays an invoice the server posted. That test, the engine twins, and the desktop gate are the checks against GnuCash-written rows; most unit fixtures are still piecash-made (FC-19).
 
 ### Credits
 - @DrSkippy — the closed-position valuation bug and its regression test (#184).
