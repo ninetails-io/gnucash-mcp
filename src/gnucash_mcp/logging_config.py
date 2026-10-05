@@ -672,6 +672,11 @@ def setup_logging(
         audit_handler.setFormatter(logging.Formatter("%(message)s"))
         audit_logger.addHandler(audit_handler)
         audit_handler.ensure_file(today)
+        # A write the last server process started and never logged.
+        try:
+            _report_interrupted_write()
+        except Exception:  # noqa: BLE001 — never block startup
+            pass
     else:
         # Disable audit logging
         audit_logger.setLevel(logging.CRITICAL + 1)
@@ -3149,6 +3154,156 @@ def _extract_after_state(result: str, entity_type: str | None) -> dict | None:
         return None
 
 
+# ── Write intent (DS-11) ─────────────────────────────────────────────
+#
+# A write's audit entry is rendered from its result, so it can only be
+# written after the commit. A server killed in between left a
+# committed write with no line at all. The intent is the write-ahead
+# half: one small file beside the audit log, written before the tool
+# runs and removed once its entry (or its ERROR line) is on the trail.
+# A file found later, whose process is gone, becomes an INTERRUPTED
+# line naming the tool and what it was asked to do.
+
+_INTENT_NAME = ".pending-write.json"
+_INTENT_PARAMS_MAX = 2000
+
+
+def _audit_directory() -> "Path | None":
+    for handler in logging.getLogger(AUDIT_LOGGER_NAME).handlers:
+        if isinstance(handler, _DailyFileHandler):
+            return handler.directory
+    return None
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        return True
+    return True
+
+
+def _report_interrupted_write() -> None:
+    """Turn a leftover intent into an INTERRUPTED line. Called when
+    logging is set up for a book and before each new intent. An
+    intent whose process is still running belongs to another server
+    on the same book, mid-write, and is left alone."""
+    directory = _audit_directory()
+    if directory is None:
+        return
+    path = directory / _INTENT_NAME
+    try:
+        with path.open() as f:
+            left = json.load(f)
+    except FileNotFoundError:
+        return
+    except (OSError, json.JSONDecodeError):
+        left = {}
+    pid = left.get("pid")
+    if isinstance(pid, int) and pid != os.getpid() and _pid_alive(pid):
+        return
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    logger = logging.getLogger(AUDIT_LOGGER_NAME)
+    stamp = datetime.now().astimezone().isoformat().split("T")[1][:8]
+    text = (
+        f"{left.get('tool', '(unknown tool)')} started "
+        f"{left.get('timestamp', '(time unknown)')} and the server "
+        f"stopped before its audit entry was written. The write may "
+        f"have been committed. Asked for: {left.get('params', '?')}"
+    )
+    logger.info(f"{stamp}  INTERRUPTED  {_escape_audit_value(text)}")
+    logger.info("")
+    _flush_logger(logger)
+
+
+def _write_intent(tool: str, params, timestamp: str) -> "Path | None":
+    """Record that a write is starting. Never raises: a book write
+    must not fail because its intent could not be noted."""
+    try:
+        directory = _audit_directory()
+        if directory is None:
+            return None
+        _report_interrupted_write()
+        path = directory / _INTENT_NAME
+        payload = json.dumps({
+            "pid": os.getpid(),
+            "tool": tool,
+            "timestamp": timestamp,
+            "params": _scrub_credentials(
+                json.dumps(params, default=str)
+            )[:_INTENT_PARAMS_MAX],
+        })
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(payload)
+        return path
+    except Exception as e:  # noqa: BLE001 — must swallow
+        logging.getLogger(DEBUG_LOGGER_NAME).warning(
+            f"Write intent not recorded: {type(e).__name__}: {e}"
+        )
+        return None
+
+
+def _clear_intent(path: "Path | None") -> None:
+    if path is None:
+        return
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def _audit_render_failed(
+    logger, debug_logger, tool: str, timestamp: str,
+    classification: str, exc: Exception,
+) -> None:
+    """The tool succeeded and its audit entry could not be rendered:
+    say so on the trail in one line, and never raise."""
+    try:
+        reason = _scrub_credentials(f"{type(exc).__name__}: {exc}")
+        debug_logger.warning(
+            f"Audit entry for {tool} could not be rendered: "
+            f"{_escape_audit_value(reason)}"
+        )
+        if classification != "write":
+            return
+        time_part = (
+            timestamp.split("T")[1][:8] if "T" in timestamp
+            else timestamp[:8]
+        )
+        logger.info(
+            f"{time_part}  WRITE  {tool}: succeeded; its audit entry "
+            f"could not be rendered ({_escape_audit_value(reason)})"
+        )
+        logger.info("")
+        _flush_logger(logger)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def audit_to_stderr() -> None:
+    """Last resort when no audit file can be opened for the current
+    book (a ``switch_book`` whose target AND whose fallback both
+    failed): send the trail to stderr, which the host keeps, so a
+    write is never unrecorded (adversarial review 2026-09-30,
+    DS-10)."""
+    import sys
+
+    logger = logging.getLogger(AUDIT_LOGGER_NAME)
+    logger.handlers.clear()
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter("AUDIT %(message)s"))
+    handler.addFilter(CredentialScrubFilter())
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+
 def audit_log(
     classification: str = "read",
     operation: str | None = None,
@@ -3246,8 +3401,65 @@ def audit_log(
 
             start_time = time.time()
 
+            intent = None
+            if classification == "write":
+                intent = _write_intent(
+                    func.__name__, normalized_kwargs, timestamp,
+                )
+
             try:
                 result = func(*args, **kwargs)
+            except Exception as e:
+                elapsed_ms = (time.time() - start_time) * 1000
+                entry["result"] = "error"
+                entry["error"] = str(e)
+
+                # Drop any staged before-state so it can't leak into the
+                # next call. Failed writes don't render before_state in
+                # the error line anyway.
+                if _get_book_func is not None:
+                    try:
+                        book = _get_book_func()
+                        if book is not None:
+                            book._consume_audit_before()
+                    except Exception:
+                        pass
+
+                # Exception text can quote the connection string
+                # (piecash: "Database 'postgresql://user:pw@…' does
+                # not exist"); mask it before it reaches either log.
+                error_message = _scrub_credentials(str(e))
+                # One record per line here too: the text echoes
+                # caller-supplied values, and a newline in one forged
+                # a debug-log record (SEC-18).
+                debug_logger.debug(
+                    f"MCP response: tool={func.__name__} status=error "
+                    f"elapsed={elapsed_ms:.0f}ms "
+                    f"error={_escape_audit_value(error_message)}"
+                )
+
+                # Log a simple error line. Exception text embeds
+                # user-controlled values (account names, descriptions
+                # echoed by validators), so it passes the same escape
+                # as formatted entries — a raw newline here could
+                # forge an entry boundary just as well.
+                time_part = timestamp.split("T")[1][:8] if "T" in timestamp else timestamp[:8]
+                error_text = (
+                    f"{time_part}  ERROR  {func.__name__}: "
+                    f"{_escape_audit_value(error_message)}"
+                )
+                logger.info(error_text)
+                logger.info("")
+                _flush_logger(logger)
+                _clear_intent(intent)
+                raise
+
+            # The call returned: whatever it wrote is committed. From
+            # here nothing may replace ``result`` — a failure while
+            # rendering the entry used to surface as the tool's error,
+            # reporting a committed write as failed (adversarial
+            # review 2026-09-30, DS-16).
+            try:
                 elapsed_ms = (time.time() - start_time) * 1000
 
                 # Always consume staged before-state (even on reads)
@@ -3311,51 +3523,13 @@ def audit_log(
                     logger.info(text_entry)
                     logger.info("")  # Blank line between entries
                 _flush_logger(logger)
-                return result
-
-            except Exception as e:
-                elapsed_ms = (time.time() - start_time) * 1000
-                entry["result"] = "error"
-                entry["error"] = str(e)
-
-                # Drop any staged before-state so it can't leak into the
-                # next call. Failed writes don't render before_state in
-                # the error line anyway.
-                if _get_book_func is not None:
-                    try:
-                        book = _get_book_func()
-                        if book is not None:
-                            book._consume_audit_before()
-                    except Exception:
-                        pass
-
-                # Exception text can quote the connection string
-                # (piecash: "Database 'postgresql://user:pw@…' does
-                # not exist"); mask it before it reaches either log.
-                error_message = _scrub_credentials(str(e))
-                # One record per line here too: the text echoes
-                # caller-supplied values, and a newline in one forged
-                # a debug-log record (SEC-18).
-                debug_logger.debug(
-                    f"MCP response: tool={func.__name__} status=error "
-                    f"elapsed={elapsed_ms:.0f}ms "
-                    f"error={_escape_audit_value(error_message)}"
+            except Exception as render_exc:  # noqa: BLE001
+                _audit_render_failed(
+                    logger, debug_logger, func.__name__, timestamp,
+                    classification, render_exc,
                 )
-
-                # Log a simple error line. Exception text embeds
-                # user-controlled values (account names, descriptions
-                # echoed by validators), so it passes the same escape
-                # as formatted entries — a raw newline here could
-                # forge an entry boundary just as well.
-                time_part = timestamp.split("T")[1][:8] if "T" in timestamp else timestamp[:8]
-                error_text = (
-                    f"{time_part}  ERROR  {func.__name__}: "
-                    f"{_escape_audit_value(error_message)}"
-                )
-                logger.info(error_text)
-                logger.info("")
-                _flush_logger(logger)
-                raise
+            _clear_intent(intent)
+            return result
 
         # Expose the declared classification/operation on the wrapper.
         # @wraps copies __dict__ outward through later decorator layers

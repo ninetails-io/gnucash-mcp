@@ -1580,7 +1580,25 @@ def _switch_book_impl(name: str) -> str:
                 _audit_line(f"FAILED → {target.name} (still on "
                             f"{previous.name})")
             except Exception:
-                pass  # original error is the actionable one
+                # Both failed: there is no audit file for the book
+                # the session is still on. The trail goes to stderr
+                # rather than nowhere, and the error says so (it was
+                # swallowed, and every later write went unrecorded:
+                # adversarial review 2026-09-30, DS-10).
+                from gnucash_mcp.logging_config import audit_to_stderr
+                if _logging_audit:
+                    audit_to_stderr()
+                    _audit_line(f"FAILED → {target.name} (still on "
+                                f"{previous.name}; audit file "
+                                f"unavailable, trail on stderr)")
+                    raise RuntimeError(
+                        f"Could not switch to {target.name}, and the "
+                        f"audit log for {previous.name} could not be "
+                        f"reopened either. Still on {previous.name}; "
+                        f"its audit entries go to the server's stderr "
+                        f"until a switch_book succeeds or the server "
+                        f"restarts."
+                    ) from None
         raise
     _audit_line(
         f"← now active (from "

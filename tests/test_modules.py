@@ -1167,6 +1167,35 @@ class TestMultiBook:
         assert srv._current_path == two_books[0].resolve()
         assert srv.get_book().book_path.name == "alex.gnucash"
 
+    def test_a_switch_that_fails_twice_keeps_an_audit_trail(
+        self, two_books, monkeypatch, capsys,
+    ):
+        """DS-10: the target's logging fails AND the previous book's
+        cannot be reopened. The session stays on the previous book,
+        and its audit entries go to stderr instead of nowhere."""
+        import logging
+
+        import gnucash_mcp.server as srv
+        from gnucash_mcp.logging_config import audit_note, setup_logging
+        self._select(srv, two_books)  # current = alex
+        monkeypatch.setattr(srv, "_logging_audit", True)
+
+        def boom(path):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(srv, "_activate_logging", boom)
+        try:
+            with pytest.raises(RuntimeError, match="stderr"):
+                srv._switch_book_impl("beast")
+            assert srv._current_path == two_books[0].resolve()
+            assert logging.getLogger("gnucash_mcp.audit").handlers
+            audit_note("CREATE BACKUP", "after the failure")
+            err = capsys.readouterr().err
+            assert "SWITCH BOOK  FAILED" in err
+            assert "CREATE BACKUP  after the failure" in err
+        finally:
+            setup_logging(book_path=None, audit=False, debug=False)
+
     def test_orientation_reports_currency_and_count(self, two_books):
         import gnucash_mcp.server as srv
         alex, _ = two_books

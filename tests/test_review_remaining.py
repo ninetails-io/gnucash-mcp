@@ -452,3 +452,114 @@ class TestC32AssignSplitToLotSavesOnceOrNotAtAll:
         with pytest.raises(ValueError, match="no default currency"):
             gb.assign_split_to_lot(split_guid=split, lot_guid=lot)
         assert self._assigned(investment_book) == 0
+
+
+@pytest.fixture
+def audited(test_book, tmp_path, monkeypatch):
+    """Audit logging pointed at a scratch folder, and a write tool
+    wrapped the way every registered tool is."""
+    import json
+
+    from gnucash_mcp import logging_config as lc
+
+    monkeypatch.setenv("GNUCASH_LOG_DIR", str(tmp_path / "logs"))
+    lc.setup_logging(book_path=str(test_book), audit=True)
+    directory = lc._audit_directory()
+    seen = {}
+
+    @lc.audit_log(
+        classification="write", operation="create",
+        entity_type="transaction",
+    )
+    def tool(description: str = "x") -> str:
+        seen["intent_during_call"] = (directory / lc._INTENT_NAME).exists()
+        if description == "raise":
+            raise ValueError("refused")
+        return json.dumps({"guid": "a" * 32, "status": "created"})
+
+    def trail():
+        return "\n".join(
+            p.read_text() for p in sorted(directory.glob("*.txt"))
+        )
+
+    try:
+        yield lc, tool, directory, seen, trail
+    finally:
+        lc.setup_logging(book_path=None, audit=False, debug=False)
+
+
+class TestDS16ARenderFailureNeverReplacesTheResult:
+    def test_the_result_comes_back_and_the_trail_says_why(
+        self, audited, monkeypatch,
+    ):
+        lc, tool, _directory, _seen, trail = audited
+
+        def boom(entry):
+            raise KeyError("after_state")
+
+        monkeypatch.setattr(lc, "_format_audit_entry_text", boom)
+        assert '"status": "created"' in tool(description="ok")
+        assert (
+            "WRITE  tool: succeeded; its audit entry could not be rendered"
+            in trail()
+        )
+        assert "KeyError" in trail()
+
+
+class TestDS11AWriteLeavesAnIntentUntilItsEntryIsWritten:
+    def test_the_intent_is_there_during_the_call_and_gone_after(
+        self, audited,
+    ):
+        lc, tool, directory, seen, _trail = audited
+        tool(description="ok")
+        assert seen["intent_during_call"] is True
+        assert not (directory / lc._INTENT_NAME).exists()
+
+    def test_a_refused_write_clears_its_intent(self, audited):
+        lc, tool, directory, _seen, trail = audited
+        with pytest.raises(ValueError):
+            tool(description="raise")
+        assert not (directory / lc._INTENT_NAME).exists()
+        assert "ERROR  tool: refused" in trail()
+
+    def _leave(self, lc, directory, pid):
+        import json
+        (directory / lc._INTENT_NAME).write_text(json.dumps({
+            "pid": pid, "tool": "create_transactions",
+            "timestamp": "2026-10-05T09:00:00-07:00",
+            "params": '{"rows": "..."}',
+        }))
+
+    def _dead_pid(self):
+        import subprocess
+        import sys
+        p = subprocess.Popen([sys.executable, "-c", "pass"])
+        p.wait()
+        return p.pid
+
+    def test_an_intent_left_by_a_dead_server_is_reported_at_startup(
+        self, audited, test_book,
+    ):
+        lc, _tool, directory, _seen, trail = audited
+        self._leave(lc, directory, self._dead_pid())
+        lc.setup_logging(book_path=str(test_book), audit=True)
+        text = trail()
+        assert "INTERRUPTED  create_transactions started" in text
+        assert "may have been committed" in text
+        assert not (directory / lc._INTENT_NAME).exists()
+
+    def test_and_before_the_next_write(self, audited):
+        lc, tool, directory, _seen, trail = audited
+        self._leave(lc, directory, self._dead_pid())
+        tool(description="ok")
+        assert trail().count("INTERRUPTED") == 1
+
+    def test_an_intent_of_a_running_server_is_left_alone(
+        self, audited, test_book,
+    ):
+        import os
+        lc, _tool, directory, _seen, trail = audited
+        self._leave(lc, directory, os.getppid())
+        lc.setup_logging(book_path=str(test_book), audit=True)
+        assert "INTERRUPTED" not in trail()
+        assert (directory / lc._INTENT_NAME).exists()
