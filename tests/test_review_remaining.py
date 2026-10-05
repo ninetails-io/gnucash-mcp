@@ -353,3 +353,56 @@ class TestC67BusinessPostingsFollowTheNumOption:
             ("", "Accounts Receivable", "Payment"),
             ("", "Checking", ""),
         ]
+
+
+class TestFC14StartupReadsTheVersionsTable:
+    """A SQLite file whose tables piecash will not open is named at
+    startup, with what to do, instead of failing on the first call."""
+
+    def test_a_book_the_server_reads_passes(self, test_book):
+        from gnucash_mcp.server import _book_format_error
+        assert _book_format_error(test_book) is None
+
+    def test_a_sqlite_file_that_is_not_a_book(self, tmp_path):
+        from gnucash_mcp.server import _book_format_error
+        p = tmp_path / "notes.gnucash"
+        _q(p, "create table notes (body text)")
+        assert "not a GnuCash book" in _book_format_error(p)
+
+    def test_a_book_last_saved_by_2_6(self, test_book):
+        from piecash.core.session import version_supported
+
+        from gnucash_mcp.server import _book_format_error
+        for table, version in version_supported["2.6"].items():
+            _q(
+                test_book,
+                "update versions set table_version = ? where table_name = ?",
+                (version, table),
+            )
+        msg = _book_format_error(test_book)
+        assert "GnuCash 2.6 or older" in msg
+        assert "save it once" in msg
+        # piecash agrees that it cannot open this file.
+        with pytest.raises(Exception):
+            GnuCashBook(str(test_book)).list_accounts()
+
+    def test_a_table_version_nobody_knows(self, test_book):
+        from gnucash_mcp.server import _book_format_error
+        _q(
+            test_book,
+            "update versions set table_version = 99 "
+            "where table_name = 'splits'",
+        )
+        msg = _book_format_error(test_book)
+        assert "versions this server does not read (splits)" in msg
+
+    def test_the_sample_books_pass(self):
+        from pathlib import Path
+
+        from gnucash_mcp.server import _book_format_error
+        samples = Path(__file__).resolve().parent.parent / "samples"
+        for name in (
+            "alex-chen-morales.gnucash", "lin-wei.gnucash",
+        ):
+            if (samples / name).exists():
+                assert _book_format_error(samples / name) is None, name
