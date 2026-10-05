@@ -18,6 +18,23 @@ Sizes are relative to one working session: small, medium, large.
 
 ---
 
+## Fixed since this list was written
+
+On `fix/1.5.0-numbers`, each with its test and its CHANGELOG line.
+
+| Commit | Item |
+|---|---|
+| `4d81469` | MM-12. The budget report converts at monthly closes, as the flow reports do. |
+| `7937d7a` | C46. The discount window counts from the posting date, through the billing-term math. |
+| `9ba2283` | Side-finding 9. A rounded share quantity implies no price. |
+| `a5c6f4b` | C20 and the rest of MM-10. Amounts print the way GnuCash prints them. |
+
+Side-finding 13 (the 644.57) is explained to the cent in
+`specs/v1.5/testing/BOOKKEEPER_REPORT_SIDE_FINDING_13.md`. It is not
+a server defect.
+
+---
+
 ## Worth doing first
 
 These touch a number someone reads, or a book someone could damage.
@@ -30,39 +47,12 @@ These touch a number someone reads, or a book someone could damage.
   what it can do is leave a `gnc-mcp/schema` marker a future server
   checks, and say plainly in the upgrade notes not to run both. The
   only item here where a stored amount can end up wrong. Small.
-- **MM-12 — `get_budget_report` converts actuals at one rate.**
-  `budgets.py`, `_account_conversion_factors(book, last_end)`. The
-  spending and income reports convert each split at its month's
-  close; on a multi-currency book the two disagree (260.0 against
-  240.0 in the review's case). Needs a ruling first: a budget report
-  is a flow report, which argues for `_monthly_conversion_factors`.
-  Small once ruled.
 - **C63 — date-range filters compare stored text.** `_query.py`.
   Correct for every row GnuCash 3 or later wrote (verified on 5.12).
   A row in the 2.6-era compact form, or stamped at local midnight,
   can fall on the wrong side of a boundary. Options: detect such
   rows once at open and warn on the dashboard, or compare on a
   normalized form. Medium, and needs a 2.6-written book in hand.
-- **C20 — three-decimal currencies shown at two.** `reporting.py`,
-  `core.py`, `logging_config.py`, `_format.py`. A BHD 10.125 balance
-  reads 10.13, 10.12, and 10.12 on three surfaces. Also inside this
-  one: `_format_number` rounds half-up and the dashboard's `_r2`
-  half-even, so any book can differ by 0.01 between surfaces on an
-  exact half-cent. Route every display through the commodity's
-  quantum. Medium, four modules.
-- **C46 — early-payment discount window counts from `date_opened`.**
-  `business.py`, the discount-window anchor. It can close before the
-  document is posted. Fails safe. The server's own
-  `_billterm_due_date` anchors on the post date and handles proximo
-  terms; the discount window should use the same anchor. GnuCash has
-  no early-payment logic to match, so this is the server's policy to
-  set. Small.
-- **Side-finding 9 — an implied price from a rounded quantity.** A
-  BTC quantity of 0.00005 on a four-decimal commodity rounds to
-  0.0001 and the implied price is 20000, not 40000. The write warns
-  through `_fx_sanity_warnings`; the price row is still written and
-  valuation counts it. Decide whether such a split should imply a
-  price at all. Small.
 
 ## Desktop parity
 
@@ -105,9 +95,6 @@ These touch a number someone reads, or a book someone could damage.
   piecash's `utf8mb4` tables and cannot see it. Refuse the character
   with a clear message on such a book. Small, needs a
   desktop-created MariaDB book.
-- **MM-10, the remainder.** `get_prices` keeps a small rate's
-  digits; lot quantities still show four decimals (0.00004321 BTC
-  reads 0.0000). `investments.py`. Small.
 - **C62 — the `Credit Notes` feature flag is not stamped.** Closed
   as designed; here so nobody rediscovers it. Only GnuCash before
   2.5.0 reads the flag, and a feature stamp is the riskiest row the
@@ -173,9 +160,6 @@ These touch a number someone reads, or a book someone could damage.
 - **FC-18 — the bundled demo books are old piecash-format files.**
   Being addressed by the sample-book generation work ahead of the
   release.
-- **Side-finding 13 — GnuCash's own Balance Sheet on the Alex demo
-  is off by 644.57.** The bookkeeper's, during the generator top-up.
-  Not shown to be a server defect.
 - **The read-only-period warning has no database-backend test.** Its
   one query is a plain SELECT; a case in `test_db_backend.py` would
   make that a fact. Small.
