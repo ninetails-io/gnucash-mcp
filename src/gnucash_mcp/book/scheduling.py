@@ -364,7 +364,6 @@ class SchedulingMixin:
             ],
         )
         book.session.flush()
-        denom = currency.fraction
         for split, leg in zip(txn.splits, legs):
             label = f"template split for {leg['account'].fullname}"
             frame_guid = uuid.uuid4().hex

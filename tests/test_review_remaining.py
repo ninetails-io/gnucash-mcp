@@ -383,7 +383,7 @@ class TestFC14StartupReadsTheVersionsTable:
         assert "GnuCash 2.6 or older" in msg
         assert "save it once" in msg
         # piecash agrees that it cannot open this file.
-        with pytest.raises(Exception):
+        with pytest.raises(ValueError, match="Unsupported table versions"):
             GnuCashBook(str(test_book)).list_accounts()
 
     def test_a_table_version_nobody_knows(self, test_book):
