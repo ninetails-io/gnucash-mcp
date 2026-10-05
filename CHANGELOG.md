@@ -157,6 +157,7 @@ Schedule recipes, invoice links, and budget signs are now stored the way GnuCash
 - **Intel Macs install without a Rust toolchain again**: `cryptography` (transitive, via `mcp`) dropped macOS x86_64 wheels at 49.0; a marker-scoped constraint keeps 48.0.1 on that platform only, every other platform stays current.
 - `void_transaction` refuses a transaction with a reconciled split unless `force` is set, the gate `delete_transaction` and `replace_splits` already had. It used to warn and proceed. Side-finding 11.
 - Void and unvoid handle a transaction's notes as `xaccTransVoid` and `xaccTransUnvoid` do. A void keeps an empty notes field as well as a filled one, and an unvoid restores the former notes whatever the void note reads, so a transaction voided by a GnuCash running in German gets its notes back. A transaction that had no notes keeps the void's note after an unvoid, as in GnuCash; the server used to remove it when it was the English text. Review item SS-17.
+- A scheduled transaction's template amounts are stored as the reduced fractions GnuCash's editor stores (4200.00 as 4200/1, the unused side as 0/1), where the server wrote 420000/100 and 0/100. The values were always equal; templates already in a book are left as they are. Review item C26.
 
 ### Known limitations
 Found by the pre-release review and left as they are in 1.5, each by a recorded decision. None changes a stored amount. They are listed so that a boundary is a documented one. Item numbers refer to `specs/v1.5/testing/ADVERSARIAL_REVIEW_1.5.md`.
@@ -168,7 +169,6 @@ Found by the pre-release review and left as they are in 1.5, each by a recorded 
 - **Credit notes do not stamp the `Credit Notes` feature flag.** Only GnuCash older than 2.5.0 reads it (C62).
 - **Manual backups are not capped.** `create_backup` writes a file on every call (C60).
 - **No tool hides an account.** The slot tools refuse `hidden` because GnuCash reads that flag from the account itself; hide an account in GnuCash.
-- A scheduled transaction's template amounts are stored at the currency's denominator (4200.00 as 420000/100) where GnuCash stores a reduced fraction. The values are equal (C26).
 - A book file renamed or removed between a write's commit and its response: the write is reported as failed though it committed, and an empty file can appear at the old path (C28).
 - `assign_split_to_lot` can commit and then report an error on a book whose root account has no currency (C32).
 - A `GNUCASH_LOG_DIR` override skips the symlink and ownership checks the default log location gets (C53).

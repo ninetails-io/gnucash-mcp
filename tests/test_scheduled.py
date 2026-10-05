@@ -1709,9 +1709,10 @@ class TestNativeTemplates:
             rent = seen[rent_guid]
             assert rent["sched-xaction/account"][0] == 5
             assert rent["sched-xaction/debit-formula"][1] == "1850.00"
-            assert rent["sched-xaction/debit-numeric"][3:] == (185000, 100)
+            # Reduced, as gnc_exp_parser hands them to the editor (C26).
+            assert rent["sched-xaction/debit-numeric"][3:] == (1850, 1)
             assert rent["sched-xaction/credit-formula"][1] == ""
-            assert rent["sched-xaction/credit-numeric"][3:] == (0, 100)
+            assert rent["sched-xaction/credit-numeric"][3:] == (0, 1)
             # Nothing legacy on the SX row.
             assert _slots_for(book, sx[0]) == {}
 
@@ -2313,7 +2314,10 @@ class TestDesktopFormulaAmounts:
         from gnucash_mcp.book.scheduling import SchedulingMixin
         amount = SchedulingMixin._rational_amount
         assert str(amount(4250, 100, 100)) == "42.50"
-        assert str(amount(25, 1, 100)) == "25"
+        # A whole amount the editor reduced still reads at the
+        # currency's places (C26).
+        assert str(amount(25, 1, 100)) == "25.00"
+        assert str(amount(25, 1, 1)) == "25"
         assert str(amount(-185000, 100, 100)) == "-1850.00"
         assert str(amount(1, 3, 1)) == "0"          # a zero-decimal currency
         assert str(amount(-100, 3, 100)) == "-33.33"
