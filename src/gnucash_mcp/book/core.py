@@ -6844,6 +6844,7 @@ class CoreMixin:
         placeholder: bool | None = None,
         account_type: str | None = None,
         notes: str | None = None,
+        hidden: bool | None = None,
     ) -> dict:
         """Update an existing account's properties.
 
@@ -6852,6 +6853,9 @@ class CoreMixin:
             new_name: New name for the account (just the name, not full path).
             description: New description.
             placeholder: New placeholder status.
+            hidden: Hide or show the account. Written as desktop
+                writes it: the ``hidden`` slot ("true", or no slot)
+                and the account's column together.
             account_type: New account type (e.g., "CREDIT", "BANK"). Only
                 changes within the same debit/credit polarity family are
                 allowed (e.g., LIABILITY to CREDIT, ASSET to BANK).
@@ -6901,6 +6905,25 @@ class CoreMixin:
             if placeholder is not None and bool(placeholder) != bool(account.placeholder):
                 account.placeholder = _gnc_bool(placeholder)
                 changed["placeholder"] = bool(placeholder)
+
+            if hidden is not None:
+                # xaccAccountSetHidden (set_kvp_boolean_path): the
+                # string "true", or the slot removed. Desktop reads
+                # the slot and its SQL backend saves the column from
+                # it, so the two are written together and a slot
+                # that disagrees with the column is brought in step.
+                slot_says = "hidden" in account and (
+                    _slot_value_str(account["hidden"]) == "true"
+                )
+                if bool(hidden) != bool(account.hidden):
+                    account.hidden = _gnc_bool(hidden)
+                    changed["hidden"] = bool(hidden)
+                if hidden and not slot_says:
+                    account["hidden"] = "true"
+                    changed["hidden"] = True
+                elif not hidden and "hidden" in account:
+                    del account["hidden"]
+                    changed["hidden"] = False
 
             if notes is not None:
                 self._validate_account_notes(notes)

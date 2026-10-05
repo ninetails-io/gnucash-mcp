@@ -104,3 +104,48 @@ class TestSideFinding11VoidingAReconciledSplitNeedsForce:
         split = gb.get_transaction(guid)["splits"][0]
         gb.set_reconcile_state(split_guid=split["guid"], state="c")
         assert gb.void_transaction(guid, reason="oops")["status"] == "voided"
+
+
+class TestHiddenIsWrittenTheWayDesktopWritesIt:
+    """xaccAccountSetHidden keeps a string slot "true" (or no slot)
+    and the SQL backend saves the column from it. The server reads
+    the column, so update_account writes both."""
+
+    ACCT = "Expenses:Groceries"
+
+    def _state(self, path):
+        return _q(
+            path,
+            "select a.hidden, s.slot_type, s.string_val from accounts a "
+            "left join slots s on s.obj_guid = a.guid and s.name = 'hidden' "
+            "where a.name = 'Groceries'",
+        )
+
+    def test_hide_and_show(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        hid = gb.update_account(self.ACCT, hidden=True)
+        assert hid["hidden"] is True
+        assert self._state(test_book) == [(1, 4, "true")]
+        assert gb.get_account(self.ACCT)["hidden"] is True
+        shown = gb.update_account(self.ACCT, hidden=False)
+        assert shown["hidden"] is False
+        assert self._state(test_book) == [(0, None, None)]
+        assert "hidden" not in gb.get_account(self.ACCT)
+
+    def test_no_change_is_not_reported(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        assert "hidden" not in gb.update_account(self.ACCT, hidden=False)
+
+    def test_a_slot_out_of_step_with_the_column_is_brought_in_step(
+        self, test_book,
+    ):
+        gb = GnuCashBook(str(test_book))
+        _q(test_book, "update accounts set hidden = 1 where name = 'Groceries'")
+        fixed = gb.update_account(self.ACCT, hidden=True)
+        assert fixed["hidden"] is True
+        assert self._state(test_book) == [(1, 4, "true")]
+
+    def test_the_slot_tools_point_at_update_account(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match=r"update_account\(hidden"):
+            gb.set_account_slot(self.ACCT, "hidden", "true")

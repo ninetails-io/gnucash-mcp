@@ -1310,8 +1310,13 @@ def _fmt_account_update(entry: dict) -> list[str]:
                 f'"{before.get("description") or ""}" → '
                 f'"{after["description"] or ""}"'
             )
-        for key, label in (("placeholder", "Placeholder"), ("type", "Type")):
-            if key in after and after[key] != before.get(key):
+        for key, label in (
+            ("placeholder", "Placeholder"), ("hidden", "Hidden"),
+            ("type", "Type"),
+        ):
+            if key in after and after[key] != before.get(
+                key, False if key == "hidden" else None,
+            ):
                 lines.append(
                     f"{_INDENT}{label}: {before.get(key)} → {after[key]}"
                 )

@@ -784,6 +784,7 @@ def register(mcp, get_book) -> None:
         placeholder: bool | None = None,
         account_type: str | None = None,
         notes: str | None = None,
+        hidden: bool | None = None,
     ) -> str:
         """Update an existing account's properties.
 
@@ -798,6 +799,9 @@ def register(mcp, get_book) -> None:
                 (e.g., ASSET to LIABILITY) are blocked.
             notes: New notes (max 4096 bytes; shared with GnuCash
                 desktop's Notes field). Pass "" to clear.
+            hidden: Hide the account (true) or show it again (false),
+                as the Hidden box in GnuCash's account editor does.
+                Balances and reports still count a hidden account.
         """
         book = get_book()
         result = book.update_account(
@@ -807,6 +811,7 @@ def register(mcp, get_book) -> None:
             placeholder=placeholder,
             account_type=account_type,
             notes=notes,
+            hidden=hidden,
         )
         return _json(result)
 

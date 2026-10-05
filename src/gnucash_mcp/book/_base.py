@@ -1027,6 +1027,9 @@ def _account_to_dict(account: piecash.Account) -> dict:
         "description": account.description or "",
         "placeholder": bool(account.placeholder),
     }
+    # Conditional, like notes: a visible account keeps its shape.
+    if account.hidden:
+        result["hidden"] = True
     # Account notes live in the "notes" slot — the same key GnuCash
     # desktop's account editor reads/writes. Conditional so
     # note-less accounts keep their original shape.
