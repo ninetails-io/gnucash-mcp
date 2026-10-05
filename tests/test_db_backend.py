@@ -279,9 +279,46 @@ class TestRedaction:
 # ── Reads and writes over a URI ───────────────────────────────────
 
 
+def _read_only_period_is_named(gb: GnuCashBook) -> None:
+    """The read-only-period warning's one query (a slot read by name)
+    on whatever backend ``gb`` is: the option stored as GnuCash
+    stores it, a double under options/Accounts, then one write on
+    each side of the date (review C69)."""
+    from datetime import timedelta
+
+    with gb.open(readonly=False) as book:
+        book["options"] = {"Accounts": {
+            "Day Threshold for Read-Only Transactions (red line)": 30.0,
+        }}
+        book.save()
+
+    def spend(days_ago: int) -> dict:
+        return gb.create_transaction(
+            description=f"Read-only probe {days_ago}",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "3.21"},
+                {"account": "Assets:Checking", "amount": "-3.21"},
+            ],
+            trans_date=date.today() - timedelta(days=days_ago),
+            check_duplicates=False,
+        )
+
+    def kinds(result: dict) -> list:
+        return [
+            w.get("type") for w in result.get("warnings", [])
+            if isinstance(w, dict)
+        ]
+
+    assert "read_only_period" in kinds(spend(40))
+    assert "read_only_period" not in kinds(spend(5))
+
+
 class TestUriBookOperations:
     def test_accounts_read_back(self, uri_book):
         assert "Assets:Checking" in uri_book.list_accounts()
+
+    def test_read_only_period_is_named(self, uri_book):
+        _read_only_period_is_named(uri_book)
 
     def test_write_round_trips(self, uri_book):
         result = uri_book.create_transaction(
@@ -898,6 +935,9 @@ class _RealDatabaseTests:
         listing = db_book.list_accounts()
         assert "Assets:Checking" in listing
         assert "Expenses:Groceries" in listing
+
+    def test_read_only_period_is_named(self, db_book):
+        _read_only_period_is_named(db_book)
 
     def test_write_round_trips(self, db_book):
         result = db_book.create_transaction(
