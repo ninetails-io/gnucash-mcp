@@ -273,6 +273,7 @@ def register(mcp, get_book) -> None:
     def void_transaction(
         guid: TransactionGuid,
         reason: str,
+        force: bool = False,
     ) -> str:
         """Void a transaction (proper accounting void, not delete).
 
@@ -287,9 +288,12 @@ def register(mcp, get_book) -> None:
         Args:
             guid: Transaction GUID to void (32-character hex string, or 8+ char prefix)
             reason: Reason for voiding (required for audit trail)
+            force: Void even though a split is reconciled. Refused
+                without it; the affected account then needs
+                reconciling again.
         """
         book = get_book()
-        result = book.void_transaction(guid=guid, reason=reason)
+        result = book.void_transaction(guid=guid, reason=reason, force=force)
         return _json(result)
 
     @mcp.tool()
@@ -302,7 +306,9 @@ def register(mcp, get_book) -> None:
 
         The inverse of void_transaction: original split values come
         back from the slots the void stored, and the void markers
-        and reason are cleared. All-or-nothing — if any split's
+        and reason are cleared. The notes it had before the void
+        come back; a transaction that had none keeps the void's
+        note, as in GnuCash. All-or-nothing — if any split's
         stored void data is missing, the tool errors and restores
         nothing (no partial resurrection). Errors too if the
         transaction isn't found or isn't voided. Restored splits

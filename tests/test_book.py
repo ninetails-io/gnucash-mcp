@@ -10047,13 +10047,10 @@ class TestVoidTransaction:
         self, test_book: Path,
     ):
         """Voiding a transaction that contains reconciled splits
-        breaks the reconciled balance for the affected accounts —
-        the bank statement that originally reconciled is no longer
-        accurate. Unlike ``delete_transaction`` (which blocks on
-        reconciled splits), voiding is an audit operation that
-        should never be silently rejected; the result includes a
-        ``warning`` field naming the affected account(s) so the
-        caller knows what they just broke."""
+        breaks the reconciled balance for the affected accounts, so
+        it is refused without ``force`` (side-finding 11: the gate
+        delete and replace_splits already had). Forced, the result
+        includes a ``warning`` naming the affected account(s)."""
         gc_book = GnuCashBook(str(test_book))
 
         transactions = gc_book.list_transactions(compact=False)["transactions"]
@@ -10068,11 +10065,15 @@ class TestVoidTransaction:
             state="y",
         )
 
+        with pytest.raises(ValueError, match="force=true"):
+            gc_book.void_transaction(guid, reason="Wrong amount entered")
+        assert gc_book.get_transaction(guid)["splits"][0]["value"] != "0"
+
         result = gc_book.void_transaction(
-            guid, reason="Wrong amount entered",
+            guid, reason="Wrong amount entered", force=True,
         )
 
-        # Void still succeeded.
+        # The forced void succeeded.
         assert result["status"] == "voided"
         # And surfaced a warning naming the affected account.
         assert "warning" in result

@@ -155,6 +155,8 @@ Schedule recipes, invoice links, and budget signs are now stored the way GnuCash
 - Demo-book continuation counts ledger rows only when guarding its frozen prefix; schedule templates are not activity (#181).
 - **An unpriced holding is worth its remaining cost basis** (#185): remaining units at the running average cost of the legs that acquired them, so a fully sold position is exactly zero and a partly sold one carries none of its realized gain. The old fallback summed every leg's raw value, which left a sold-out altcoin on the balance sheet as a phantom holding — found and fixed for the closed case by @DrSkippy in #184. One rule now serves `balance_sheet`, `net_worth` (point-in-time and series), the dashboard, and runway, so they agree by construction; voided and undated legs are skipped the way every own-splits sum skips them.
 - **Intel Macs install without a Rust toolchain again**: `cryptography` (transitive, via `mcp`) dropped macOS x86_64 wheels at 49.0; a marker-scoped constraint keeps 48.0.1 on that platform only, every other platform stays current.
+- `void_transaction` refuses a transaction with a reconciled split unless `force` is set, the gate `delete_transaction` and `replace_splits` already had. It used to warn and proceed. Side-finding 11.
+- Void and unvoid handle a transaction's notes as `xaccTransVoid` and `xaccTransUnvoid` do. A void keeps an empty notes field as well as a filled one, and an unvoid restores the former notes whatever the void note reads, so a transaction voided by a GnuCash running in German gets its notes back. A transaction that had no notes keeps the void's note after an unvoid, as in GnuCash; the server used to remove it when it was the English text. Review item SS-17.
 
 ### Known limitations
 Found by the pre-release review and left as they are in 1.5, each by a recorded decision. None changes a stored amount. They are listed so that a boundary is a documented one. Item numbers refer to `specs/v1.5/testing/ADVERSARIAL_REVIEW_1.5.md`.
@@ -170,8 +172,6 @@ Found by the pre-release review and left as they are in 1.5, each by a recorded 
 - A book file renamed or removed between a write's commit and its response: the write is reported as failed though it committed, and an empty file can appear at the old path (C28).
 - `assign_split_to_lot` can commit and then report an error on a book whose root account has no currency (C32).
 - A `GNUCASH_LOG_DIR` override skips the symlink and ownership checks the default log location gets (C53).
-- `unvoid_transaction` removes the void note only when it is GnuCash's English text; a transaction voided by a GnuCash running in another language keeps the localized note (SS-17).
-- `void_transaction` warns on a reconciled split and proceeds (side-finding 11).
 - The audit line for a write is written after the write commits. A server killed in between leaves the write without its line (DS-11); a failure while rendering the line would report a committed write as an error, though no input is known to cause one (DS-16); a `switch_book` that fails twice over can leave the session without an audit file (DS-10).
 - The startup check confirms the book is a SQLite file, not that its tables are a version the server reads; a book from GnuCash 2.6 or older passes startup and fails on the first call (FC-14).
 - A 1.4.x server is not stopped from writing to a book 1.5 has converted. Do not point both at one book (FC-20).
