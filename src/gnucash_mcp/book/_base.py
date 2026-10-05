@@ -2240,7 +2240,25 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         and leaves this one alone.
         """
         if self.source.is_file:
-            return {"sqlite_file": str(self.source.path)}
+            # One connection for the life of the open. piecash's
+            # engine uses NullPool for a SQLite file: every commit
+            # closes the connection and the next statement reconnects
+            # BY PATH. A book renamed or replaced in that instant (a
+            # sync client, a backup tool) then got a new, empty file
+            # at its old path, and the write that had just committed
+            # was reported as failed when its response was being
+            # built (adversarial review 2026-09-30, C28). StaticPool
+            # keeps the one descriptor, which follows the file.
+            # Nothing is reset when the connection is handed back:
+            # the session owns its transaction, and a reset on a
+            # shared connection would roll that transaction back.
+            from sqlalchemy.pool import StaticPool
+
+            return {
+                "sqlite_file": str(self.source.path),
+                "poolclass": StaticPool,
+                "pool_reset_on_return": None,
+            }
         return {"uri_conn": self.source.uri}
 
     def _find_account(self, book: piecash.Book, fullname: str) -> piecash.Account | None:

@@ -811,3 +811,40 @@ class TestC63DateRangesAreDecidedOnTheDecodedDate:
         with gb.open(readonly=True) as book:
             assert gb._has_compact_post_dates(book) is False
             assert gb._compact_dates_cache[1] is False
+
+
+class TestC28ABookMovedBetweenCommitAndResponse:
+    """Every write builds its response after the commit. The book's
+    connection used to be reopened by path for that, so a file moved
+    in between got an empty twin at its old path and the committed
+    write was reported as failed."""
+
+    def test_the_write_is_reported_and_no_empty_file_appears(
+        self, test_book, monkeypatch,
+    ):
+        import os
+
+        import piecash
+
+        gb = GnuCashBook(str(test_book))
+        moved = test_book.with_name("moved.gnucash")
+        real_save = piecash.Book.save
+
+        def save_then_move(book):
+            real_save(book)
+            if test_book.exists():
+                os.rename(test_book, moved)
+
+        monkeypatch.setattr(piecash.Book, "save", save_then_move)
+        made = gb.create_account(
+            name="Moved Under Us", account_type="EXPENSE", parent="Expenses",
+        )
+        monkeypatch.undo()
+        assert made["status"] == "created"
+        assert made["fullname"] == "Expenses:Moved Under Us"
+        assert not test_book.exists()
+        rows = _q(
+            moved, "select count(*) from accounts where name = ?",
+            ("Moved Under Us",),
+        )
+        assert rows == [(1,)]
