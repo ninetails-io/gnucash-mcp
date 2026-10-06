@@ -87,7 +87,7 @@ its CHANGELOG line.
 | `1e82edb` | C28. One connection per book open. |
 | `d56bd6b` | Converted balances round once per account, so a statement's lines add up to its total (found during C20). |
 | `8e3f021` | FC-19. A book `gnucash-cli` creates, swept by the server and loaded again by GnuCash (`test_gnucash_created_book.py`). |
-| (this commit) | FC-20 guard, and the trading-accounts refusal, per the close-out rulings. |
+| `7b8f101` | FC-20 guard, and the trading-accounts refusal, per the close-out rulings. |
 
 Narrower than the finding, on purpose:
 
