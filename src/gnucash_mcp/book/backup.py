@@ -588,7 +588,9 @@ class BackupMixin:
         mid-transaction, after which nothing else can read the file.
 
         Returns ``{"pre_upgrade_backup": <filename>}`` when it wrote
-        one, else ``{}``.
+        one, ``{"pre_upgrade_backup_existing": <filename>}`` when the
+        auto-backup just taken already holds this state, else ``{}``.
+        The marker file names that snapshot either way.
         """
         if self._pre_upgrade_checked or not self.source.is_file:
             return {}
@@ -606,9 +608,21 @@ class BackupMixin:
                     label=self._PRE_UPGRADE_LABEL,
                     _committed_state=True,
                 )
-                result["pre_upgrade_backup"] = Path(made["path"]).name
+                holds = Path(made["path"]).name
+                result["pre_upgrade_backup"] = holds
+            else:
+                # The auto-backup taken moments ago (the first write
+                # of a process) IS the pre-conversion copy. Name it,
+                # here and in the marker: a reader of the folder could
+                # not otherwise tell which file holds that state
+                # (bookkeeper close-out loop, 2026-10-05, flag 2).
+                newest = self.list_backups()
+                holds = Path(newest[0]["path"]).name if newest else "?"
+                result["pre_upgrade_backup_existing"] = holds
             marker.parent.mkdir(parents=True, exist_ok=True)
-            marker.write_text(_format_ts(_now_utc()) + "\n")
+            marker.write_text(
+                f"{_format_ts(_now_utc())}\nsnapshot: {holds}\n"
+            )
         except Exception as e:
             raise ValueError(
                 f"This write would convert the book's stored shapes to "

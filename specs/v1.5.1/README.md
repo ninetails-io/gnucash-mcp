@@ -40,6 +40,9 @@ branch). Find code by name, not by the review's line numbers.
   - an engine twin for posting a foreign-currency document, which
     needs the twin's `post` verb to supply the exchange rate
     (`gncInvoiceAddPrice`), as the Post dialog does.
+  The refusal covers stock and fund purchases too, the common case
+  (the bookkeeper's step 11 addendum put a VTSAX buy on record),
+  and the CHANGELOG says so in plain words.
 
 ### Not the server's code
 

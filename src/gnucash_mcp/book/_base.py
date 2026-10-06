@@ -3103,7 +3103,8 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         # an old server after the conversion (FC-20): say so here, and
         # on the dashboard for a while (_OLD_SERVER_WRITE_KEY).
         converted = {
-            k: v for k, v in out.items() if k != "pre_upgrade_backup"
+            k: v for k, v in out.items()
+            if k not in ("pre_upgrade_backup", "pre_upgrade_backup_existing")
         }
         # A snapshot taken above for a book that then had nothing to
         # convert guarded nothing: withdraw it rather than leave a

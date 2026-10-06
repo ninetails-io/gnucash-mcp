@@ -844,6 +844,15 @@ A condensed changelog of major releases lives in
 - Try opening the book in GnuCash itself to verify it isn't
   corrupted.
 
+### Docker: "both GNUCASH_BOOK_PATH and GNUCASH_BOOK_URI are set"
+
+The image ships with `GNUCASH_BOOK_PATH` pointing at its bundled
+demo books. To serve a database book from it, clear that default
+on the command line (`-e GNUCASH_BOOK_PATH=`) beside your
+`GNUCASH_BOOK_URI`; to serve a mounted file, set
+`GNUCASH_BOOK_PATH` to the mounted path and run the container as
+the user who owns the file (`--user "$(id -u):$(id -g)"`).
+
 ### "Account not found"
 
 - Use full account paths: `Expenses:Groceries`, not just

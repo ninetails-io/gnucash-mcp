@@ -1065,3 +1065,39 @@ class TestTradingAccountsBooksRefuseWhatWouldWriteTradingSplits:
                 post_date="2026-01-15",
             )
         assert gb.get_invoice(inv["id"])["status"] != "posted"
+
+
+class TestThePreUpgradeMarkerNamesTheSnapshot:
+    """Bookkeeper close-out loop, flag 2: when the auto-backup taken
+    moments before already holds the pre-conversion state, nothing
+    more is copied, and the marker says which file that is."""
+
+    def test_an_existing_copy_is_named(self, test_book, monkeypatch):
+        from gnucash_mcp.book.backup import BackupMixin
+
+        from gnucash_mcp.book.backup import _write_state
+
+        gb = GnuCashBook(str(test_book))
+        # What the auto-backup leaves: a copy, and the book's hash as
+        # the identical-content anchor.
+        taken = gb.create_backup(stage="session")
+        _write_state(
+            gb._backups_dir(), test_book.stem, {},
+            book_sha256=gb._current_book_hash(),
+        )
+        monkeypatch.setattr(BackupMixin, "_pre_upgrade_checked", False)
+        result = gb._ensure_pre_upgrade_snapshot()
+        name = taken["path"].rsplit("/", 1)[-1]
+        assert result == {"pre_upgrade_backup_existing": name}
+        assert f"snapshot: {name}" in gb._pre_upgrade_marker().read_text()
+        assert sorted(p.name for p in gb._backups_dir().glob("*.gnucash")) == [name]
+
+    def test_a_fresh_copy_is_named_too(self, test_book, monkeypatch):
+        from gnucash_mcp.book.backup import BackupMixin
+
+        gb = GnuCashBook(str(test_book))
+        monkeypatch.setattr(BackupMixin, "_pre_upgrade_checked", False)
+        result = gb._ensure_pre_upgrade_snapshot()
+        name = result["pre_upgrade_backup"]
+        assert name.endswith("-manual-pre-1-5-upgrade.gnucash")
+        assert f"snapshot: {name}" in gb._pre_upgrade_marker().read_text()
