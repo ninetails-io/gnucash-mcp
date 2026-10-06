@@ -472,7 +472,9 @@ def audited(test_book, tmp_path, monkeypatch):
         entity_type="transaction",
     )
     def tool(description: str = "x") -> str:
-        seen["intent_during_call"] = (directory / lc._INTENT_NAME).exists()
+        seen["intent_during_call"] = (
+            directory / lc._intent_name(__import__("os").getpid())
+        ).exists()
         if description == "raise":
             raise ValueError("refused")
         return json.dumps({"guid": "a" * 32, "status": "created"})
@@ -513,18 +515,18 @@ class TestDS11AWriteLeavesAnIntentUntilItsEntryIsWritten:
         lc, tool, directory, seen, _trail = audited
         tool(description="ok")
         assert seen["intent_during_call"] is True
-        assert not (directory / lc._INTENT_NAME).exists()
+        assert not list(directory.glob(".pending-write*.json"))
 
     def test_a_refused_write_clears_its_intent(self, audited):
         lc, tool, directory, _seen, trail = audited
         with pytest.raises(ValueError):
             tool(description="raise")
-        assert not (directory / lc._INTENT_NAME).exists()
+        assert not list(directory.glob(".pending-write*.json"))
         assert "ERROR  tool: refused" in trail()
 
     def _leave(self, lc, directory, pid):
         import json
-        (directory / lc._INTENT_NAME).write_text(json.dumps({
+        (directory / lc._intent_name(pid)).write_text(json.dumps({
             "pid": pid, "tool": "create_transactions",
             "timestamp": "2026-10-05T09:00:00-07:00",
             "params": '{"rows": "..."}',
@@ -546,7 +548,7 @@ class TestDS11AWriteLeavesAnIntentUntilItsEntryIsWritten:
         text = trail()
         assert "INTERRUPTED  create_transactions started" in text
         assert "may have been committed" in text
-        assert not (directory / lc._INTENT_NAME).exists()
+        assert not list(directory.glob(".pending-write*.json"))
 
     def test_and_before_the_next_write(self, audited):
         lc, tool, directory, _seen, trail = audited
@@ -562,7 +564,7 @@ class TestDS11AWriteLeavesAnIntentUntilItsEntryIsWritten:
         self._leave(lc, directory, os.getppid())
         lc.setup_logging(book_path=str(test_book), audit=True)
         assert "INTERRUPTED" not in trail()
-        assert (directory / lc._INTENT_NAME).exists()
+        assert (directory / lc._intent_name(os.getppid())).exists()
 
 
 @pytest.mark.skipif(
@@ -1087,10 +1089,29 @@ class TestThePreUpgradeMarkerNamesTheSnapshot:
         )
         monkeypatch.setattr(BackupMixin, "_pre_upgrade_checked", False)
         result = gb._ensure_pre_upgrade_snapshot()
-        name = taken["path"].rsplit("/", 1)[-1]
-        assert result == {"pre_upgrade_backup_existing": name}
+        session_copy = taken["path"].rsplit("/", 1)[-1]
+        name = result["pre_upgrade_backup"]
+        # The auto-backup's copy, under the manual label, which
+        # retention never prunes (S-3); a hard link where possible.
+        assert name.endswith("-manual-pre-1-5-upgrade.gnucash")
         assert f"snapshot: {name}" in gb._pre_upgrade_marker().read_text()
-        assert sorted(p.name for p in gb._backups_dir().glob("*.gnucash")) == [name]
+        files = {p.name: p for p in gb._backups_dir().glob("*.gnucash")}
+        assert set(files) == {session_copy, name}
+        assert files[name].read_bytes() == files[session_copy].read_bytes()
+
+    def test_a_withdrawn_snapshot_is_struck_from_the_marker(
+        self, test_book, monkeypatch,
+    ):
+        from gnucash_mcp.book.backup import BackupMixin
+
+        gb = GnuCashBook(str(test_book))
+        monkeypatch.setattr(BackupMixin, "_pre_upgrade_checked", False)
+        result = gb._ensure_pre_upgrade_snapshot()
+        gb._withdraw_pre_upgrade_snapshot(result["pre_upgrade_backup"])
+        assert "snapshot: none (nothing to convert)" in (
+            gb._pre_upgrade_marker().read_text()
+        )
+        assert not list(gb._backups_dir().glob("*-manual-pre-1-5-upgrade.gnucash"))
 
     def test_a_fresh_copy_is_named_too(self, test_book, monkeypatch):
         from gnucash_mcp.book.backup import BackupMixin
@@ -1101,3 +1122,100 @@ class TestThePreUpgradeMarkerNamesTheSnapshot:
         name = result["pre_upgrade_backup"]
         assert name.endswith("-manual-pre-1-5-upgrade.gnucash")
         assert f"snapshot: {name}" in gb._pre_upgrade_marker().read_text()
+
+
+
+class TestScopedReviewStorage:
+    """Scoped review 2026-10-05, storage findings."""
+
+    def test_the_pid_probe_lives_in_one_place(self):
+        """S-1: os.kill(pid, 0) terminates the process on Windows.
+        The probe is _format._pid_alive, and nothing else calls
+        os.kill."""
+        import re
+        from pathlib import Path
+
+        src = Path(__file__).resolve().parent.parent / "src" / "gnucash_mcp"
+        offenders = [
+            str(p.relative_to(src)) for p in src.rglob("*.py")
+            if p.name != "_format.py" and re.search(r"\bos\.kill\(", p.read_text())
+        ]
+        assert offenders == []
+
+    def test_the_probe_answers_for_this_process_and_a_dead_one(self):
+        import os
+        import subprocess
+        import sys
+
+        from gnucash_mcp._format import _pid_alive
+
+        assert _pid_alive(os.getpid()) is True
+        p = subprocess.Popen([sys.executable, "-c", "pass"])
+        p.wait()
+        assert _pid_alive(p.pid) is False
+        assert _pid_alive("x") is None
+
+    def test_a_trading_book_still_takes_schedules_voids_and_unvoids(
+        self, test_book,
+    ):
+        """S-2, S-7: the refusal is piecash's own trigger, a quantity
+        imbalance; a template (zero splits), a void (zero amounts) and
+        an unvoid of a balanced transaction leave none."""
+        gb = GnuCashBook(str(test_book))
+        gb.create_account(
+            name="Euro", account_type="BANK", parent="Assets", commodity="EUR",
+        )
+        crossed = gb.create_transaction(
+            description="To euro", splits=[
+                {"account": "Assets:Euro", "amount": "110.00", "quantity": "100.00"},
+                {"account": "Assets:Checking", "amount": "-110.00"},
+            ],
+            trans_date=date(2026, 3, 1), check_duplicates=False,
+        )
+        # Give it the trading splits desktop would have written, so it
+        # is a desktop-made transaction for the test's purposes.
+        import piecash
+
+        with gb.open(readonly=False) as book:
+            usd = book.default_currency
+            eur = book.commodities(mnemonic="EUR")
+            trading = piecash.Account(
+                name="Trading", type="TRADING", commodity=usd,
+                parent=book.root_account, placeholder=1,
+            )
+            ccy = piecash.Account(
+                name="CURRENCY", type="TRADING", commodity=usd,
+                parent=trading, placeholder=1,
+            )
+            t_eur = piecash.Account(name="EUR", type="TRADING", commodity=eur, parent=ccy)
+            t_usd = piecash.Account(name="USD", type="TRADING", commodity=usd, parent=ccy)
+            txn = gb._find_transaction(book, crossed["guid"])
+            txn.splits.append(piecash.Split(
+                account=t_eur, value=Decimal("-110"), quantity=Decimal("-100"),
+            ))
+            txn.splits.append(piecash.Split(
+                account=t_usd, value=Decimal("110"), quantity=Decimal("110"),
+            ))
+            book.save()
+        _trading_accounts_on(test_book)
+        sx = gb.create_scheduled_transaction(
+            name="Rent", description="Rent",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "900.00"},
+                {"account": "Assets:Checking", "amount": "-900.00"},
+            ],
+            start_date="2026-01-01", frequency="monthly",
+        )
+        assert sx["guid"]
+        gb.update_scheduled_transaction(sx["guid"], notes="Rent, monthly")
+        assert gb.void_transaction(crossed["guid"], reason="oops")["status"] == "voided"
+        gb.unvoid_transaction(crossed["guid"])
+        assert gb.get_transaction(crossed["guid"])["splits"][0]["value"] != "0"
+        with pytest.raises(ValueError, match="quantity imbalance in EUR"):
+            gb.create_transaction(
+                description="Again", splits=[
+                    {"account": "Assets:Euro", "amount": "11.00", "quantity": "10.00"},
+                    {"account": "Assets:Checking", "amount": "-11.00"},
+                ],
+                trans_date=date(2026, 3, 2), check_duplicates=False,
+            )

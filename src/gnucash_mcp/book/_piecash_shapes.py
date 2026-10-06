@@ -578,22 +578,28 @@ def _transaction_validate(self) -> None:
     ):
         book = self.book
         if book is not None and book.use_trading_accounts:
-            commodities = {
-                sp.account.commodity for sp in self.splits
-                if sp.account is not None and sp.account.type != "TRADING"
-            }
-            if len(commodities) > 1 or (
-                commodities and self.currency not in commodities
-            ):
-                names = ", ".join(sorted(c.mnemonic for c in commodities))
+            # Exactly piecash's own trigger for adding trading splits:
+            # a non-zero quantity imbalance in some commodity. A void
+            # (every quantity zero), an unvoid of a desktop-made
+            # transaction (its trading splits already balance each
+            # commodity), and a schedule template (zero splits on the
+            # ``template`` pseudo-commodity) all pass; the first cut
+            # compared commodity SETS and refused all three (scoped
+            # review 2026-10-05, S-2, S-7, I-8).
+            _value, imbalances = self.calculate_imbalances()
+            unbalanced = sorted(
+                c.mnemonic for c, q in imbalances.items() if q
+            )
+            if unbalanced:
                 raise ValueError(
                     f"This book uses trading accounts, and this "
-                    f"transaction spans more than one commodity "
-                    f"({names}). The server does not yet write the "
-                    f"trading splits GnuCash writes for it, so the "
-                    f"write is refused; nothing changed. Enter it in "
-                    f"GnuCash desktop. Same-currency entries are "
-                    f"unaffected."
+                    f"transaction leaves a quantity imbalance in "
+                    f"{', '.join(unbalanced)} that GnuCash would settle "
+                    f"with trading splits. The server does not yet "
+                    f"write those the way GnuCash does, so the write is "
+                    f"refused; nothing changed. Enter it in GnuCash "
+                    f"desktop. Same-currency entries, voids, and edits "
+                    f"that leave the amounts alone are unaffected."
                 )
     _piecash_transaction_validate(self)
 

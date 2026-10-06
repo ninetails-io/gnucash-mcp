@@ -23,6 +23,7 @@ from gnucash_mcp._format import (
     _book_display_name,
     _format_exact,
     _scrub_credentials,
+    _pid_alive as _format_pid_alive,
 )
 
 AUDIT_LOGGER_NAME = "gnucash_mcp.audit"
@@ -344,18 +345,25 @@ def write_private_file(path: Path, text: str) -> None:
     pointed at (adversarial review 2026-09-30, C53). A stale temp
     file from a crashed write is removed first; the exclusive create
     then fails loudly if something reappears in between."""
+    import tempfile
+
     path = Path(path)
-    tmp = path.with_name(path.name + ".tmp")
+    # A unique temp name per write: a fixed one let two processes
+    # remove each other's half-written file (scoped review, S-6).
+    # mkstemp creates exclusively, 0600, and never follows a link.
+    fd, tmp = tempfile.mkstemp(
+        dir=str(path.parent), prefix=path.name + ".", suffix=".tmp",
+    )
     try:
-        os.unlink(tmp)  # the link itself, never its target
-    except FileNotFoundError:
-        pass
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    flags |= getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(tmp, flags, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(text)
-    os.replace(tmp, path)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _check_mcp_dir_entry(mcp_dir: Path, alternative: str) -> None:
@@ -3235,7 +3243,15 @@ def _extract_after_state(result: str, entity_type: str | None) -> dict | None:
 # A file found later, whose process is gone, becomes an INTERRUPTED
 # line naming the tool and what it was asked to do.
 
-_INTENT_NAME = ".pending-write.json"
+_INTENT_PREFIX = ".pending-write"
+_INTENT_SUFFIX = ".json"
+
+
+def _intent_name(pid: int) -> str:
+    """One intent file per process: two servers on one book (a
+    desktop client and a terminal, say) must not overwrite or clear
+    each other's (scoped review 2026-10-05, S-6)."""
+    return f"{_INTENT_PREFIX}-{pid}{_INTENT_SUFFIX}"
 _INTENT_PARAMS_MAX = 2000
 
 
@@ -3246,14 +3262,10 @@ def _audit_directory() -> "Path | None":
     return None
 
 
-def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except (PermissionError, OSError):
-        return True
-    return True
+def _pid_alive(pid) -> bool:
+    """A process that cannot be shown dead is treated as alive (an
+    intent of a running twin is left alone)."""
+    return _format_pid_alive(pid) is not False
 
 
 def _report_interrupted_write() -> None:
@@ -3264,32 +3276,32 @@ def _report_interrupted_write() -> None:
     directory = _audit_directory()
     if directory is None:
         return
-    path = directory / _INTENT_NAME
-    try:
-        with path.open() as f:
-            left = json.load(f)
-    except FileNotFoundError:
-        return
-    except (OSError, json.JSONDecodeError):
-        left = {}
-    pid = left.get("pid")
-    if isinstance(pid, int) and pid != os.getpid() and _pid_alive(pid):
-        return
-    try:
-        path.unlink()
-    except OSError:
-        pass
-    logger = logging.getLogger(AUDIT_LOGGER_NAME)
-    stamp = datetime.now().astimezone().isoformat().split("T")[1][:8]
-    text = (
-        f"{left.get('tool', '(unknown tool)')} started "
-        f"{left.get('timestamp', '(time unknown)')} and the server "
-        f"stopped before its audit entry was written. The write may "
-        f"have been committed. Asked for: {left.get('params', '?')}"
-    )
-    logger.info(f"{stamp}  INTERRUPTED  {_escape_audit_value(text)}")
-    logger.info("")
-    _flush_logger(logger)
+    for path in sorted(directory.glob(f"{_INTENT_PREFIX}*{_INTENT_SUFFIX}")):
+        try:
+            with path.open() as f:
+                left = json.load(f)
+        except FileNotFoundError:
+            continue
+        except (OSError, json.JSONDecodeError):
+            left = {}
+        pid = left.get("pid")
+        if isinstance(pid, int) and pid != os.getpid() and _pid_alive(pid):
+            continue
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        logger = logging.getLogger(AUDIT_LOGGER_NAME)
+        stamp = datetime.now().astimezone().isoformat().split("T")[1][:8]
+        text = (
+            f"{left.get('tool', '(unknown tool)')} started "
+            f"{left.get('timestamp', '(time unknown)')} and the server "
+            f"stopped before its audit entry was written. The write may "
+            f"have been committed. Asked for: {left.get('params', '?')}"
+        )
+        logger.info(f"{stamp}  INTERRUPTED  {_escape_audit_value(text)}")
+        logger.info("")
+        _flush_logger(logger)
 
 
 def _write_intent(tool: str, params, timestamp: str) -> "Path | None":
@@ -3300,7 +3312,7 @@ def _write_intent(tool: str, params, timestamp: str) -> "Path | None":
         if directory is None:
             return None
         _report_interrupted_write()
-        path = directory / _INTENT_NAME
+        path = directory / _intent_name(os.getpid())
         payload = json.dumps({
             "pid": os.getpid(),
             "tool": tool,

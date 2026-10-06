@@ -48,6 +48,7 @@ from gnucash_mcp._format import (
     _one_line,
     _parse_book_url,
     _tsv_cell,
+    _pid_alive,
 )
 
 # GnuCash stores GUIDs as lowercase hex (via uuid4().hex). We accept both
@@ -2125,15 +2126,18 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
             yield book
         finally:
             close_start = time.time()
-            book.close()
-            # piecash binds a fresh engine to every open_book and
-            # never disposes it, so the pool keeps a connection
-            # checked in after close. On PostgreSQL that is one
-            # server slot per tool call until the cyclic GC happens
-            # to reclaim the engine (measured: 15 opens, 15 open
-            # connections). Dispose explicitly; the engine is
-            # single-use by construction here.
-            book.session.get_bind().dispose()
+            try:
+                book.close()
+            finally:
+                # piecash binds a fresh engine to every open_book and
+                # never disposes it, so the pool keeps a connection
+                # checked in after close. On PostgreSQL that is one
+                # server slot per tool call until the cyclic GC
+                # happens to reclaim the engine (measured: 15 opens,
+                # 15 open connections). Dispose explicitly, even when
+                # close raised (scoped review, S-8); the engine is
+                # single-use by construction here.
+                book.session.get_bind().dispose()
             close_elapsed = (time.time() - close_start) * 1000
             debug_logger.debug(f"Book closed in {close_elapsed:.0f}ms")
 
@@ -2230,17 +2234,17 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
                 socket.gethostname().split(".")[0].lower()
             )
             if local:
-                try:
-                    os.kill(int(pid), 0)
-                    note += ", which is still running."
-                except ProcessLookupError:
+                alive = _pid_alive(pid)
+                if alive is False:
                     note += (
                         ", which is no longer running: a stale lock "
                         "left by a crash. Open the book in GnuCash, "
                         "choose \"Open Anyway\", and close it again "
                         "to clear it."
                     )
-                except (PermissionError, ValueError, OverflowError):
+                elif alive:
+                    note += ", which is still running."
+                else:
                     note += "."
             else:
                 note += " (another machine)."
@@ -3102,9 +3106,15 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         # pre-1.5 shape found in a book already marked was written by
         # an old server after the conversion (FC-20): say so here, and
         # on the dashboard for a while (_OLD_SERVER_WRITE_KEY).
+        # What counts as a conversion: anything a converter changed.
+        # GnuCash's natural-sign stamp on a book's FIRST budget is
+        # what desktop itself does, not a conversion of an old shape
+        # (scoped review 2026-10-05, M-7); it counts only beside a
+        # scrub.
         converted = {
             k: v for k, v in out.items()
-            if k not in ("pre_upgrade_backup", "pre_upgrade_backup_existing")
+            if k != "pre_upgrade_backup"
+            and not (k == "book_stamped" and not out.get("book_scrubbed"))
         }
         # A snapshot taken above for a book that then had nothing to
         # convert guarded nothing: withdraw it rather than leave a

@@ -1525,3 +1525,59 @@ def _parse_update_tsv(tsv: str) -> list[dict]:
             row[name] = ""
         out.append(row)
     return out
+
+
+def _pid_alive(pid: int) -> "bool | None":
+    """Is a process with this id running? True, False, or None when
+    it cannot be told.
+
+    The ONE place the question is asked (grep-locked by
+    ``tests/test_review_remaining.py``). ``os.kill(pid, 0)`` is the
+    POSIX probe; on Windows ``os.kill`` TERMINATES the process
+    (``TerminateProcess`` with the signal as exit code), so the probe
+    there is ``OpenProcess`` + ``GetExitCodeProcess`` (scoped review
+    2026-10-05, S-1: the audit intent's liveness check, and the
+    ``gnclock`` holder's, would have killed GnuCash desktop or a twin
+    server on Windows).
+    """
+    import os
+    import sys
+
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            handle = kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION, False, pid,
+            )
+            if not handle:
+                # ERROR_INVALID_PARAMETER (87): no such process.
+                return False if ctypes.get_last_error() == 87 else None
+            try:
+                code = wintypes.DWORD()
+                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                    return None
+                return code.value == STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:  # noqa: BLE001
+            return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return None
+    return True

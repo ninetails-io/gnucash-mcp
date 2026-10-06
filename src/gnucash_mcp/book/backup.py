@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import re
 import shlex
 import sqlite3
@@ -587,10 +588,10 @@ class BackupMixin:
         can spill SQLite's page cache and take the exclusive lock
         mid-transaction, after which nothing else can read the file.
 
-        Returns ``{"pre_upgrade_backup": <filename>}`` when it wrote
-        one, ``{"pre_upgrade_backup_existing": <filename>}`` when the
-        auto-backup just taken already holds this state, else ``{}``.
-        The marker file names that snapshot either way.
+        Returns ``{"pre_upgrade_backup": <filename>}``: the file
+        written here, or the auto-backup's copy of this very state
+        under the manual label (a hard link where possible). The
+        marker file names it.
         """
         if self._pre_upgrade_checked or not self.source.is_file:
             return {}
@@ -612,13 +613,30 @@ class BackupMixin:
                 result["pre_upgrade_backup"] = holds
             else:
                 # The auto-backup taken moments ago (the first write
-                # of a process) IS the pre-conversion copy. Name it,
-                # here and in the marker: a reader of the folder could
-                # not otherwise tell which file holds that state
-                # (bookkeeper close-out loop, 2026-10-05, flag 2).
+                # of a process) holds the pre-conversion state, but it
+                # is a STAGE file that retention prunes (scoped review
+                # 2026-10-05, S-3). Give it the manual label, as a hard
+                # link where the filesystem allows (no second copy of a
+                # large book) and a copy otherwise: manual snapshots are
+                # never pruned, and the marker names the file a reader
+                # can find (bookkeeper close-out loop, flag 2).
                 newest = self.list_backups()
-                holds = Path(newest[0]["path"]).name if newest else "?"
-                result["pre_upgrade_backup_existing"] = holds
+                if not newest:
+                    raise RuntimeError(
+                        "the book hash matched the last backup, but no "
+                        "backup file is on disk"
+                    )
+                source = self._backups_dir() / Path(newest[0]["path"]).name
+                target = self._backups_dir() / (
+                    f"{self.book_path.stem}-{_format_ts(_now_utc())}"
+                    f"-{_MANUAL_STAGE_NAME}-{self._PRE_UPGRADE_LABEL}.gnucash"
+                )
+                try:
+                    os.link(source, target)
+                except OSError:
+                    shutil.copy2(source, target)
+                holds = target.name
+                result["pre_upgrade_backup"] = holds
             marker.parent.mkdir(parents=True, exist_ok=True)
             marker.write_text(
                 f"{_format_ts(_now_utc())}\nsnapshot: {holds}\n"
@@ -656,6 +674,17 @@ class BackupMixin:
             debug_logger.warning(
                 f"Unneeded pre-upgrade snapshot not removed: {e}"
             )
+            return
+        # The marker named that file (close-out flag 2); say instead
+        # that nothing needed a copy (scoped review, S-4 / M-6).
+        try:
+            marker = self._pre_upgrade_marker()
+            stamp = marker.read_text().splitlines()[0]
+            marker.write_text(
+                f"{stamp}\nsnapshot: none (nothing to convert)\n"
+            )
+        except (OSError, IndexError):
+            pass
 
     def create_backup(
         self,
