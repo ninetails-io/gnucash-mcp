@@ -102,6 +102,25 @@ _BUDGET_UNREVERSED_KEY = f"features/{_BUDGET_UNREVERSED_FEATURE}"
 # recognize (the bookkeeper's production book would not open).
 # Never released; migrated away on the next budget write.
 _BUDGET_UNREVERSED_BOGUS_KEY = "features/Budgets: sign reversal fixed"
+# The server's own marks, on the root account in its ``gnc-mcp`` frame
+# (never in GnuCash's ``features`` frame: a key GnuCash doesn't know
+# makes the book unopenable). ``converted-by``: the server version
+# that first ran the pre-1.5 converters on this book. ``old-server-
+# write``: the day a converting write last found a pre-1.5 shape in a
+# book already marked, which only a 1.4.x server (or older) writes;
+# that server's ``set_budget_amount`` stores magnitudes into a book
+# stamped for natural signs, and those rows carry no mark of their
+# own, so the finding is a warning to review them, never a rewrite
+# (review FC-20; bookkeeper ruling 2026-10-05, item 2).
+_CONVERTED_BY_KEY = "gnc-mcp/converted-by"
+_OLD_SERVER_WRITE_KEY = "gnc-mcp/old-server-write"
+# A converter count that only an OLD SERVER'S rows can produce: each
+# keys on a shape the old server alone wrote (the C9 / G-1 rule).
+_OLD_SERVER_FINGERPRINTS = (
+    "templates_migrated", "invoice_links_migrated", "voids_migrated",
+    "entries_normalized",
+)
+_OLD_SERVER_WARNING_DAYS = 30
 _BUDGET_UNREVERSED_DESCRIPTION = (
     "Store budget amounts unreversed (i.e. natural) signs "
     "(requires at least Gnucash 3.8)"
@@ -2965,6 +2984,46 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
                 out[key] = value
         return out
 
+    @staticmethod
+    def _root_slot_str(book, key: str) -> "str | None":
+        """A string slot on the root account, or None."""
+        try:
+            return _slot_value_str(book.root_account[key])
+        except KeyError:
+            return None
+
+    @staticmethod
+    def _old_server_write_warning(converted_by: str) -> str:
+        return (
+            f"A server older than 1.5 has written to this book since "
+            f"version {converted_by} converted it: it left shapes only "
+            f"the old server writes, which were converted again. Budget "
+            f"amounts that server set on income, liability, or equity "
+            f"accounts are stored with the wrong sign and cannot be "
+            f"told apart from correct ones; review them with "
+            f"get_budget. Do not point both versions at one book."
+        )
+
+    def _old_server_write_dashboard_line(self, book) -> "str | None":
+        """The dashboard's warning for _OLD_SERVER_WRITE_KEY, for
+        _OLD_SERVER_WARNING_DAYS after the last finding; None after
+        that (the audit log keeps the write that found it)."""
+        seen = self._root_slot_str(book, _OLD_SERVER_WRITE_KEY)
+        if not seen:
+            return None
+        try:
+            when = date.fromisoformat(seen)
+        except ValueError:
+            return None
+        if (date.today() - when).days > _OLD_SERVER_WARNING_DAYS:
+            return None
+        return (
+            f"An older server (1.4.x) wrote to this book after its "
+            f"conversion (seen {when.isoformat()}): budget amounts it "
+            f"set on income, liability, or equity accounts may carry "
+            f"the wrong sign — review them with get_budget"
+        )
+
     def _upgrade_book_shapes(self, book) -> dict:
         """Write path only: convert every pre-1.5 private shape in the
         book to GnuCash's own, posting nothing, and say what it did.
@@ -2987,6 +3046,7 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         ``voids_migrated``, ``book_stamped``, ``book_scrubbed``.
         """
         out: dict = {}
+        marked_before = self._root_slot_str(book, _CONVERTED_BY_KEY)
         # First, and before anything is converted: a snapshot of the
         # book as it stands (once per book; refuses the write if a
         # file book cannot be snapshotted). Absent when the backup
@@ -3038,16 +3098,34 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
                     out["book_stamped"] = _BUDGET_UNREVERSED_FEATURE
                 if st.get("scrubbed"):
                     out["book_scrubbed"] = True
+        # The book has been through the converters: mark it, once. A
+        # pre-1.5 shape found in a book already marked was written by
+        # an old server after the conversion (FC-20): say so here, and
+        # on the dashboard for a while (_OLD_SERVER_WRITE_KEY).
+        converted = {
+            k: v for k, v in out.items() if k != "pre_upgrade_backup"
+        }
         # A snapshot taken above for a book that then had nothing to
         # convert guarded nothing: withdraw it rather than leave a
         # "pre-1.5 upgrade" copy beside a book that was never
-        # upgraded.
-        taken = out.get("pre_upgrade_backup")
-        if taken is not None and len(out) == 1:
-            withdraw = getattr(self, "_withdraw_pre_upgrade_snapshot", None)
-            if withdraw is not None:
-                withdraw(taken)
-            return {}
+        # upgraded. The mark below is not a conversion.
+        taken = out.pop("pre_upgrade_backup", None)
+        if taken is not None:
+            if converted:
+                out["pre_upgrade_backup"] = taken
+            else:
+                withdraw = getattr(self, "_withdraw_pre_upgrade_snapshot", None)
+                if withdraw is not None:
+                    withdraw(taken)
+        if marked_before is None:
+            from gnucash_mcp import __version__
+            book.root_account[_CONVERTED_BY_KEY] = __version__
+            out["book_marked_converted"] = __version__
+        elif any(converted.get(k) for k in _OLD_SERVER_FINGERPRINTS):
+            book.root_account[_OLD_SERVER_WRITE_KEY] = date.today().isoformat()
+            out["old_server_write"] = self._old_server_write_warning(
+                marked_before,
+            )
         return out
 
     # ── Desktop's reconcile-info frame ─────────────────────────────

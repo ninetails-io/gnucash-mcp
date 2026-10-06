@@ -732,12 +732,19 @@ Established chokepoints and the rule each one owns:
   - The engine twin's `dump` ends with the book's own slots
     (options, counters, feature flags). `iso_date_feature` is the
     one named difference there.
-- **Trading-accounts books are NOT at parity** (found 2026-10-05).
-  piecash writes the trading splits, at a denominator GnuCash does
-  not use, and finds the tree by the English name; `pay_invoice`
-  books a realized FX split where GnuCash books none. Open in
-  `specs/v1.5.1/README.md`. Don't describe cross-currency writes in
-  such a book as desktop's rows until an engine twin says so.
+- **Trading-accounts books REFUSE a cross-commodity write**
+  (`_piecash_shapes._transaction_validate`, bookkeeper ruling
+  2026-10-05 item 3). piecash's trading splits are at a denominator
+  GnuCash does not use, the tree is found by the English name, and
+  `pay_invoice` books a realized FX split where GnuCash books none.
+  What has to be built before the refusal lifts is listed in
+  `specs/v1.5.1/README.md`; an engine twin decides when it has.
+- `_CONVERTED_BY_KEY` / `_OLD_SERVER_WRITE_KEY` (`_base.py`): the
+  server's own marks on the root account. The first converting write
+  marks the book; a pre-1.5 fingerprint found later in a marked book
+  (`_OLD_SERVER_FINGERPRINTS`) is an old server's write, warned about
+  in the response and on the dashboard for 30 days, never rewritten
+  (FC-20; C9/G-1 doctrine: no fingerprint, no flip).
 
 Working rules:
 

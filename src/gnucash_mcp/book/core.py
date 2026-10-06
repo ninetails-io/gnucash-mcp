@@ -1148,6 +1148,16 @@ class CoreMixin:
                 f"{far_latest.isoformat()}) — likely a typo; "
                 f"search_transactions to inspect"
             )
+        # An old server has written here since 1.5 converted the book
+        # (FC-20): its budget rows may carry the wrong sign.
+        try:
+            old_server = self._old_server_write_dashboard_line(book)
+            if old_server:
+                integrity.append(old_server)
+        except Exception as exc:
+            check_failures.append(
+                self._check_failed(book, "Old-server-write", exc)
+            )
 
         # ── 2a. Overdrawn accounts ──
         # A single BANK/CASH account below zero as of today. Low-cash

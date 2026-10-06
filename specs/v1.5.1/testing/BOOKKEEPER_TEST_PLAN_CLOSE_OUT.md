@@ -121,10 +121,21 @@ whose description has an emoji.
 - Pass: `id` inside it is not root; a write to a demo book works and
   leaves an audit log.
 
-## Not in this loop
+## 11. A trading-accounts book
 
-- **Trading-accounts books.** Found today and not fixed: a
-  cross-currency payment in such a book is not the rows GnuCash
-  writes. Do not gate on it; rule on whether it blocks the tag.
-- **FC-20** and the **old cross-currency payments**: waiting on the
-  maintainer.
+In a scratch copy, tick File > Properties > Accounts > "Use Trading
+Accounts" in GnuCash. Through the server, enter a USD-to-EUR
+transfer, and a same-currency expense.
+
+- Pass: the transfer is refused, naming the option and GnuCash
+  desktop as the way to enter it; the expense goes through.
+
+## 12. An old server's write
+
+On a book 1.5 has converted, run a 1.4.4 server and create a
+scheduled transaction with it. Back on 1.5, make any business or
+schedule write.
+
+- Pass: the response carries `old_server_write`, and the dashboard's
+  Warnings section says an older server wrote to the book and that
+  its budget signs need review.

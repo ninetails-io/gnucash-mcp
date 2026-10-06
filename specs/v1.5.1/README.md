@@ -15,45 +15,31 @@ branch). Find code by name, not by the review's line numbers.
 
 ## Open
 
-### Waiting on a decision
+### Ruled on 2026-10-05 (bookkeeper close-out decisions)
 
-- **FC-20 — a 1.4.x server writing to a book 1.5 has converted.**
-  1.4.4 reads schedule recipes only from the `splits-json` slot 1.5
-  deletes, and its `set_budget_amount` writes magnitudes into a book
-  stamped for natural signs, so an income budget lands with the wrong
-  sign. Ruled 2026-10-05: the guard is a slot in the server's own
-  `gnc-mcp` frame, not a feature flag or schema marker. Not built
-  yet: a budget row 1.4.4 wrote carries no mark of its own, so the
-  slot can say "an old server has written here since conversion"
-  only when that server also left a shape with a fingerprint (a
-  `splits-json` recipe, an old invoice link, an old void). What the
-  slot should do on that evidence is the open question.
-- **Payments booked by 1.2 through 1.4.4 across currencies.** Their
-  FX leg has value 0 in the transaction's currency and the gain in
-  the quantity alone, which GnuCash's Balance Sheet (no trading
-  accounts) reads as no gain. 1.5 books new payments in the payment
-  account's currency. Whether a converter restates the old ones is
-  undecided; see `specs/v1.5/testing/
-  BOOKKEEPER_REPORT_SIDE_FINDING_13.md`, "Not in scope".
-
-### Found on 2026-10-05, not fixed
-
-- **Books that use trading accounts.** The review refuted the claim
-  that no trading splits are written (C68) and left three residuals
-  unchecked. An engine twin of a cross-currency payment in a
-  trading-accounts book now shows:
-  - `pay_document` books a realized FX gain or loss split. GnuCash
-    books none in such a book: the receivable is relieved at the
-    payment's value and the trading accounts carry the difference.
-  - The trading splits themselves are piecash's: value and quantity
-    at denominator 1 where GnuCash writes the currency's fraction,
-    and a NULL reconcile date until the next converting write.
-  - piecash finds the trading tree by the English name "Trading".
-  - Posting a foreign-currency document in a trading-accounts book
-    has no engine twin: the twin's `post` verb gives the engine no
-    exchange rate, and the engine refuses.
-  Until this is built, a trading-accounts book gets rows desktop
-  would not write on a cross-currency payment. Medium to large.
+- **FC-20:** a `gnc-mcp/converted-by` slot on the root account at
+  the first converting write; a later pre-1.5 shape with a
+  fingerprint in a marked book is warned about in the response and
+  on the dashboard for 30 days, never rewritten. Built (`tests/
+  test_review_remaining.py::TestFC20...`). A 1.4.x server that writes
+  ONLY budget amounts leaves no fingerprint and is not detected; the
+  upgrade note says not to run both.
+- **Old cross-currency payments (1.2 to 1.4.4):** leave and
+  document. The Known limitations entry says the Balance Sheet gap
+  is inherent without trading accounts, names trading accounts as
+  GnuCash's answer, and notes 1.5 payments add nothing to it.
+- **Trading-accounts books:** REFUSE a write that would produce
+  trading splits until the correct shape is built. Built, in
+  `_piecash_shapes._transaction_validate`. What remains to build,
+  for the refusal to lift:
+  - trading splits at the currency's fraction, the epoch reconcile
+    date, and the tree found by type (`xaccScrubUtilityGetOrMakeAccount`
+    under the top-level TRADING account), not by the English name;
+  - `pay_document` in such a book relieves the receivable at the
+    payment's value and books no realized FX split;
+  - an engine twin for posting a foreign-currency document, which
+    needs the twin's `post` verb to supply the exchange rate
+    (`gncInvoiceAddPrice`), as the Post dialog does.
 
 ### Not the server's code
 
@@ -101,6 +87,7 @@ its CHANGELOG line.
 | `1e82edb` | C28. One connection per book open. |
 | `d56bd6b` | Converted balances round once per account, so a statement's lines add up to its total (found during C20). |
 | `8e3f021` | FC-19. A book `gnucash-cli` creates, swept by the server and loaded again by GnuCash (`test_gnucash_created_book.py`). |
+| (this commit) | FC-20 guard, and the trading-accounts refusal, per the close-out rulings. |
 
 Narrower than the finding, on purpose:
 

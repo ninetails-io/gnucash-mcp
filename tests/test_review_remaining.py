@@ -915,3 +915,153 @@ class TestConvertedBalancesAreRoundedPerAccount:
             interval="month",
         )["series"]
         assert series[-1]["net_worth"] == point
+
+
+class TestFC20AnOldServerWritingAfterTheConversion:
+    """The converted book is marked in the server's own frame. A
+    pre-1.5 shape found later in a marked book was written by an old
+    server: the write says so, the dashboard says so for a while, and
+    nothing is rewritten (bookkeeper ruling 2026-10-05, item 2)."""
+
+    def _root_slots(self, path):
+        # A path key is a row inside the ``gnc-mcp`` frame.
+        return dict(_q(
+            path,
+            "select name, string_val from slots where name like 'gnc-mcp/%'",
+        ))
+
+    def _plant_old_entry(self, gb, path):
+        gb.create_customer(name="Acme")
+        inv = gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id=inv["id"], account="Income:Sales",
+            description="Old", quantity="1", price="10.00",
+        )
+        # gncEntryCreate's defaults, which 1.5 and desktop write and
+        # the old server left blank: the C9 fingerprint.
+        _q(path, "update entries set i_disc_type = '' where description = 'Old'")
+        return inv["id"]
+
+    def test_the_first_converting_write_marks_the_book(self, business_book):
+        from gnucash_mcp import __version__
+
+        gb = GnuCashBook(str(business_book))
+        made = gb.create_budget(name="Household", year=2026)
+        assert made["book_marked_converted"] == __version__
+        assert self._root_slots(business_book) == {
+            "gnc-mcp/converted-by": __version__,
+        }
+        assert "old_server_write" not in made
+
+    def test_an_old_shape_in_an_unmarked_book_is_just_converted(
+        self, business_book,
+    ):
+        gb = GnuCashBook(str(business_book))
+        inv = self._plant_old_entry(gb, business_book)
+        made = gb.post_invoice(inv, AR)  # a converting write
+        assert made["entries_normalized"] == 1
+        assert "old_server_write" not in made
+        assert "gnc-mcp/old-server-write" not in self._root_slots(business_book)
+
+    def test_an_old_shape_in_a_marked_book_is_warned_about(
+        self, business_book,
+    ):
+        gb = GnuCashBook(str(business_book))
+        gb.create_budget(name="Household", year=2026)  # marks
+        inv = self._plant_old_entry(gb, business_book)
+        made = gb.post_invoice(inv, AR)  # a converting write
+        assert made["entries_normalized"] == 1
+        assert "server older than 1.5 has written" in made["old_server_write"]
+        assert "get_budget" in made["old_server_write"]
+        slots = self._root_slots(business_book)
+        assert slots["gnc-mcp/old-server-write"] == date.today().isoformat()
+        # The dashboard carries it.
+        assert "An older server (1.4.x) wrote to this book" in gb.get_book_summary()
+        # Nothing was rewritten beyond the converter's own work: the
+        # budget rows are untouched (there are none to flip).
+        assert _q(business_book, "select count(*) from budget_amounts") == [(0,)]
+
+    def test_the_dashboard_line_expires(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_budget(name="Household", year=2026)
+        with gb.open(readonly=False) as book:
+            book.root_account["gnc-mcp/old-server-write"] = (
+                date.today() - timedelta(days=45)
+            ).isoformat()
+            book.save()
+        assert "An older server" not in gb.get_book_summary()
+
+
+def _trading_accounts_on(path):
+    import piecash
+
+    with piecash.open_book(
+        str(path), readonly=False, do_backup=False, open_if_lock=True,
+    ) as b:
+        b["options"] = {"Accounts": {"Use Trading Accounts": "t"}}
+        b.save()
+
+
+class TestTradingAccountsBooksRefuseWhatWouldWriteTradingSplits:
+    """Until the server writes GnuCash's trading splits, a transaction
+    across commodities in a book with "Use Trading Accounts" on is
+    refused rather than written in a shape GnuCash does not write
+    (bookkeeper ruling 2026-10-05, item 3)."""
+
+    def _euro(self, gb):
+        gb.create_account(
+            name="Euro", account_type="BANK", parent="Assets", commodity="EUR",
+        )
+
+    def _transfer(self, gb, **kw):
+        return gb.create_transaction(
+            description="To euro", splits=[
+                {"account": "Assets:Euro", "amount": "110.00", "quantity": "100.00"},
+                {"account": "Assets:Checking", "amount": "-110.00"},
+            ],
+            trans_date=date(2026, 3, 1), check_duplicates=False, **kw,
+        )
+
+    def test_a_cross_currency_transfer_is_refused(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        self._euro(gb)
+        _trading_accounts_on(test_book)
+        before = _q(test_book, "select count(*) from transactions")
+        with pytest.raises(ValueError, match="uses trading accounts"):
+            self._transfer(gb)
+        assert _q(test_book, "select count(*) from transactions") == before
+
+    def test_same_currency_entries_edits_and_deletes_pass(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        self._euro(gb)
+        crossed = self._transfer(gb)  # before the option: piecash's rows
+        _trading_accounts_on(test_book)
+        plain = _spend(gb)
+        gb.update_transaction(crossed["guid"], description="Renamed")
+        assert gb.get_transaction(crossed["guid"])["description"] == "Renamed"
+        gb.delete_transaction(crossed["guid"])
+        gb.delete_transaction(plain)
+
+    def test_a_foreign_currency_posting_is_refused(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_account(
+            name="Receivable EUR", account_type="RECEIVABLE", parent="Assets",
+            commodity="EUR",
+        )
+        gb.create_price(
+            commodity="EUR", namespace="CURRENCY", value="1.10",
+            price_date=date(2026, 1, 15),
+        )
+        gb.create_customer(name="Berlin GmbH", currency="EUR")
+        inv = gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id=inv["id"], account="Income:Sales",
+            description="Work", quantity="1", price="100.00",
+        )
+        _trading_accounts_on(business_book)
+        with pytest.raises(ValueError, match="uses trading accounts"):
+            gb.post_invoice(
+                invoice_id=inv["id"], post_account="Assets:Receivable EUR",
+                post_date="2026-01-15",
+            )
+        assert gb.get_invoice(inv["id"])["status"] != "posted"
