@@ -5,6 +5,7 @@ gnucash_mcp/tools/.
 """
 
 import json
+import re
 import logging
 import traceback
 
@@ -16,6 +17,9 @@ from typing import Annotated, Callable, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from gnucash_mcp.book import GnuCashLockError, StaleFXRateError
+
+
+_ISO_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 
 def _parse_iso_date(s: str | None) -> date | None:
@@ -34,7 +38,13 @@ def _parse_iso_date(s: str | None) -> date | None:
     """
     if not s:
         return None
-    return date.fromisoformat(s)
+    # ``date.fromisoformat`` accepts ``20260105`` and ``2026-W02-1`` on
+    # Python 3.11+ and rejects them on 3.10, a supported target; the
+    # contract is YYYY-MM-DD everywhere (scoped review 2026-10-06,
+    # IN-13).
+    if not _ISO_DATE_RE.fullmatch(s.strip()):
+        raise ValueError(f"date {s!r} is not a valid YYYY-MM-DD date")
+    return date.fromisoformat(s.strip())
 
 # Re-exports from the layer-neutral format module. Tool wrappers can
 # keep importing from ``tools._helpers`` (the historical home) without
@@ -439,7 +449,10 @@ def safe_tool(func: Callable) -> Callable:
                 {
                     "error": redact_paths(str(e)),
                     "error_type": "file_not_found",
-                    "suggestion": "Check that GNUCASH_BOOK_PATH is set correctly.",
+                    "suggestion": (
+                        "Check that GNUCASH_BOOK_PATH (or GNUCASH_BOOK_URI, "
+                        "for a database book) is set correctly."
+                    ),
                 }
             )
         except StaleFXRateError as e:

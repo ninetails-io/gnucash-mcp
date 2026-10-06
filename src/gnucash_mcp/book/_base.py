@@ -919,6 +919,15 @@ _PLAIN_NUMBER = re.compile(
 )
 
 
+def _plain_decimal(d: Decimal) -> Decimal:
+    """``Decimal("1e3")`` echoes back as ``1E+3``; the same value with
+    a non-positive exponent prints plainly (scoped review 2026-10-06,
+    IN-16). Value unchanged."""
+    if d.is_finite() and d.as_tuple().exponent > 0:
+        return Decimal(format(d, "f"))
+    return d
+
+
 def _to_decimal(value) -> Decimal:
     """Safe Decimal construction for user-supplied monetary values.
 
@@ -948,7 +957,7 @@ def _to_decimal(value) -> Decimal:
             raise ValueError(
                 f"amount must be a finite number, got {value!r}"
             )
-        return d
+        return _plain_decimal(d)
     try:
         d = Decimal(str(value))
     except InvalidOperation:
@@ -981,7 +990,7 @@ def _to_decimal(value) -> Decimal:
             f"amount {value!r} has more decimal places than can be "
             f"stored (18 at most)"
         )
-    return d
+    return _plain_decimal(d)
 
 
 def _verify_write(session, table, guid: str, label: str) -> None:
@@ -2357,7 +2366,8 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
 
         try:
             con = sqlite3.connect(
-                f"file:{self.book_path}?mode=ro", uri=True, timeout=1,
+                f"file:{quote(str(self.book_path))}?mode=ro", uri=True,
+                timeout=1,
             )
             try:
                 rows = con.execute("SELECT * FROM gnclock").fetchall()
@@ -3226,7 +3236,7 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         if n:
             out["split_reconcile_dates_filled"] = n
         out.update(self._migrate_reconcile_conventions(book))
-        n = self._migrate_slot_fillers(book)
+        n = self._migrate_slot_fillers(book, keep_business_marks=biz is None)
         if n:
             out["slot_fillers_normalized"] = n
         prices = getattr(self, "_migrate_price_shapes", None)
@@ -3399,7 +3409,7 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         return out
 
     @staticmethod
-    def _migrate_slot_fillers(book) -> int:
+    def _migrate_slot_fillers(book, keep_business_marks: bool = False) -> int:
         """Write path only: every slot the ORM wrote before
         2026-09-30 carries piecash's filler columns (``double_val``
         0.0, ``timespec_val`` NULL); GnuCash's SQL backend writes
@@ -3410,22 +3420,31 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
 
         # KVP_TYPE_DOUBLE = 2 and KVP_TYPE_TIMESPEC = 6 own those
         # columns; their values are data, not filler.
+        # The business converter reads piecash's fillers on a payment's
+        # ``date-posted`` slot and a lot's ``notes`` slot as the old
+        # server's mark. With the business module off, this pass used
+        # to wipe them first, and the rows were never converted once
+        # the module was back (scoped review 2026-10-06, BS-3).
+        keep = (
+            " AND name NOT IN ('date-posted', 'notes')"
+            if keep_business_marks else ""
+        )
         stale = (
             "SELECT COUNT(*) FROM slots WHERE "
-            "(double_val = 0 AND slot_type <> 2) OR "
-            "(timespec_val IS NULL AND slot_type <> 6)"
+            "((double_val = 0 AND slot_type <> 2) OR "
+            f"(timespec_val IS NULL AND slot_type <> 6)){keep}"
         )
         n = book.session.execute(text(stale)).scalar()
         if not n:
             return 0
         book.session.execute(text(
             "UPDATE slots SET double_val = NULL "
-            "WHERE double_val = 0 AND slot_type <> 2"
+            f"WHERE double_val = 0 AND slot_type <> 2{keep}"
         ))
         book.session.execute(
             text(
                 "UPDATE slots SET timespec_val = :epoch "
-                "WHERE timespec_val IS NULL AND slot_type <> 6"
+                f"WHERE timespec_val IS NULL AND slot_type <> 6{keep}"
             ),
             {"epoch": "1970-01-01 00:00:00"},
         )

@@ -1436,6 +1436,8 @@ def _paginate(
             f"{_range_suffix(items, date_key)}"
         )
 
+    if offset is not None and offset < 0:
+        raise ValueError(f"offset must be 0 or a positive number, got {offset}")
     if limit is not None and limit < 0:
         # Was silently the default page (IV-27).
         raise ValueError(

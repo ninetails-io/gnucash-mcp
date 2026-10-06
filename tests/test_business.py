@@ -413,7 +413,7 @@ class TestCreateJob:
 
     def test_invalid_owner_type_rejected(self, business_book):
         gb = GnuCashBook(str(business_book))
-        with pytest.raises(ValueError, match="Invalid owner_type"):
+        with pytest.raises(ValueError, match="Invalid party_type"):
             gb.create_job(
                 owner_id="000001", owner_type="custmer", name="x",
             )
@@ -500,7 +500,7 @@ class TestListJobs:
         would be ambiguous."""
         gb = GnuCashBook(str(business_book))
         with pytest.raises(
-            ValueError, match="owner_id requires owner_type",
+            ValueError, match="owner_id requires party_type",
         ):
             gb.list_jobs(owner_id="000001")
 
@@ -4983,7 +4983,7 @@ class TestCreateCreditNote:
         """Typos / unknown owner types rejected via the standard
         _parse_owner_type path."""
         gb = GnuCashBook(str(business_book))
-        with pytest.raises(ValueError, match="Invalid owner_type"):
+        with pytest.raises(ValueError, match="Invalid party_type"):
             gb.create_credit_note(
                 owner_id="000001", owner_type="custmer",
             )
@@ -6666,7 +6666,7 @@ class TestInvoiceBillIdCollision:
         assert "vendor bill" in msg
         # The coaching must name parameters the document tools
         # actually expose. The bookkeeper followed an earlier
-        # version that said "pass owner_type" into a schema
+        # version that said "pass party_type" into a schema
         # rejection: those tools take party_type / document_type.
         assert "document_type" in msg
         assert "party_type" in msg
@@ -6721,7 +6721,7 @@ class TestOwnerTypeValidation:
         with pytest.raises(ValueError) as exc_info:
             gb.get_invoice("000001", owner_type="custmer")
         msg = str(exc_info.value)
-        assert "Invalid owner_type" in msg
+        assert "Invalid party_type" in msg
         assert "'custmer'" in msg
         # All three valid options should appear in the hint.
         assert "customer" in msg
@@ -6753,7 +6753,7 @@ class TestOwnerTypeValidation:
         rejected here too."""
         gb = GnuCashBook(str(business_book))
         gb.create_customer(name="Acme Corp")
-        with pytest.raises(ValueError, match="Invalid owner_type"):
+        with pytest.raises(ValueError, match="Invalid party_type"):
             gb.pay_invoice(
                 invoice_id="000001",
                 payment_account="Assets:Checking",
@@ -6766,7 +6766,7 @@ class TestOwnerTypeValidation:
     ):
         """The reads validate the same way the writes do."""
         gb = GnuCashBook(str(business_book))
-        with pytest.raises(ValueError, match="Invalid owner_type"):
+        with pytest.raises(ValueError, match="Invalid party_type"):
             gb.list_invoices(owner_type="bogus")
 
 

@@ -59,6 +59,7 @@ from gnucash_mcp._format import (
     _period_label,
     _tsv_cell,
     _one_line,
+    _format_rate,
 )
 
 
@@ -1477,7 +1478,7 @@ class BusinessMixin:
         fx_memo = (
             f"FX {'loss' if is_loss else 'gain'} on invoice "
             f"{inv.id}: post-rate {rate_at_post:.4f}, pay-rate "
-            f"{exchange_rate}"
+            f"{_format_rate(exchange_rate)}"
         )
         split = None
         if not dry_run:
@@ -1575,7 +1576,7 @@ class BusinessMixin:
         if owner_type == "employee":
             return 5
         raise ValueError(
-            f"Invalid owner_type {owner_type!r}. "
+            f"Invalid party_type {owner_type!r}. "
             f"Must be 'customer', 'vendor', or 'employee'."
         )
 
@@ -2067,7 +2068,14 @@ class BusinessMixin:
                     f"{ccy} "
                     f"{_format_amount(grand_total, invoice.currency, separators=True)}"
                 ).strip()
-        except (ValueError, AttributeError, TypeError):
+        except ValueError:
+            # A draft with no lines yet comes to nothing (scoped
+            # review 2026-10-06, IN-19).
+            amount_str = (
+                f"{getattr(invoice.currency, 'mnemonic', '')} "
+                f"{_format_amount(Decimal(0), invoice.currency, separators=True)}"
+            ).strip()
+        except (AttributeError, TypeError):
             # Limited to the predictable shapes "?" is right for —
             # a bare ``except Exception`` would swallow programming
             # errors (KeyError/NameError) silently too.
@@ -2647,16 +2655,16 @@ class BusinessMixin:
         else:
             to_balance = -from_balance
         link_date = self._lot_link_date(from_lot, to_lot)
-        from_split = _new_split(
-            post_acct, -from_balance, -from_balance,
-            post_acct.commodity, memo="", action="Lot Link",
-        )
-        to_split = _new_split(
-            post_acct, -to_balance, -to_balance,
-            post_acct.commodity, memo="", action="Lot Link",
-        )
         txn = self._lot_link_transaction(from_lot, to_lot)
         if txn is None:
+            from_split = _new_split(
+                post_acct, -from_balance, -from_balance,
+                post_acct.commodity, memo="", action="Lot Link",
+            )
+            to_split = _new_split(
+                post_acct, -to_balance, -to_balance,
+                post_acct.commodity, memo="", action="Lot Link",
+            )
             txn = piecash.Transaction(
                 currency=post_acct.commodity,
                 description=owner_name,
@@ -2665,7 +2673,9 @@ class BusinessMixin:
                 splits=[from_split, to_split],
             )
         else:
-            txn.splits.extend([from_split, to_split])
+            # One split per lot in a link (BS-4; see _merge_into_link).
+            from_split = self._merge_into_link(txn, from_lot, post_acct, -from_balance)
+            to_split = self._merge_into_link(txn, to_lot, post_acct, -to_balance)
             if link_date > txn.post_date:
                 txn.post_date = link_date
         _lot_hold_open(from_lot)
@@ -2677,6 +2687,26 @@ class BusinessMixin:
         self._set_lot_link_memo(txn)
         self._drop_date_posted_slot(book, txn)
         return txn
+
+    @staticmethod
+    def _merge_into_link(txn, lot, post_acct, value):
+        """The leg of link transaction ``txn`` for ``lot``: the split
+        already in that lot with ``value`` added to it
+        (``xaccScrubMergeLotSubSplits`` — one split per lot), or a
+        new "Lot Link" split appended when there is none (scoped
+        review 2026-10-06, BS-4). ``value`` is in the post account's
+        commodity, the link's currency, so value and quantity agree."""
+        existing = next((sp for sp in txn.splits if sp.lot is lot), None)
+        if existing is None:
+            split = _new_split(
+                post_acct, value, value, post_acct.commodity,
+                memo="", action="Lot Link",
+            )
+            txn.splits.append(split)
+            return split
+        total = Decimal(str(existing.value)) + value
+        _set_split_amounts(existing, total, total)
+        return existing
 
     def _auto_apply_lots(self, book, lots: list, owner_name: str) -> None:
         """``gncOwnerAutoApplyPaymentsWithLots``: balance a set of one
@@ -3521,6 +3551,8 @@ class BusinessMixin:
             txn = book.session.query(Transaction).filter_by(guid=guid).first()
             if txn is None or not (txn.description or "").startswith("Credit applied: "):
                 continue
+            if guid not in old_payments:
+                continue  # the mark, not the words, says who wrote it
             splits = list(txn.splits)
             if len(splits) != 2 or any(sp.lot is None for sp in splits):
                 continue
@@ -3873,8 +3905,8 @@ class BusinessMixin:
             "lot": lot_obj,
             "balance": balance,
             "grand_total": grand_total,
-            "amount_paid": grand_total - amount_due,
-            "amount_due": amount_due,
+            "amount_paid": grand_total - amount_due + Decimal(0),
+            "amount_due": amount_due + Decimal(0),  # never "-0.00"
             # More was paid than was owed. A document whose own total
             # is negative (lines that net to a refund) owes the party
             # from the moment it posts: that is its balance, not an
@@ -3977,6 +4009,10 @@ class BusinessMixin:
         except ValueError:
             raise ValueError(
                 f"Currency not found: {code} is not an ISO 4217 code"
+                + (
+                    f" (did you mean {code.upper()}? codes are upper case)"
+                    if code != code.upper() else ""
+                )
             )
 
     def _document_status(
@@ -5019,6 +5055,10 @@ class BusinessMixin:
                 f"due_days ({due_days}): the discount window would "
                 f"outlast the term"
             )
+        if due_days > 36500:
+            # A century. An unbounded count overflowed the posting's
+            # due-date arithmetic (scoped review 2026-10-06, IN-9).
+            raise ValueError(f"due_days must be at most 36500, got {due_days}")
         if not Decimal(0) <= discount <= Decimal(100):
             raise ValueError(
                 f"discount_percent must be between 0 and 100, got "
@@ -8395,6 +8435,8 @@ class BusinessMixin:
             is_bill = self._is_bill_side(self._effective_owner_type(book, inv))
 
             pay_acct = self._resolve_account(book, payment_account)
+            if pay_acct is not None and pay_acct.placeholder:
+                raise self._placeholder_error(pay_acct)
             if not pay_acct:
                 raise self._account_not_found_error(book, payment_account)
             # The payment account is where the money moved. A
@@ -8610,6 +8652,19 @@ class BusinessMixin:
             if payment_amount > remaining_before_pay:
                 doc_label = self._doc_label_for(inv.owner_type)
                 ccy = inv.currency.mnemonic
+                if is_credit_note or negative_document:
+                    # The document owes the party (a credit note, a
+                    # refund). Paying more than it owes would hold the
+                    # excess on the side where the PARTY owes us, which
+                    # no surface lists as a prepayment and
+                    # from_prepayment cannot use (scoped review
+                    # 2026-10-06, BM-5).
+                    raise ValueError(
+                        f"{payment_amount} {ccy} exceeds what {doc_label} "
+                        f"{invoice_id} owes ({remaining_before_pay} {ccy}); "
+                        f"the excess cannot be held as a prepayment. "
+                        f"Pay what is owed."
+                    )
                 owed_now = remaining_before_pay.quantize(
                     _commodity_quantum(inv.currency)
                 )
@@ -8793,9 +8848,18 @@ class BusinessMixin:
                         dry_run=dry_run,
                     )
                 )
-                disc_quantity, _disc_rate = _convert(
-                    expected, discount_acct.commodity,
-                )
+                if received is not None and discount_acct.commodity == txn_currency:
+                    # The bank amount fixes the rate; no quote is
+                    # needed, and a quote would value the discount at
+                    # a rate nobody paid (scoped review 2026-10-06, BM-4).
+                    disc_quantity = (expected * exchange_rate).quantize(
+                        _commodity_quantum(discount_acct.commodity),
+                        rounding=ROUND_HALF_UP,
+                    )
+                else:
+                    disc_quantity, _disc_rate = _convert(
+                        expected, discount_acct.commodity,
+                    )
                 # Customer payment: discount is EXPENSE (debit), +value
                 # Vendor bill payment: discount is INCOME (credit), -value
                 disc_value_sign = -1 if effective_is_bill else 1
@@ -8813,7 +8877,7 @@ class BusinessMixin:
                 else:
                     discount_value_txn = (
                         expected * exchange_rate
-                    ).quantize(txn_quantum)
+                    ).quantize(txn_quantum, rounding=ROUND_HALF_UP)
                 if not dry_run:
                     discount_split = _new_split(
                         discount_acct, disc_value_sign * discount_value_txn,
@@ -9805,17 +9869,16 @@ class BusinessMixin:
                     f"{link_date.isoformat()}. Omit apply_date."
                 )
             owner_name = self._end_owner_name(book, cn)
-            cn_split = _new_split(
-                post_acct, cn_split_value, cn_split_value,
-                post_acct.commodity, memo="", action="Lot Link",
-            )
-            target_split = _new_split(
-                post_acct, target_split_value, target_split_value,
-                post_acct.commodity, memo="", action="Lot Link",
-            )
-
             txn = self._lot_link_transaction(cn_lot, target_lot)
             if txn is None:
+                cn_split = _new_split(
+                    post_acct, cn_split_value, cn_split_value,
+                    post_acct.commodity, memo="", action="Lot Link",
+                )
+                target_split = _new_split(
+                    post_acct, target_split_value, target_split_value,
+                    post_acct.commodity, memo="", action="Lot Link",
+                )
                 txn = piecash.Transaction(
                     currency=post_acct.commodity,
                     description=owner_name,
@@ -9824,7 +9887,11 @@ class BusinessMixin:
                     splits=[cn_split, target_split],
                 )
             else:
-                txn.splits.extend([cn_split, target_split])
+                # One split per lot in a link (BS-4; see _merge_into_link).
+                cn_split = self._merge_into_link(txn, cn_lot, post_acct, cn_split_value)
+                target_split = self._merge_into_link(
+                    txn, target_lot, post_acct, target_split_value,
+                )
                 if link_date > txn.post_date:
                     txn.post_date = link_date
 
@@ -10507,7 +10574,7 @@ class BusinessMixin:
 
         if owner_id and not owner_type:
             raise ValueError(
-                "owner_id requires owner_type to be set — "
+                "owner_id requires party_type to be set — "
                 "customer and vendor IDs share a sequence space, "
                 "so disambiguation is required."
             )
@@ -10969,7 +11036,7 @@ class BusinessMixin:
                             _tsv_cell(u["party_name"] or ""),
                             f"{u['currency']} {u['amount']}",
                             f"since {u['since']}",
-                            _tsv_cell(u["account"]),
+                            _one_line(u["account"]),
                         ]))
                     text_out += "\n" + "\n".join(lines)
                 return text_out
@@ -11144,7 +11211,12 @@ class BusinessMixin:
         if rate is None:
             return Decimal(str(split.value)), False
         quantum = _commodity_quantum(default_currency)
-        return (Decimal(str(split.value)) * rate).quantize(quantum), True
+        return (
+            (Decimal(str(split.value)) * rate).quantize(
+                quantum, rounding=ROUND_HALF_UP,
+            ),
+            True,
+        )
 
     def _bill_amounts_in_default(
         self, book, bill, default_currency,

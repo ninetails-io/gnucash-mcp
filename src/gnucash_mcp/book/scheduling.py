@@ -1684,6 +1684,26 @@ class SchedulingMixin:
             created_guid = txn_result.get("guid")
             if not created_guid or txn_result.get("status") == "rejected":
                 raise
+            # If the advance DID commit and the failure came after it,
+            # the instance must stay: deleting it would skip the
+            # occurrence for good (scoped review 2026-10-06, CS-6).
+            try:
+                with self.open(readonly=True) as check:
+                    sx_now = self._find_scheduled_transaction(check, guid)
+                    advanced = (
+                        sx_now is not None and sx_now.last_occur == txn_date
+                    )
+            except Exception:
+                advanced = False
+            if advanced:
+                raise RuntimeError(
+                    f"'{sx_name}' was entered as transaction "
+                    f"{created_guid} and the schedule advanced to it, "
+                    f"but the reply could not be built "
+                    f"({type(exc).__name__}: {exc}). Nothing needs "
+                    f"redoing; list_scheduled_transactions shows the "
+                    f"new state."
+                ) from exc
             try:
                 self.delete_transaction(created_guid, force=True)
             except Exception:

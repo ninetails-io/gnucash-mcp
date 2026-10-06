@@ -291,7 +291,7 @@ def redact_paths(text: str) -> str:
     # A file URL is a path with a scheme on it, not a connection
     # string to keep whole.
     text = re.sub(
-        r"file://(/[^\s'\"<>]+)",
+        r"(?:file|sqlite)://(/[^\s'\"<>?]+)",
         lambda m: m.group(1).rstrip("/").rsplit("/", 1)[-1], text,
     )
     text = _DB_URI_IN_TEXT_RE.sub(hold, text)

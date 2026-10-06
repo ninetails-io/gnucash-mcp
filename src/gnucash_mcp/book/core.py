@@ -5162,7 +5162,7 @@ class CoreMixin:
                     for name in sorted(effects):
                         delta, mnemonic = effects[name]
                         out.append(
-                            f"{_tsv_cell(name)}\t{delta}\t"
+                            f"{_one_line(name)}\t{delta}\t"
                             f"{mnemonic}"
                         )
                     effects_tsv = "\n".join(out)

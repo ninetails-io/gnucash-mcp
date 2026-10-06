@@ -612,8 +612,8 @@ class BackupMixin:
             holds = Path(made["path"]).name
             result["pre_upgrade_backup"] = holds
             marker.parent.mkdir(parents=True, exist_ok=True)
-            marker.write_text(
-                f"{_format_ts(_now_utc())}\nsnapshot: {holds}\n"
+            write_private_file(
+                marker, f"{_format_ts(_now_utc())}\nsnapshot: {holds}\n",
             )
         except Exception as e:
             raise ValueError(
@@ -654,8 +654,8 @@ class BackupMixin:
         try:
             marker = self._pre_upgrade_marker()
             stamp = marker.read_text().splitlines()[0]
-            marker.write_text(
-                f"{stamp}\nsnapshot: none (nothing to convert)\n"
+            write_private_file(
+                marker, f"{stamp}\nsnapshot: none (nothing to convert)\n",
             )
         except (OSError, IndexError):
             pass

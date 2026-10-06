@@ -1930,3 +1930,174 @@ class TestSecondReviewSerious:
             "﻿ref\tcommodity\tdate\tvalue\nr\tVTSAX\t2026-02-02\t234.56\n"
         )
         assert rows[0]["value"] == "234.56"
+
+
+class TestSecondReviewMinor:
+    def test_a_refund_beyond_a_credit_note_is_not_a_prepayment(self, business_book):
+        """BM-5."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme")
+        cn = gb.create_credit_note(owner_id="000001", owner_type="customer")
+        gb.add_credit_note_entry(
+            credit_note_id=cn["id"], account="Income:Sales",
+            description="Refund", quantity="1", price="100.00",
+        )
+        gb.post_invoice(
+            invoice_id=cn["id"], post_account=AR, post_date="2026-01-16",
+            owner_type="customer",
+        )
+        with pytest.raises(ValueError, match="cannot be held as a prepayment"):
+            gb.pay_invoice(
+                invoice_id=cn["id"], payment_account="Assets:Checking",
+                amount="150.00", payment_date="2026-01-20",
+                owner_type="customer", allow_prepayment=True,
+            )
+
+    def test_a_settled_document_reads_zero_not_negative_zero(self, business_book):
+        """BM-7."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_vendor(name="Sup")
+        bill = gb.create_bill(vendor_id="000001")
+        gb.add_bill_entry(
+            bill_id=bill["id"], account="Expenses:Services",
+            description="H", quantity="1", price="80.00",
+        )
+        gb.post_invoice(
+            invoice_id=bill["id"], post_account="Liabilities:Accounts Payable",
+            post_date="2026-01-16", owner_type="vendor",
+        )
+        gb.pay_invoice(
+            invoice_id=bill["id"], payment_account="Assets:Checking",
+            amount="80.00", payment_date="2026-01-20", owner_type="vendor",
+        )
+        assert gb.get_invoice(bill["id"], owner_type="vendor")["amount_due"] == "0.00"
+
+    def test_a_scientific_amount_echoes_plainly(self):
+        """IN-16."""
+        from gnucash_mcp.book._base import _to_decimal
+
+        assert str(_to_decimal("1e3")) == "1000"
+        assert str(_to_decimal("1E+1")) == "10"
+        assert str(_to_decimal("12.50")) == "12.50"
+
+    def test_dates_are_yyyy_mm_dd_and_name_their_row(self):
+        """IN-13."""
+        from gnucash_mcp.tools._helpers import _parse_iso_date
+
+        assert _parse_iso_date("2026-01-05") == date(2026, 1, 5)
+        for bad in ("20260105", "2026-W02-1", "2026-1-5"):
+            with pytest.raises(ValueError, match="YYYY-MM-DD"):
+                _parse_iso_date(bad)
+
+    def test_commodity_namespace_rules(self, test_book):
+        """IN-12."""
+        gb = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match="cannot contain ':'"):
+            gb.create_commodity(mnemonic="X:QQ", fullname="x", namespace="NYSE")
+        with pytest.raises(ValueError, match="CURRENCY"):
+            gb.create_commodity(mnemonic="USD", fullname="Fake", namespace="currency")
+        with pytest.raises(ValueError, match="template"):
+            gb.create_commodity(mnemonic="template", fullname="t", namespace="template")
+
+    def test_billterm_days_are_bounded(self, business_book):
+        """IN-9."""
+        gb = GnuCashBook(str(business_book))
+        with pytest.raises(ValueError, match="at most 36500"):
+            gb.create_billterm(name="Forever", due_days=2**31)
+
+    def test_slot_values_fit_the_column(self, test_book):
+        """IN-11."""
+        gb = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match="at most 4096"):
+            gb.set_account_slot("Expenses:Groceries", "color", "x" * 5000)
+
+    def test_a_negative_offset_is_refused(self):
+        """IN-20."""
+        from gnucash_mcp._format import _paginate
+
+        with pytest.raises(ValueError, match="offset must be"):
+            _paginate([1, 2, 3], offset=-1, limit=2, entity_name="things")
+
+    def test_a_sqlite_uri_is_redacted_like_a_path(self, monkeypatch):
+        """CS-5."""
+        from gnucash_mcp.logging_config import redact_paths
+
+        monkeypatch.setenv("GNUCASH_REDACT_PATHS", "1")
+        out = redact_paths("Invalid SQLite URL: sqlite:////Users/me/private/books/mine.gnucash")
+        assert "/Users/me" not in out and "mine.gnucash" in out
+
+    def test_slot_fillers_keep_the_business_marks_when_business_is_off(self, test_book):
+        """BS-3."""
+        gb = GnuCashBook(str(test_book))
+        guid = _spend(gb)
+        _q(
+            test_book,
+            "update slots set double_val = 0, timespec_val = NULL "
+            "where name = 'date-posted' and obj_guid like ?",
+            (guid + "%",),
+        )
+        with gb.open(readonly=False) as book:
+            gb._migrate_slot_fillers(book, keep_business_marks=True)
+            book.save()
+        assert _q(
+            test_book,
+            "select count(*) from slots where name = 'date-posted' "
+            "and double_val = 0 and obj_guid like ?",
+            (guid + "%",),
+        ) == [(1,)]
+
+    def test_an_extended_lot_link_has_one_split_per_lot(self, business_book):
+        """BS-4: one credit note applied to two invoices is three
+        splits in one link transaction, as the engine writes it."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme")
+        for price in ("100.00", "50.00"):
+            inv = gb.create_invoice(customer_id="000001")
+            gb.add_invoice_entry(
+                invoice_id=inv["id"], account="Income:Sales",
+                description="Work", quantity="1", price=price,
+            )
+            gb.post_invoice(inv["id"], AR, post_date="2026-01-15")
+        cn = gb.create_credit_note(owner_id="000001", owner_type="customer")
+        gb.add_credit_note_entry(
+            credit_note_id=cn["id"], account="Income:Sales",
+            description="Refund", quantity="1", price="120.00",
+        )
+        gb.post_invoice(
+            invoice_id=cn["id"], post_account=AR, post_date="2026-01-16",
+            owner_type="customer",
+        )
+        first = gb.apply_credit_note(
+            credit_note_id=cn["id"], applies_to_invoice_id="000001",
+            owner_type="customer",
+        )
+        second = gb.apply_credit_note(
+            credit_note_id=cn["id"], applies_to_invoice_id="000002",
+            owner_type="customer",
+        )
+        assert first["transaction_guid"] == second["transaction_guid"]
+        link = gb.get_transaction(first["transaction_guid"])
+        assert len(link["splits"]) == 3
+        assert Decimal(gb.get_invoice(cn["id"], owner_type="customer")["amount_due"]) == 0
+
+    def test_desktop_price_rows_are_left_alone_by_the_converter(self, test_book):
+        """BS-5: a Price Editor row of GnuCash 2.6–4.0 at local
+        midnight, and a Finance::Quote row with an unreduced value,
+        keep their shape; only a source GnuCash never writes marks a
+        row as the old server's."""
+        gb = GnuCashBook(str(test_book))
+        gb.create_account(
+            name="Euro", account_type="BANK", parent="Assets", commodity="EUR",
+        )
+        gb.create_price(
+            commodity="EUR", namespace="CURRENCY", value="1.10",
+            price_date=date(2026, 1, 10),
+        )
+        _q(
+            test_book,
+            "update prices set source = 'Finance::Quote', value_num = 1787000, "
+            "value_denom = 10000, date = '2026-01-10 05:00:00'",
+        )
+        before = _q(test_book, "select source, value_num, value_denom, date from prices")
+        gb.create_budget(name="B", year=2026)  # a converting write
+        assert _q(test_book, "select source, value_num, value_denom, date from prices") == before
