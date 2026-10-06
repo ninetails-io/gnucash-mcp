@@ -757,6 +757,42 @@ Established chokepoints and the rule each one owns:
   it draws (Arabic, Indic, emoji, tag sequences) and drops it
   between Latin letters. Transaction dates bind through
   `_neutral_time` (`_date_bind`), not piecash's flat 10:59.
+- **From the second scoped review (`specs/v1.5.1/review/
+  SCOPED_REVIEW_2026-10-06.md`, four readers over the whole close-out
+  diff):** `_check_one_line` is the rule for every name-like field
+  (party, schedule, budget, bill term, job, lot title, document ID,
+  commodity): no tab, line break, NEL, or Unicode line/paragraph
+  separator, so a name can never start a row of its own on the
+  dashboard or in a report (the C57 class, found a second time; the
+  emitters also pass names through `_one_line`). `_check_ledger_date`
+  is the one date range, GnuCash's 1400-01-01 to 9998-12-31
+  (MINTIME/MAXTIME, a year's headroom for far-date arithmetic),
+  applied where a transaction date binds (`_date_bind`) and on every
+  schedule, budget, and report date; a refusal raised at bind time
+  comes back through `safe_tool` as a validation error, never
+  `unexpected_error`. `_stored_timestamp_utc` is the one decoder for
+  a timestamp read by raw SQL (ISO text, GnuCash 2.6's compact form,
+  a driver's datetime); the reconcile-info converter raised on the
+  compact form and refused every later write to the book (BS-2).
+  `_merge_into_link` extends a lot link as `gncOwnerCreateLotLink`
+  does, one split per (lot, account), added to rather than
+  duplicated, and `apply_credit_note` signs each link split as the
+  negation of its lot's balance, never by side (BM-1).
+  `_account_references` is the one census of what else points at an
+  account (schedule templates, document lines, tax-table entries,
+  `invoices.post_acc`, `employees.ccard_guid`, budget amounts);
+  `delete_account` refuses while any remain (CS-4).
+  `_legacy_folder_may_belong_to` claims a pre-1.5 `.mcp` folder for
+  a book only when the folder's audit log names the book's GUID
+  (CS-3). `register_secrets_from_url` / `_mask_known_secrets`
+  (`_format.py`): a connection string's password is registered at
+  startup and masked as TEXT wherever it appears, because a password
+  holding a quote or a space defeats the URL-shaped scrub (CS-1).
+  `_ensure_pre_upgrade_snapshot` always writes a fresh copy of the
+  committed state; the hard link to a stage backup it took before
+  could be an older state of the book (CS-2). And the converter rule
+  held three more times (BS-1, BS-5, BS-6): a pass that cannot name
+  the old server's own mark on a row does not touch the row.
 - `_CONVERTED_BY_KEY` / `_OLD_SERVER_WRITE_KEY` (`_base.py`): the
   server's own marks on the root account. The first converting write
   marks the book; a pre-1.5 fingerprint found later in a marked book

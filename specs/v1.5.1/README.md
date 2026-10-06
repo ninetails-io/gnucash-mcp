@@ -50,6 +50,34 @@ Three readers over the merged diff: `review/SCOPED_REVIEW_2026-10-05.md`
 holds the resolution table. All fixed on `fix/1.5.0-scoped-review`
 except S-9 (a `?` in the book path; pre-existing, listed).
 
+### The second scoped review of 2026-10-06
+
+Four readers over the whole close-out diff (`43353a7..d42400e`):
+`review/SCOPED_REVIEW_2026-10-06.md` holds the resolution table. Fixed
+on `fix/1.5.0-scoped-review` (`3748c6a`, `de67dc1`) except these,
+each listed under Known limitations in the CHANGELOG:
+
+- **BM-9** — `_commodity_quantum` is a power of ten; a fraction-5
+  currency (MGA) can receive a converted amount off its grid.
+  `_entry_math.round_half_up` already handles it; the conversion
+  sites should round the same way.
+- **CS-9** — `_log_dir_identity` resolves the path without folding
+  case; a case-variant or moved path gets a new folder. Identify by
+  `(st_dev, st_ino)` with the path kept for display.
+- **BS-7** — document-level converter passes key on any old-server
+  line; key them on `billto_type = 0` alone.
+- **BS-8** — engine strings ("Lot Link", "Voided transaction", the
+  document titles) are written in English; desktop writes `_()`.
+- **BS-9** — the once-per-book marker leaves a 1.4.x server's later
+  rows converted without a fresh snapshot (FC-20 names them).
+  Re-arm the snapshot when a marked book shows a fingerprint.
+- **IN-7** — the representability bound should check the numerator
+  over the commodity's denominator, in the per-row validators.
+- **IN-5** (the warning half), **IN-20** (start after end;
+  `opening_balance` and statement-line amount errors could name
+  their field and cure), **IN-21** (piecash's `create_book` advice
+  on a missing database).
+
 ### Not the server's code
 
 - **FC-18 — the bundled demo books are old piecash-format files.**
