@@ -751,7 +751,12 @@ class BackupMixin:
                     "size_bytes": held.stat().st_size,
                     "note": (
                         "The book has not changed since this backup "
-                        "was taken; no new copy was written."
+                        "was taken; no new copy was written"
+                        + (
+                            f", so the label {safe_label!r} was not applied"
+                            if safe_label else ""
+                        )
+                        + "."
                     ),
                     "restore_hint": redact_paths(
                         self._restore_hint(held)

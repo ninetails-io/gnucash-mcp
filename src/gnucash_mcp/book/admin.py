@@ -8,6 +8,7 @@ statement close day, etc. Values are stored as strings.
 import re
 
 from gnucash_mcp.book._base import _slot_value_str  # noqa: F401  (re-exported for callers)
+from gnucash_mcp.book._base import _check_control_chars
 
 # Slot keys with embedded ``/`` create hierarchical sub-slots in
 # GnuCash's KVP store rather than flat keys. The MCP-facing
@@ -178,6 +179,7 @@ class AdminMixin:
                 disallowed characters.
         """
         _check_user_slot_key(key, "set")
+        _check_control_chars(value, "slot value")
         # Length cap. Encode to UTF-8 to count bytes (so a
         # multi-byte unicode payload can't sneak past a char-count
         # check). 64 KiB is generous for any real per-account

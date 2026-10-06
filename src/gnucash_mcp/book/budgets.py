@@ -33,6 +33,9 @@ from gnucash_mcp.book._base import (
     _unique_prefix,
     _verify_composite_write,
     _verify_write,
+    _check_text,
+    _TEXT_WIDTH,
+    _SLOT_TEXT_WIDTH,
 )
 from gnucash_mcp._format import (
     _format_exact,
@@ -584,6 +587,14 @@ class BudgetsMixin:
             ValueError: duplicate name, invalid period_type /
                 num_periods / start_date.
         """
+        # Every free-text argument through the one text gate (scoped
+        # review 2026-10-05, I-4): no control characters, GnuCash's
+        # column width.
+        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic"):
+            _check_text(
+                locals().get(_field),
+                _SLOT_TEXT_WIDTH if _field == "notes" else _TEXT_WIDTH, _field,
+            )
         import uuid
 
 

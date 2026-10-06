@@ -49,6 +49,17 @@ _NET_INCOME_TYPES = frozenset({"INCOME", "EXPENSE"})
 _CASH_TYPES = frozenset({"BANK", "CASH"})
 
 
+def _sum_rounded_cells(cells: dict, currency) -> dict[str, Decimal]:
+    """``{(name, month): amount}`` → ``{name: total}`` with each cell
+    rounded once to the currency's unit first (M-2)."""
+    totals: dict[str, Decimal] = {}
+    for (name, _month), amount in cells.items():
+        totals[name] = totals.get(name, Decimal("0")) + _round_converted(
+            amount, currency,
+        )
+    return totals
+
+
 def _format_breakdown_tsv(
     rows: list[dict], total: Decimal, label_key: str, currency=None,
 ) -> str:
@@ -319,6 +330,7 @@ class ReportingMixin:
         # category fullname → {period_label: signed Decimal}
         label_set = set(period_labels)
         totals: dict[str, dict[str, Decimal]] = {}
+        month_cells: dict[tuple[str, str, str], Decimal] = {}
         for split, txn, account in rows:
             plabel = _period_label(txn.post_date, group_by)
             if plabel not in label_set:
@@ -337,8 +349,18 @@ class ReportingMixin:
                 split, account, factor,
             )
             group_account = self._get_account_at_depth(account, depth)
-            bucket = totals.setdefault(group_account.fullname, {})
-            bucket[plabel] = bucket.get(plabel, Decimal("0")) + amount
+            month = _period_label(txn.post_date, "month")
+            key = (group_account.fullname, plabel, month)
+            month_cells[key] = month_cells.get(key, Decimal("0")) + amount
+        # The (category, month) cell is the rounding grain everywhere
+        # (M-2): a quarter or year cell is the sum of its rounded
+        # months, so this table's totals equal the single-period
+        # report's.
+        for (name, plabel, _month), amount in month_cells.items():
+            bucket = totals.setdefault(name, {})
+            bucket[plabel] = bucket.get(plabel, Decimal("0")) + _round_converted(
+                amount, book.default_currency,
+            )
 
         cat_totals = {
             name: sum(per.values(), Decimal("0"))
@@ -436,11 +458,15 @@ class ReportingMixin:
                 book, start_date, end_date,
             )
 
-            totals: dict[str, Decimal] = {}
+            # Accumulate SIGNED amounts so refunds net against
+            # spending within a category — dropping negatives would
+            # report GROSS spend. The grain is the (category, month)
+            # cell: each is rounded once to the currency's unit and
+            # every figure is a sum of cells, so the lines add up to
+            # the TOTAL and the grouped table's grand total is this
+            # one (scoped review 2026-10-05, M-2; TestModeAgreement).
+            cells: dict[tuple[str, str], Decimal] = {}
             for split, txn, account in rows:
-                # Accumulate SIGNED amounts so refunds net against
-                # spending within a category — dropping negatives
-                # would report GROSS spend.
                 amount = self._split_in_default_currency(
                     split, account,
                     self._monthly_factor(monthly_factors, txn, account),
@@ -452,10 +478,9 @@ class ReportingMixin:
                 group_account = self._get_account_at_depth(
                     account, depth
                 )
-                account_name = group_account.fullname
-                totals[account_name] = totals.get(
-                    account_name, Decimal("0")
-                ) + amount
+                key = (group_account.fullname, _period_label(txn.post_date, "month"))
+                cells[key] = cells.get(key, Decimal("0")) + amount
+            totals = _sum_rounded_cells(cells, book.default_currency)
 
             # Net decision AFTER aggregation: a net-refunded category
             # isn't a spend LINE but still belongs in the TOTAL —
@@ -476,11 +501,11 @@ class ReportingMixin:
                 )
                 categories.append({
                     "account": account_name,
-                    "amount": str(amount),
+                    "amount": _format_converted(amount, book.default_currency),
                     "percent": str(percent.quantize(Decimal("0.1"))),
                 })
             excluded_rows = [
-                {"account": n, "amount": str(a)}
+                {"account": n, "amount": _format_converted(a, book.default_currency)}
                 for n, a in sorted(excluded.items(), key=lambda x: x[1])
             ]
 
@@ -501,7 +526,7 @@ class ReportingMixin:
                 return out
             # period is an input echo — LLM supplied start/end dates.
             result = {
-                "total": str(total),
+                "total": _format_converted(total, book.default_currency),
                 "categories": categories,
             }
             if excluded_rows:
@@ -561,27 +586,19 @@ class ReportingMixin:
                 book, start_date, end_date,
             )
 
-            totals: dict[str, Decimal] = {}
+            # (category, month) cells, each rounded once, as in
+            # spending_by_category (M-2).
+            cells: dict[tuple[str, str], Decimal] = {}
             for split, txn, account in rows:
-                # Income is stored negative; flip. Signed
-                # accumulation so losses/clawbacks net against gains
-                # within a source — see spending_by_category.
                 amount = -self._split_in_default_currency(
                     split, account,
                     self._monthly_factor(monthly_factors, txn, account),
                 )
-                # ``depth`` not ``depth - 1`` — same off-by-one
-                # hazard as spending_by_category.
-                group_account = self._get_account_at_depth(
-                    account, depth
-                )
-                account_name = group_account.fullname
-                totals[account_name] = totals.get(
-                    account_name, Decimal("0")
-                ) + amount
+                group_account = self._get_account_at_depth(account, depth)
+                key = (group_account.fullname, _period_label(txn.post_date, "month"))
+                cells[key] = cells.get(key, Decimal("0")) + amount
+            totals = _sum_rounded_cells(cells, book.default_currency)
 
-            # Net decision AFTER aggregation — see
-            # spending_by_category.
             displayed = {n: a for n, a in totals.items() if a > 0}
             excluded = {n: a for n, a in totals.items() if a < 0}
             total = (
@@ -600,7 +617,7 @@ class ReportingMixin:
                     "percent": str(percent.quantize(Decimal("0.1"))),
                 })
             excluded_rows = [
-                {"account": n, "amount": str(a)}
+                {"account": n, "amount": _format_converted(a, book.default_currency)}
                 for n, a in sorted(excluded.items(), key=lambda x: x[1])
             ]
 
@@ -621,7 +638,7 @@ class ReportingMixin:
                 return out
             # period is an input echo — LLM supplied start/end dates.
             result = {
-                "total": str(total),
+                "total": _format_converted(total, book.default_currency),
                 "sources": sources,
             }
             if excluded_rows:
@@ -1173,8 +1190,10 @@ class ReportingMixin:
             monthly_factors = self._monthly_conversion_factors(
                 book, start_date, end_date,
             )
-            inflows = Decimal("0")
-            outflows = Decimal("0")
+            # Per-month cells, rounded once (M-2), as the grouped
+            # table's are.
+            in_cells: dict[str, Decimal] = {}
+            out_cells: dict[str, Decimal] = {}
             transfers_excluded: set[str] = set()
             for split, txn, acct in rows:
                 # Skip voided splits BEFORE the transfer-vs-real
@@ -1191,17 +1210,27 @@ class ReportingMixin:
                     self._monthly_factor(monthly_factors, txn, acct),
                 )
                 if amt > 0:
-                    inflows += amt
+                    m = _period_label(txn.post_date, "month")
+                    in_cells[m] = in_cells.get(m, Decimal("0")) + amt
                 elif amt < 0:
-                    outflows += -amt
+                    m = _period_label(txn.post_date, "month")
+                    out_cells[m] = out_cells.get(m, Decimal("0")) - amt
 
             # period (input echo) and net (derivable) are dropped.
             # The canonical fullname is echoed so %short/GUID input
             # still yields a readable name.
+            inflows = sum(
+                (_round_converted(v, book.default_currency) for v in in_cells.values()),
+                Decimal("0"),
+            )
+            outflows = sum(
+                (_round_converted(v, book.default_currency) for v in out_cells.values()),
+                Decimal("0"),
+            )
             result = {
                 "account": account_label,
-                "inflows": str(inflows),
-                "outflows": str(outflows),
+                "inflows": _format_converted(inflows, book.default_currency),
+                "outflows": _format_converted(outflows, book.default_currency),
             }
             if transfers_excluded:
                 result["transfers_excluded"] = len(transfers_excluded)
@@ -1237,6 +1266,8 @@ class ReportingMixin:
 
         inflows = {pl: Decimal("0") for pl in period_labels}
         outflows = {pl: Decimal("0") for pl in period_labels}
+        in_months: dict[tuple[str, str], Decimal] = {}
+        out_months: dict[tuple[str, str], Decimal] = {}
         transfers_excluded: set[str] = set()
         for split, txn, acct in rows:
             if _is_voided(split):
@@ -1259,10 +1290,18 @@ class ReportingMixin:
                 split, acct,
                 self._monthly_factor(monthly_factors, txn, acct),
             )
+            month = _period_label(txn.post_date, "month")
             if amt > 0:
-                inflows[plabel] += amt
+                k = (plabel, month)
+                in_months[k] = in_months.get(k, Decimal("0")) + amt
             elif amt < 0:
-                outflows[plabel] += -amt
+                k = (plabel, month)
+                out_months[k] = out_months.get(k, Decimal("0")) - amt
+        # Rounded per month, summed into the period (M-2).
+        for (plabel, _m), v in in_months.items():
+            inflows[plabel] += _round_converted(v, book.default_currency)
+        for (plabel, _m), v in out_months.items():
+            outflows[plabel] += _round_converted(v, book.default_currency)
 
         return _format_grouped_cashflow_tsv(
             period_labels=period_labels,

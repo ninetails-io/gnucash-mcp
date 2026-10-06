@@ -44,6 +44,7 @@ from gnucash_mcp.book._base import (
     _neutral_time,
     _verify_delete,
     _verify_write,
+    _SLOT_TEXT_WIDTH,
 )
 from gnucash_mcp._format import (
     _GROUP_BY_VALUES,
@@ -4382,6 +4383,14 @@ class BusinessMixin:
         Returns:
             ``{"id": ..., "name": ..., "currency": ..., "status": "created"}``
         """
+        # Every free-text argument through the one text gate (scoped
+        # review 2026-10-05, I-4): no control characters, GnuCash's
+        # column width.
+        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic"):
+            _check_text(
+                locals().get(_field),
+                _SLOT_TEXT_WIDTH if _field == "notes" else _TEXT_WIDTH, _field,
+            )
         from piecash.business.person import Address
 
         # Cap free-text byte lengths up front.
@@ -4475,6 +4484,7 @@ class BusinessMixin:
         if address:
             for key in cls._ADDRESS_FIELDS:
                 value = address.get(key)
+                _check_text(value, _TEXT_WIDTH, f"address.{key}")
                 if value is None:
                     continue
                 if not isinstance(value, str):
@@ -4902,6 +4912,14 @@ class BusinessMixin:
         only. See ``_update_business_person`` for address-merge
         semantics, the diff-style response, and failure modes.
         """
+        # Every free-text argument through the one text gate (scoped
+        # review 2026-10-05, I-4): no control characters, GnuCash's
+        # column width.
+        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic"):
+            _check_text(
+                locals().get(_field),
+                _SLOT_TEXT_WIDTH if _field == "notes" else _TEXT_WIDTH, _field,
+            )
         with self.open(readonly=False) as book:
             customer = self._find_customer(book, customer_id)
             if not customer:
@@ -6191,6 +6209,14 @@ class BusinessMixin:
         Returns:
             Dict with id, customer_id, date_opened, status.
         """
+        # Every free-text argument through the one text gate (scoped
+        # review 2026-10-05, I-4): no control characters, GnuCash's
+        # column width.
+        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic"):
+            _check_text(
+                locals().get(_field),
+                _SLOT_TEXT_WIDTH if _field == "notes" else _TEXT_WIDTH, _field,
+            )
         return self._create_business_document(
             owner_type=2,
             owner_id=customer_id,
@@ -6229,6 +6255,14 @@ class BusinessMixin:
         Returns:
             Dict with id, vendor_id, date_opened, status.
         """
+        # Every free-text argument through the one text gate (scoped
+        # review 2026-10-05, I-4): no control characters, GnuCash's
+        # column width.
+        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic"):
+            _check_text(
+                locals().get(_field),
+                _SLOT_TEXT_WIDTH if _field == "notes" else _TEXT_WIDTH, _field,
+            )
         return self._create_business_document(
             owner_type=4,
             owner_id=vendor_id,
@@ -6269,6 +6303,14 @@ class BusinessMixin:
         Returns:
             Dict with id, employee_id, date_opened, status.
         """
+        # Every free-text argument through the one text gate (scoped
+        # review 2026-10-05, I-4): no control characters, GnuCash's
+        # column width.
+        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic"):
+            _check_text(
+                locals().get(_field),
+                _SLOT_TEXT_WIDTH if _field == "notes" else _TEXT_WIDTH, _field,
+            )
         return self._create_business_document(
             owner_type=5,
             owner_id=employee_id,
@@ -6386,6 +6428,14 @@ class BusinessMixin:
             ValueError: invalid/employee owner_type, or any
                 source-link validation failure.
         """
+        # Every free-text argument through the one text gate (scoped
+        # review 2026-10-05, I-4): no control characters, GnuCash's
+        # column width.
+        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic"):
+            _check_text(
+                locals().get(_field),
+                _SLOT_TEXT_WIDTH if _field == "notes" else _TEXT_WIDTH, _field,
+            )
         int_owner_type = self._parse_owner_type(owner_type)
         if int_owner_type == 5:
             raise ValueError(
@@ -6681,6 +6731,14 @@ class BusinessMixin:
         Side effect: the taxtable's stored ``refcount`` is bumped
         for desktop interop (our checks use SQL-computed counts).
         """
+        # Every free-text argument through the one text gate (scoped
+        # review 2026-10-05, I-4): no control characters, GnuCash's
+        # column width.
+        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic"):
+            _check_text(
+                locals().get(_field),
+                _SLOT_TEXT_WIDTH if _field == "notes" else _TEXT_WIDTH, _field,
+            )
         import uuid
         from piecash.business.invoice import Entry
 
@@ -8143,6 +8201,7 @@ class BusinessMixin:
                 book,
                 [prev_post_date.date() if prev_post_date else None],
                 "", dialog="Unpost command",
+                outcome="the posting it removed was dated inside the closed period",
             )
             if closed:
                 result["read_only_period"] = closed
@@ -10314,6 +10373,14 @@ class BusinessMixin:
             ValueError: invalid/employee owner_type, or owner not
                 found.
         """
+        # Every free-text argument through the one text gate (scoped
+        # review 2026-10-05, I-4): no control characters, GnuCash's
+        # column width.
+        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic"):
+            _check_text(
+                locals().get(_field),
+                _SLOT_TEXT_WIDTH if _field == "notes" else _TEXT_WIDTH, _field,
+            )
         from piecash.business.invoice import Job
 
         int_owner_type = self._parse_owner_type(owner_type)
@@ -10536,6 +10603,14 @@ class BusinessMixin:
         Raises:
             ValueError: If job not found or no fields supplied.
         """
+        # Every free-text argument through the one text gate (scoped
+        # review 2026-10-05, I-4): no control characters, GnuCash's
+        # column width.
+        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic"):
+            _check_text(
+                locals().get(_field),
+                _SLOT_TEXT_WIDTH if _field == "notes" else _TEXT_WIDTH, _field,
+            )
         if name is None and reference is None and active is None:
             raise ValueError(
                 "update_job requires at least one of name, "

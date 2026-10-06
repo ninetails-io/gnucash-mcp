@@ -1219,3 +1219,334 @@ class TestScopedReviewStorage:
                 ],
                 trans_date=date(2026, 3, 2), check_duplicates=False,
             )
+
+
+# ── Scoped review of 2026-10-05: money and input findings ───────────
+
+
+class TestScopedReviewMoney:
+    def test_the_dashboard_budget_line_agrees_with_the_report(self, test_book):
+        """M-1: both convert each month's actuals at that month's
+        close; the headline kept one period-end rate."""
+        from tests.conftest import drop_transaction_prices
+
+        gb = GnuCashBook(str(test_book))
+        gb.create_account(
+            name="Euro Food", account_type="EXPENSE", parent="Expenses",
+            commodity="EUR",
+        )
+        year = date.today().year
+        gb.create_budget(name="Year", year=year)
+        gb.set_budget_amount("Year", "Expenses:Euro Food", "100.00")
+        for month, rate in ((1, "1.0"), (2, "1.4")):
+            gb.create_transaction(
+                description=f"Food {month}", splits=[
+                    {"account": "Expenses:Euro Food", "amount": str(100 * float(rate)),
+                     "quantity": "100.00"},
+                    {"account": "Assets:Checking", "amount": str(-100 * float(rate))},
+                ],
+                trans_date=date(year, month, 15), check_duplicates=False,
+            )
+        drop_transaction_prices(test_book)
+        for month, rate in ((1, "1.0"), (2, "1.4"), (12, "2.0")):
+            gb.create_price(
+                commodity="EUR", namespace="CURRENCY", value=rate,
+                price_date=date(year, month, 28),
+            )
+        if date.today() < date(year, 3, 1):
+            pytest.skip("needs February to have closed")
+        report = gb.get_budget_report(
+            budget_name="Year", period="ytd", compact=False,
+        )
+        actual = Decimal(str(report["totals"]["actual"]))
+        with gb.open(readonly=True) as book:
+            headline = gb._budget_headline(book, list(book.transactions))
+        assert headline is not None
+        assert headline["spent"] == actual.quantize(Decimal("1"))
+
+    def _three_euro_categories(self, gb, test_book, rate="1.0005"):
+        from tests.conftest import drop_transaction_prices
+
+        for name in ("Food", "Rent", "Fun"):
+            gb.create_account(
+                name=name, account_type="EXPENSE", parent="Expenses",
+                commodity="EUR",
+            )
+            gb.create_transaction(
+                description=name, splits=[
+                    {"account": f"Expenses:{name}", "amount": "10.00",
+                     "quantity": "10.00"},
+                    {"account": "Assets:Checking", "amount": "-10.00"},
+                ],
+                trans_date=date(2026, 3, 10), check_duplicates=False,
+            )
+        drop_transaction_prices(test_book)
+        gb.create_price(
+            commodity="EUR", namespace="CURRENCY", value=rate,
+            price_date=date(2026, 3, 31),
+        )
+
+    def test_flow_report_lines_add_up_and_granularities_agree(self, test_book):
+        """M-2: 10.00 three times at 1.0005 is 10.00, 10.00, 10.00 and
+        30.00, in the single table, the grouped table, and the
+        structured output alike."""
+        gb = GnuCashBook(str(test_book))
+        self._three_euro_categories(gb, test_book)
+        single = gb.spending_by_category(
+            start_date=date(2026, 1, 1), end_date=date(2026, 3, 31),
+            compact=False,
+        )
+        assert [c["amount"] for c in single["categories"]] == ["10.00"] * 3
+        assert single["total"] == "30.00"
+        table = gb.spending_by_category(
+            start_date=date(2026, 1, 1), end_date=date(2026, 3, 31),
+        )
+        assert "TOTAL" in table and "30.00" in table and "30.02" not in table
+        grouped = gb.spending_by_category(
+            start_date=date(2026, 1, 1), end_date=date(2026, 3, 31),
+            group_by="quarter",
+        )
+        assert "30.00" in grouped and "30.02" not in grouped
+        flow = gb.cash_flow(start_date=date(2026, 1, 1), end_date=date(2026, 3, 31))
+        assert "." in flow["outflows"]  # formatted, not a raw Decimal
+
+    def test_lot_gain_is_the_difference_of_its_rounded_parts(self, investment_book):
+        """M-3."""
+        gb = GnuCashBook(str(investment_book))
+        lot = gb.create_lot(account="Assets:Investments:VTSAX", title="Lot")
+        made = gb.create_transaction(
+            description="Buy 3 for 100", splits=[
+                {"account": "Assets:Investments:VTSAX", "amount": "100.00",
+                 "quantity": "3"},
+                {"account": "Assets:Checking", "amount": "-100.00"},
+            ],
+            trans_date=date(2026, 1, 15), check_duplicates=False,
+        )
+        split = next(
+            s["guid"] for s in gb.get_transaction(made["guid"])["splits"]
+            if s["account"].endswith("VTSAX")
+        )
+        gb.assign_split_to_lot(split_guid=split, lot_guid=lot["guid"])
+        gain = gb.calculate_lot_gain(lot["guid"], shares="1", sale_price="10.015")
+        proceeds, cost, capital = (
+            Decimal(gain[k]) for k in ("sale_proceeds", "cost_basis", "capital_gain")
+        )
+        assert proceeds == Decimal("10.02")  # a split value: half-up
+        assert capital == proceeds - cost
+
+    def test_a_desktop_amount_finer_than_the_currency_rounds(self):
+        """M-4: 1001/1000 in a USD schedule is 1.00 to Since-Last-Run."""
+        from gnucash_mcp.book.scheduling import SchedulingMixin
+
+        amount = SchedulingMixin._rational_amount
+        assert str(amount(1001, 1000, 100)) == "1.00"
+        assert str(amount(1005, 1000, 100)) == "1.01"
+        assert str(amount(10005, 1000, 1)) == "10"
+
+    def test_transaction_dates_bind_at_gnucashs_adjusted_neutral_time(self):
+        """M-5: the stored stamp follows _neutral_time, not a flat
+        10:59, so a far zone reads the day back correctly."""
+        from datetime import datetime, timezone
+
+        from piecash.sa_extra import _DateAsDateTime
+
+        from gnucash_mcp.book._base import _neutral_time
+
+        d = date(2026, 1, 31)
+        bound = _DateAsDateTime(neutral_time=True).process_bind_param(d, None)
+        assert isinstance(bound, datetime) and bound.tzinfo is None
+        expected = _neutral_time(d).astimezone(timezone.utc).replace(tzinfo=None)
+        assert bound == expected
+
+
+class TestScopedReviewInput:
+    ESC = "x\x1b[31my"
+
+    def test_update_transactions_and_statements_gate_their_text(self, test_book):
+        """I-1."""
+        gb = GnuCashBook(str(test_book))
+        guid = _spend(gb)
+        out = gb.update_transactions([{"guid": guid, "description": self.ESC}])
+        assert "control character" in str(out)
+        assert gb.get_transaction(guid)["description"] == "Void probe"
+        with pytest.raises(ValueError, match="line 1: description contains a control"):
+            gb.enter_statement(
+                account_name="Assets:Checking", statement_date=date(2026, 6, 30),
+                opening_balance=str(gb.get_balance("Assets:Checking")),
+                closing_balance=str(gb.get_balance("Assets:Checking") - Decimal("5")),
+                lines=[{"ref": "1", "date": date(2026, 6, 1), "description": self.ESC,
+                        "amount": "-5.00", "account": "Expenses:Groceries"}],
+            )
+
+    def test_a_payments_wording_is_not_a_number(self, business_book):
+        """I-2: with Num on split actions, a batch row numbered 1234
+        against a recorded payment is still a HIGH duplicate."""
+        _num_on_split_actions(business_book)
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme")
+        inv = gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id=inv["id"], account="Income:Sales",
+            description="Work", quantity="1", price="100.00",
+        )
+        gb.post_invoice(inv["id"], AR, post_date="2026-05-01")
+        gb.pay_invoice(
+            invoice_id=inv["id"], payment_account="Assets:Checking",
+            amount="100.00", payment_date="2026-05-10",
+        )
+        result = gb.create_transactions([{
+            "ref": "1", "date": date(2026, 5, 10), "description": "Acme",
+            "num": "1234",
+            "splits": [
+                {"account": "Assets:Checking", "amount": "100.00"},
+                {"account": AR, "amount": "-100.00"},
+            ],
+        }])
+        assert "HIGH" in str(result) and "rejected" in str(result)
+        assert _q(
+            business_book,
+            "select count(*) from transactions where post_date like '2026-05-10%'",
+        ) == [(1,)]
+
+    def test_a_claim_cannot_annotate_a_posting_record(self, business_book):
+        """I-3: reconciling a posting is fine; writing its Num is an
+        edit of a read-only transaction."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_account(
+            name="Company Card", account_type="CREDIT", parent="Liabilities",
+        )
+        gb.create_employee(name="Dana")
+        voucher = gb.create_voucher(employee_id="000001")
+        gb.add_voucher_entry(
+            voucher_id=voucher["id"], account="Expenses:Services",
+            description="Hotel", quantity="1", price="60.00",
+        )
+        _q(business_book, "update employees set ccard_guid = "
+           "(select guid from accounts where name = 'Company Card')")
+        _q(business_book, "update entries set b_paytype = 2")
+        gb.post_invoice(
+            invoice_id=voucher["id"], post_account="Liabilities:Accounts Payable",
+            post_date="2026-05-01", owner_type="employee",
+        )
+        (card_split,) = _q(
+            business_book,
+            "select s.guid from splits s join accounts a on a.guid = s.account_guid "
+            "where a.name = 'Company Card'",
+        )[0]
+        with_num = gb.enter_statement(
+            account_name="Liabilities:Company Card",
+            statement_date=date(2026, 5, 31),
+            opening_balance="0", closing_balance="60.00",
+            lines=[{"ref": "1", "date": date(2026, 5, 1), "description": "Hotel",
+                    "amount": "60.00", "match": card_split, "num": "AUTH 1"}],
+            dry_run=False,
+        )
+        assert "posting record" in str(with_num)
+        assert _q(
+            business_book, "select num from transactions where num != ''",
+        ) == [(voucher["id"],)]
+
+    @pytest.mark.parametrize("field", [
+        "customer name", "customer address", "invoice notes", "entry description",
+        "job name", "budget name", "schedule name", "schedule memo",
+        "lot title", "commodity fullname", "account description", "slot value",
+    ])
+    def test_every_free_text_field_refuses_a_control_character(
+        self, business_book, field,
+    ):
+        """I-4."""
+        gb = GnuCashBook(str(business_book))
+        bad = self.ESC
+        with pytest.raises(ValueError, match="control character"):
+            if field == "customer name":
+                gb.create_customer(name=bad)
+            elif field == "customer address":
+                gb.create_customer(name="Acme", address={"addr1": bad})
+            elif field == "invoice notes":
+                gb.create_customer(name="Acme")
+                gb.create_invoice(customer_id="000001", notes=bad)
+            elif field == "entry description":
+                gb.create_customer(name="Acme")
+                inv = gb.create_invoice(customer_id="000001")
+                gb.add_invoice_entry(
+                    invoice_id=inv["id"], account="Income:Sales",
+                    description=bad, quantity="1", price="1",
+                )
+            elif field == "job name":
+                gb.create_customer(name="Acme")
+                gb.create_job(owner_id="000001", owner_type="customer", name=bad)
+            elif field == "budget name":
+                gb.create_budget(name=bad, year=2026)
+            elif field == "schedule name":
+                gb.create_scheduled_transaction(
+                    name=bad, description="x",
+                    splits=[{"account": "Expenses:Services", "amount": "1"},
+                            {"account": "Assets:Checking", "amount": "-1"}],
+                    start_date="2026-01-01", frequency="monthly",
+                )
+            elif field == "schedule memo":
+                gb.create_scheduled_transaction(
+                    name="ok", description="x",
+                    splits=[{"account": "Expenses:Services", "amount": "1", "memo": bad},
+                            {"account": "Assets:Checking", "amount": "-1"}],
+                    start_date="2026-01-01", frequency="monthly",
+                )
+            elif field == "lot title":
+                gb.create_commodity(mnemonic="ZZ1", fullname="Zed Fund", namespace="FUND")
+                gb.create_account(name="Fund", account_type="MUTUAL", parent="Assets",
+                                  commodity="ZZ1", commodity_namespace="FUND")
+                gb.create_lot(account="Assets:Fund", title=bad)
+            elif field == "commodity fullname":
+                gb.create_commodity(mnemonic="ZZZ", fullname=bad)
+            elif field == "account description":
+                gb.create_account(name="Dining", account_type="EXPENSE",
+                                  parent="Expenses", description=bad)
+            elif field == "slot value":
+                gb.set_account_slot("Expenses:Services", "color", bad)
+
+    def test_lookalikes_by_script(self, test_book):
+        """I-5, I-6, I-7: a joiner that draws something keeps a name
+        distinct; one that draws nothing does not; blanks that are not
+        spaces are not visible characters."""
+        gb = GnuCashBook(str(test_book))
+        ok = lambda n: gb.create_account(name=n, account_type="EXPENSE", parent="Expenses")  # noqa: E731
+        ok("Grocery Store")
+        ok("می‌خواهم"); ok("میخواهم")                 # Persian, with and without ZWNJ
+        ok("👨‍👩‍👧"); ok("👨👩👧")                  # a family, and three people
+        ok("🏴\U000e0067\U000e0062\U000e0065\U000e006e\U000e0067\U000e007f")
+        ok("🏴\U000e0067\U000e0062\U000e0073\U000e0063\U000e0074\U000e007f")
+        for twin in ("Groceries͏", "Groceries️", "Groceriesㅤ",
+                     "Grocery Store".replace(" Store", ""), "Gro‍ceries"):
+            with pytest.raises(ValueError, match="looks the same as|invisible"):
+                ok(twin)
+        for blank in ("ㅤ", "⠀⠀", "‍‌"):
+            with pytest.raises(ValueError, match="no visible characters"):
+                ok(blank)
+        # A move checks too.
+        gb.create_account(name="Holding", account_type="EXPENSE", parent="Expenses", placeholder=True)
+        gb.create_account(name="Gro‍ceries", account_type="EXPENSE", parent="Expenses:Holding")
+        with pytest.raises(ValueError, match="looks the same as"):
+            gb.move_account("Expenses:Holding:Gro‍ceries", "Expenses")
+
+    def test_list_accounts_and_the_dashboard_know_a_hidden_parent(self, test_book):
+        """I-12, I-13."""
+        from gnucash_mcp.book._base import _is_hidden
+
+        gb = GnuCashBook(str(test_book))
+        gb.create_account(name="Old Bank", account_type="BANK", parent="Assets", placeholder=True)
+        gb.create_account(name="Savings", account_type="BANK", parent="Assets:Old Bank")
+        gb.update_account("Assets:Old Bank", hidden=True)
+        listing = gb.list_accounts()
+        assert "Assets:Old Bank [PLACEHOLDER, HIDDEN]" in listing or "HIDDEN" in listing
+        with gb.open(readonly=True) as book:
+            child = gb._find_account(book, "Assets:Old Bank:Savings")
+            assert child.hidden in (0, None, False)
+            assert _is_hidden(child) is True
+
+    def test_the_fc20_warning_names_every_flipped_type(self):
+        """I-11."""
+        from gnucash_mcp.book._base import BaseGnuCashBook
+
+        text = BaseGnuCashBook._old_server_write_warning("1.4.4")
+        for word in ("income", "liability", "credit card", "payable", "equity"):
+            assert word in text

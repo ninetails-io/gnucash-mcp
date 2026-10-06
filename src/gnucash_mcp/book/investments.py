@@ -13,13 +13,14 @@ Depends on shared helpers from BaseGnuCashBook:
 """
 
 from datetime import date, datetime
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 
 import piecash
 from piecash.core.commodity import Price
 from piecash.core.transaction import Lot
 
 from gnucash_mcp.book._currency import _price_row_utc, _price_tie_rank
+from gnucash_mcp.book._base import _commodity_quantum
 from gnucash_mcp.book._base import (
     _format_account_amount,
     _lot_cache_flag,
@@ -37,12 +38,16 @@ from gnucash_mcp.book._base import (
     _to_date,
     _to_decimal,
     _unique_prefix,
+    _check_text,
+    _TEXT_WIDTH,
+    _SLOT_TEXT_WIDTH,
 )
 from gnucash_mcp._format import (
     _format_converted,
     _format_number,
     _format_price,
     _paginate,
+    _round_converted,
 )
 
 
@@ -238,6 +243,14 @@ class InvestmentsMixin:
         Raises:
             ValueError: If commodity already exists in that namespace.
         """
+        # Every free-text argument through the one text gate (scoped
+        # review 2026-10-05, I-4): no control characters, GnuCash's
+        # column width.
+        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic"):
+            _check_text(
+                locals().get(_field),
+                _SLOT_TEXT_WIDTH if _field == "notes" else _TEXT_WIDTH, _field,
+            )
         # Validate up front — useful errors instead of an
         # IntegrityError or silent corruption downstream.
         if not mnemonic or not mnemonic.strip():
@@ -1517,6 +1530,14 @@ class InvestmentsMixin:
         Raises:
             ValueError: If account not found.
         """
+        # Every free-text argument through the one text gate (scoped
+        # review 2026-10-05, I-4): no control characters, GnuCash's
+        # column width.
+        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic"):
+            _check_text(
+                locals().get(_field),
+                _SLOT_TEXT_WIDTH if _field == "notes" else _TEXT_WIDTH, _field,
+            )
 
         with self.open(readonly=False) as book:
             acct = self._resolve_account(book, account)
@@ -1872,7 +1893,16 @@ class InvestmentsMixin:
                 purchase_value_default * shares_to_sell
                 / raw["purchase_quantity"]
             )
-            proceeds = price * shares_to_sell
+            # Proceeds are what a sale split would store: rounded
+            # half-up to the currency, as a split is. The cost is a
+            # converted figure, rounded once. The gain is their
+            # difference, so the three lines agree (scoped review
+            # 2026-10-05, M-3).
+            quantum = _commodity_quantum(default_ccy)
+            proceeds = (price * shares_to_sell).quantize(
+                quantum, rounding=ROUND_HALF_UP,
+            )
+            cost_basis = _round_converted(cost_basis, default_ccy)
             gain = proceeds - cost_basis
             gain_pct = (gain / cost_basis * 100) if cost_basis else Decimal(0)
 

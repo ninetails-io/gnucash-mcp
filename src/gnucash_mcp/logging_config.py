@@ -1224,6 +1224,8 @@ def _fmt_transaction_void(entry: dict) -> list[str]:
         f"{time_part}  VOID TRANSACTION  guid:{guid}",
         f'{_INDENT}Reason: "{params.get("reason", "")}"',
     ]
+    if params.get("force"):
+        lines.append(f"{_INDENT}Forced: reconciled split(s) voided")
     if before:
         desc = before.get("description", "")
         date_str = before.get("date", "")
@@ -1402,7 +1404,9 @@ def _fmt_account_update(entry: dict) -> list[str]:
                 key, False if key == "hidden" else None,
             ):
                 lines.append(
-                    f"{_INDENT}{label}: {before.get(key)} → {after[key]}"
+                    f"{_INDENT}{label}: "
+                    f"{before.get(key, False if key == 'hidden' else None)} "
+                    f"→ {after[key]}"
                 )
         # ``notes`` is a diff-echo key: present in after_state only
         # when the update changed it ("" = cleared).

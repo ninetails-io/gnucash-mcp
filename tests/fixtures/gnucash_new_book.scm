@@ -60,7 +60,10 @@
         (add liab "Accounts Payable" 12 0)
         (add income "Sales" 8 0)
         (add expenses "Groceries" 9 0)
-        (add equity "Opening Balances" 10 0))
+        (let ((ob (add equity "Opening Balances" 10 0)))
+          ;; The New Account Hierarchy assistant marks it so
+          ;; (equity-type = opening-balance).
+          ((c void "xaccAccountSetIsOpeningBalance" '* int) ob 1)))
       ((c void "qof_session_save" '* '*) session %null-pointer)
       (let ((err ((c int "qof_session_get_error" '*) session)))
         ((c void "qof_session_end" '*) session)

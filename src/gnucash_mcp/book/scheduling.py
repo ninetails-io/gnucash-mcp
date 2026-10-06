@@ -47,6 +47,9 @@ from gnucash_mcp.book._base import (  # noqa: F401 — re-exported ports
     _verify_composite_write,
     _verify_delete,
     _verify_write,
+    _check_text,
+    _TEXT_WIDTH,
+    _SLOT_TEXT_WIDTH,
 )
 from gnucash_mcp._format import _paginate
 
@@ -465,12 +468,18 @@ class SchedulingMixin:
         places = len(str(denom)) - 1
         if denom == 10 ** places:
             # Never fewer places than the currency has: the editor
-            # stores 4200.00 reduced, as 4200/1.
+            # stores 4200.00 reduced, as 4200/1. Never more either:
+            # desktop stores "1.001" typed into a USD schedule as
+            # 1001/1000 and Since-Last-Run rounds it half-up to the
+            # currency; the server refused the instance (scoped
+            # review 2026-10-05, M-4).
             unit = len(str(fraction)) - 1
             if fraction == 10 ** unit and places < unit:
                 return Decimal(num).scaleb(-places).quantize(
                     Decimal(1).scaleb(-unit)
                 )
+            if fraction == 10 ** unit and places > unit:
+                return _entry_math.round_half_up(Fraction(num, denom), fraction)
             return Decimal(num).scaleb(-places)
         return _entry_math.round_half_up(Fraction(num, denom), fraction)
 
@@ -817,12 +826,23 @@ class SchedulingMixin:
             ValueError: If invalid frequency, accounts not found,
                        or splits don't balance.
         """
+        # Every free-text argument through the one text gate (scoped
+        # review 2026-10-05, I-4): no control characters, GnuCash's
+        # column width.
+        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic"):
+            _check_text(
+                locals().get(_field),
+                _SLOT_TEXT_WIDTH if _field == "notes" else _TEXT_WIDTH, _field,
+            )
         if frequency not in self.VALID_FREQUENCIES:
             raise ValueError(
                 f"Invalid frequency: {frequency}. "
                 f"Valid: {', '.join(sorted(self.VALID_FREQUENCIES))}"
             )
 
+        for leg in splits or []:
+            if isinstance(leg, dict):
+                _check_text(leg.get("memo"), _TEXT_WIDTH, "memo")
         parsed_start = date.fromisoformat(start_date)
         parsed_end = (
             date.fromisoformat(end_date) if end_date else None
@@ -1735,6 +1755,14 @@ class SchedulingMixin:
         Raises:
             ValueError: If not found.
         """
+        # Every free-text argument through the one text gate (scoped
+        # review 2026-10-05, I-4): no control characters, GnuCash's
+        # column width.
+        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic"):
+            _check_text(
+                locals().get(_field),
+                _SLOT_TEXT_WIDTH if _field == "notes" else _TEXT_WIDTH, _field,
+            )
         with self.open(readonly=False) as book:
             sx = self._find_scheduled_transaction(book, guid)
             if not sx:

@@ -10201,7 +10201,7 @@ class TestSpendingByCategory:
             end_date=date(2020, 1, 31),
         )
 
-        assert result["total"] == "0"
+        assert result["total"] == "0.00"
         assert result["categories"] == []
 
     def test_spending_by_category_nets_refunds(self, tmp_path: Path):
@@ -12279,7 +12279,7 @@ class TestMultiCurrencyBalances:
             end_date=date(2024, 12, 31),
             depth=2,
         )
-        assert result["total"] == "200"
+        assert result["total"] == "200.00"
         assert len(result["categories"]) == 1
         assert result["categories"][0]["account"] == "Expenses:Groceries"
 
@@ -12291,7 +12291,7 @@ class TestMultiCurrencyBalances:
             end_date=date(2024, 12, 31),
             depth=2,
         )
-        assert result["total"] == "3000"
+        assert result["total"] == "3000.00"
         assert len(result["sources"]) == 1
         assert result["sources"][0]["account"] == "Income:Salary"
 

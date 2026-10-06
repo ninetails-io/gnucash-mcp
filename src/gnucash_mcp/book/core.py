@@ -32,6 +32,7 @@ from gnucash_mcp._format import (
     _signal_strength,
     _split_match_verdict,
     _tsv_cell,
+    _period_label,
 )
 
 _debug_logger = logging.getLogger(DEBUG_LOGGER_NAME)
@@ -100,6 +101,8 @@ from gnucash_mcp.book._base import (
     _unique_prefix,
     _INVISIBLE_NAME_CHARS,
     _name_skeleton,
+    _is_hidden,
+    _check_control_chars,
 )
 
 
@@ -557,7 +560,7 @@ class CoreMixin:
             # dashboard, listed here as excluded. Hidden with money
             # still in it stays visible — that is itself a finding
             # (spec B3).
-            if account.hidden and self._own_splits_balance(
+            if _is_hidden(account) and self._own_splits_balance(
                 account, as_of=today,
             ) == 0:
                 results.append({
@@ -1468,7 +1471,7 @@ class CoreMixin:
                 balance = self._own_splits_balance(a, as_of=today)
                 # A hidden, zero-balance account is closed (spec
                 # B3): it doesn't put its commodity in use.
-                if a.hidden and balance == 0:
+                if _is_hidden(a) and balance == 0:
                     continue
                 in_use[c.guid] = c
                 if c.guid not in held and balance != 0:
@@ -1821,10 +1824,19 @@ class CoreMixin:
         bounds = candidate["bounds"]
         default_currency = self._require_default_currency(book)
 
-        # Targets FX-convert at the period-end rate — raw sums would
-        # be apples-to-oranges against default-currency actuals
-        # (mirrors get_budget_report).
-        factors = self._account_conversion_factors(book, period_end)
+        # A budget line is a FLOW figure: each actual converts at its
+        # own month's close and each target at the close of the month
+        # its period ends in, exactly as get_budget_report does
+        # (MM-12). This headline kept one period-end rate after the
+        # report moved, and the two disagreed on a multi-currency book
+        # (scoped review 2026-10-05, M-1).
+        monthly_factors = self._monthly_conversion_factors(
+            book, period_start, period_end,
+        )
+        period_end_month = {
+            p: _period_label(min(p_end, period_end), "month")
+            for p, (_p_start, p_end) in enumerate(bounds)
+        }
         total_budgeted = Decimal("0")
         targets_by_period: dict[int, Decimal] = {}
         budgeted_accounts: list = []
@@ -1835,7 +1847,9 @@ class CoreMixin:
             # income on its own side.
             if ba.account.type != "EXPENSE":
                 continue
-            factor = factors.get(ba.account.guid)
+            factor = monthly_factors.get(
+                period_end_month.get(ba.period_num, ""), {},
+            ).get(ba.account.guid)
             if factor is not None:
                 ba_amount = ba_amount * factor
             total_budgeted += ba_amount
@@ -1883,7 +1897,8 @@ class CoreMixin:
                 # net into the headline — same convention as
                 # get_budget_report's expenses side.
                 actuals += self._split_in_default_currency(
-                    s, s.account, factors.get(s.account.guid),
+                    s, s.account,
+                    self._monthly_factor(monthly_factors, txn, s.account),
                 )
 
         # Expected by today: elapsed periods in full, the current
@@ -4130,7 +4145,7 @@ class CoreMixin:
                 )
 
                 cand_nums = [txn.num] + (
-                    [s.action for s in txn.splits] if num_on_split else []
+                    self._num_bearing_actions(txn) if num_on_split else []
                 )
                 signal_str = (
                     ("D" if desc_match else "-")
@@ -5425,6 +5440,16 @@ class CoreMixin:
                     ln.get("link"), _SLOT_TEXT_WIDTH,
                     f"line {ln['ref']}: link",
                 )
+                # The same gate for every text a line carries, in the
+                # dry run, so the commit never rejects a line the
+                # rehearsal called NEW (scoped review 2026-10-05, I-1).
+                for field, width in (
+                    ("description", _TEXT_WIDTH), ("raw", _TEXT_WIDTH),
+                    ("notes", _SLOT_TEXT_WIDTH),
+                ):
+                    _check_text(
+                        ln.get(field), width, f"line {ln['ref']}: {field}",
+                    )
                 amounts[ln["ref"]] = amt
             for label, bal in (
                 ("opening_balance", opening),
@@ -5662,6 +5687,27 @@ class CoreMixin:
         )
 
     @staticmethod
+    def _num_bearing_actions(txn) -> list[str]:
+        """With Num on split actions, the actions that can carry a
+        number a person typed. The engine writes its own words into
+        actions — "Payment" on a payment's receivable leg, the
+        document ID on a posting's, "Lot Link" — and desktop
+        translates them, so they are told apart by what the
+        transaction IS (its ``trans-txn-type``: I, P, L) and by the
+        accounts GnuCash's business and stock code owns, not by the
+        word. Counting them as numbers made a real duplicate of a
+        payment score ``x`` and get created (scoped review
+        2026-10-05, I-2)."""
+        if str(txn.get("trans-txn-type") or "") in ("I", "P", "L"):
+            return []
+        return [
+            s.action for s in txn.splits
+            if s.account.type not in (
+                "RECEIVABLE", "PAYABLE", "TRADING", "STOCK", "MUTUAL",
+            )
+        ]
+
+    @staticmethod
     def _statement_cand_nums(split, num_on_split: bool) -> list[str]:
         """The numbers a statement candidate carries: the
         transaction's Num, plus, when the book keeps the register's
@@ -5670,8 +5716,11 @@ class CoreMixin:
         batch entry writes a number as desktop's CSV importer does;
         the batch screen reads both, so the statement screen must
         too, or a check entered by batch shows no number here."""
-        return [split.transaction.num] + (
-            [split.action] if num_on_split else []
+        txn = split.transaction
+        return [txn.num] + (
+            [split.action]
+            if num_on_split and split.action in
+            CoreMixin._num_bearing_actions(txn) else []
         )
 
     def _statement_prep_create(
@@ -6156,6 +6205,13 @@ class CoreMixin:
                     skipped.append((ln, s))
                     by_ref[ln["ref"]] = {"kind": "overlap", "split": s}
                 else:
+                    # Reconciling a document's posting is fine; writing
+                    # its Num, notes, memo or link is an edit of a
+                    # read-only transaction (scoped review, I-3).
+                    if any(ln.get(k) for k in ("raw", "notes", "num", "link")):
+                        self._refuse_posting_record(
+                            book, s.transaction, "annotate",
+                        )
                     claimed_guids.add(s.guid)
                     claims.append((ln, s))
                     by_ref[ln["ref"]] = {"kind": "claim", "split": s}
@@ -6734,6 +6790,7 @@ class CoreMixin:
 
     @classmethod
     def _validate_account_notes(cls, notes: str) -> None:
+        _check_control_chars(notes, "notes")
         byte_len = len(notes.encode("utf-8"))
         if byte_len > cls._ACCOUNT_NOTES_MAX_BYTES:
             raise ValueError(
@@ -6787,6 +6844,7 @@ class CoreMixin:
         # Validate the account name (shared chokepoint with
         # update_account's rename branch).
         self._validate_account_name(name)
+        _check_text(description, _TEXT_WIDTH, "description")
         if notes:
             self._validate_account_notes(notes)
 
@@ -6944,6 +7002,7 @@ class CoreMixin:
                 changed["name"] = new_name
 
             if description is not None and description != account.description:
+                _check_text(description, _TEXT_WIDTH, "description")
                 account.description = description
                 changed["description"] = description
 
@@ -7055,6 +7114,7 @@ class CoreMixin:
                     raise ValueError(
                         f"Account '{account.name}' already exists under '{new_parent}'"
                     )
+                self._refuse_lookalike_name(account.name, sibling.name, new_parent)
 
             account.parent = new_parent_account
 
@@ -7621,6 +7681,8 @@ class CoreMixin:
                         raise ValueError(
                             "row changes nothing — every cell empty"
                         )
+                    _check_text(u.get("description"), _TEXT_WIDTH, "description")
+                    _check_text(u.get("notes"), _SLOT_TEXT_WIDTH, "notes")
                     _check_text(u.get("num"), _TEXT_WIDTH, "num")
                     _check_text(u.get("link"), _SLOT_TEXT_WIDTH, "link")
                     txn = self._find_transaction(book, key)

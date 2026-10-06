@@ -736,6 +736,26 @@ _SLOT_TEXT_WIDTH = 4096
 _TAXTABLE_NAME_WIDTH = 50
 
 
+def _check_control_chars(value, what: str) -> None:
+    """Refuse a NUL (PostgreSQL rejects one outright; SQLite stores
+    the string but shows it cut off) and every other control
+    character: nothing a person types, and a terminal escape or a
+    backspace in a description rewrites what the next reader of the
+    register or the audit log sees. Tab, newline and carriage return
+    stay: notes are multi-line, and the row builders escape them
+    (IV-20). ``None`` and non-strings pass."""
+    if not isinstance(value, str):
+        return
+    if "\x00" in value:
+        raise ValueError(f"{what} contains a NUL character")
+    for ch in value:
+        code = ord(ch)
+        if (code < 0x20 and ch not in "\t\n\r") or 0x7F <= code <= 0x9F:
+            raise ValueError(
+                f"{what} contains a control character (U+{code:04X})"
+            )
+
+
 def _check_text(value, width: int, what: str) -> None:
     """Refuse text GnuCash's schema cannot hold: longer than the
     column, or carrying a NUL (PostgreSQL rejects one outright, and
@@ -744,19 +764,7 @@ def _check_text(value, width: int, what: str) -> None:
     C65 / IV-19 / IV-20."""
     if not isinstance(value, str):
         return
-    if "\x00" in value:
-        raise ValueError(f"{what} contains a NUL character")
-    # The other control characters: nothing a person types, and a
-    # terminal escape or a backspace in a description rewrites what
-    # the next reader of the register or the audit log sees. Tab,
-    # newline and carriage return stay: notes are multi-line, and the
-    # row builders escape them (IV-20, the remainder).
-    for ch in value:
-        code = ord(ch)
-        if (code < 0x20 and ch not in "\t\n\r") or 0x7F <= code <= 0x9F:
-            raise ValueError(
-                f"{what} contains a control character (U+{code:04X})"
-            )
+    _check_control_chars(value, what)
     if len(value) > width:
         raise ValueError(
             f"{what} is {len(value)} characters; GnuCash stores at "
@@ -778,16 +786,60 @@ _INVISIBLE_NAME_CHARS = frozenset(
 
 
 def _name_skeleton(name: str) -> str:
-    """What a name looks like: every format character (Unicode
-    category Cf: zero-width joiners, direction marks) dropped, then
-    NFC. Two names with one skeleton are indistinguishable on screen
-    (IV-21, the remainder)."""
+    """What a name looks like, for telling two apart (IV-21).
+
+    NFC, then every character that cannot show on its own is dropped
+    and every space-like character becomes one space. A joiner (ZWJ,
+    ZWNJ) is kept where it changes what is drawn — between Arabic,
+    Indic or emoji characters — and dropped between letters of
+    scripts where it draws nothing (Latin, Greek, Cyrillic); tag
+    characters stay, since they make one flag out of another. So a
+    Persian word with and without its ZWNJ, an emoji family and its
+    three members, and England's flag and Scotland's are different
+    names, while "Gro<ZWJ>ceries" is "Groceries" (scoped review
+    2026-10-05, I-5, I-6)."""
     import unicodedata
 
-    return unicodedata.normalize(
-        "NFC",
-        "".join(ch for ch in name if unicodedata.category(ch) != "Cf"),
-    )
+    text = unicodedata.normalize("NFC", name)
+    out = []
+    for i, ch in enumerate(text):
+        code = ord(ch)
+        if ch in ("\u200c", "\u200d"):
+            prev = text[i - 1] if i else ""
+            nxt = text[i + 1] if i + 1 < len(text) else ""
+            if _joiner_can_show(prev) or _joiner_can_show(nxt):
+                out.append(ch)
+            continue
+        if 0xE0000 <= code <= 0xE007F:  # tag characters
+            out.append(ch)
+            continue
+        if ch in _INVISIBLE_LOOKALIKES or unicodedata.category(ch) == "Cf":
+            continue
+        if unicodedata.category(ch) == "Zs":
+            out.append(" ")
+            continue
+        out.append(ch)
+    return "".join(out)
+
+
+# Characters that draw nothing or draw a blank and are not spaces:
+# the combining grapheme joiner, variation selectors, Hangul fillers,
+# the braille blank.
+_INVISIBLE_LOOKALIKES = frozenset(
+    "\u034f\u115f\u1160\u3164\uffa0\u2800"
+) | frozenset(chr(c) for c in range(0xFE00, 0xFE10))
+
+
+def _joiner_can_show(ch: str) -> bool:
+    """Does a ZWJ/ZWNJ next to ``ch`` change what is drawn? Yes for
+    anything outside the Latin, Greek and Cyrillic blocks and ASCII
+    punctuation: Arabic and Indic shaping, and emoji sequences."""
+    import unicodedata
+
+    if not ch or unicodedata.category(ch) in ("Cf", "Zs", "Cc"):
+        return False
+    code = ord(ch)
+    return code >= 0x0530 and not (0x1E00 <= code <= 0x1FFF)
 
 
 _PLAIN_NUMBER = re.compile(
@@ -1175,6 +1227,19 @@ def _slot_bool(entity, key: str) -> bool | None:
     return None
 
 
+def _is_hidden(account) -> bool:
+    """``xaccAccountIsHidden``: an account is hidden when it or any
+    ancestor carries the flag. The server read each account's own
+    flag, so hiding a parent left its children in the dashboard
+    (scoped review 2026-10-05, I-13)."""
+    a = account
+    while a is not None and a.type != "ROOT":
+        if a.hidden:
+            return True
+        a = a.parent
+    return False
+
+
 def _account_to_compact_line(account: piecash.Account) -> str:
     """Convert a piecash Account to a compact one-line string.
 
@@ -1197,6 +1262,8 @@ def _account_to_compact_line(account: piecash.Account) -> str:
         annotations.append(account.type)
     if account.placeholder:
         annotations.append("PLACEHOLDER")
+    if account.hidden:
+        annotations.append("HIDDEN")
 
     # Book text goes into a one-line row: escaped, so a name holding
     # a newline or tab cannot start a row of its own, and left
@@ -3002,8 +3069,8 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
             f"A server older than 1.5 has written to this book since "
             f"version {converted_by} converted it: it left shapes only "
             f"the old server writes, which were converted again. Budget "
-            f"amounts that server set on income, liability, or equity "
-            f"accounts are stored with the wrong sign and cannot be "
+            f"amounts that server set on income, liability, credit card, "
+            f"payable, or equity accounts are stored with the wrong sign and cannot be "
             f"told apart from correct ones; review them with "
             f"get_budget. Do not point both versions at one book."
         )
@@ -3024,8 +3091,9 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         return (
             f"An older server (1.4.x) wrote to this book after its "
             f"conversion (seen {when.isoformat()}): budget amounts it "
-            f"set on income, liability, or equity accounts may carry "
-            f"the wrong sign — review them with get_budget"
+            f"set on income, liability, credit card, payable, or equity "
+            f"accounts may carry the wrong sign — review them with "
+            f"get_budget"
         )
 
     def _upgrade_book_shapes(self, book) -> dict:
@@ -3763,6 +3831,7 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
     def _read_only_period_note(
         self, book, dates, action: str, threshold: "date | None" = None,
         dialog: "str | None" = None,
+        outcome: str = "its register will show this transaction as read-only",
     ) -> "str | None":
         """The one sentence every transaction write attaches when it
         touches the book's read-only period (review C69, ruled a
@@ -3804,8 +3873,7 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
                 f"read-only date {threshold.isoformat()} (the book "
                 f"option \"Day Threshold for Read-Only Transactions\" "
                 f"is {days} days). GnuCash's {dialog} does not check "
-                f"the option either; its register will show this "
-                f"transaction as read-only. Check that the closed "
+                f"the option either; {outcome}. Check that the closed "
                 f"period was meant to change"
             )
         return (

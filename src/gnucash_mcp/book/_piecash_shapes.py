@@ -65,7 +65,7 @@ from fractions import Fraction
 from piecash._common import GncValidationError
 from piecash.core.commodity import Price
 from piecash.core.transaction import Split, Transaction
-from piecash.sa_extra import pure_slot_property
+from piecash.sa_extra import _DateAsDateTime, pure_slot_property
 
 from gnucash_mcp.book._currency import (
     CurrencyMixin,
@@ -558,6 +558,28 @@ def _use_gnucash_slot_fillers() -> None:
     table.c.timespec_val.default = epoch
     epoch._set_parent_with_dispatch(table.c.timespec_val)
 
+
+_piecash_date_bind = _DateAsDateTime.process_bind_param
+
+
+def _date_bind(self, value, dialect):
+    """piecash binds a transaction's date at a flat 10:59 UTC. GnuCash
+    adjusts that stamp beyond UTC-10 / UTC+13 so it still reads as
+    the intended day locally (``_neutral_time``, review C25); the
+    server applied the adjustment to documents and prices but let
+    piecash stamp transactions, so in Pago Pago or on Kiritimati a
+    transaction decoded a day off and fell into the wrong period
+    (scoped review 2026-10-05, M-5)."""
+    if value is not None and self.neutral_time:
+        from datetime import timezone
+
+        from gnucash_mcp.book._base import _neutral_time
+
+        return _neutral_time(value).astimezone(timezone.utc).replace(tzinfo=None)
+    return _piecash_date_bind(self, value, dialect)
+
+
+_DateAsDateTime.process_bind_param = _date_bind
 
 _piecash_transaction_validate = Transaction.validate
 
