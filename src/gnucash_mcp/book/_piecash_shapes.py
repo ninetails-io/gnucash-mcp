@@ -47,6 +47,13 @@ Slot filler columns
 
     Both honor GnuCash's same-day rule: an existing price from a
     preferred source stays; otherwise the row is updated in place.
+
+``Transaction.doc_link``
+    piecash maps ``notes`` but not the register's other slot field,
+    the document link. ``xaccTransSetDocLink`` (Transaction.cpp)
+    keeps it in a string slot under its pre-4.x name ``assoc_uri``
+    and removes the slot when the link is set empty; the property
+    does both, through the same accessor piecash uses for notes.
 """
 
 from __future__ import annotations
@@ -57,7 +64,8 @@ from fractions import Fraction
 
 from piecash._common import GncValidationError
 from piecash.core.commodity import Price
-from piecash.core.transaction import Split
+from piecash.core.transaction import Split, Transaction
+from piecash.sa_extra import pure_slot_property
 
 from gnucash_mcp.book._currency import (
     CurrencyMixin,
@@ -551,6 +559,49 @@ def _use_gnucash_slot_fillers() -> None:
     epoch._set_parent_with_dispatch(table.c.timespec_val)
 
 
+_piecash_transaction_validate = Transaction.validate
+
+
+def _transaction_validate(self) -> None:
+    """piecash's ``Transaction.validate``, behind one refusal: in a
+    book with "Use Trading Accounts" on, a new or re-split transaction
+    whose splits span more than one commodity is refused, because the
+    trading splits piecash would add are not the rows GnuCash writes
+    (value and quantity at denominator 1; a payment's realized FX
+    split beside them where GnuCash books none) and the tree is found
+    by its English name. Wrong rows are a defect, a refusal is a
+    boundary (bookkeeper ruling 2026-10-05, item 3). Same-commodity
+    entries, edits that leave the splits alone, and deletes pass."""
+    old = self.get_all_changes()
+    if old["STATE_CHANGES"][-1] != "deleted" and (
+        "new" in old["STATE_CHANGES"] or hasattr(self, "_recalculate_balance")
+    ):
+        book = self.book
+        if book is not None and book.use_trading_accounts:
+            commodities = {
+                sp.account.commodity for sp in self.splits
+                if sp.account is not None and sp.account.type != "TRADING"
+            }
+            if len(commodities) > 1 or (
+                commodities and self.currency not in commodities
+            ):
+                names = ", ".join(sorted(c.mnemonic for c in commodities))
+                raise ValueError(
+                    f"This book uses trading accounts, and this "
+                    f"transaction spans more than one commodity "
+                    f"({names}). The server does not yet write the "
+                    f"trading splits GnuCash writes for it, so the "
+                    f"write is refused; nothing changed. Enter it in "
+                    f"GnuCash desktop. Same-currency entries are "
+                    f"unaffected."
+                )
+    _piecash_transaction_validate(self)
+
+
 _use_gnucash_slot_fillers()
 Price.validate = _price_validate
 Split.validate = _split_validate
+Transaction.validate = _transaction_validate
+# Transaction.cpp: doclink_uri_str = "assoc_uri" ("the old name for
+# the document link, kept for compatibility"). Set None to remove.
+Transaction.doc_link = pure_slot_property("assoc_uri")

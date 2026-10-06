@@ -279,9 +279,46 @@ class TestRedaction:
 # ── Reads and writes over a URI ───────────────────────────────────
 
 
+def _read_only_period_is_named(gb: GnuCashBook) -> None:
+    """The read-only-period warning's one query (a slot read by name)
+    on whatever backend ``gb`` is: the option stored as GnuCash
+    stores it, a double under options/Accounts, then one write on
+    each side of the date (review C69)."""
+    from datetime import timedelta
+
+    with gb.open(readonly=False) as book:
+        book["options"] = {"Accounts": {
+            "Day Threshold for Read-Only Transactions (red line)": 30.0,
+        }}
+        book.save()
+
+    def spend(days_ago: int) -> dict:
+        return gb.create_transaction(
+            description=f"Read-only probe {days_ago}",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "3.21"},
+                {"account": "Assets:Checking", "amount": "-3.21"},
+            ],
+            trans_date=date.today() - timedelta(days=days_ago),
+            check_duplicates=False,
+        )
+
+    def kinds(result: dict) -> list:
+        return [
+            w.get("type") for w in result.get("warnings", [])
+            if isinstance(w, dict)
+        ]
+
+    assert "read_only_period" in kinds(spend(40))
+    assert "read_only_period" not in kinds(spend(5))
+
+
 class TestUriBookOperations:
     def test_accounts_read_back(self, uri_book):
         assert "Assets:Checking" in uri_book.list_accounts()
+
+    def test_read_only_period_is_named(self, uri_book):
+        _read_only_period_is_named(uri_book)
 
     def test_write_round_trips(self, uri_book):
         result = uri_book.create_transaction(
@@ -898,6 +935,46 @@ class _RealDatabaseTests:
         listing = db_book.list_accounts()
         assert "Assets:Checking" in listing
         assert "Expenses:Groceries" in listing
+
+    def test_read_only_period_is_named(self, db_book):
+        _read_only_period_is_named(db_book)
+
+    def test_an_emoji_on_desktop_shaped_mysql_tables_is_refused_by_name(
+        self, db_book,
+    ):
+        """Side-finding 12. GnuCash desktop creates utf8mb3 tables;
+        piecash (this fixture) creates utf8mb4. Make ``transactions``
+        desktop's shape, and a four-byte character is refused before
+        the database is asked to store it."""
+        if db_book.source.backend != "mysql":
+            pytest.skip("utf8mb3 is MySQL's")
+        from sqlalchemy import text
+
+        def emoji_write():
+            return db_book.create_transaction(
+                description="Lunch \U0001F35C",
+                splits=[
+                    {"account": "Expenses:Groceries", "amount": "9.00"},
+                    {"account": "Assets:Checking", "amount": "-9.00"},
+                ],
+                trans_date=date(2026, 2, 2), check_duplicates=False,
+            )
+
+        def convert(charset):
+            with db_book.open(readonly=False) as book:
+                book.session.execute(text(
+                    f"ALTER TABLE transactions CONVERT TO CHARACTER SET {charset}"
+                ))
+            db_book._mysql_three_byte = None
+
+        convert("utf8mb3")
+        try:
+            with pytest.raises(ValueError, match="utf8mb3"):
+                emoji_write()
+            assert "Lunch" not in db_book.search_transactions("Lunch")
+        finally:
+            convert("utf8mb4")
+        assert emoji_write()["status"] == "created"
 
     def test_write_round_trips(self, db_book):
         result = db_book.create_transaction(

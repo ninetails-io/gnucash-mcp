@@ -25,8 +25,11 @@ from gnucash_mcp.logging_config import DEBUG_LOGGER_NAME
 from gnucash_mcp._format import (
     _candidate_comparison_tsv,
     _dry_run_summary,
-    _format_number,
+    _num_signal,
     _paginate,
+    _round_converted,
+    _signal_confidence,
+    _signal_strength,
     _split_match_verdict,
     _tsv_cell,
 )
@@ -81,8 +84,11 @@ from gnucash_mcp.book._base import (
     _is_voided,
     _lot_forget_flag,
     _money_precision_error,
+    _format_account_amount,
     _new_split,
+    _no_price_if_rounded,
     _set_split_amounts,
+    _split_from_validated,
     _split_amounts,
     _slot_bool,
     _slot_value_str,
@@ -92,6 +98,8 @@ from gnucash_mcp.book._base import (
     _transaction_to_compact_line,
     _transaction_to_dict,
     _unique_prefix,
+    _INVISIBLE_NAME_CHARS,
+    _name_skeleton,
 )
 
 
@@ -135,8 +143,8 @@ class _SummaryData:
     ``get_book_summary``, populated in one walk over ``book.accounts``
     by ``_collect_summary_balance_sheet``.
 
-    Totals are pre-rounded to 2 dp; per-leaf balances stay at native
-    precision so renderers can re-round. Internal — no caller outside
+    Every figure is pre-rounded to the book currency's unit (see
+    ``_collect_summary_balance_sheet``); renderers print as given. Internal — no caller outside
     get_book_summary and its renderers should depend on the shape.
     """
 
@@ -147,7 +155,7 @@ class _SummaryData:
     receivable_accts: list[tuple[str, Decimal]] = field(default_factory=list)
     payable_accts: list[tuple[str, Decimal]] = field(default_factory=list)
 
-    # Totals (pre-rounded to 2dp).
+    # Totals (pre-rounded to the currency's unit).
     assets_total: Decimal = Decimal("0")
     liabilities_total: Decimal = Decimal("0")
     receivables_total: Decimal = Decimal("0")
@@ -640,7 +648,7 @@ class CoreMixin:
             if outstanding_count:
                 outstanding = {
                     "outstanding_count": outstanding_count,
-                    "outstanding_value": str(outstanding_value),
+                    "outstanding_value": _format_account_amount(outstanding_value, account),
                     "outstanding_oldest_date":
                         outstanding_oldest_date.isoformat(),
                     "commodity": account.commodity.mnemonic,
@@ -688,7 +696,7 @@ class CoreMixin:
                         "status": f"through {latest_y_date.isoformat()}",
                         "days_behind": days_behind,
                         "unreconciled_count": unreconciled_count,
-                        "unreconciled_value": str(unreconciled_value),
+                        "unreconciled_value": _format_account_amount(unreconciled_value, account),
                         "commodity": account.commodity.mnemonic,
                         "latest_y_date": latest_y_date.isoformat(),
                         "oldest_unreconciled_date":
@@ -1139,6 +1147,16 @@ class CoreMixin:
                 f"dated more than a year ahead (latest "
                 f"{far_latest.isoformat()}) — likely a typo; "
                 f"search_transactions to inspect"
+            )
+        # An old server has written here since 1.5 converted the book
+        # (FC-20): its budget rows may carry the wrong sign.
+        try:
+            old_server = self._old_server_write_dashboard_line(book)
+            if old_server:
+                integrity.append(old_server)
+        except Exception as exc:
+            check_failures.append(
+                self._check_failed(book, "Old-server-write", exc)
             )
 
         # ── 2a. Overdrawn accounts ──
@@ -2489,10 +2507,9 @@ class CoreMixin:
                 # dashboard review, 2026-08-21).
                 value_part = ""
                 if "unreconciled_value" in entry:
-                    amt = Decimal(entry["unreconciled_value"])
+                    amt = entry["unreconciled_value"].lstrip("-")
                     value_part = (
-                        f" / {entry['commodity']} "
-                        f"{_format_number(abs(amt))} net"
+                        f" / {entry['commodity']} {amt} net"
                     )
                 out.append(
                     f"  {leaf}: {n} split{plural}{value_part} "
@@ -2513,12 +2530,12 @@ class CoreMixin:
                 continue
             leaf = entry["account"].split(":")[-1]
             n = entry["outstanding_count"]
-            amt = Decimal(entry["outstanding_value"])
+            amt = entry["outstanding_value"].lstrip("-")
             out.append(
                 f"  {leaf}: {n} outstanding item{'s' if n != 1 else ''} "
                 f"older than last reconcile (oldest "
                 f"{entry['outstanding_oldest_date']}, "
-                f"{entry['commodity']} {_format_number(abs(amt))} net)"
+                f"{entry['commodity']} {amt} net)"
             )
         if current_count:
             plural = "s" if current_count != 1 else ""
@@ -2740,9 +2757,25 @@ class CoreMixin:
                 if has_activity:
                     data.expense_active += 1
 
-        # Pre-round all totals once so renderers format directly.
+        # Every figure is a value in the book's currency: round each
+        # account's as GnuCash rounds a conversion (half-even, to the
+        # currency's unit; ``_round_converted``), and total the
+        # rounded figures as desktop's account tree does — so the
+        # renderers print what they are given, at the currency's own
+        # places (review C20: a BHD book read at two).
         def _r2(v: Decimal) -> Decimal:
-            return v.quantize(Decimal("0.01"))
+            return _round_converted(v, default_currency)
+
+        data.asset_leaves = [
+            (n, _r2(v), note) for n, v, note in data.asset_leaves
+        ]
+        for attr in (
+            "credit_cards", "other_liab_accts",
+            "receivable_accts", "payable_accts",
+        ):
+            setattr(data, attr, [
+                (n, _r2(v)) for n, v in getattr(data, attr)
+            ])
 
         data.receivables_total = _r2(
             sum((b for _, b in data.receivable_accts), Decimal("0"))
@@ -2971,7 +3004,7 @@ class CoreMixin:
         for name, usd_value, note in sorted(
             data.asset_leaves, key=lambda x: x[1], reverse=True
         ):
-            rounded = usd_value.quantize(Decimal("0.01"))
+            rounded = usd_value
             if note is None:
                 lines.append(f"  {name}: {currency} {rounded}")
             else:
@@ -3016,7 +3049,7 @@ class CoreMixin:
             all_liab_leaves.sort(key=lambda x: x[1], reverse=True)
             top_n = all_liab_leaves[:3]
             top_parts = [
-                f"{n} {currency} {b.quantize(Decimal('0.01'))}"
+                f"{n} {currency} {b}"
                 for n, b in top_n
             ]
             lines.append(
@@ -3061,7 +3094,7 @@ class CoreMixin:
             ):
                 lines.append(
                     f"  {name}: {currency} "
-                    f"{bal.quantize(Decimal('0.01'))}"
+                    f"{bal}"
                 )
         if data.payable_accts:
             bill_n = biz_counts["open_bills"]
@@ -3083,7 +3116,7 @@ class CoreMixin:
             ):
                 lines.append(
                     f"  {name}: {currency} "
-                    f"{bal.quantize(Decimal('0.01'))}"
+                    f"{bal}"
                 )
         return lines
 
@@ -3713,10 +3746,12 @@ class CoreMixin:
                 # prefixes stay valid _resolve_guid keys; cached by
                 # book mtime.
                 prefixes = self._transaction_prefix_map(book)
+                num_on_split = self._num_is_split_action(book)
                 lines = [indicator]
                 lines += [
                     _transaction_to_compact_line(
-                        t, focus_account=focus_fullname, prefixes=prefixes
+                        t, focus_account=focus_fullname, prefixes=prefixes,
+                        num_on_split=num_on_split,
                     )
                     for t in page
                 ]
@@ -3892,6 +3927,8 @@ class CoreMixin:
         want_duplicates: bool,
         want_recent: bool,
         trans_currency: str | None = None,
+        proposed_num: str | list[str] | None = None,
+        num_on_split: bool = False,
         sweep: list[tuple["piecash.Transaction", str]] | None = None,
         duplicate_window_days: int = 30,
         stability_days: int = 90,
@@ -3919,7 +3956,12 @@ class CoreMixin:
             want_stability: Warn when recent matches disagree on the
                 categorization pattern.
             want_duplicates: Score the ±window range on description,
-                amount, date; emit HIGH/MEDIUM candidates.
+                amount, date, and — when the proposal has a number —
+                Num; emit HIGH/MEDIUM candidates.
+            proposed_num: The proposal's number, or its numbers
+                (``_batch_row_nums``). A candidate's numbers are its
+                transaction num, plus every split action when
+                ``num_on_split`` (the book keeps Num there).
             want_recent: Keep top N matches for the post-write
                 split-consistency warning.
             sweep: A precomputed ``_signal_sweep(book)`` — pass it
@@ -4087,14 +4129,17 @@ class CoreMixin:
                     <= _MATCH_DATE_TIGHT_DAYS
                 )
 
-                signals = sum([desc_match, amount_match, date_match])
-                if signals >= 2:
-                    confidence = "HIGH" if signals == 3 else "MEDIUM"
-                    signal_str = (
-                        ("D" if desc_match else "-")
-                        + ("A" if amount_match else "-")
-                        + ("D" if date_match else "-")
-                    )
+                cand_nums = [txn.num] + (
+                    [s.action for s in txn.splits] if num_on_split else []
+                )
+                signal_str = (
+                    ("D" if desc_match else "-")
+                    + ("A" if amount_match else "-")
+                    + ("D" if date_match else "-")
+                    + _num_signal(proposed_num, cand_nums)
+                )
+                if _signal_strength(signal_str) >= 2:
+                    confidence = _signal_confidence(signal_str)
                     # Category (non-funding) legs, for the ruling-9
                     # self-contained comparison; all legs when
                     # filtering leaves nothing (transfers), same
@@ -4145,6 +4190,9 @@ class CoreMixin:
                         "currency_code": txn.currency.mnemonic,
                         "date": txn.post_date.isoformat(),
                         "description": txn.description,
+                        "num": ", ".join(
+                            n for n in dict.fromkeys(cand_nums) if n
+                        ),
                         "notes": txn.notes or "",
                         "categories": cat_legs,
                         "amount": str(primary_amount),
@@ -4481,8 +4529,9 @@ class CoreMixin:
 
                 confidence<TAB>guid<TAB>date<TAB>amount<TAB>cur<TAB>description<TAB>signals
 
-            Confidence is HIGH or MEDIUM; signals is a three-char
-            D/A/D code (description / amount / date, dash = no match).
+            Confidence is HIGH or MEDIUM; signals is a D/A/D code
+            (description / amount / date, dash = no match) — see
+            ``_format._num_signal`` for the fourth, Num, character.
 
         Raises:
             ValueError: imbalance, <2 splits, unknown account,
@@ -4631,9 +4680,8 @@ class CoreMixin:
                 # never call book.save().
                 if not readonly:
                     piecash_splits.append(
-                        _new_split(
-                            account, v["value"], v["quantity"],
-                            trans_currency,
+                        _split_from_validated(
+                            v, trans_currency,
                             memo=v["memo"] or "",
                             action=v["action"] or "",
                         )
@@ -4726,6 +4774,7 @@ class CoreMixin:
 
         Spec: specs/BATCH_TRANSACTION_ENTRY_SPEC.md. Each entry is
         ``{ref, date (date), description, notes (optional),
+        num (optional), link (optional — the document link),
         currency (optional ISO code — the row's transaction
         currency, defaulting to the book default),
         splits: [{account, amount, memo (optional),
@@ -4800,6 +4849,8 @@ class CoreMixin:
                         txn.get("description"), _TEXT_WIDTH, "description",
                     )
                     _check_text(txn.get("notes"), _SLOT_TEXT_WIDTH, "notes")
+                    _check_text(txn.get("num"), _TEXT_WIDTH, "num")
+                    _check_text(txn.get("link"), _SLOT_TEXT_WIDTH, "link")
                     try:
                         txn["date"] - timedelta(days=366)
                         txn["date"] + timedelta(days=366)
@@ -4865,6 +4916,8 @@ class CoreMixin:
                         "ref": ref,
                         "description": txn["description"],
                         "notes": txn.get("notes") or "",
+                        "num": txn.get("num") or "",
+                        "link": txn.get("link") or None,
                         "trans_date": txn["date"],
                         "currency": row_currency,
                         "validated": validated,
@@ -4890,6 +4943,7 @@ class CoreMixin:
                 return self._batch_envelope(transactions, by_ref, [])
 
             # --- Phase 2: duplicate screen (against existing book) ---
+            num_on_split = self._num_is_split_action(book)
             accepted = []
             for p in prepared:
                 p_cat_values = [
@@ -4908,6 +4962,8 @@ class CoreMixin:
                     want_auto_fill=False, want_stability=False,
                     want_duplicates=True, want_recent=False,
                     trans_currency=p["currency"].mnemonic,
+                    proposed_num=self._batch_row_nums(p, num_on_split),
+                    num_on_split=num_on_split,
                     sweep=_sweep(),
                 )
                 dups = signals.duplicates
@@ -4925,6 +4981,11 @@ class CoreMixin:
                     ]
                     proposal = {
                         "desc": p["description"],
+                        "num": ", ".join(dict.fromkeys(
+                            n for n in self._batch_row_nums(
+                                p, num_on_split,
+                            ) if n
+                        )),
                         "date": p["trans_date"],
                         # SIGNED primary (max-abs split's value) —
                         # the comparison table reads sign as
@@ -5102,20 +5163,25 @@ class CoreMixin:
             built = []
             for p, dup_count, _max_conf in accepted:
                 piecash_splits = [
-                    _new_split(
-                        v["account"], v["value"], v["quantity"],
-                        p["currency"], memo=v["memo"] or "",
+                    _split_from_validated(
+                        v, p["currency"], memo=v["memo"] or "",
                         action=v["action"] or "",
                     )
                     for v in p["validated"]
                 ]
+                # The num goes to transactions.num as desktop's CSV
+                # importer puts it (GncPreTrans::create_trans,
+                # xaccTransSetNum) — a batch row has no register
+                # account whose split could carry it instead.
                 txn_obj = piecash.Transaction(
                     currency=p["currency"],
                     description=p["description"],
+                    num=p["num"],
                     notes=p["notes"] or None,
                     post_date=p["trans_date"],
                     splits=piecash_splits,
                 )
+                txn_obj.doc_link = p["link"]
                 built.append((p, txn_obj, dup_count, _max_conf))
 
             # Single flush for the whole batch — per the "don't flush
@@ -5235,6 +5301,8 @@ class CoreMixin:
                 ),
                 "desc_new": prop["desc"],
                 "desc_old": d["description"],
+                "num_new": prop.get("num", ""),
+                "num_old": d.get("num", ""),
                 "notes_old": d.get("notes", ""),
                 "cat_new": CoreMixin._cats_str(prop["cats"]),
                 "cat_old": CoreMixin._cats_str(
@@ -5352,6 +5420,11 @@ class CoreMixin:
                 )
                 if error:
                     raise error
+                _check_text(ln.get("num"), _TEXT_WIDTH, f"line {ln['ref']}: num")
+                _check_text(
+                    ln.get("link"), _SLOT_TEXT_WIDTH,
+                    f"line {ln['ref']}: link",
+                )
                 amounts[ln["ref"]] = amt
             for label, bal in (
                 ("opening_balance", opening),
@@ -5483,13 +5556,18 @@ class CoreMixin:
             def _book_amount(ln) -> Decimal:
                 return (sign * amounts[ln["ref"]]).quantize(quantum)
 
+            # A candidate's numbers: _statement_cand_nums.
+            num_on_split = self._num_is_split_action(book)
+
             def _candidates_for(ln) -> list[dict]:
                 """DAD-style scoring against the account's own
                 splits. A candidate needs the amount signal alone
                 (the universe is narrow enough that an amount match
-                is meaningful — and the rent case has ONLY that), or
+                is meaningful — and the rent case has ONLY that),
                 desc+date without amount (the fix-the-book-typo
-                case)."""
+                case), or the same Num. A different Num rules a
+                candidate out as the same event: it can be neither
+                exact nor strong."""
                 target = _book_amount(ln)
                 probe = (
                     ln.get("description") or ln.get("raw") or ""
@@ -5514,8 +5592,13 @@ class CoreMixin:
                         bool(probe) and bool(tdesc)
                         and (probe in tdesc or tdesc in probe)
                     )
+                    num_char = _num_signal(
+                        ln.get("num"),
+                        self._statement_cand_nums(s, num_on_split),
+                    )
                     if not (
                         amount_match or (desc_match and date_match)
+                        or num_char == "N"
                     ):
                         continue
                     cands.append({
@@ -5524,13 +5607,16 @@ class CoreMixin:
                             ("D" if desc_match else "-")
                             + ("A" if amount_match else "-")
                             + ("D" if date_match else "-")
+                            + num_char
                         ),
                         # Exact = the same event, not the monthly
                         # pattern: amount to the quantum AND date
-                        # within the tight window. Drives the
-                        # OVERLAP class and the commit guard.
+                        # within the tight window, and no other
+                        # number on it. Drives the OVERLAP class and
+                        # the commit guard.
                         "exact": (
                             date_match
+                            and num_char != "x"
                             and s.quantity.quantize(quantum)
                             == target
                         ),
@@ -5560,6 +5646,33 @@ class CoreMixin:
                 force_base, force_duplicates, default_currency,
                 warn_rows=warn_rows,
             )
+
+    @staticmethod
+    def _batch_row_nums(p, num_on_split: bool) -> list[str]:
+        """A batch row's numbers, read the way a candidate's are
+        (``_collect_create_signals``): its Num cell, plus, when the
+        book keeps the register's Num on split actions, its ``act``
+        cells. With the option on, ``act`` on a leg IS that
+        register's Num, so a check numbered that way must count as
+        numbered, or a different check for the same amount on the
+        same day reads as an exact twin (bookkeeper report N-3)."""
+        return [p["num"] or ""] + (
+            [v.get("action") or "" for v in p["validated"]]
+            if num_on_split else []
+        )
+
+    @staticmethod
+    def _statement_cand_nums(split, num_on_split: bool) -> list[str]:
+        """The numbers a statement candidate carries: the
+        transaction's Num, plus, when the book keeps the register's
+        Num on split actions, this account's split action. With the
+        option on, the transaction's Num is desktop's T-Num, where
+        batch entry writes a number as desktop's CSV importer does;
+        the batch screen reads both, so the statement screen must
+        too, or a check entered by batch shows no number here."""
+        return [split.transaction.num] + (
+            [split.action] if num_on_split else []
+        )
 
     def _statement_prep_create(
         self, book, account, ln, book_amount, default_currency,
@@ -5732,6 +5845,7 @@ class CoreMixin:
         n_refuse = len(phase_a["errors"]) + len(phase_a["guards"])
 
         counts = {"NEW": 0, "MATCH": 0, "OVERLAP": 0, "AMBIGUOUS": 0}
+        num_on_split = self._num_is_split_action(book)
         line_rows: list[tuple] = []
         cand_rows: list[dict] = []
         projected = reconciled_balance.quantize(quantum)
@@ -5755,7 +5869,8 @@ class CoreMixin:
             # (bookkeeper findings, maiden flight + T6).
             strong = [
                 c for c in unrec
-                if sum(1 for ch in c["signals"] if ch != "-") >= 2
+                if _signal_strength(c["signals"]) >= 2
+                and "x" not in c["signals"]
                 and not c["recurring"]
             ]
             if strong:
@@ -5843,8 +5958,7 @@ class CoreMixin:
             if not show_all:
                 strong_listed = [
                     c for c in listed
-                    if sum(1 for ch in c["signals"] if ch != "-")
-                    >= 2
+                    if _signal_strength(c["signals"]) >= 2
                 ]
                 if strong_listed and len(strong_listed) < len(listed):
                     n_suppressed = len(listed) - len(strong_listed)
@@ -5861,13 +5975,10 @@ class CoreMixin:
                     for s2 in txn.splits
                     if s2.account.guid != account.guid
                 ]
-                risk = sum(1 for ch in c["signals"] if ch != "-")
                 cand_rows.append({
                     "ref": ln["ref"],
                     "candidate_guid": split_prefixes[s.guid],
-                    "confidence": {
-                        3: "HIGH", 2: "MEDIUM", 1: "LOW",
-                    }.get(risk, ""),
+                    "confidence": _signal_confidence(c["signals"]),
                     "state": s.reconcile_state,
                     "date_new": ln["date"].isoformat(),
                     "date_old": txn.post_date.isoformat(),
@@ -5883,6 +5994,12 @@ class CoreMixin:
                         ln.get("description") or ln.get("raw") or ""
                     ),
                     "desc_old": txn.description or "",
+                    "num_new": ln.get("num", ""),
+                    "num_old": " / ".join(dict.fromkeys(
+                        n for n in reversed(
+                            self._statement_cand_nums(s, num_on_split)
+                        ) if n
+                    )),
                     "notes_old": txn.notes or "",
                     "memo_old": s.memo or "",
                     "cat_new": (
@@ -6204,6 +6321,22 @@ class CoreMixin:
                 f"written."
             )
 
+        # The statement is the statement account's register: its
+        # Num goes where that register's Num cell puts it
+        # (gnc_set_num_action with the account's own split).
+        num_on_split = self._num_is_split_action(book)
+
+        def _num_of(split):
+            return (
+                split.action if num_on_split else split.transaction.num
+            ) or ""
+
+        def _set_num(split, num):
+            if num_on_split:
+                split.action = num
+            else:
+                split.transaction.num = num
+
         # Audit before-state: the claimed splits' prior annotations
         # and states, for the ENTER formatter's diffs.
         self._stage_audit_before({
@@ -6214,6 +6347,8 @@ class CoreMixin:
                     "state": s.reconcile_state,
                     "memo": s.memo or "",
                     "notes": s.transaction.notes or "",
+                    "num": _num_of(s),
+                    "link": s.transaction.doc_link or "",
                     "description": s.transaction.description or "",
                     "date": (
                         s.transaction.post_date.isoformat()
@@ -6232,15 +6367,18 @@ class CoreMixin:
                 s.memo = ln["raw"]
             if ln.get("notes"):
                 s.transaction.notes = ln["notes"]
+            if ln.get("num"):
+                _set_num(s, ln["num"])
+            if ln.get("link"):
+                s.transaction.doc_link = ln["link"]
             s.reconcile_state = "y"
             s.reconcile_date = rec_dt
 
         built = []
         for ln, validated, src in prepared:
             piecash_splits = [
-                _new_split(
-                    v["account"], v["value"], v["quantity"],
-                    default_currency, memo=v["memo"] or "",
+                _split_from_validated(
+                    v, default_currency, memo=v["memo"] or "",
                     action=v["action"] or "",
                 )
                 for v in validated
@@ -6258,6 +6396,9 @@ class CoreMixin:
             # part of the statement, so it lands reconciled.
             piecash_splits[0].reconcile_state = "y"
             piecash_splits[0].reconcile_date = rec_dt
+            if ln.get("num"):
+                _set_num(piecash_splits[0], ln["num"])
+            txn_obj.doc_link = ln.get("link") or None
             built.append((ln, txn_obj, src))
 
         # A statement commit is a reconcile: record it the way
@@ -6350,7 +6491,12 @@ class CoreMixin:
         Args:
             query: Search string. For 'amount': exact ("100.00"),
                 ">100", "<100", or range "100-200".
-            field: 'description', 'memo', 'notes', or 'amount'.
+            field: 'description', 'memo', 'notes', 'num', or
+                'amount'. 'num' matches what the book's register
+                calls Num: the transaction number, and — in a book
+                that keeps Num on split actions ("Use Split Action
+                Field for Number") — any split's action as well,
+                desktop's Find "Number/Action".
             limit: Page size. Capped at 250. ``0`` = count only.
             offset: 0-indexed first row to return.
             compact: One line per transaction (default) or a verbose
@@ -6359,10 +6505,13 @@ class CoreMixin:
         Raises:
             ValueError: If field is not valid.
         """
-        if field not in ("description", "memo", "notes", "amount"):
+        if field not in ("description", "memo", "notes", "num", "amount"):
             raise ValueError(f"Invalid search field: {field}")
 
         with self.open(readonly=True) as book:
+            num_on_split = (
+                field == "num" and self._num_is_split_action(book)
+            )
             # Whole-book scan: the template filter reads every
             # transaction's splits, the memo and amount modes every
             # split, the notes mode every transaction's slots — one
@@ -6395,6 +6544,16 @@ class CoreMixin:
                             matched.append(transaction)
                             break
 
+                elif field == "num":
+                    q = query.lower()
+                    if q in (transaction.num or "").lower() or (
+                        num_on_split and any(
+                            q in (s.action or "").lower()
+                            for s in transaction.splits
+                        )
+                    ):
+                        matched.append(transaction)
+
                 elif field == "amount":
                     if self._match_amount(transaction, query):
                         matched.append(transaction)
@@ -6415,9 +6574,13 @@ class CoreMixin:
             if compact:
                 # Prefix map cached by book mtime.
                 prefixes = self._transaction_prefix_map(book)
+                show_split_nums = self._num_is_split_action(book)
                 lines = [indicator]
                 lines += [
-                    _transaction_to_compact_line(t, prefixes=prefixes)
+                    _transaction_to_compact_line(
+                        t, prefixes=prefixes,
+                        num_on_split=show_split_nums,
+                    )
                     for t in page
                 ]
                 return "\n".join(lines)
@@ -6494,6 +6657,22 @@ class CoreMixin:
     }
 
     @staticmethod
+    def _refuse_lookalike_name(name: str, existing: str, parent: str) -> None:
+        """Refuse a name that reads exactly like a sibling's and is
+        stored differently (a zero-width joiner, a direction mark, a
+        decomposed accent): two "Groceries" lines nobody can tell
+        apart. Names already in a book are never touched."""
+        if name != existing and _name_skeleton(name) == _name_skeleton(
+            existing
+        ):
+            raise ValueError(
+                f"Account name {name!r} looks the same as "
+                f"{existing!r}, which already exists under "
+                f"'{parent}'; they differ only in invisible "
+                f"characters or in how an accent is encoded."
+            )
+
+    @staticmethod
     def _validate_account_name(name: str) -> None:
         """Validate a user-supplied account name.
 
@@ -6531,6 +6710,16 @@ class CoreMixin:
             raise ValueError(
                 f"Account name {name!r} begins or ends with whitespace."
             )
+        hidden = sorted({
+            f"U+{ord(ch):04X}" for ch in name if ch in _INVISIBLE_NAME_CHARS
+        })
+        if hidden:
+            raise ValueError(
+                f"Account name {name!r} contains invisible or "
+                f"direction-changing characters ({', '.join(hidden)})."
+            )
+        if not _name_skeleton(name).strip():
+            raise ValueError("Account name has no visible characters")
         if len(name) > _TEXT_WIDTH:
             raise ValueError(
                 f"Account name is {len(name)} characters; GnuCash "
@@ -6619,6 +6808,7 @@ class CoreMixin:
                     raise ValueError(
                         f"Account '{name}' already exists under '{parent_label}'"
                     )
+                self._refuse_lookalike_name(name, child.name, parent_label)
 
             # Determine commodity
             if commodity is None:
@@ -6693,6 +6883,7 @@ class CoreMixin:
         placeholder: bool | None = None,
         account_type: str | None = None,
         notes: str | None = None,
+        hidden: bool | None = None,
     ) -> dict:
         """Update an existing account's properties.
 
@@ -6701,6 +6892,9 @@ class CoreMixin:
             new_name: New name for the account (just the name, not full path).
             description: New description.
             placeholder: New placeholder status.
+            hidden: Hide or show the account. Written as desktop
+                writes it: the ``hidden`` slot ("true", or no slot)
+                and the account's column together.
             account_type: New account type (e.g., "CREDIT", "BANK"). Only
                 changes within the same debit/credit polarity family are
                 allowed (e.g., LIABILITY to CREDIT, ASSET to BANK).
@@ -6735,11 +6929,17 @@ class CoreMixin:
                 self._validate_account_name(new_name)
                 if account.parent:
                     for sibling in account.parent.children:
-                        if sibling.name == new_name and sibling.guid != account.guid:
+                        if sibling.guid == account.guid:
+                            continue
+                        if sibling.name == new_name:
                             raise ValueError(
                                 f"Account '{new_name}' already exists under "
                                 f"'{account.parent.fullname}'"
                             )
+                        self._refuse_lookalike_name(
+                            new_name, sibling.name,
+                            account.parent.fullname or "root",
+                        )
                 account.name = new_name
                 changed["name"] = new_name
 
@@ -6750,6 +6950,25 @@ class CoreMixin:
             if placeholder is not None and bool(placeholder) != bool(account.placeholder):
                 account.placeholder = _gnc_bool(placeholder)
                 changed["placeholder"] = bool(placeholder)
+
+            if hidden is not None:
+                # xaccAccountSetHidden (set_kvp_boolean_path): the
+                # string "true", or the slot removed. Desktop reads
+                # the slot and its SQL backend saves the column from
+                # it, so the two are written together and a slot
+                # that disagrees with the column is brought in step.
+                slot_says = "hidden" in account and (
+                    _slot_value_str(account["hidden"]) == "true"
+                )
+                if bool(hidden) != bool(account.hidden):
+                    account.hidden = _gnc_bool(hidden)
+                    changed["hidden"] = bool(hidden)
+                if hidden and not slot_says:
+                    account["hidden"] = "true"
+                    changed["hidden"] = True
+                elif not hidden and "hidden" in account:
+                    del account["hidden"]
+                    changed["hidden"] = False
 
             if notes is not None:
                 self._validate_account_notes(notes)
@@ -7126,6 +7345,8 @@ class CoreMixin:
         expected_description: str | None = None,
         expected_date: date | None = None,
         expected_notes: str | None = None,
+        expected_num: str | None = None,
+        expected_link: str | None = None,
         expected_splits: list[dict] | None = None,
     ) -> None:
         """Re-load the transaction from disk and verify expected
@@ -7166,6 +7387,16 @@ class CoreMixin:
                     f"Transaction write verification failed: "
                     f"notes on disk is {actual_notes!r}, "
                     f"expected {wanted!r}"
+                )
+
+        for what, actual, wanted in (
+            ("num", transaction.num or "", expected_num),
+            ("document link", transaction.doc_link or "", expected_link),
+        ):
+            if wanted is not None and actual != wanted:
+                raise RuntimeError(
+                    f"Transaction write verification failed: "
+                    f"{what} on disk is {actual!r}, expected {wanted!r}"
                 )
 
         if expected_splits is not None:
@@ -7213,6 +7444,15 @@ class CoreMixin:
                     _to_decimal(expected["quantity"])
                     if "quantity" in expected else None
                 )
+                if eq is not None:
+                    # Compare with what GnuCash stores: a share
+                    # quantity finer than the commodity's unit is
+                    # rounded on write (and reported). Comparing the
+                    # typed figure reported a committed update as a
+                    # failed one.
+                    eq = Decimal(str(_split_amounts(
+                        ev, eq, transaction.currency, resolved,
+                    )[1]))
                 # Consume the first split matching value (and quantity,
                 # when the caller specified it).
                 match_idx = next(
@@ -7345,7 +7585,8 @@ class CoreMixin:
         """Per-row transaction updates in one book-open / one save.
 
         Each entry: ``{guid, description (optional), notes
-        (optional), date (optional, datetime.date)}`` — absent keys
+        (optional), date (optional, datetime.date), num (optional),
+        link (optional — the document link)}`` — absent keys
         leave the field unchanged (the TSV's empty cells), while an
         explicit ``""`` clears (produced only by the TSV ``clear``
         column — an opt-in per-row declaration, so a sparse batch
@@ -7373,11 +7614,15 @@ class CoreMixin:
                 key = u["guid"]
                 try:
                     if not any(
-                        f in u for f in ("description", "notes", "date")
+                        f in u for f in (
+                            "description", "notes", "date", "num", "link",
+                        )
                     ):
                         raise ValueError(
                             "row changes nothing — every cell empty"
                         )
+                    _check_text(u.get("num"), _TEXT_WIDTH, "num")
+                    _check_text(u.get("link"), _SLOT_TEXT_WIDTH, "link")
                     txn = self._find_transaction(book, key)
                     if not txn:
                         raise ValueError(f"Transaction not found: {key}")
@@ -7427,6 +7672,13 @@ class CoreMixin:
                     txn.notes = u["notes"] or None
                 if "date" in u:
                     txn.post_date = u["date"]
+                # The register's T-Num cell: gnc_set_num_action(trans,
+                # NULL, num, NULL) is xaccTransSetNum whatever the
+                # book's num-source option says.
+                if "num" in u:
+                    txn.num = u["num"]
+                if "link" in u:
+                    txn.doc_link = u["link"] or None
 
             if prepared:
                 book.save()
@@ -7437,6 +7689,8 @@ class CoreMixin:
                     expected_description=u.get("description"),
                     expected_date=u.get("date"),
                     expected_notes=u.get("notes"),
+                    expected_num=u.get("num"),
+                    expected_link=u.get("link"),
                 )
                 by_key[u["guid"]] = {
                     "guid": u["guid"], "status": "updated",
@@ -7635,6 +7889,7 @@ class CoreMixin:
                     account_name = split.account.fullname
                     if account_name in split_updates:
                         v = split_updates[account_name]
+                        _no_price_if_rounded(split, v)
                         _set_split_amounts(
                             split, v["value"], v["quantity"],
                         )
@@ -7865,9 +8120,8 @@ class CoreMixin:
                 match = _claim(
                     carryover, v["account"].guid, v["value"], v["quantity"],
                 )
-                new_split = _new_split(
-                    v["account"], v["value"], v["quantity"],
-                    transaction.currency,
+                new_split = _split_from_validated(
+                    v, transaction.currency,
                     memo=v["memo"] or (match["memo"] if match else ""),
                     action=v["action"] or (match["action"] if match else ""),
                     transaction=transaction,

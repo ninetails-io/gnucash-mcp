@@ -465,6 +465,8 @@ _NO_STRIP_NEEDED = {
         "reaches the del",
     ("core.py", 'del account["notes"]'):
         "notes is a string slot (Account.cpp set_kvp_string_path)",
+    ("core.py", 'del account["hidden"]'):
+        "hidden is a string slot (Account.cpp set_kvp_boolean_path)",
     ("reconciliation.py", "del split[key]"):
         "void-former-amount / void-former-value: numeric slots",
     ("reconciliation.py", 'del transaction["void-former-notes"]'):

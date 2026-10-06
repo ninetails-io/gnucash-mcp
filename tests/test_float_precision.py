@@ -321,7 +321,7 @@ class TestScheduledSplitsPersistedAsStrings:
                 ),
             ).fetchall()
         assert sorted((n, d) for _, n, d in numerics) == [
-            (0, 100), (0, 100), (9487, 100), (9487, 100),
+            (0, 1), (0, 1), (9487, 100), (9487, 100),
         ]
         assert sorted(f[0] for f in formulas) == ["94.87", "94.87"]
         # And the recipe balances exactly when read back.

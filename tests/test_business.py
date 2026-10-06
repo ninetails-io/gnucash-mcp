@@ -9820,6 +9820,56 @@ class TestPayInvoiceEarlyPaymentDiscount:
         assert "discount_expired" in result
         assert "discount_available" not in result
 
+    def test_discount_window_counts_from_post_date(self, business_book):
+        """C46: a document opened weeks before it is posted keeps its
+        whole discount window, counted from the posting date as the
+        due date is. Anchored on date_opened, the window had closed
+        before the document existed in A/R."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_billterm(
+            name="2/10 Net 30", due_days=30,
+            discount_days=10, discount_percent="2",
+        )
+        gb.create_invoice(
+            customer_id="000001", term="2/10 Net 30",
+            date_opened="2026-05-01",
+        )
+        gb.add_invoice_entry(
+            invoice_id="000001", account="Income:Sales",
+            description="Consulting", quantity="1", price="1000.00",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+            post_date="2026-06-01",
+        )
+        result = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="980",
+            payment_date="2026-06-08",
+            apply_discount=True,
+        )
+        assert result["status"] == "paid"
+        assert Decimal(result["discount"]["amount"]) == Decimal("20.00")
+
+    def test_discount_window_on_a_proximo_term(self):
+        """A proximo term's discount days name a day of the month,
+        through the same compute_time as its due days."""
+        from types import SimpleNamespace
+        from gnucash_mcp.book.business import BusinessMixin
+        term = SimpleNamespace(
+            type=BusinessMixin._TERM_TYPE_PROXIMO,
+            duedays=20, discountdays=10, cutoff=19,
+        )
+        assert BusinessMixin._billterm_discount_date(
+            term, date(2010, 6, 14),
+        ) == date(2010, 7, 10)
+        assert BusinessMixin._billterm_due_date(
+            term, date(2010, 6, 14),
+        ) == date(2010, 7, 20)
+
 
 # ============== _compute_fx_gain_loss Unit Tests ==============
 

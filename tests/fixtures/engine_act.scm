@@ -120,6 +120,42 @@
                             (gnc-pricedb-get-db book) price)))
                 (gnc-price-unref price)
                 (if added "ok" "rejected"))))))
+     ;; txn|path|from|to|amount|d|m|y|description|num|link
+     ;; path "import": desktop's CSV importer (xaccTransSetNum);
+     ;; path "register": the register's Num cell on the FROM
+     ;; account's split (gnc_set_num_action, engine-helpers.c).
+     ((string=? verb "txn")
+      (let ((from (xaccAccountLookup (list-ref fields 2) book))
+            (to (xaccAccountLookup (list-ref fields 3) book))
+            (amount (string->number (list-ref fields 4)))
+            (n (lambda (i) (string->number (list-ref fields i))))
+            (num (list-ref fields 9))
+            (link (list-ref fields 10)))
+        (if (or (null? from) (null? to))
+            "missing"
+            (let ((trans (xaccMallocTransaction book))
+                  (s1 (xaccMallocSplit book))
+                  (s2 (xaccMallocSplit book)))
+              (xaccTransBeginEdit trans)
+              (xaccTransSetCurrency trans (xaccAccountGetCommodity from))
+              (xaccTransSetDatePostedSecsNormalized
+               trans (gnc-dmy2time64-neutral (n 5) (n 6) (n 7)))
+              (xaccTransSetDescription trans (list-ref fields 8))
+              (xaccSplitSetParent s1 trans)
+              (xaccSplitSetAccount s1 from)
+              (xaccSplitSetValue s1 (- amount))
+              (xaccSplitSetAmount s1 (- amount))
+              (xaccSplitSetParent s2 trans)
+              (xaccSplitSetAccount s2 to)
+              (xaccSplitSetValue s2 amount)
+              (xaccSplitSetAmount s2 amount)
+              (if (string=? (list-ref fields 1) "register")
+                  (gnc-set-num-action trans s1 num #f)
+                  (xaccTransSetNum trans num))
+              (if (not (string-null? link))
+                  (xaccTransSetDocLink trans link))
+              (xaccTransCommitEdit trans)
+              "ok"))))
      (else "unknown"))))
 
 (define (renderer report-obj)

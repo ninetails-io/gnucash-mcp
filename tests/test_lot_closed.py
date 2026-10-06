@@ -165,7 +165,7 @@ class TestDesktopTouchedLots:
     def test_close_lot_refuses_a_balance(self, desktop_touched_book):
         gb = GnuCashBook(str(desktop_touched_book))
         lots = gb.list_lots(account="Assets:STK", compact=False)["lots"]
-        with pytest.raises(ValueError, match="still holds 10.0000 STK"):
+        with pytest.raises(ValueError, match="still holds 10 STK"):
             gb.close_lot(lots[0]["guid"])
 
     def test_close_lot_caches_one_on_a_zero_balance(self, desktop_touched_book):

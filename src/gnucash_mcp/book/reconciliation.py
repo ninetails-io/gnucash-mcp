@@ -557,24 +557,29 @@ class ReconciliationMixin:
                 result["warning"] = warning
             return result
 
-    def void_transaction(self, guid: str, reason: str) -> dict:
+    def void_transaction(
+        self, guid: str, reason: str, force: bool = False,
+    ) -> dict:
         """Void a transaction (proper accounting void, not delete).
 
         Preserves the transaction for audit, zeroes the split
         values, and stashes the originals in slots for unvoiding.
 
         Voiding reconciled splits breaks the affected accounts'
-        reconciliation balance. The void proceeds anyway — it's an
-        audit operation that must never be silently rejected (unlike
-        ``delete_transaction``, which gates on force) — and the
-        result carries a ``warning`` naming the affected accounts.
+        reconciliation balance, so it is refused unless ``force``,
+        the same gate as ``delete_transaction`` and
+        ``replace_splits`` (desktop's register asks before it
+        changes a reconciled split). A forced void carries a
+        ``warning`` naming the affected accounts.
 
         Args:
             guid: Transaction GUID to void.
             reason: Required for the audit trail.
+            force: Allow voiding a transaction with reconciled splits.
 
         Raises:
-            ValueError: If transaction not found or already voided.
+            ValueError: If transaction not found, already voided, or
+                reconciled and not forced.
         """
         if not reason or not reason.strip():
             raise ValueError("Void reason is required")
@@ -602,6 +607,9 @@ class ReconciliationMixin:
             # transaction!" A voided posting zeroes the split the
             # document's lot is measured from.
             self._refuse_posting_record(book, transaction, "void")
+            self._require_force_for_reconciled(
+                transaction, force, "Voiding",
+            )
 
             # Detect reconciled splits BEFORE zeroing — capture the
             # account names we'll cite in the warning.
@@ -675,9 +683,10 @@ class ReconciliationMixin:
         types a bracket-assigned Decimal as a NUMERIC slot and a str
         as a STRING slot (kvp.py ``slot()``), which is what makes the
         shapes line up with GnuCash's."""
-        former_notes = transaction.notes
-        if former_notes:
-            transaction["void-former-notes"] = former_notes
+        # xaccTransVoid copies the notes whenever the slot holds a
+        # string, an empty one included.
+        if "notes" in transaction:
+            transaction["void-former-notes"] = transaction.notes or ""
         transaction.notes = "Voided transaction"
         transaction["void-reason"] = reason
         transaction["void-time"] = self._gnc_void_time()
@@ -840,12 +849,14 @@ class ReconciliationMixin:
 
                 split.reconcile_state = "n"
 
+            # xaccTransUnvoid: the former notes come back when there
+            # are any; otherwise the notes stay as the void left them
+            # (GnuCash writes that text in the user's language, so it
+            # cannot be recognized and is not guessed at).
             former_notes = transaction.get("void-former-notes")
             if former_notes is not None:
                 transaction.notes = str(former_notes)
                 del transaction["void-former-notes"]
-            elif (transaction.notes or "") == "Voided transaction":
-                transaction.notes = None
             for key in ("void-reason", "void-time", "trans-read-only"):
                 if key in transaction:
                     del transaction[key]

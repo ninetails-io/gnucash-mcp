@@ -1238,6 +1238,12 @@ def _book_format_error(path: Path) -> str | None:
     call with a DatabaseError a non-developer can't decode.
     Unreadable files return None: the real open surfaces its own
     error with the existing error_type contract.
+
+    A SQLite file is then asked for its ``versions`` table
+    (``_book_tables_error``): a file that is not a GnuCash book, or
+    one last saved by GnuCash 2.6, used to pass startup and fail
+    every tool call with piecash's bare "Unsupported table versions"
+    (adversarial review 2026-09-30, FC-14).
     """
     try:
         with open(path, "rb") as fh:
@@ -1245,7 +1251,7 @@ def _book_format_error(path: Path) -> str | None:
     except OSError:
         return None
     if head.startswith(_SQLITE_MAGIC):
-        return None
+        return _book_tables_error(path)
     if head.startswith(b"\x1f\x8b") or head.lstrip().startswith(b"<?xml"):
         return (
             f"{path.name} is in GnuCash's XML format. Open it in "
@@ -1257,6 +1263,70 @@ def _book_format_error(path: Path) -> str | None:
         "format (unrecognized file header). In GnuCash, use "
         "File > Save As with the sqlite3 format, then pick the "
         "new file."
+    )
+
+
+def _book_tables_error(path: Path) -> str | None:
+    """Would piecash open this SQLite file's tables? The same
+    comparison piecash makes at open (``version_supported``, the
+    "Gnucash" rows aside), made once at startup so the answer comes
+    with something to do about it. None when the tables are a set
+    the server reads, and None when the file cannot be read at all:
+    the real open reports that."""
+    import sqlite3
+    from urllib.parse import quote
+
+    from piecash.core.session import version_supported
+
+    try:
+        con = sqlite3.connect(f"file:{quote(str(path))}?mode=ro", uri=True)
+        try:
+            has_table = con.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'versions'"
+            ).fetchone()
+            rows = con.execute(
+                "SELECT table_name, table_version FROM versions"
+            ).fetchall() if has_table else None
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return None
+    if rows is None:
+        return (
+            f"{path.name} is a SQLite file but not a GnuCash book (it "
+            "has no versions table). Pick the file GnuCash saves, in "
+            "the sqlite3 format."
+        )
+    book = {
+        name: version for name, version in rows if "Gnucash" not in name
+    }
+    matched = None
+    for release, tables in version_supported.items():
+        if book == {k: v for k, v in tables.items() if "Gnucash" not in k}:
+            matched = release
+            break
+    if matched is not None and matched != "2.6":
+        return None
+    if matched == "2.6":
+        return (
+            f"{path.name} was last saved by GnuCash 2.6 or older, and "
+            "its tables are in a form this server does not read. Open "
+            "it in GnuCash 3 or later and save it once; that upgrades "
+            "the file."
+        )
+    newest = version_supported[list(version_supported)[-1]]
+    differing = sorted(
+        name for name in set(book) | {
+            k for k in newest if "Gnucash" not in k
+        }
+        if book.get(name) != newest.get(name)
+    )
+    return (
+        f"{path.name} has GnuCash tables in versions this server does "
+        f"not read ({', '.join(differing[:6])}"
+        f"{', ...' if len(differing) > 6 else ''}). Open it in a "
+        "current GnuCash and save it, then try again."
     )
 
 
@@ -1510,7 +1580,25 @@ def _switch_book_impl(name: str) -> str:
                 _audit_line(f"FAILED → {target.name} (still on "
                             f"{previous.name})")
             except Exception:
-                pass  # original error is the actionable one
+                # Both failed: there is no audit file for the book
+                # the session is still on. The trail goes to stderr
+                # rather than nowhere, and the error says so (it was
+                # swallowed, and every later write went unrecorded:
+                # adversarial review 2026-09-30, DS-10).
+                from gnucash_mcp.logging_config import audit_to_stderr
+                if _logging_audit:
+                    audit_to_stderr()
+                    _audit_line(f"FAILED → {target.name} (still on "
+                                f"{previous.name}; audit file "
+                                f"unavailable, trail on stderr)")
+                    raise RuntimeError(
+                        f"Could not switch to {target.name}, and the "
+                        f"audit log for {previous.name} could not be "
+                        f"reopened either. Still on {previous.name}; "
+                        f"its audit entries go to the server's stderr "
+                        f"until a switch_book succeeds or the server "
+                        f"restarts."
+                    ) from None
         raise
     _audit_line(
         f"← now active (from "

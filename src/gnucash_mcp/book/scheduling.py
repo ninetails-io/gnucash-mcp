@@ -16,6 +16,7 @@ Depends on shared helpers from BaseGnuCashBook:
 
 from datetime import date, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from fractions import Fraction
 import uuid
 
 import piecash
@@ -363,7 +364,6 @@ class SchedulingMixin:
             ],
         )
         book.session.flush()
-        denom = currency.fraction
         for split, leg in zip(txn.splits, legs):
             label = f"template split for {leg['account'].fullname}"
             frame_guid = uuid.uuid4().hex
@@ -385,11 +385,15 @@ class SchedulingMixin:
                     KVP_Type.KVP_TYPE_STRING, label,
                     string_val=format(val, "f") if val else "",
                 )
+                # The SX editor stores what gnc_exp_parser returns,
+                # a reduced fraction (gnc_numeric_reduce): 4200.00 is
+                # 4200/1, 42.50 is 85/2, and the unused side is 0/1.
+                reduced = Fraction(val)
                 self._slot_insert(
                     book, frame_guid, f"{self._SX_FRAME}/{side}-numeric",
                     KVP_Type.KVP_TYPE_NUMERIC, label,
-                    numeric_val_num=int(val * denom),
-                    numeric_val_denom=denom,
+                    numeric_val_num=reduced.numerator,
+                    numeric_val_denom=reduced.denominator,
                 )
             if leg.get("quantity") is not None:
                 q = leg["quantity"]
@@ -456,12 +460,17 @@ class SchedulingMixin:
         summary`` down with it, on any book holding such a schedule,
         enabled or not (adversarial review 2026-09-30, C19).
         """
-        from fractions import Fraction
-
         from gnucash_mcp.book import _entry_math
 
         places = len(str(denom)) - 1
         if denom == 10 ** places:
+            # Never fewer places than the currency has: the editor
+            # stores 4200.00 reduced, as 4200/1.
+            unit = len(str(fraction)) - 1
+            if fraction == 10 ** unit and places < unit:
+                return Decimal(num).scaleb(-places).quantize(
+                    Decimal(1).scaleb(-unit)
+                )
             return Decimal(num).scaleb(-places)
         return _entry_math.round_half_up(Fraction(num, denom), fraction)
 
@@ -1585,8 +1594,13 @@ class SchedulingMixin:
         # Re-find by guid — the phase-1 ORM object detached when
         # its session closed.
         shapes: dict = {}
+        closed = None
         try:
             with self.open(readonly=False) as book:
+                closed = self._read_only_period_note(
+                    book, [txn_date], "",
+                    dialog="Since Last Run assistant",
+                )
                 sx = self._find_scheduled_transaction(book, guid)
                 if not sx:
                     # SX deleted concurrently between phases — the
@@ -1675,6 +1689,8 @@ class SchedulingMixin:
         if rate_notes:
             response["warnings"] = rate_notes
         response.update(shapes)
+        if closed and response["status"] != "rejected":
+            response["read_only_period"] = closed
         if txn_result.get("status") == "rejected":
             # Evidence that the rejection is the CORRECT outcome —
             # without it, the natural retry instinct re-triggers the

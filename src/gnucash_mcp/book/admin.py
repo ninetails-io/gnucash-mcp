@@ -64,7 +64,7 @@ _RESERVED_ACCOUNT_KEYS: dict[str, str] = {
     ),
     "hidden": (
         "a flag GnuCash keeps in step with the account record; "
-        "set it in GnuCash desktop"
+        "use update_account(hidden=...)"
     ),
 }
 

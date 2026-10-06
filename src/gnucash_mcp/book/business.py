@@ -48,6 +48,8 @@ from gnucash_mcp.book._base import (
 from gnucash_mcp._format import (
     _GROUP_BY_VALUES,
     _enumerate_periods,
+    _format_amount,
+    _format_exact,
     _format_grouped_tsv,
     _format_number,
     _paginate,
@@ -142,7 +144,7 @@ def _format_vendor_spending_compact(
         d = Decimal(s)
         if d == d.to_integral_value():
             return f"{currency} {int(d):,}"
-        return f"{currency} {d:,.2f}"
+        return f"{currency} {_format_exact(d)}"
 
     billed_strs = [_money(v["total_billed"]) for v in vendors_list]
     paid_strs = [_money(v["total_paid"]) for v in vendors_list]
@@ -210,7 +212,7 @@ def _format_outstanding_invoices_compact(rows: list[dict]) -> str:
         ccy = r.get("currency") or ""
         # Strip trailing zeros for compact display: "4200.00" → "4,200".
         amount_dec = Decimal(r.get("amount_due") or "0")
-        amount_str = f"{int(amount_dec):,}" if amount_dec == int(amount_dec) else f"{amount_dec:,.2f}"
+        amount_str = f"{int(amount_dec):,}" if amount_dec == int(amount_dec) else _format_exact(amount_dec)
         posted = r.get("date_posted") or "?"
         # Credit notes have no due date — they sit as available
         # credit until applied or refunded.
@@ -1122,15 +1124,13 @@ class BusinessMixin:
         if discount_days <= 0 or discount_pct <= 0:
             return None
 
-        # Use date_opened as the discount-window anchor — that's the
-        # invoice issuance date (what's printed on the invoice the
-        # customer received). date_posted is when it hit A/R, often
-        # the same day but not guaranteed; the customer's discount
-        # eligibility is measured from when they got the invoice.
-        anchor = inv.date_opened
-        if isinstance(anchor, datetime):
-            anchor = anchor.date()
-        eligible_until = anchor + timedelta(days=discount_days)
+        # The window runs from the posting date, by the same rule as
+        # the due date (C46): a window anchored on date_opened could
+        # close before the document was even posted.
+        posted = inv.date_posted
+        if isinstance(posted, datetime):
+            posted = posted.date()
+        eligible_until = self._billterm_discount_date(bt, posted)
 
         # Pre-tax principal for discount calculation. Catch the rare
         # corrupted-entries case the same way other callers do.
@@ -2053,7 +2053,10 @@ class BusinessMixin:
             if grand_total == int(grand_total):
                 amount_str = f"{ccy} {int(grand_total):,}".strip()
             else:
-                amount_str = f"{ccy} {grand_total:,.2f}".strip()
+                amount_str = (
+                    f"{ccy} "
+                    f"{_format_amount(grand_total, invoice.currency, separators=True)}"
+                ).strip()
         except (ValueError, AttributeError, TypeError):
             # Limited to the predictable shapes "?" is right for —
             # a bare ``except Exception`` would swallow programming
@@ -3120,16 +3123,46 @@ class BusinessMixin:
 
     @staticmethod
     def _billterm_due_date(term, post_date: date) -> date:
-        """``gncBillTermComputeDueDate``, ported verbatim from
+        """``gncBillTermComputeDueDate``: ``compute_time`` over the
+        term's due days. See ``_billterm_compute_time``."""
+        if term is None:
+            return post_date
+        return BusinessMixin._billterm_compute_time(
+            term, post_date, int(term.duedays or 0),
+        )
+
+    @staticmethod
+    def _billterm_discount_date(term, post_date: date) -> date:
+        """The last day of a term's early-payment window: the same
+        ``compute_time`` over the term's DISCOUNT days, from the same
+        posting date. GnuCash 5.12 computes no discount date (the
+        engine exports only ``gncBillTermComputeDueDate``), so this
+        is the server's rule, chosen to mean what the due date
+        means: a "2/10 net 30" window closes ten days after posting
+        as the due date falls thirty after, and on a proximo term the
+        discount days name a day of the month as the due days do.
+        Anchoring on ``date_opened`` let the window close before the
+        document was posted (review C46)."""
+        if term is None:
+            return post_date
+        return BusinessMixin._billterm_compute_time(
+            term, post_date, int(term.discountdays or 0),
+        )
+
+    @staticmethod
+    def _billterm_compute_time(term, post_date: date, days: int) -> date:
+        """``compute_time`` / ``compute_monthyear``, ported verbatim from
         GnuCash ``libgnucash/engine/gncBillTerm.c`` (stable, read
         2026-09-28): ``compute_time`` / ``compute_monthyear``. A
         port, not a reinterpretation — like ``_recurrence_next``
         and Recurrence.cpp — so the server and desktop's Due Bills
         Reminder name the same day.
 
-        - ``None`` terms: the posting date
-          (``if (!term) return post_date;``).
-        - **DAYS**: posting date + ``due_days``.
+        ``days`` is the term's due days or discount days; the
+        callers handle ``None`` terms (``if (!term) return
+        post_date;``).
+
+        - **DAYS**: posting date + ``days``.
         - **PROXIMO** (``compute_monthyear``): a ``cutoff`` of 0 or
           below is relative to the posting month's end (``cutoff +=
           gnc_date_get_last_mday(...)``: -3 is the 25th in February,
@@ -3149,9 +3182,7 @@ class BusinessMixin:
         """
         import calendar
 
-        if term is None:
-            return post_date
-        due_days = int(term.duedays or 0)
+        due_days = days
         term_type = term.type
         if term_type == BusinessMixin._TERM_TYPE_DAYS:
             return post_date + timedelta(days=due_days)
@@ -7691,7 +7722,15 @@ class BusinessMixin:
             # commodity differs from the transaction currency —
             # brokerage vocabulary on a client bill. Forward-only:
             # existing transactions are never rewritten to conform.
-            doc_action = type_string
+            #
+            # gnc_set_num_action (engine-helpers.c), which every one
+            # of these legs and the transaction's number go through
+            # in gncInvoicePostToAccount: with the book option "Use
+            # Split Action Field for Number" on, the document's ID is
+            # each split's action and the type is the transaction's
+            # number; off, the other way round (review C67).
+            num_on_split = self._num_is_split_action(book)
+            doc_action = inv.id if num_on_split else type_string
             ar_ap_split = _new_split(
                 post_acct, ar_ap_value,
                 _qty_for_split(post_acct, ar_ap_value), inv.currency,
@@ -7763,12 +7802,12 @@ class BusinessMixin:
                     if (term.refcount or 0) > 0:
                         term.refcount = term.refcount - 1
 
-            # num = invoice ID, matching GnuCash UI behavior
+            # num = invoice ID (the type, with Num on split actions).
             txn = piecash.Transaction(
                 currency=inv.currency,
                 description=txn_desc,
                 post_date=parsed_date,
-                num=inv.id,
+                num=type_string if num_on_split else inv.id,
                 splits=piecash_splits,
             )
 
@@ -7845,6 +7884,11 @@ class BusinessMixin:
                 result["fx_stale"] = max(
                     fx_stale_overrides, key=lambda m: m["age_days"]
                 )
+            closed = self._read_only_period_note(
+                book, [parsed_date], "", dialog="Post Invoice dialog",
+            )
+            if closed:
+                result["read_only_period"] = closed
         result.update(shapes)
         return result
 
@@ -8095,6 +8139,13 @@ class BusinessMixin:
                 )
             if link_txns:
                 result["links_removed"] = len(link_txns)
+            closed = self._read_only_period_note(
+                book,
+                [prev_post_date.date() if prev_post_date else None],
+                "", dialog="Unpost command",
+            )
+            if closed:
+                result["read_only_period"] = closed
             return result
 
     def pay_invoice(
@@ -8591,14 +8642,15 @@ class BusinessMixin:
 
                 eligible_until = disc_summary["eligible_until"]
                 if parsed_date > eligible_until:
-                    anchor = inv.date_opened
-                    if isinstance(anchor, datetime):
-                        anchor = anchor.date()
+                    posted = inv.date_posted
+                    if isinstance(posted, datetime):
+                        posted = posted.date()
                     raise ValueError(
                         f"Payment date {parsed_date.isoformat()} is "
                         f"beyond the billterm discount window "
-                        f"({disc_summary['discount_days']} days "
-                        f"from {anchor.isoformat()}; deadline was "
+                        f"(posted {posted.isoformat()}, "
+                        f"{disc_summary['discount_days']} discount "
+                        f"days; deadline was "
                         f"{eligible_until.isoformat()}). Pay without "
                         f"apply_discount for a normal late payment, "
                         f"or issue a credit note to formally write "
@@ -8965,11 +9017,18 @@ class BusinessMixin:
                 memo=memo,  # desktop puts the memo on both legs
                 action="Payment",
             )
+            # gncOwnerCreatePaymentLotSecs sends the transfer split
+            # alone through gnc_set_num_action(NULL, xfer_split, num,
+            # "Payment"): with Num on split actions its action is the
+            # payment's number, which this tool never has, so it is
+            # empty. The post-account split is "Payment" either way.
             bank_split = _new_split(
                 pay_acct, proposed[1]["value"], proposed[1]["quantity"],
                 txn_currency,
                 memo=memo,
-                action="Payment",
+                action=(
+                    "" if self._num_is_split_action(book) else "Payment"
+                ),
             )
             splits = [ar_ap_split, bank_split]
             if discount_split is not None:
@@ -9088,6 +9147,12 @@ class BusinessMixin:
             if total_paid is not None:
                 result["total_paid"] = str(total_paid)
             _attach_extras(result)
+            closed = self._read_only_period_note(
+                book, [parsed_date], "",
+                dialog="Process Payment dialog",
+            )
+            if closed:
+                result["read_only_period"] = closed
 
         result.update(shapes)
         return result
@@ -9286,6 +9351,13 @@ class BusinessMixin:
                 "currency": ccy,
                 "from_payments": used,
             }
+            closed = self._read_only_period_note(
+                book,
+                [date.fromisoformat(u["date"]) for u in used if u["date"]],
+                "", dialog="Process Payment dialog",
+            )
+            if closed:
+                result["read_only_period"] = closed
         result.update(shapes)
         return result
 
@@ -9723,6 +9795,12 @@ class BusinessMixin:
                 "apply_date": str(link_date),
                 "status": "applied",
             }
+            closed = self._read_only_period_note(
+                book, [link_date], "",
+                dialog="Process Payment dialog",
+            )
+            if closed:
+                result["read_only_period"] = closed
             # The stored applies-to link is provenance, not a
             # constraint — netting against whatever's open next is
             # the normal flow. When the applied target diverges
@@ -11126,6 +11204,7 @@ class BusinessMixin:
             partial_labels=_partial_period_labels(
                 start_date, end_date, group_by,
             ),
+            currency=default_currency,
         )
         if unconverted:
             mnem = default_currency.mnemonic

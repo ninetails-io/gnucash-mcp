@@ -59,6 +59,7 @@ REGISTRY: dict[str, tuple[KVP_Type, str]] = {
     "date-posted": (K.KVP_TYPE_GDATE, "Transaction.cpp xaccTransSetDatePostedGDate"),
     "notes": (K.KVP_TYPE_STRING, "Transaction.cpp trans_notes_str; Account.cpp 'notes'; gnc-lot.cpp 'notes'"),
     "from-sched-xaction": (K.KVP_TYPE_GUID, "Transaction.cpp GNC_SX_FROM"),
+    "assoc_uri": (K.KVP_TYPE_STRING, "Transaction.cpp doclink_uri_str, xaccTransSetDocLink (empty removes)"),
     # Void — Transaction.cpp xaccTransVoid, Split.cpp xaccSplitVoid
     "void-reason": (K.KVP_TYPE_STRING, "Transaction.cpp void_reason_str"),
     "void-time": (K.KVP_TYPE_STRING, "Transaction.cpp void_time_str, gnc_time64_to_iso8601_buff"),
@@ -69,6 +70,7 @@ REGISTRY: dict[str, tuple[KVP_Type, str]] = {
     "title": (K.KVP_TYPE_STRING, "gnc-lot.cpp gnc_lot_set_title"),
     # Accounts — Account.cpp
     "placeholder": (K.KVP_TYPE_STRING, "Account.cpp 'placeholder' (boolean stored as string)"),
+    "hidden": (K.KVP_TYPE_STRING, "Account.cpp xaccAccountSetHidden, set_kvp_boolean_path ('true' or no slot)"),
     "balance-limit": (K.KVP_TYPE_FRAME, "Account.cpp KEY_BALANCE_LIMIT; dialog-account.c gnc_ui_to_account leaves the empty frame on every account it saves"),
     "reconcile-info": (K.KVP_TYPE_FRAME, "Account.cpp KEY_RECONCILE_INFO"),
     "reconcile-info/last-date": (K.KVP_TYPE_GINT64, "Account.cpp xaccAccountSetReconcileLastDate (time64)"),

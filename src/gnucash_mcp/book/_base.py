@@ -44,6 +44,7 @@ from gnucash_mcp.book import _piecash_shapes  # noqa: F401,E402
 from gnucash_mcp.book._query import QueryMixin
 from gnucash_mcp._format import (
     _book_display_name,
+    _format_amount,
     _one_line,
     _parse_book_url,
     _tsv_cell,
@@ -101,6 +102,25 @@ _BUDGET_UNREVERSED_KEY = f"features/{_BUDGET_UNREVERSED_FEATURE}"
 # recognize (the bookkeeper's production book would not open).
 # Never released; migrated away on the next budget write.
 _BUDGET_UNREVERSED_BOGUS_KEY = "features/Budgets: sign reversal fixed"
+# The server's own marks, on the root account in its ``gnc-mcp`` frame
+# (never in GnuCash's ``features`` frame: a key GnuCash doesn't know
+# makes the book unopenable). ``converted-by``: the server version
+# that first ran the pre-1.5 converters on this book. ``old-server-
+# write``: the day a converting write last found a pre-1.5 shape in a
+# book already marked, which only a 1.4.x server (or older) writes;
+# that server's ``set_budget_amount`` stores magnitudes into a book
+# stamped for natural signs, and those rows carry no mark of their
+# own, so the finding is a warning to review them, never a rewrite
+# (review FC-20; bookkeeper ruling 2026-10-05, item 2).
+_CONVERTED_BY_KEY = "gnc-mcp/converted-by"
+_OLD_SERVER_WRITE_KEY = "gnc-mcp/old-server-write"
+# A converter count that only an OLD SERVER'S rows can produce: each
+# keys on a shape the old server alone wrote (the C9 / G-1 rule).
+_OLD_SERVER_FINGERPRINTS = (
+    "templates_migrated", "invoice_links_migrated", "voids_migrated",
+    "entries_normalized",
+)
+_OLD_SERVER_WARNING_DAYS = 30
 _BUDGET_UNREVERSED_DESCRIPTION = (
     "Store budget amounts unreversed (i.e. natural) signs "
     "(requires at least Gnucash 3.8)"
@@ -289,6 +309,9 @@ _READ_ONLY_DAYS_KEY = (
     "options/Accounts/"
     "Day Threshold for Read-Only Transactions (red line)"
 )
+# qofbookslots.h OPTION_SECTION_ACCOUNTS / OPTION_NAME_NUM_FIELD_SOURCE.
+# A boolean book option, stored as the string "t" when on.
+_NUM_SOURCE_KEY = "options/Accounts/Use Split Action Field for Number"
 
 
 def _future_statement_warning(statement_date: date) -> str | None:
@@ -410,6 +433,17 @@ def _commodity_quantum(commodity) -> Decimal:
     return Decimal(1) / Decimal(fraction)
 
 
+def _format_account_amount(value, account, *, separators: bool = False) -> str:
+    """An amount in an account's own commodity, printed as GnuCash's
+    ``gnc_account_print_info`` prints it: the account's unit
+    (``xaccAccountGetCommoditySCU``) sets the places."""
+    unit = _account_unit(account)
+    return _format_amount(
+        value, account.commodity,
+        fraction=int(Decimal(1) / unit), separators=separators,
+    )
+
+
 def _account_unit(account) -> Decimal:
     """An account's smallest quantity, as a Decimal quantum.
 
@@ -459,6 +493,30 @@ def _new_split(account, value, quantity, currency, **fields):
     return piecash.Split(
         account=account, value=value, quantity=quantity, **fields,
     )
+
+
+def _split_from_validated(v: dict, currency, **fields):
+    """``_new_split`` for one dict from ``_validate_transaction_splits``,
+    carrying its rounding forward: see ``_no_price_if_rounded``."""
+    split = _new_split(
+        v["account"], v["value"], v["quantity"], currency, **fields,
+    )
+    _no_price_if_rounded(split, v)
+    return split
+
+
+def _no_price_if_rounded(split, v: dict) -> None:
+    """A split whose quantity was rounded to its commodity's unit
+    implies no price. 0.00005 BTC on a four-decimal commodity is
+    stored as 0.0001, and the price the stored row implies is half
+    the rate the caller paid (side-finding 9: 20000 for a 40000
+    coin), which valuation would then count. The rounding is
+    reported (``quantity_rounded``); the day's rate is left to a
+    quote or a split that states it exactly."""
+    if v.get("quantity_as_entered") is not None:
+        from gnucash_mcp.book._piecash_shapes import SKIP_IMPLIED_PRICE_ATTR
+
+        setattr(split, SKIP_IMPLIED_PRICE_ATTR, True)
 
 
 def _set_split_amounts(split, value, quantity) -> None:
@@ -598,6 +656,35 @@ def _dialect_name(book) -> str:
     return book.session.get_bind().dialect.name
 
 
+# The table an INSERT or UPDATE writes to.
+_WRITE_TARGET = re.compile(
+    r"\s*(?:INSERT\s+(?:IGNORE\s+)?INTO|UPDATE)\s+`?([A-Za-z_]+)`?",
+    re.IGNORECASE,
+)
+
+
+def _first_four_byte_character(parameters) -> "str | None":
+    """The first character outside the Basic Multilingual Plane in a
+    statement's bound parameters (a dict, a sequence, or a list of
+    either for executemany), or None."""
+    if isinstance(parameters, str):
+        for ch in parameters:
+            if ord(ch) > 0xFFFF:
+                return ch
+        return None
+    if isinstance(parameters, dict):
+        parameters = parameters.values()
+    if isinstance(parameters, (list, tuple)) or hasattr(
+        parameters, "__iter__"
+    ) and not isinstance(parameters, (bytes, bytearray)):
+        for item in parameters:
+            if isinstance(item, (str, dict, list, tuple)):
+                found = _first_four_byte_character(item)
+                if found is not None:
+                    return found
+    return None
+
+
 def _rollback_if_aborted(session) -> bool:
     """Clear an aborted PostgreSQL transaction after a swallowed error.
 
@@ -658,11 +745,48 @@ def _check_text(value, width: int, what: str) -> None:
         return
     if "\x00" in value:
         raise ValueError(f"{what} contains a NUL character")
+    # The other control characters: nothing a person types, and a
+    # terminal escape or a backspace in a description rewrites what
+    # the next reader of the register or the audit log sees. Tab,
+    # newline and carriage return stay: notes are multi-line, and the
+    # row builders escape them (IV-20, the remainder).
+    for ch in value:
+        code = ord(ch)
+        if (code < 0x20 and ch not in "\t\n\r") or 0x7F <= code <= 0x9F:
+            raise ValueError(
+                f"{what} contains a control character (U+{code:04X})"
+            )
     if len(value) > width:
         raise ValueError(
             f"{what} is {len(value)} characters; GnuCash stores at "
             f"most {width}"
         )
+
+
+# Characters that are invisible or reorder the text around them and
+# have no use in a name: zero-width space, word joiner, BOM, and the
+# bidirectional embedding / override / isolate controls. ZWNJ and ZWJ
+# are NOT here (Persian and Indic spelling, and emoji sequences, need
+# them), nor the LRM / RLM marks; ``_name_skeleton`` catches a name
+# that differs from its sibling only by those.
+_INVISIBLE_NAME_CHARS = frozenset(
+    "\u200b\u2060\ufeff"
+    "\u202a\u202b\u202c\u202d\u202e"
+    "\u2066\u2067\u2068\u2069"
+)
+
+
+def _name_skeleton(name: str) -> str:
+    """What a name looks like: every format character (Unicode
+    category Cf: zero-width joiners, direction marks) dropped, then
+    NFC. Two names with one skeleton are indistinguishable on screen
+    (IV-21, the remainder)."""
+    import unicodedata
+
+    return unicodedata.normalize(
+        "NFC",
+        "".join(ch for ch in name if unicodedata.category(ch) != "Cf"),
+    )
 
 
 _PLAIN_NUMBER = re.compile(
@@ -988,6 +1112,9 @@ def _account_to_dict(account: piecash.Account) -> dict:
         "description": account.description or "",
         "placeholder": bool(account.placeholder),
     }
+    # Conditional, like notes: a visible account keeps its shape.
+    if account.hidden:
+        result["hidden"] = True
     # Account notes live in the "notes" slot — the same key GnuCash
     # desktop's account editor reads/writes. Conditional so
     # note-less accounts keep their original shape.
@@ -1291,8 +1418,12 @@ def _transaction_to_dict(
             for s in _ordered_splits(transaction)
         ],
     }
+    if transaction.num:
+        result["num"] = transaction.num
     if transaction.notes:
         result["notes"] = transaction.notes
+    if transaction.doc_link:
+        result["doc_link"] = transaction.doc_link
     return result
 
 
@@ -1361,23 +1492,37 @@ _SPLIT_COLLAPSE_THRESHOLD = 4
 _SPLIT_COLLAPSE_KEEP = 3
 
 
-def _format_one_split(split: piecash.Split, transaction: piecash.Transaction) -> str:
+def _format_one_split(
+    split: piecash.Split, transaction: piecash.Transaction,
+    num_on_split: bool = False,
+) -> str:
     """Render one split as ``account amount``, with cross-currency annotation.
 
     Shared between the full and collapsed split-list paths so the
-    per-split rendering stays consistent with history.
+    per-split rendering stays consistent with history. With
+    ``num_on_split`` (the book keeps the register's Num on split
+    actions), a leg's number follows it as `` #<number>``: it is the
+    Num that leg's account register shows.
     """
     account_name = _one_line(split.account.fullname)
     amount = split.quantity
+    tag = (
+        f" #{_one_line(split.action)}"
+        if num_on_split and split.action else ""
+    )
     if split.quantity != split.value:
         currency = transaction.currency.mnemonic
         commodity = split.account.commodity.mnemonic
-        return f"{account_name} {amount} {commodity} (={split.value} {currency})"
-    return f"{account_name} {amount}"
+        return (
+            f"{account_name} {amount} {commodity} "
+            f"(={split.value} {currency}){tag}"
+        )
+    return f"{account_name} {amount}{tag}"
 
 
 def _format_splits_collapsed(
     splits: list[piecash.Split], transaction: piecash.Transaction,
+    num_on_split: bool = False,
 ) -> str:
     """Render a split list, collapsing long tails.
 
@@ -1388,12 +1533,16 @@ def _format_splits_collapsed(
     incommensurable and produce misleading orderings.
     """
     if len(splits) <= _SPLIT_COLLAPSE_THRESHOLD:
-        return ", ".join(_format_one_split(s, transaction) for s in splits)
+        return ", ".join(
+            _format_one_split(s, transaction, num_on_split) for s in splits
+        )
 
     ranked = sorted(splits, key=lambda s: abs(s.value), reverse=True)
     kept = ranked[:_SPLIT_COLLAPSE_KEEP]
     more = len(splits) - _SPLIT_COLLAPSE_KEEP
-    shown = ", ".join(_format_one_split(s, transaction) for s in kept)
+    shown = ", ".join(
+        _format_one_split(s, transaction, num_on_split) for s in kept
+    )
     return f"{shown}, +{more} more"
 
 
@@ -1401,6 +1550,7 @@ def _transaction_to_compact_line(
     transaction: piecash.Transaction,
     focus_account: str | None = None,
     prefixes: dict[str, str] | None = None,
+    num_on_split: bool = False,
 ) -> str:
     """Convert a piecash Transaction to a compact tab-separated line.
 
@@ -1413,6 +1563,18 @@ def _transaction_to_compact_line(
     - **Register** (``focus_account`` set)::
 
           YYYY-MM-DD<TAB>guid<TAB>±Amount<TAB>Description<TAB>Other splits[, +N more]
+
+    Either shape then carries the notes cell when the transaction
+    has notes, and a labeled ``num:<number>`` cell when it has a
+    number.
+
+    ``num_on_split`` (the book option "Use Split Action Field for
+    Number"): the register's Num is each account's split action,
+    the transaction's own number desktop's T-Num. The register
+    shape's ``num:`` is then the focused account's split action,
+    and a ``tnum:`` cell carries the transaction's number; the
+    unfiltered shape tags each leg ``#<number>`` and labels the
+    transaction's number ``tnum:``.
 
       The checking-register view: column 3 is the signed impact on
       the filtered account (what a reconciler reads), whose own
@@ -1453,14 +1615,33 @@ def _transaction_to_compact_line(
             amt_str = str(focus_amt)
         else:
             amt_str = "0"
-        splits_str = _format_splits_collapsed(other_splits, transaction)
+        splits_str = _format_splits_collapsed(
+            other_splits, transaction, num_on_split,
+        )
         line = f"{date_str}\t{short}\t{amt_str}\t{desc}\t{splits_str}"
     else:
-        splits_str = _format_splits_collapsed(splits, transaction)
+        splits_str = _format_splits_collapsed(
+            splits, transaction, num_on_split,
+        )
         line = f"{date_str}\t{short}\t{desc}\t{splits_str}"
 
     if transaction.notes:
         line += f"\t{_tsv_cell(transaction.notes)}"
+    # Labeled, not positional: notes is already an optional trailing
+    # cell, and the number must never ride inside the description
+    # (auto-fill matches on description).
+    if not num_on_split:
+        if transaction.num:
+            line += f"\tnum:{_tsv_cell(transaction.num)}"
+        return line
+    if focus_account is not None:
+        register_nums = ", ".join(dict.fromkeys(
+            s.action for s in focus_splits if s.action
+        ))
+        if register_nums:
+            line += f"\tnum:{_tsv_cell(register_nums)}"
+    if transaction.num:
+        line += f"\ttnum:{_tsv_cell(transaction.num)}"
     return line
 
 
@@ -1939,6 +2120,8 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
             raise ValueError("max_retries must be at least 1")
 
         try:
+            if not readonly:
+                self._guard_three_byte_text(book)
             yield book
         finally:
             close_start = time.time()
@@ -1953,6 +2136,66 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
             book.session.get_bind().dispose()
             close_elapsed = (time.time() - close_start) * 1000
             debug_logger.debug(f"Book closed in {close_elapsed:.0f}ms")
+
+    def _guard_three_byte_text(self, book) -> None:
+        """On a MySQL/MariaDB book whose tables are ``utf8mb3``,
+        refuse a write carrying a character outside the Basic
+        Multilingual Plane, by name, before the database sees it.
+
+        GnuCash desktop creates its MySQL tables ``utf8mb3`` (three
+        bytes per character). An emoji is four: strict mode answers
+        with a raw "Incorrect string value" DataError, and without
+        strict mode the character is stored as ``?`` and the write
+        reports success. piecash's own tables are ``utf8mb4``, so the
+        suite's fixtures never see it (adversarial review 2026-09-30,
+        side-finding 12). Checked at the cursor, the one place every
+        ORM and raw-SQL write passes. The charset is read once per
+        book instance."""
+        if _dialect_name(book) != "mysql":
+            return
+        from sqlalchemy import event, text
+
+        narrow = getattr(self, "_mysql_three_byte", None)
+        if narrow is None:
+            try:
+                row = book.session.execute(
+                    text(
+                        "SELECT DISTINCT table_name "
+                        "FROM information_schema.columns "
+                        "WHERE table_schema = DATABASE() "
+                        "AND character_set_name IN ('utf8', 'utf8mb3')"
+                    )
+                ).fetchall()
+                # Per table: one book can hold both kinds (desktop's
+                # tables beside ones made later), and a write to a
+                # four-byte table is none of this guard's business.
+                narrow = frozenset(str(r[0]).lower() for r in row)
+            except Exception as e:
+                _rollback_if_aborted(book.session)
+                debug_logger.warning(
+                    f"MySQL charset check failed: {type(e).__name__}: {e}"
+                )
+                narrow = frozenset()
+            self._mysql_three_byte = narrow
+        if not narrow:
+            return
+
+        def refuse(conn, cursor, statement, parameters, context, many):
+            target = _WRITE_TARGET.match(statement)
+            if target is None or target.group(1).lower() not in narrow:
+                return
+            found = _first_four_byte_character(parameters)
+            if found is not None:
+                raise ValueError(
+                    f"This book's `{target.group(1)}` table is utf8mb3 "
+                    f"(as GnuCash desktop creates it) and cannot store the "
+                    f"character {found!r} (U+{ord(found):04X}). Remove "
+                    f"it and retry; nothing was written."
+                )
+
+        event.listen(
+            book.session.get_bind(), "before_cursor_execute", refuse,
+        )
 
     def _lock_holder_note(self) -> str:
         """Who holds a file book's lock, read from its ``gnclock``
@@ -2016,7 +2259,25 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         and leaves this one alone.
         """
         if self.source.is_file:
-            return {"sqlite_file": str(self.source.path)}
+            # One connection for the life of the open. piecash's
+            # engine uses NullPool for a SQLite file: every commit
+            # closes the connection and the next statement reconnects
+            # BY PATH. A book renamed or replaced in that instant (a
+            # sync client, a backup tool) then got a new, empty file
+            # at its old path, and the write that had just committed
+            # was reported as failed when its response was being
+            # built (adversarial review 2026-09-30, C28). StaticPool
+            # keeps the one descriptor, which follows the file.
+            # Nothing is reset when the connection is handed back:
+            # the session owns its transaction, and a reset on a
+            # shared connection would roll that transaction back.
+            from sqlalchemy.pool import StaticPool
+
+            return {
+                "sqlite_file": str(self.source.path),
+                "poolclass": StaticPool,
+                "pool_reset_on_return": None,
+            }
         return {"uri_conn": self.source.uri}
 
     def _find_account(self, book: piecash.Book, fullname: str) -> piecash.Account | None:
@@ -2723,6 +2984,46 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
                 out[key] = value
         return out
 
+    @staticmethod
+    def _root_slot_str(book, key: str) -> "str | None":
+        """A string slot on the root account, or None."""
+        try:
+            return _slot_value_str(book.root_account[key])
+        except KeyError:
+            return None
+
+    @staticmethod
+    def _old_server_write_warning(converted_by: str) -> str:
+        return (
+            f"A server older than 1.5 has written to this book since "
+            f"version {converted_by} converted it: it left shapes only "
+            f"the old server writes, which were converted again. Budget "
+            f"amounts that server set on income, liability, or equity "
+            f"accounts are stored with the wrong sign and cannot be "
+            f"told apart from correct ones; review them with "
+            f"get_budget. Do not point both versions at one book."
+        )
+
+    def _old_server_write_dashboard_line(self, book) -> "str | None":
+        """The dashboard's warning for _OLD_SERVER_WRITE_KEY, for
+        _OLD_SERVER_WARNING_DAYS after the last finding; None after
+        that (the audit log keeps the write that found it)."""
+        seen = self._root_slot_str(book, _OLD_SERVER_WRITE_KEY)
+        if not seen:
+            return None
+        try:
+            when = date.fromisoformat(seen)
+        except ValueError:
+            return None
+        if (date.today() - when).days > _OLD_SERVER_WARNING_DAYS:
+            return None
+        return (
+            f"An older server (1.4.x) wrote to this book after its "
+            f"conversion (seen {when.isoformat()}): budget amounts it "
+            f"set on income, liability, or equity accounts may carry "
+            f"the wrong sign — review them with get_budget"
+        )
+
     def _upgrade_book_shapes(self, book) -> dict:
         """Write path only: convert every pre-1.5 private shape in the
         book to GnuCash's own, posting nothing, and say what it did.
@@ -2745,6 +3046,7 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         ``voids_migrated``, ``book_stamped``, ``book_scrubbed``.
         """
         out: dict = {}
+        marked_before = self._root_slot_str(book, _CONVERTED_BY_KEY)
         # First, and before anything is converted: a snapshot of the
         # book as it stands (once per book; refuses the write if a
         # file book cannot be snapshotted). Absent when the backup
@@ -2796,16 +3098,35 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
                     out["book_stamped"] = _BUDGET_UNREVERSED_FEATURE
                 if st.get("scrubbed"):
                     out["book_scrubbed"] = True
+        # The book has been through the converters: mark it, once. A
+        # pre-1.5 shape found in a book already marked was written by
+        # an old server after the conversion (FC-20): say so here, and
+        # on the dashboard for a while (_OLD_SERVER_WRITE_KEY).
+        converted = {
+            k: v for k, v in out.items()
+            if k not in ("pre_upgrade_backup", "pre_upgrade_backup_existing")
+        }
         # A snapshot taken above for a book that then had nothing to
         # convert guarded nothing: withdraw it rather than leave a
         # "pre-1.5 upgrade" copy beside a book that was never
-        # upgraded.
-        taken = out.get("pre_upgrade_backup")
-        if taken is not None and len(out) == 1:
-            withdraw = getattr(self, "_withdraw_pre_upgrade_snapshot", None)
-            if withdraw is not None:
-                withdraw(taken)
-            return {}
+        # upgraded. The mark below is not a conversion.
+        taken = out.pop("pre_upgrade_backup", None)
+        if taken is not None:
+            if converted:
+                out["pre_upgrade_backup"] = taken
+            else:
+                withdraw = getattr(self, "_withdraw_pre_upgrade_snapshot", None)
+                if withdraw is not None:
+                    withdraw(taken)
+        if marked_before is None:
+            from gnucash_mcp import __version__
+            book.root_account[_CONVERTED_BY_KEY] = __version__
+            out["book_marked_converted"] = __version__
+        elif any(converted.get(k) for k in _OLD_SERVER_FINGERPRINTS):
+            book.root_account[_OLD_SERVER_WRITE_KEY] = date.today().isoformat()
+            out["old_server_write"] = self._old_server_write_warning(
+                marked_before,
+            )
         return out
 
     # ── Desktop's reconcile-info frame ─────────────────────────────
@@ -3405,8 +3726,33 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
             return None
         return date.today() - timedelta(days=days)
 
+    @staticmethod
+    def _num_is_split_action(book) -> bool:
+        """Whether the book's Num column is each split's action.
+
+        ``qof_book_use_split_action_for_num_field`` (qofbook.cpp):
+        true only when the option's string is exactly ``"t"``. With
+        it on, desktop's register writes what the user types in Num
+        to the register account's split action
+        (``gnc_set_num_action``, engine-helpers.c), and
+        ``transactions.num`` becomes the second-line T-Num."""
+        from sqlalchemy import text
+        try:
+            row = book.session.execute(
+                text(
+                    "SELECT string_val FROM slots "
+                    "WHERE name = :name AND slot_type = 4"
+                ),
+                {"name": _NUM_SOURCE_KEY},
+            ).fetchone()
+        except Exception:
+            _rollback_if_aborted(book.session)
+            raise
+        return row is not None and row[0] == "t"
+
     def _read_only_period_note(
         self, book, dates, action: str, threshold: "date | None" = None,
+        dialog: "str | None" = None,
     ) -> "str | None":
         """The one sentence every transaction write attaches when it
         touches the book's read-only period (review C69, ruled a
@@ -3421,7 +3767,13 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         moves a date passes both); ``action`` is the verb phrase
         ("entering a transaction", "voiding this transaction").
         Pass ``threshold`` when the caller read it once for a batch.
-        None when the book has no threshold or no date is before it."""
+        None when the book has no threshold or no date is before it.
+
+        ``dialog`` names the desktop window that does the same thing
+        WITHOUT checking the option (Post Invoice, Process Payment,
+        Since Last Run): the sentence then says that desktop would
+        have written it too, and that its register will show the
+        result read-only. ``action`` is unused in that form."""
         if threshold is None:
             threshold = self._read_only_before(book)
         if threshold is None:
@@ -3436,6 +3788,16 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         if not early:
             return None
         days = (date.today() - threshold).days
+        if dialog is not None:
+            return (
+                f"dated {early[0].isoformat()}, before the book's "
+                f"read-only date {threshold.isoformat()} (the book "
+                f"option \"Day Threshold for Read-Only Transactions\" "
+                f"is {days} days). GnuCash's {dialog} does not check "
+                f"the option either; its register will show this "
+                f"transaction as read-only. Check that the closed "
+                f"period was meant to change"
+            )
         return (
             f"dated {early[0].isoformat()}, before the book's "
             f"read-only date {threshold.isoformat()} (the book option "

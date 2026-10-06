@@ -9,6 +9,7 @@ Logs are stored alongside the GnuCash book file:
 import json
 import logging
 import os
+import stat
 import re
 import time
 from datetime import datetime, timezone
@@ -20,6 +21,7 @@ from gnucash_mcp._env import _env_errors, _parse_env_toggle
 from gnucash_mcp._format import (
     _URI_IN_TEXT_RE as _DB_URI_IN_TEXT_RE,
     _book_display_name,
+    _format_exact,
     _scrub_credentials,
 )
 
@@ -334,6 +336,59 @@ def _log_dir_identity(book_path: Path | str, identity: str | None) -> str:
         return str(book_path)
 
 
+def write_private_file(path: Path, text: str) -> None:
+    """Write a small state file under the log directory: to a temp
+    file created exclusively and without following a link, mode
+    0600, then renamed into place. ``open(tmp, "w")`` followed a
+    symlink planted at the temp name and overwrote whatever it
+    pointed at (adversarial review 2026-09-30, C53). A stale temp
+    file from a crashed write is removed first; the exclusive create
+    then fails loudly if something reappears in between."""
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        os.unlink(tmp)  # the link itself, never its target
+    except FileNotFoundError:
+        pass
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(tmp, flags, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def _check_mcp_dir_entry(mcp_dir: Path, alternative: str) -> None:
+    """An existing ``.mcp`` entry must be a real directory owned by
+    the current user: not a symlink, not another owner's. POSIX
+    only. ``alternative`` ends the refusal with what to do instead."""
+    if os.name != "posix":
+        return
+    try:
+        if not (mcp_dir.exists() or mcp_dir.is_symlink()):
+            return
+        if mcp_dir.is_symlink():
+            raise ValueError(
+                f"Refusing to use {mcp_dir}: path is a "
+                f"symlink. Logs/backups must live in a "
+                f"real directory you own; a symlink "
+                f"could redirect writes elsewhere. "
+                f"Remove or replace it, or {alternative}."
+            )
+        st = mcp_dir.stat()
+        if st.st_uid != os.geteuid():
+            raise ValueError(
+                f"Refusing to use {mcp_dir}: directory "
+                f"is owned by uid={st.st_uid}, not the "
+                f"current user (uid={os.geteuid()}). "
+                f"Logs/backups go to a directory you "
+                f"own; mismatched ownership suggests an "
+                f"earlier symlink/hijack attempt."
+            )
+    except FileNotFoundError:
+        pass
+
+
 def _read_log_dir_owner(mcp_dir: Path) -> str | None:
     try:
         return (mcp_dir / _LOG_DIR_OWNER_FILE).read_text(
@@ -357,8 +412,8 @@ def claim_log_dir(mcp_dir: Path, book_path: Path | str,
         if owner_file.exists():
             return
         mcp_dir.mkdir(parents=True, exist_ok=True)
-        owner_file.write_text(
-            _log_dir_identity(book_path, identity) + "\n", encoding="utf-8",
+        write_private_file(
+            owner_file, _log_dir_identity(book_path, identity) + "\n",
         )
     except OSError:
         pass
@@ -380,8 +435,9 @@ def resolve_mcp_dir(
     match and the interleave would persist. v1.4.0-and-earlier flat
     files (``{GNUCASH_LOG_DIR}/audit`` …) stay on disk untouched;
     move them into the book's subdir manually to keep old history
-    attached. Permission checks are bypassed under the override
-    (explicit user opt-in), as before.
+    attached. The parent-permission check is not made under the
+    override (the folder is the user's explicit choice); the per-book
+    entry inside it is still checked (no symlink, owned by you).
 
     The filename alone is not the book. Two servers sharing one
     ``GNUCASH_LOG_DIR`` — ``2026/ledger.gnucash`` and
@@ -428,10 +484,18 @@ def resolve_mcp_dir(
         owner = _read_log_dir_owner(plain)
         mine = _log_dir_identity(book_path, identity)
         if owner is None or owner == mine:
-            return plain
-        import hashlib
-        tag = hashlib.sha256(mine.encode("utf-8")).hexdigest()[:8]
-        return base / f"{name}-{tag}.mcp"
+            chosen = plain
+        else:
+            import hashlib
+            tag = hashlib.sha256(mine.encode("utf-8")).hexdigest()[:8]
+            chosen = base / f"{name}-{tag}.mcp"
+        # The override picks the folder; it does not waive what the
+        # per-book entry inside it must be (review C53). The parent's
+        # own mode is the user's choice here and is not checked.
+        _check_mcp_dir_entry(
+            chosen, "point GNUCASH_LOG_DIR at a different folder",
+        )
+        return chosen
 
     book_path = Path(book_path)
     parent = book_path.parent
@@ -472,29 +536,9 @@ def resolve_mcp_dir(
         # by the current user. Catches the case where an earlier
         # attack already pre-created the symlink and the parent
         # has since been re-tightened.
-        try:
-            if mcp_dir.exists() or mcp_dir.is_symlink():
-                if mcp_dir.is_symlink():
-                    raise ValueError(
-                        f"Refusing to use {mcp_dir}: path is a "
-                        f"symlink. Logs/backups must live in a "
-                        f"real directory you own; a symlink "
-                        f"could redirect writes elsewhere. "
-                        f"Remove or replace it, or set "
-                        f"GNUCASH_LOG_DIR to a different path."
-                    )
-                st = mcp_dir.stat()
-                if st.st_uid != os.geteuid():
-                    raise ValueError(
-                        f"Refusing to use {mcp_dir}: directory "
-                        f"is owned by uid={st.st_uid}, not the "
-                        f"current user (uid={os.geteuid()}). "
-                        f"Logs/backups go to a directory you "
-                        f"own; mismatched ownership suggests an "
-                        f"earlier symlink/hijack attempt."
-                    )
-        except FileNotFoundError:
-            pass
+        _check_mcp_dir_entry(
+            mcp_dir, "set GNUCASH_LOG_DIR to a different path",
+        )
 
     return mcp_dir
 
@@ -580,6 +624,33 @@ class _DailyFileHandler(logging.Handler):
             self.handleError(record)
 
 
+def _tighten_existing_files(log_dir: Path) -> None:
+    """Audit logs, debug logs, and backups written before 1.5 were
+    created with the default umask, usually 0644: a full ledger
+    history, and whole copies of the book, readable by every local
+    account. New files are created 0600; this brings the ones already
+    there into line, once per logging setup (adversarial review
+    2026-09-30, SEC-15). Only regular files this user owns are
+    touched; links are not followed. Best-effort and POSIX-only."""
+    if os.name != "posix":
+        return
+    try:
+        uid = os.geteuid()
+        for root, _dirs, files in os.walk(log_dir, followlinks=False):
+            for name in files:
+                path = os.path.join(root, name)
+                try:
+                    st = os.lstat(path)
+                    if not stat.S_ISREG(st.st_mode) or st.st_uid != uid:
+                        continue
+                    if st.st_mode & 0o077:
+                        os.chmod(path, st.st_mode & 0o700 & 0o600)
+                except OSError:
+                    continue
+    except OSError:
+        pass
+
+
 def setup_logging(
     book_path: str | None = None,
     debug: bool = False,
@@ -634,6 +705,7 @@ def setup_logging(
     # also runs the symlink-hijack sanity checks.
     log_dir = resolve_mcp_dir(book_path, identity=display_name)
     _log_dir = log_dir
+    _tighten_existing_files(log_dir)
     # Under GNUCASH_LOG_DIR, record whose folder this is, so a
     # different book with the same filename gets its own.
     claim_log_dir(log_dir, book_path, identity=display_name)
@@ -671,6 +743,11 @@ def setup_logging(
         audit_handler.setFormatter(logging.Formatter("%(message)s"))
         audit_logger.addHandler(audit_handler)
         audit_handler.ensure_file(today)
+        # A write the last server process started and never logged.
+        try:
+            _report_interrupted_write()
+        except Exception:  # noqa: BLE001 — never block startup
+            pass
     else:
         # Disable audit logging
         audit_logger.setLevel(logging.CRITICAL + 1)
@@ -716,17 +793,19 @@ Book: {book_path}{tz_line}
 
 
 def _format_amount(amount: str | None) -> str:
-    """Format an amount string with commas and alignment."""
+    """Format an amount string with commas, never rounded.
+
+    The log sees an amount without its commodity, so it cannot know
+    the places GnuCash would print; what it can do is never drop a
+    digit the book holds. A BHD 10.125 printed at two places read
+    10.12 here and 10.13 on the balance sheet (review C20). At least
+    two places, as before, for the common case."""
     if amount is None:
         return "0.00"
     try:
         from decimal import Decimal
         val = Decimal(amount)
-        # Format with commas and 2 decimal places
-        sign = "-" if val < 0 else ""
-        abs_val = abs(val)
-        formatted = f"{abs_val:,.2f}"
-        return f"{sign}{formatted}"
+        return _format_exact(val)
     except Exception:
         return str(amount)
 
@@ -874,6 +953,7 @@ def _parse_batch_submission(tsv: str) -> dict:
     """
     from gnucash_mcp._format import (
         _BATCH_LEGACY_GROUP,
+        _batch_row_fixed,
         _batch_row_splits,
         _batch_tsv_layout,
     )
@@ -888,9 +968,7 @@ def _parse_batch_submission(tsv: str) -> dict:
         # Malformed extension header — the write path rejected the
         # whole submission; render rows in the legacy shape.
         layout = {
-            "has_notes": False, "has_cur": False,
-            "notes_idx": None, "cur_idx": None, "fixed": 3,
-            "group": _BATCH_LEGACY_GROUP,
+            "fixed_idx": {}, "fixed": 3, "group": _BATCH_LEGACY_GROUP,
         }
     fixed = layout["fixed"]
     for ln in lines[1:]:
@@ -906,12 +984,7 @@ def _parse_batch_submission(tsv: str) -> dict:
         entry = {
             "description": f[2], "date": f[1].strip(), "splits": splits,
         }
-        ni = layout["notes_idx"]
-        if ni is not None and len(f) > ni and f[ni].strip():
-            entry["notes"] = f[ni].strip()
-        ci = layout["cur_idx"]
-        if ci is not None and len(f) > ci and f[ci].strip():
-            entry["currency"] = f[ci].strip().upper()
+        entry.update(_batch_row_fixed(f, layout))
         out[f[0].strip()] = entry
     return out
 
@@ -1059,11 +1132,14 @@ def _fmt_transaction_create_batch(entry: dict) -> list[str]:
         when = date_str
         if src.get("currency"):
             when = f"{date_str}, {src['currency']}"
+        num = f"#{src['num']}  " if src.get("num") else ""
         lines.append(
-            f'{_INDENT}CREATE  guid:{guid}  "{desc}" ({when})'
+            f'{_INDENT}CREATE  guid:{guid}  {num}"{desc}" ({when})'
         )
         if src.get("notes"):
             lines.append(f"{_INDENT_SPLITS}notes: {src['notes']}")
+        if src.get("link"):
+            lines.append(f"{_INDENT_SPLITS}link: {src['link']}")
         reason = r.get("reason", "")
         if reason.startswith("auto_filled_from:"):
             # Splitless submission — the source guid is the trail to
@@ -1118,6 +1194,12 @@ def _fmt_transaction_update_batch(entry: dict) -> list[str]:
         if "date" in r:
             old_dt = old.get("date", "")
             parts.append(f"Date: {old_dt} → {r['date']}")
+        if "num" in r:
+            old_num = old.get("num") or "(none)"
+            parts.append(f"Num: {old_num} → {r['num'] or '(none)'}")
+        if "link" in r:
+            old_l = old.get("doc_link") or "(none)"
+            parts.append(f"Link: {old_l} → {r['link'] or '(none)'}")
         lines.append(f"{_INDENT}{'  '.join(parts)}")
     if len(rows) > 15:
         lines.append(f"{_INDENT}... and {len(rows) - 15} more")
@@ -1304,8 +1386,13 @@ def _fmt_account_update(entry: dict) -> list[str]:
                 f'"{before.get("description") or ""}" → '
                 f'"{after["description"] or ""}"'
             )
-        for key, label in (("placeholder", "Placeholder"), ("type", "Type")):
-            if key in after and after[key] != before.get(key):
+        for key, label in (
+            ("placeholder", "Placeholder"), ("hidden", "Hidden"),
+            ("type", "Type"),
+        ):
+            if key in after and after[key] != before.get(
+                key, False if key == "hidden" else None,
+            ):
                 lines.append(
                     f"{_INDENT}{label}: {before.get(key)} → {after[key]}"
                 )
@@ -2749,12 +2836,15 @@ def _fmt_statement_enter(entry: dict) -> list[str]:
         guid = r.get("guid", "")
         if status == "created":
             desc = src.get("description") or src.get("raw") or ""
+            num = f"#{src['num']}  " if src.get("num") else ""
             lines.append(
-                f'{_INDENT}CREATE  guid:{guid}  "{desc}" '
+                f'{_INDENT}CREATE  guid:{guid}  {num}"{desc}" '
                 f'({src.get("date", "")}, {src.get("amount", "")})'
             )
             if src.get("notes"):
                 lines.append(f"{_INDENT_SPLITS}notes: {src['notes']}")
+            if src.get("link"):
+                lines.append(f"{_INDENT_SPLITS}link: {src['link']}")
             note = r.get("note", "")
             if note.startswith("auto_filled_from:"):
                 lines.append(
@@ -2781,13 +2871,15 @@ def _fmt_statement_enter(entry: dict) -> list[str]:
                     f"{_INDENT_SPLITS}memo: "
                     f"{old.get('memo', '') or '(empty)'} → {new_memo}"
                 )
-            new_notes = src.get("notes", "")
-            if new_notes and new_notes != old.get("notes", ""):
-                lines.append(
-                    f"{_INDENT_SPLITS}notes: "
-                    f"{old.get('notes', '') or '(empty)'} → "
-                    f"{new_notes}"
-                )
+            for field, key in (
+                ("notes", "notes"), ("num", "num"), ("link", "link"),
+            ):
+                new_val = src.get(key, "")
+                if new_val and new_val != old.get(key, ""):
+                    lines.append(
+                        f"{_INDENT_SPLITS}{field}: "
+                        f"{old.get(key, '') or '(empty)'} → {new_val}"
+                    )
         elif status == "skipped_duplicate":
             lines.append(
                 f"{_INDENT}SKIP  split:{guid}  already reconciled"
@@ -3133,6 +3225,154 @@ def _extract_after_state(result: str, entity_type: str | None) -> dict | None:
         return None
 
 
+# ── Write intent (DS-11) ─────────────────────────────────────────────
+#
+# A write's audit entry is rendered from its result, so it can only be
+# written after the commit. A server killed in between left a
+# committed write with no line at all. The intent is the write-ahead
+# half: one small file beside the audit log, written before the tool
+# runs and removed once its entry (or its ERROR line) is on the trail.
+# A file found later, whose process is gone, becomes an INTERRUPTED
+# line naming the tool and what it was asked to do.
+
+_INTENT_NAME = ".pending-write.json"
+_INTENT_PARAMS_MAX = 2000
+
+
+def _audit_directory() -> "Path | None":
+    for handler in logging.getLogger(AUDIT_LOGGER_NAME).handlers:
+        if isinstance(handler, _DailyFileHandler):
+            return handler.directory
+    return None
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        return True
+    return True
+
+
+def _report_interrupted_write() -> None:
+    """Turn a leftover intent into an INTERRUPTED line. Called when
+    logging is set up for a book and before each new intent. An
+    intent whose process is still running belongs to another server
+    on the same book, mid-write, and is left alone."""
+    directory = _audit_directory()
+    if directory is None:
+        return
+    path = directory / _INTENT_NAME
+    try:
+        with path.open() as f:
+            left = json.load(f)
+    except FileNotFoundError:
+        return
+    except (OSError, json.JSONDecodeError):
+        left = {}
+    pid = left.get("pid")
+    if isinstance(pid, int) and pid != os.getpid() and _pid_alive(pid):
+        return
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    logger = logging.getLogger(AUDIT_LOGGER_NAME)
+    stamp = datetime.now().astimezone().isoformat().split("T")[1][:8]
+    text = (
+        f"{left.get('tool', '(unknown tool)')} started "
+        f"{left.get('timestamp', '(time unknown)')} and the server "
+        f"stopped before its audit entry was written. The write may "
+        f"have been committed. Asked for: {left.get('params', '?')}"
+    )
+    logger.info(f"{stamp}  INTERRUPTED  {_escape_audit_value(text)}")
+    logger.info("")
+    _flush_logger(logger)
+
+
+def _write_intent(tool: str, params, timestamp: str) -> "Path | None":
+    """Record that a write is starting. Never raises: a book write
+    must not fail because its intent could not be noted."""
+    try:
+        directory = _audit_directory()
+        if directory is None:
+            return None
+        _report_interrupted_write()
+        path = directory / _INTENT_NAME
+        payload = json.dumps({
+            "pid": os.getpid(),
+            "tool": tool,
+            "timestamp": timestamp,
+            "params": _scrub_credentials(
+                json.dumps(params, default=str)
+            )[:_INTENT_PARAMS_MAX],
+        })
+        write_private_file(path, payload)
+        return path
+    except Exception as e:  # noqa: BLE001 — must swallow
+        logging.getLogger(DEBUG_LOGGER_NAME).warning(
+            f"Write intent not recorded: {type(e).__name__}: {e}"
+        )
+        return None
+
+
+def _clear_intent(path: "Path | None") -> None:
+    if path is None:
+        return
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def _audit_render_failed(
+    logger, debug_logger, tool: str, timestamp: str,
+    classification: str, exc: Exception,
+) -> None:
+    """The tool succeeded and its audit entry could not be rendered:
+    say so on the trail in one line, and never raise."""
+    try:
+        reason = _scrub_credentials(f"{type(exc).__name__}: {exc}")
+        debug_logger.warning(
+            f"Audit entry for {tool} could not be rendered: "
+            f"{_escape_audit_value(reason)}"
+        )
+        if classification != "write":
+            return
+        time_part = (
+            timestamp.split("T")[1][:8] if "T" in timestamp
+            else timestamp[:8]
+        )
+        logger.info(
+            f"{time_part}  WRITE  {tool}: succeeded; its audit entry "
+            f"could not be rendered ({_escape_audit_value(reason)})"
+        )
+        logger.info("")
+        _flush_logger(logger)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def audit_to_stderr() -> None:
+    """Last resort when no audit file can be opened for the current
+    book (a ``switch_book`` whose target AND whose fallback both
+    failed): send the trail to stderr, which the host keeps, so a
+    write is never unrecorded (adversarial review 2026-09-30,
+    DS-10)."""
+    import sys
+
+    logger = logging.getLogger(AUDIT_LOGGER_NAME)
+    logger.handlers.clear()
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter("AUDIT %(message)s"))
+    handler.addFilter(CredentialScrubFilter())
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+
 def audit_log(
     classification: str = "read",
     operation: str | None = None,
@@ -3230,8 +3470,65 @@ def audit_log(
 
             start_time = time.time()
 
+            intent = None
+            if classification == "write":
+                intent = _write_intent(
+                    func.__name__, normalized_kwargs, timestamp,
+                )
+
             try:
                 result = func(*args, **kwargs)
+            except Exception as e:
+                elapsed_ms = (time.time() - start_time) * 1000
+                entry["result"] = "error"
+                entry["error"] = str(e)
+
+                # Drop any staged before-state so it can't leak into the
+                # next call. Failed writes don't render before_state in
+                # the error line anyway.
+                if _get_book_func is not None:
+                    try:
+                        book = _get_book_func()
+                        if book is not None:
+                            book._consume_audit_before()
+                    except Exception:
+                        pass
+
+                # Exception text can quote the connection string
+                # (piecash: "Database 'postgresql://user:pw@…' does
+                # not exist"); mask it before it reaches either log.
+                error_message = _scrub_credentials(str(e))
+                # One record per line here too: the text echoes
+                # caller-supplied values, and a newline in one forged
+                # a debug-log record (SEC-18).
+                debug_logger.debug(
+                    f"MCP response: tool={func.__name__} status=error "
+                    f"elapsed={elapsed_ms:.0f}ms "
+                    f"error={_escape_audit_value(error_message)}"
+                )
+
+                # Log a simple error line. Exception text embeds
+                # user-controlled values (account names, descriptions
+                # echoed by validators), so it passes the same escape
+                # as formatted entries — a raw newline here could
+                # forge an entry boundary just as well.
+                time_part = timestamp.split("T")[1][:8] if "T" in timestamp else timestamp[:8]
+                error_text = (
+                    f"{time_part}  ERROR  {func.__name__}: "
+                    f"{_escape_audit_value(error_message)}"
+                )
+                logger.info(error_text)
+                logger.info("")
+                _flush_logger(logger)
+                _clear_intent(intent)
+                raise
+
+            # The call returned: whatever it wrote is committed. From
+            # here nothing may replace ``result`` — a failure while
+            # rendering the entry used to surface as the tool's error,
+            # reporting a committed write as failed (adversarial
+            # review 2026-09-30, DS-16).
+            try:
                 elapsed_ms = (time.time() - start_time) * 1000
 
                 # Always consume staged before-state (even on reads)
@@ -3295,51 +3592,13 @@ def audit_log(
                     logger.info(text_entry)
                     logger.info("")  # Blank line between entries
                 _flush_logger(logger)
-                return result
-
-            except Exception as e:
-                elapsed_ms = (time.time() - start_time) * 1000
-                entry["result"] = "error"
-                entry["error"] = str(e)
-
-                # Drop any staged before-state so it can't leak into the
-                # next call. Failed writes don't render before_state in
-                # the error line anyway.
-                if _get_book_func is not None:
-                    try:
-                        book = _get_book_func()
-                        if book is not None:
-                            book._consume_audit_before()
-                    except Exception:
-                        pass
-
-                # Exception text can quote the connection string
-                # (piecash: "Database 'postgresql://user:pw@…' does
-                # not exist"); mask it before it reaches either log.
-                error_message = _scrub_credentials(str(e))
-                # One record per line here too: the text echoes
-                # caller-supplied values, and a newline in one forged
-                # a debug-log record (SEC-18).
-                debug_logger.debug(
-                    f"MCP response: tool={func.__name__} status=error "
-                    f"elapsed={elapsed_ms:.0f}ms "
-                    f"error={_escape_audit_value(error_message)}"
+            except Exception as render_exc:  # noqa: BLE001
+                _audit_render_failed(
+                    logger, debug_logger, func.__name__, timestamp,
+                    classification, render_exc,
                 )
-
-                # Log a simple error line. Exception text embeds
-                # user-controlled values (account names, descriptions
-                # echoed by validators), so it passes the same escape
-                # as formatted entries — a raw newline here could
-                # forge an entry boundary just as well.
-                time_part = timestamp.split("T")[1][:8] if "T" in timestamp else timestamp[:8]
-                error_text = (
-                    f"{time_part}  ERROR  {func.__name__}: "
-                    f"{_escape_audit_value(error_message)}"
-                )
-                logger.info(error_text)
-                logger.info("")
-                _flush_logger(logger)
-                raise
+            _clear_intent(intent)
+            return result
 
         # Expose the declared classification/operation on the wrapper.
         # @wraps copies __dict__ outward through later decorator layers

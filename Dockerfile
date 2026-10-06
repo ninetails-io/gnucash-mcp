@@ -34,8 +34,20 @@ COPY scripts/synthetic_book ./scripts/synthetic_book
 RUN uv run --no-sync python scripts/synthetic_book/rebuild_all.py --continue-only \
     && rm -f /tmp/pre-continue-*
 
+# Run as an ordinary user, not root. The user owns /app because the
+# server writes there: each demo book's audit log and backups go in
+# a folder beside it. To serve a book mounted from the host instead,
+# run the container as the user who owns that file, e.g.
+#   docker run --user "$(id -u):$(id -g)" -v "$PWD:/books" \
+#     -e GNUCASH_BOOK_PATH=/books/my.gnucash ...
+# The server is started from the virtualenv directly, so it needs no
+# writable home directory under whatever user runs it.
+RUN useradd --create-home --uid 10001 gnucash \
+    && chown -R gnucash:gnucash /app
+USER gnucash
+
 ENV GNUCASH_BOOK_PATH=/app/samples/alex-chen-morales.gnucash:/app/samples/lin-wei.gnucash:/app/samples/sabine-brenner.gnucash
 
 # MCP stdio transport: the client (or registry checker) talks
 # JSON-RPC over stdin/stdout.
-CMD ["uv", "run", "--no-sync", "gnucash-mcp", "--modules=all"]
+CMD ["/app/.venv/bin/gnucash-mcp", "--modules=all"]

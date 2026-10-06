@@ -263,7 +263,7 @@ class TestGetBookSummary:
 
         result = gc_book.get_book_summary()
         # 1000 EUR × 1.20 = $1200. Decimal("1.20") stringifies as "1.2".
-        assert "1000 EUR @ 1.2" in result
+        assert "1000.00 EUR @ 1.2" in result
         assert "(USD 1200.00)" in result
 
     def test_investment_no_price_falls_back_to_cost_basis(
@@ -284,7 +284,7 @@ class TestGetBookSummary:
         assert drop_transaction_prices(multi_currency_book) > 0
         gc_book = GnuCashBook(str(multi_currency_book))
         result = gc_book.get_book_summary()
-        assert "1000 EUR — no price data" in result
+        assert "1000.00 EUR — no price data" in result
         assert "(USD 1100.00)" in result or "(USD 1100)" in result
 
     def test_business_entities_line(self, business_book: Path):
@@ -3426,7 +3426,7 @@ class TestStalePriceReadsValuationRate:
         result = GnuCashBook(str(tmp_path / "eur.gnucash")).get_book_summary()
         assert self._stale_lines(result) == [], result
         # ... and the account values through that inverse rate.
-        assert "USD Account: 1080 USD @ 0.925" in result and "(EUR 1000.00)" in result, result
+        assert "USD Account: 1080.00 USD @ 0.925" in result and "(EUR 1000.00)" in result, result
 
     def test_inverse_only_rate_goes_stale_by_its_own_date(self, tmp_path):
         from tests.conftest import drop_transaction_prices
@@ -10047,13 +10047,10 @@ class TestVoidTransaction:
         self, test_book: Path,
     ):
         """Voiding a transaction that contains reconciled splits
-        breaks the reconciled balance for the affected accounts —
-        the bank statement that originally reconciled is no longer
-        accurate. Unlike ``delete_transaction`` (which blocks on
-        reconciled splits), voiding is an audit operation that
-        should never be silently rejected; the result includes a
-        ``warning`` field naming the affected account(s) so the
-        caller knows what they just broke."""
+        breaks the reconciled balance for the affected accounts, so
+        it is refused without ``force`` (side-finding 11: the gate
+        delete and replace_splits already had). Forced, the result
+        includes a ``warning`` naming the affected account(s)."""
         gc_book = GnuCashBook(str(test_book))
 
         transactions = gc_book.list_transactions(compact=False)["transactions"]
@@ -10068,11 +10065,15 @@ class TestVoidTransaction:
             state="y",
         )
 
+        with pytest.raises(ValueError, match="force=true"):
+            gc_book.void_transaction(guid, reason="Wrong amount entered")
+        assert gc_book.get_transaction(guid)["splits"][0]["value"] != "0"
+
         result = gc_book.void_transaction(
-            guid, reason="Wrong amount entered",
+            guid, reason="Wrong amount entered", force=True,
         )
 
-        # Void still succeeded.
+        # The forced void succeeded.
         assert result["status"] == "voided"
         # And surfaced a warning naming the affected account.
         assert "warning" in result

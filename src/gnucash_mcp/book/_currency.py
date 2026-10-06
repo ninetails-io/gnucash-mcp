@@ -25,6 +25,7 @@ from gnucash_mcp._format import (
     _enumerate_periods,
     _format_rate,
     _period_label,
+    _round_converted,
 )
 
 # ── FX staleness cap ───────────────────────────────────────────────
@@ -982,7 +983,10 @@ class CurrencyMixin:
                         f"{entered} stored as {v['quantity']} — "
                         f"{account.commodity.mnemonic} is counted in "
                         f"units of "
-                        f"{_commodity_quantum(account.commodity)}."
+                        f"{_commodity_quantum(account.commodity)}. "
+                        f"No price was recorded from this split: "
+                        f"the stored amounts imply a rate the "
+                        f"entry did not state."
                     ),
                 })
             value = abs(Decimal(str(v["value"])))
@@ -1066,26 +1070,41 @@ class CurrencyMixin:
         Returns:
             ``(value_in_default_currency, display_note)``;
             ``display_note`` is None for default-currency accounts.
+
+        A converted value is rounded to the default currency's unit
+        HERE, once per account, as GnuCash rounds a conversion
+        (``gnc_pricedb_convert_balance``): totals built from these
+        are sums of what each line shows, so a statement's lines add
+        up to its total and every surface reaches the same total.
+        ``balance_sheet`` and ``net_worth`` round per account the
+        same way; summing unrounded values and rounding the total
+        could differ from the lines by a unit per commodity.
         """
         if account.commodity == default_currency:
             return quantity, None
+        from gnucash_mcp.book._base import _format_account_amount
+
         sym = account.commodity.mnemonic
+        shown = _format_account_amount(quantity, account)
         rate = rates.get(account.commodity.guid)
         if rate is not None:
-            note = f"{quantity} {sym} @ {_format_rate(rate)}"
+            note = f"{shown} {sym} @ {_format_rate(rate)}"
             via = (provenance or {}).get(account.commodity.guid)
             if via:
                 note += f" ({via})"
-            return quantity * rate, note
+            return _round_converted(quantity * rate, default_currency), note
         if not with_cost_fallback:
-            return Decimal("0"), f"{quantity} {sym} — no price data"
+            return Decimal("0"), f"{shown} {sym} — no price data"
         # No market price for the holding: its remaining cost basis
         # in the book default (see ``_unpriced_cost_basis``).
         cost_basis = self._unpriced_cost_basis(
             book, account.splits,
             default_currency=default_currency, as_of=today,
         )
-        return cost_basis, f"{quantity} {sym} — no price data"
+        return (
+            _round_converted(cost_basis, default_currency),
+            f"{shown} {sym} — no price data",
+        )
 
     def _leg_value_in_default(
         self,
