@@ -32,9 +32,11 @@ Bill term with a 2% / 10-day discount; invoice of 1000 on it; a
 partial payment of 400 on day 2; then pay the rest on day 5 with the
 discount.
 
-- Pass: the discount is 2% of the 600 remaining, not of 1000 less a
-  "credit" of 400. (Before the fix, a payment whose transaction
-  touched another lot counted as a credit application.)
+- Pass: the discount is 20.00, 2% of the 1000 principal, so the
+  settling payment is 580. (Before the fix the 400 payment counted
+  as a credit application and the discount shrank to 2% of 600,
+  12.00.) Corrected after the bookkeeper's Q1: the first wording
+  named 12 and 12.
 
 ## 3. A cross-currency bill's outstanding amount (BM-3, BM-6)
 
@@ -86,13 +88,18 @@ quit). Then make a converting write (create a budget).
 
 `GNUCASH_LOG_DIR` set; two books both named `ledger.gnucash` in two
 folders, both configured. In the log folder plant a pre-1.5-style
-folder `ledger.mcp` holding an audit log copied from book A.
+folder named `ledger.gnucash.mcp` (the per-book name; the first
+wording said `ledger.mcp`, which no version ever made) holding
+either a copy of book A under `backups/` or an audit file whose
+`Book:` line is book A's path, and no `.owner` file.
 
 - Start the server, write to book B first. Pass: B gets its own
-  `ledger.gnucash-<hash>.mcp`; `ledger.mcp` is untouched. Write to
-  book A. Pass: A's audit continues in `ledger.mcp`. (Before the
-  fix whichever book wrote first took the folder, and its retention
-  pruned the other's backups.)
+  `ledger.gnucash-<hash>.mcp`; `ledger.gnucash.mcp` is untouched.
+  Write to book A. Pass: A's audit continues in
+  `ledger.gnucash.mcp`. (Before the fix whichever book wrote first
+  took the folder, and its retention pruned the other's backups.)
+- A folder with neither backups nor an audit header is claimed by
+  the first writer, as before: it has no history to misattribute.
 
 ## 8. An account still in use cannot be deleted (CS-4)
 
@@ -116,9 +123,10 @@ Each with a name holding a line break and a second line reading
   (the ID), `create_commodity`. Pass: all refused, naming the field
   and the character. `get_book_summary` afterwards shows no such
   line.
-- `create_document` with an ID of 300 characters. Pass: refused
-  (the column is 2048 on SQLite but PostgreSQL's is narrower; the
-  width is the gate's).
+- `create_document` with an ID of 2,049 characters. Pass: refused
+  at GnuCash's own column width, 2048 (`MAX_ID_LEN`, the same on
+  every backend). A 300-character ID is legal in GnuCash and so
+  here; the first wording of this arm was wrong about PostgreSQL.
 - An invoice `notes` of `\x1b[31m`; a `pay_document` memo of the
   same. Pass: refused.
 

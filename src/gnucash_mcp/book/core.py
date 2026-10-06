@@ -7203,30 +7203,51 @@ class CoreMixin:
     @staticmethod
     def _account_references(book, guid: str) -> list[str]:
         """What still points at an account besides its splits and
-        children: schedule templates, document lines, tax tables,
-        posted documents, employees' cards, budget rows."""
+        children, each kind counted and NAMED: schedule templates,
+        document lines, tax tables, posted documents, employees'
+        cards, budget rows. A count alone sent the bookkeeper
+        looking for which schedule (second-review loop, step 8)."""
         from sqlalchemy import text
 
         checks = (
             ("scheduled transaction template(s)",
-             "SELECT COUNT(*) FROM slots WHERE name = 'sched-xaction/account' "
-             "AND guid_val = :g"),
-            ("document line(s)",
-             "SELECT COUNT(*) FROM entries WHERE i_acct = :g OR b_acct = :g"),
+             # The account slot sits inside the split's
+             # ``sched-xaction`` frame: child row → frame row (its
+             # guid_val is the child's obj_guid) → template split →
+             # the schedule whose template account holds it.
+             "SELECT DISTINCT sx.name FROM slots c "
+             "JOIN slots f ON f.guid_val = c.obj_guid "
+             "AND f.name = 'sched-xaction' "
+             "JOIN splits sp ON sp.guid = f.obj_guid "
+             "JOIN schedxactions sx ON sx.template_act_guid = sp.account_guid "
+             "WHERE c.name = 'sched-xaction/account' AND c.guid_val = :g"),
+            ("document(s) with line(s)",
+             "SELECT DISTINCT i.id FROM entries e "
+             "JOIN invoices i ON i.guid = e.invoice OR i.guid = e.bill "
+             "WHERE e.i_acct = :g OR e.b_acct = :g"),
             ("tax table(s)",
-             "SELECT COUNT(*) FROM taxtable_entries WHERE account = :g"),
+             "SELECT DISTINCT tt.name FROM taxtable_entries te "
+             "JOIN taxtables tt ON tt.guid = te.taxtable "
+             "WHERE te.account = :g"),
             ("posted document(s)",
-             "SELECT COUNT(*) FROM invoices WHERE post_acc = :g"),
+             "SELECT id FROM invoices WHERE post_acc = :g"),
             ("employee card setting(s)",
-             "SELECT COUNT(*) FROM employees WHERE ccard_guid = :g"),
-            ("budget row(s)",
-             "SELECT COUNT(*) FROM budget_amounts WHERE account_guid = :g"),
+             "SELECT id FROM employees WHERE ccard_guid = :g"),
+            ("budget(s)",
+             "SELECT DISTINCT b.name FROM budget_amounts ba "
+             "JOIN budgets b ON b.guid = ba.budget_guid "
+             "WHERE ba.account_guid = :g"),
         )
         out = []
         for label, sql in checks:
-            n = book.session.execute(text(sql), {"g": guid}).scalar() or 0
-            if n:
-                out.append(f"{n} {label}")
+            names = sorted(
+                _one_line(str(r[0])) for r in
+                book.session.execute(text(sql), {"g": guid}).fetchall()
+                if r[0] is not None
+            )
+            if names:
+                shown = ", ".join(names[:5]) + ("…" if len(names) > 5 else "")
+                out.append(f"{len(names)} {label}: {shown}")
         return out
 
     def _validate_transaction_deletable(

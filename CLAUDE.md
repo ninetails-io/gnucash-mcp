@@ -783,8 +783,9 @@ Established chokepoints and the rule each one owns:
   `invoices.post_acc`, `employees.ccard_guid`, budget amounts);
   `delete_account` refuses while any remain (CS-4).
   `_legacy_folder_may_belong_to` claims a pre-1.5 `.mcp` folder for
-  a book only when the folder's audit log names the book's GUID
-  (CS-3). `register_secrets_from_url` / `_mask_known_secrets`
+  a book only when the folder's own contents do not name another
+  owner: its backups' `books.guid`, then the `Book:` path in its
+  newest audit file (CS-3; the bookkeeper's Q2 added the header). `register_secrets_from_url` / `_mask_known_secrets`
   (`_format.py`): a connection string's password is registered at
   startup and masked as TEXT wherever it appears, because a password
   holding a quote or a space defeats the URL-shaped scrub (CS-1).

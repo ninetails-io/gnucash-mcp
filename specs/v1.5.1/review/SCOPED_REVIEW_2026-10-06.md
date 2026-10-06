@@ -52,7 +52,7 @@ reproduction script re-run against the fixed code.
 | BS-9 later old-server rows converted without a snapshot | NIT | Open; the response and the dashboard name the rows (FC-20). Known limitations. |
 | CS-1 a password holding a quote or a space goes out unmasked | BLOCKER | Fixed, `3748c6a`: `register_secrets_from_url` at startup, `_mask_known_secrets` on every road out. |
 | CS-2 pre-upgrade snapshot a hard link to an OLDER state | SERIOUS | Fixed, `3748c6a`: always a fresh copy of the committed state. |
-| CS-3 legacy folder claimed by the first same-named book | SERIOUS | Fixed, `3748c6a`: `_legacy_folder_may_belong_to`, by the book's GUID in the folder's audit log. |
+| CS-3 legacy folder claimed by the first same-named book | SERIOUS | Fixed, `3748c6a`: `_legacy_folder_may_belong_to`, by the book GUID in the folder's backups; the audit header's `Book:` path added after the bookkeeper's Q2. |
 | CS-4 `delete_account` with references elsewhere | SERIOUS | Fixed, `3748c6a`: `_account_references`; refused by name. |
 | CS-5 `sqlite:///` URIs not redacted | MINOR | Fixed, `de67dc1`. |
 | CS-6 C27 rollback deletes an instance whose advance was committed | MINOR | Fixed, `de67dc1`: the schedule is re-read; the instance stays and the error says so. |
@@ -81,3 +81,6 @@ reproduction script re-run against the fixed code.
 | IN-19 empty draft lists with `?` | NIT | Fixed, `de67dc1`: `0.00`. |
 | IN-20 small boundary inconsistencies | NIT | In part, `de67dc1`: a negative `offset` is refused. A report whose start is after its end still answers an empty total; listed. |
 | IN-21 URI-mode errors give the wrong cure | NIT | In part, `3748c6a`: the not-found cure names `GNUCASH_BOOK_URI`. piecash's `create_book` advice on a missing database still surfaces; listed. |
+| SR2-B1 `create_billterm` takes a multi-line name (bookkeeper's live pass) | SERIOUS | Fixed, `TestBookkeeperSecondLoop`: bill-term and tax-table names pass `_check_one_line`. |
+| SR2-B2 a 300-character document ID is accepted (bookkeeper's live pass) | — | Not a defect: GnuCash's `MAX_ID_LEN` is 2048 on every backend, and the gate is that width; the test plan misstated PostgreSQL's column. |
+| Q1 / Q2 (bookkeeper's queries) | — | Plan errors, corrected in the plan; Q2 also added the audit header as adoption evidence. Answers in `testing/BOOKKEEPER_REPORT_SECOND_REVIEW.md`. |

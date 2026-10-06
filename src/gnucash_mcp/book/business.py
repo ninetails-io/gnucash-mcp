@@ -46,6 +46,7 @@ from gnucash_mcp.book._base import (
     _verify_write,
     _SLOT_TEXT_WIDTH,
     _check_one_line,
+    _check_ledger_date,
 )
 from gnucash_mcp._format import (
     _GROUP_BY_VALUES,
@@ -4097,7 +4098,8 @@ class BusinessMixin:
 
         if not rows:
             raise ValueError(
-                f"Cannot post: invoice {inv.id} has no entries"
+                f"Cannot post: {self._doc_noun(inv).lower()} {inv.id} "
+                f"has no entries"
             )
 
         # Taxtable resolution is cached so an invoice with many
@@ -5038,6 +5040,7 @@ class BusinessMixin:
         from piecash.business.invoice import Billterm
 
         _check_text(name, _TEXT_WIDTH, "Billterm name")
+        _check_one_line(name, "Billterm name")
         _check_text(description, _TEXT_WIDTH, "Billterm description")
         discount = _to_decimal(discount_percent)
         # gncBillTerm has no meaning for a negative day count or a
@@ -5384,6 +5387,7 @@ class BusinessMixin:
 
         # taxtables.name is the narrowest text column GnuCash has.
         _check_text(name, _TAXTABLE_NAME_WIDTH, "Taxtable name")
+        _check_one_line(name, "Taxtable name")
         with self.open(readonly=False) as book:
             existing = self._find_taxtable(book, name)
             if existing:
@@ -5583,6 +5587,7 @@ class BusinessMixin:
 
             if new_name is not None and new_name != tt.name:
                 _check_text(new_name, _TAXTABLE_NAME_WIDTH, "Taxtable name")
+                _check_one_line(new_name, "Taxtable name")
                 collision = self._find_taxtable(book, new_name)
                 if collision and collision.guid != tt.guid:
                     raise ValueError(
@@ -5848,6 +5853,16 @@ class BusinessMixin:
         return BusinessMixin._OWNER_TYPE_TO_DOC_LABEL.get(
             owner_type, "Document"
         )
+
+    @staticmethod
+    def _doc_noun(inv) -> str:
+        """What to call THIS document in a sentence: ``Credit note``
+        when its slot says so, else the owner type's label. A refusal
+        on a credit note read "Invoice CN3" (bookkeeper, second-review
+        loop)."""
+        if BusinessMixin._get_is_credit_note(inv):
+            return "Credit note"
+        return BusinessMixin._doc_label_for(inv.owner_type)
 
     # ── Credit-note slot helpers ─────────────────────────────────
     #
@@ -6498,7 +6513,7 @@ class BusinessMixin:
             # Defensive — _parse_owner_type would only return 2,
             # 4, or 5; this guards against a future addition.
             raise ValueError(
-                f"Credit notes require owner_type 'customer' or "
+                f"Credit notes require party_type 'customer' or "
                 f"'vendor', got {owner_type!r}."
             )
 
@@ -7130,8 +7145,8 @@ class BusinessMixin:
                     )
                     raise ValueError(
                         f"Job {job_id!r} is a {expected} job; "
-                        f"owner_type={owner_type!r} doesn't match. "
-                        f"Drop the owner_type filter or pass a "
+                        f"party_type={owner_type!r} doesn't match. "
+                        f"Drop the party_type filter or pass a "
                         f"matching job_id."
                     )
                 query = query.filter(
@@ -7637,6 +7652,7 @@ class BusinessMixin:
             date.fromisoformat(post_date) if post_date
             else date.today()
         )
+        _check_ledger_date(parsed_date, "post_date")
 
         with self.open(readonly=False) as book:
             # Every pre-1.5 shape in the book converts on this write
@@ -7671,7 +7687,7 @@ class BusinessMixin:
                 raise ValueError(
                     f"Document not found: {invoice_id}. If the ID "
                     f"is shared across document types, pass "
-                    f"owner_type ('customer', 'vendor', or "
+                    f"party_type ('customer', 'vendor', or "
                     f"'employee' for vouchers) explicitly."
                 )
 
@@ -7744,7 +7760,9 @@ class BusinessMixin:
             owner = self._find_invoice_owner_by_guid(
                 book, inv.owner_type, inv.owner_guid,
             )
-            owner_name = owner.name if owner else f"Invoice {inv.id}"
+            owner_name = (
+                owner.name if owner else f"{self._doc_noun(inv)} {inv.id}"
+            )
             # description=None falls back to the owner name (GnuCash
             # UI convention); an explicit "" deliberately blanks the
             # field — ``or owner_name`` would collapse "" into the
@@ -8405,6 +8423,7 @@ class BusinessMixin:
             date.fromisoformat(payment_date) if payment_date
             else date.today()
         )
+        _check_ledger_date(parsed_date, "payment_date")
 
         with self.open(readonly=dry_run) as book:
             # Every pre-1.5 shape in the book converts on a real
@@ -8502,7 +8521,9 @@ class BusinessMixin:
             owner = self._find_invoice_owner_by_guid(
                 book, inv.owner_type, inv.owner_guid,
             )
-            owner_name = owner.name if owner else f"Invoice {inv.id}"
+            owner_name = (
+                owner.name if owner else f"{self._doc_noun(inv)} {inv.id}"
+            )
             # description: None → owner name; explicit "" blanks the
             # field deliberately. Same pattern as post_invoice.
             txn_desc = description if description is not None else owner_name
@@ -8650,7 +8671,7 @@ class BusinessMixin:
             settle_amount = payment_amount
             excess = Decimal("0")
             if payment_amount > remaining_before_pay:
-                doc_label = self._doc_label_for(inv.owner_type)
+                doc_label = self._doc_noun(inv)
                 ccy = inv.currency.mnemonic
                 if is_credit_note or negative_document:
                     # The document owes the party (a credit note, a
@@ -9315,7 +9336,7 @@ class BusinessMixin:
             inv = self._find_invoice(book, invoice_id, owner_type=ot)
             if not inv:
                 raise ValueError(f"Document not found: {invoice_id}")
-            doc_label = self._doc_label_for(inv.owner_type)
+            doc_label = self._doc_noun(inv)
             if not _is_invoice_posted(inv):
                 raise ValueError(
                     f"{doc_label} {invoice_id} is not posted — post it "

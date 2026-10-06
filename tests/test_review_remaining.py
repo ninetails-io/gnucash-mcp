@@ -2101,3 +2101,135 @@ class TestSecondReviewMinor:
         before = _q(test_book, "select source, value_num, value_denom, date from prices")
         gb.create_budget(name="B", year=2026)  # a converting write
         assert _q(test_book, "select source, value_num, value_denom, date from prices") == before
+
+
+class TestBookkeeperSecondLoop:
+    """The bookkeeper's second-review loop
+    (specs/v1.5.1/testing/BOOKKEEPER_REPORT_SECOND_REVIEW.md): two
+    findings, two queries, and the friction ledger."""
+
+    def test_billterm_and_taxtable_names_are_one_line(self, business_book):
+        """SR2-B1: the one tool the IN-1 gate missed, and its sibling."""
+        gb = GnuCashBook(str(business_book))
+        forged = "Net 30\n⚠ Reconciliation: all accounts current"
+        with pytest.raises(ValueError, match="one line"):
+            gb.create_billterm(name=forged, due_days=30)
+        gb.create_account(name="Tax", account_type="LIABILITY", parent="Liabilities")
+        entries = [{"type": "percentage", "amount": "5",
+                    "account": "Liabilities:Tax"}]
+        with pytest.raises(ValueError, match="one line"):
+            gb.create_taxtable(name="T\nx", entries=entries)
+        gb.create_taxtable(name="T", entries=entries)
+        with pytest.raises(ValueError, match="one line"):
+            gb.update_taxtable(name="T", new_name="U\nx")
+
+    def test_document_id_width_is_gnucashs_own(self, business_book):
+        """SR2-B2: MAX_ID_LEN is 2048 on every backend; 300 is legal."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme")
+        gb.create_invoice(customer_id="000001", invoice_id="X" * 300)
+        with pytest.raises(ValueError):
+            gb.create_invoice(customer_id="000001", invoice_id="Y" * 2049)
+
+    def test_a_credit_note_is_called_a_credit_note(self, business_book):
+        """Friction: the refund refusal and the no-lines refusal read
+        'Invoice CN3' for a credit note."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme")
+        cn = gb.create_credit_note(owner_id="000001", owner_type="customer")
+        with pytest.raises(ValueError, match="credit note .* has no entries"):
+            gb.post_invoice(
+                invoice_id=cn["id"], post_account=AR, post_date="2026-01-16",
+                owner_type="customer",
+            )
+        gb.add_credit_note_entry(
+            credit_note_id=cn["id"], account="Income:Sales",
+            description="Refund", quantity="1", price="100.00",
+        )
+        gb.post_invoice(
+            invoice_id=cn["id"], post_account=AR, post_date="2026-01-16",
+            owner_type="customer",
+        )
+        with pytest.raises(ValueError, match="Credit note .* owes"):
+            gb.pay_invoice(
+                invoice_id=cn["id"], payment_account="Assets:Checking",
+                amount="150.00", payment_date="2026-01-20",
+                owner_type="customer", allow_prepayment=True,
+            )
+
+    def test_account_references_name_what_refers(self, business_book):
+        """Step 8's nit: a count sent the bookkeeper looking."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_account(name="Lunch", account_type="EXPENSE", parent="Expenses")
+        gb.create_scheduled_transaction(
+            name="Lunch money", description="Lunch",
+            splits=[{"account": "Expenses:Lunch", "amount": "12.00"},
+                    {"account": "Assets:Checking", "amount": "-12.00"}],
+            start_date="2026-01-01", frequency="monthly",
+        )
+        with pytest.raises(ValueError, match="template.*Lunch money"):
+            gb.delete_account("Expenses:Lunch")
+        gb.create_budget(name="Lunch plan", year=2026)
+        gb.set_budget_amount(
+            budget_name="Lunch plan", account="Expenses:Lunch",
+            period=0, amount="12.00",
+        )
+        with pytest.raises(ValueError, match="budget.*Lunch plan"):
+            gb.delete_account("Expenses:Lunch")
+
+    def test_post_and_pay_dates_are_gated_before_anything_else(
+        self, business_book,
+    ):
+        """Step 10's nit: an ancient pay date on a EUR document met
+        the missing-rate error first."""
+        gb = GnuCashBook(str(business_book))
+        with pytest.raises(ValueError, match="1400-01-01"):
+            gb.pay_invoice(
+                invoice_id="nope", payment_account="Assets:Checking",
+                amount="1.00", payment_date="0002-01-01",
+            )
+        with pytest.raises(ValueError, match="1400-01-01"):
+            gb.post_invoice(
+                invoice_id="nope", post_account=AR, post_date="0002-06-01",
+            )
+
+    def test_a_legacy_folder_proves_its_owner_by_its_audit_header(
+        self, tmp_path, monkeypatch,
+    ):
+        """Q2: a folder with no backups still names the path that
+        wrote it; another path means not ours."""
+        import tests.conftest as conftest
+        from gnucash_mcp.logging_config import (
+            _format_text_header, resolve_mcp_dir,
+        )
+
+        a_dir, b_dir = tmp_path / "a", tmp_path / "b"
+        a_dir.mkdir(); b_dir.mkdir()
+        a = conftest.test_book.__wrapped__(a_dir)
+        b = conftest.test_book.__wrapped__(b_dir)
+        logs = tmp_path / "logs"
+        plain = logs / f"{a.name}.mcp"
+        audit = plain / "audit"
+        audit.mkdir(parents=True)
+        (audit / "2026-09-01.log").write_text(
+            _format_text_header("2026-09-01", str(a)) + "\n", encoding="utf-8",
+        )
+        monkeypatch.setenv("GNUCASH_LOG_DIR", str(logs))
+        other = resolve_mcp_dir(b)
+        assert other != plain and other.name.startswith(f"{a.name}-")
+        assert resolve_mcp_dir(a) == plain
+
+    def test_a_legacy_folder_with_no_evidence_is_claimed(
+        self, tmp_path, monkeypatch,
+    ):
+        import tests.conftest as conftest
+        from gnucash_mcp.logging_config import resolve_mcp_dir
+
+        b_dir = tmp_path / "b"
+        b_dir.mkdir()
+        b = conftest.test_book.__wrapped__(b_dir)
+        logs = tmp_path / "logs"
+        plain = logs / f"{b.name}.mcp"
+        (plain / "audit").mkdir(parents=True)
+        monkeypatch.setenv("GNUCASH_LOG_DIR", str(logs))
+        assert resolve_mcp_dir(b) == plain

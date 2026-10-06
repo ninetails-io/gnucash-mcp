@@ -415,27 +415,64 @@ def _book_guid_in(path) -> str | None:
     return row[0] if row else None
 
 
+def _audit_header_book(mcp_dir: Path) -> str | None:
+    """The ``Book:`` line of the newest audit file in a per-book
+    folder, or None when there is none to read."""
+    audit = Path(mcp_dir) / "audit"
+    if not audit.is_dir():
+        return None
+    for log in sorted(audit.glob("*.log"), reverse=True)[:3]:
+        try:
+            with open(log, encoding="utf-8", errors="replace") as fh:
+                for _ in range(8):
+                    line = fh.readline()
+                    if not line:
+                        break
+                    if line.startswith("Book: "):
+                        return line[len("Book: "):].strip() or None
+        except OSError:
+            continue
+    return None
+
+
 def _legacy_folder_may_belong_to(mcp_dir: Path, book_path) -> bool:
     """May an UNCLAIMED per-book folder under ``GNUCASH_LOG_DIR`` be
     this book's? A pre-1.5 folder has no ``.owner``; the first
     same-named book to write claimed it, and its retention then pruned
     the other book's snapshots (scoped review 2026-10-06, CS-3). The
-    folder's backups are copies of the book they belong to, so their
-    ``books.guid`` is positive evidence: a folder whose backups hold
-    another book's GUID is not this book's. A folder with no backups,
-    or unreadable ones, cannot be told apart and is claimed as
-    before."""
-    backups = Path(mcp_dir) / "backups"
-    if not backups.is_dir() or not Path(str(book_path)).is_file():
+    folder's own contents are the evidence, in this order:
+
+    - its backups are copies of the book they belong to, so their
+      ``books.guid`` decides: another book's GUID means not ours;
+    - failing a readable backup, the ``Book:`` line of its newest
+      audit file names the path that wrote it: another path that
+      still exists means not ours (bookkeeper, second-review loop,
+      Q2: a folder that can prove another owner is never adopted).
+
+    A folder with neither — nothing to prune and nothing to
+    interleave — is claimed as before, so the single-book user's
+    folder keeps its name."""
+    mcp_dir = Path(mcp_dir)
+    book_file = Path(str(book_path))
+    backups = mcp_dir / "backups"
+    if not book_file.is_file():
         return True
-    mine = _book_guid_in(book_path)
-    if mine is None:
-        return True
-    for copy in sorted(backups.glob("*.gnucash"), reverse=True)[:3]:
-        theirs = _book_guid_in(copy)
-        if theirs is None:
-            continue
-        return theirs == mine
+    if backups.is_dir():
+        mine = _book_guid_in(book_file)
+        if mine is not None:
+            for copy in sorted(backups.glob("*.gnucash"), reverse=True)[:3]:
+                theirs = _book_guid_in(copy)
+                if theirs is None:
+                    continue
+                return theirs == mine
+    named = _audit_header_book(mcp_dir)
+    if named:
+        try:
+            other = Path(named).expanduser()
+            if other.is_file():
+                return other.resolve() == book_file.resolve()
+        except (OSError, ValueError):
+            pass
     return True
 
 
