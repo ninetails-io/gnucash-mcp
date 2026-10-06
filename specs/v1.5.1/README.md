@@ -44,6 +44,12 @@ branch). Find code by name, not by the review's line numbers.
   (the bookkeeper's step 11 addendum put a VTSAX buy on record),
   and the CHANGELOG says so in plain words.
 
+### The scoped review of 2026-10-05
+
+Three readers over the merged diff: `review/SCOPED_REVIEW_2026-10-05.md`
+holds the resolution table. All fixed on `fix/1.5.0-scoped-review`
+except S-9 (a `?` in the book path; pre-existing, listed).
+
 ### Not the server's code
 
 - **FC-18 — the bundled demo books are old piecash-format files.**

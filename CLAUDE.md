@@ -732,13 +732,31 @@ Established chokepoints and the rule each one owns:
   - The engine twin's `dump` ends with the book's own slots
     (options, counters, feature flags). `iso_date_feature` is the
     one named difference there.
-- **Trading-accounts books REFUSE a cross-commodity write**
-  (`_piecash_shapes._transaction_validate`, bookkeeper ruling
-  2026-10-05 item 3). piecash's trading splits are at a denominator
-  GnuCash does not use, the tree is found by the English name, and
-  `pay_invoice` books a realized FX split where GnuCash books none.
-  What has to be built before the refusal lifts is listed in
+- **Trading-accounts books REFUSE a write that would need trading
+  splits** (`_piecash_shapes._transaction_validate`, bookkeeper
+  ruling 2026-10-05 item 3): the trigger is piecash's own, a non-zero
+  quantity imbalance in some commodity, so a schedule template, a
+  void, and an unvoid of a desktop-made transaction pass (the first
+  cut compared commodity sets and refused all three: scoped review
+  S-2). piecash's trading splits are at a denominator GnuCash does
+  not use, the tree is found by the English name, and `pay_invoice`
+  books a realized FX split where GnuCash books none. What has to be
+  built before the refusal lifts is listed in
   `specs/v1.5.1/README.md`; an engine twin decides when it has.
+- **From the scoped review (`specs/v1.5.1/review/`, 2026-10-05):**
+  `_pid_alive` (`_format.py`) is the ONE process probe — `os.kill(pid,
+  0)` terminates the process on Windows, and the audit intent and the
+  `gnclock` holder note both asked it (grep-locked). `_check_control_
+  chars` is the one text rule, behind `_check_text` and every writer
+  that caps bytes on its own. Flow reports round per (category,
+  month) cell and sum; the budget headline converts as the report
+  does (`_monthly_conversion_factors`). `_num_bearing_actions`: with
+  Num on split actions, an action counts as a number only off a
+  business or stock transaction. `_is_hidden` inherits the flag as
+  `xaccAccountIsHidden` does. `_name_skeleton` keeps a joiner where
+  it draws (Arabic, Indic, emoji, tag sequences) and drops it
+  between Latin letters. Transaction dates bind through
+  `_neutral_time` (`_date_bind`), not piecash's flat 10:59.
 - `_CONVERTED_BY_KEY` / `_OLD_SERVER_WRITE_KEY` (`_base.py`): the
   server's own marks on the root account. The first converting write
   marks the book; a pre-1.5 fingerprint found later in a marked book
