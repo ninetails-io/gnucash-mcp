@@ -1550,3 +1550,43 @@ class TestScopedReviewInput:
         text = BaseGnuCashBook._old_server_write_warning("1.4.4")
         for word in ("income", "liability", "credit card", "payable", "equity"):
             assert word in text
+
+
+class TestForeignFlowLinesNameTheirValuation:
+    """SR-B1 rider 2: a flow table with a foreign-currency line says
+    it is valued at monthly closes and where the cash is."""
+
+    def test_the_footer_appears_only_with_a_foreign_line(self, test_book):
+        from gnucash_mcp.book.reporting import _FOREIGN_FLOW_NOTE
+
+        gb = GnuCashBook(str(test_book))
+        plain = gb.spending_by_category(
+            start_date=date(2026, 1, 1), end_date=date(2026, 12, 31),
+        )
+        assert _FOREIGN_FLOW_NOTE not in plain
+        gb.create_account(
+            name="Fees EUR", account_type="EXPENSE", parent="Expenses",
+            commodity="EUR",
+        )
+        gb.create_transaction(
+            description="Fee", splits=[
+                {"account": "Expenses:Fees EUR", "amount": "33.35", "quantity": "33.33"},
+                {"account": "Assets:Checking", "amount": "-33.35"},
+            ],
+            trans_date=date(2026, 7, 17), check_duplicates=False,
+        )
+        for table in (
+            gb.spending_by_category(start_date=date(2026, 1, 1), end_date=date(2026, 12, 31)),
+            gb.spending_by_category(
+                start_date=date(2026, 1, 1), end_date=date(2026, 12, 31), group_by="quarter",
+            ),
+        ):
+            assert _FOREIGN_FLOW_NOTE in table
+        structured = gb.spending_by_category(
+            start_date=date(2026, 1, 1), end_date=date(2026, 12, 31), compact=False,
+        )
+        assert structured["valuation_note"] == _FOREIGN_FLOW_NOTE
+        income = gb.income_by_source(
+            start_date=date(2026, 1, 1), end_date=date(2026, 12, 31), compact=False,
+        )
+        assert "valuation_note" not in income

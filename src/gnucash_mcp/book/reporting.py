@@ -49,6 +49,23 @@ _NET_INCOME_TYPES = frozenset({"INCOME", "EXPENSE"})
 _CASH_TYPES = frozenset({"BANK", "CASH"})
 
 
+# A flow line in a foreign-commodity account is valued at its month's
+# closing rate (GB-1; GnuCash's Income Statement does the same at one
+# report-end rate), not at the cash that paid for it. A reader who
+# paid 133.40 and reads 153.46 should learn why where it happens
+# (bookkeeper ruling 2026-10-06 on SR-B1, rider 2).
+_FOREIGN_FLOW_NOTE = (
+    "Foreign-currency categories are valued at monthly closing rates; "
+    "amounts actually paid are in cash_flow."
+)
+
+
+def _has_foreign_line(rows, default_currency) -> bool:
+    return any(
+        account.commodity != default_currency for _s, _t, account in rows
+    )
+
+
 def _sum_rounded_cells(cells: dict, currency) -> dict[str, Decimal]:
     """``{(name, month): amount}`` → ``{name: total}`` with each cell
     rounded once to the currency's unit first (M-2)."""
@@ -382,7 +399,7 @@ class ReportingMixin:
                 period_totals[pl] += v
         grand_total = sum(cat_totals.values(), Decimal("0"))
 
-        return _format_grouped_tsv(
+        out = _format_grouped_tsv(
             period_labels=period_labels,
             displayed_names=displayed_names,
             totals=totals,
@@ -396,6 +413,9 @@ class ReportingMixin:
             ),
             currency=book.default_currency,
         )
+        if _has_foreign_line(rows, book.default_currency):
+            out += f"\n({_FOREIGN_FLOW_NOTE})"
+        return out
 
     def spending_by_category(
         self,
@@ -509,10 +529,13 @@ class ReportingMixin:
                 for n, a in sorted(excluded.items(), key=lambda x: x[1])
             ]
 
+            foreign = _has_foreign_line(rows, book.default_currency)
             if compact:
                 out = _format_breakdown_tsv(
                     categories, total, "account", book.default_currency,
                 )
+                if foreign:
+                    out += f"\n({_FOREIGN_FLOW_NOTE})"
                 if excluded_rows:
                     netted = ", ".join(
                         f"{r['account']} "
@@ -531,6 +554,8 @@ class ReportingMixin:
             }
             if excluded_rows:
                 result["net_negative_netted"] = excluded_rows
+            if foreign:
+                result["valuation_note"] = _FOREIGN_FLOW_NOTE
             return result
 
     def income_by_source(
@@ -621,10 +646,13 @@ class ReportingMixin:
                 for n, a in sorted(excluded.items(), key=lambda x: x[1])
             ]
 
+            foreign = _has_foreign_line(rows, book.default_currency)
             if compact:
                 out = _format_breakdown_tsv(
                     sources, total, "account", book.default_currency,
                 )
+                if foreign:
+                    out += f"\n({_FOREIGN_FLOW_NOTE})"
                 if excluded_rows:
                     netted = ", ".join(
                         f"{r['account']} "
@@ -643,6 +671,8 @@ class ReportingMixin:
             }
             if excluded_rows:
                 result["net_negative_netted"] = excluded_rows
+            if foreign:
+                result["valuation_note"] = _FOREIGN_FLOW_NOTE
             return result
 
     # ── Balance sheet and net worth ──────────────────────────────────

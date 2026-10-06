@@ -50,6 +50,7 @@ Totals: 6 SERIOUS, 21 MINOR, 5 NIT; no BLOCKER. Fixed on
 | I-13 hidden not inherited | MINOR | Fixed, `4e536e0`: `_is_hidden` walks the parents. |
 | I-14 audit `None → True` | NIT | Fixed, `4e536e0`. |
 | I-15 fixture's Opening Balances slot | NIT | Fixed, `4e536e0`. |
+| SR-B1 foreign-commodity flow lines revalued at the month's close (bookkeeper loop, 2026-10-06) | ruling | The filed GB-1 convention stands (bookkeeper ruling, with the doctrinal half retracted: `testing/BOOKKEEPER_REPORT_SCOPED_REVIEW.md`). Riders done: a Known Limitations line, and a footer on `spending_by_category` / `income_by_source` whenever a foreign-currency line is present. |
 
 Verification at `4e536e0`: full suite 3287 passed, 36 skipped;
 PostgreSQL gate 90 passed; MariaDB gate 91 passed; every reviewer's
