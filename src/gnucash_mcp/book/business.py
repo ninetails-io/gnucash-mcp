@@ -45,6 +45,7 @@ from gnucash_mcp.book._base import (
     _verify_delete,
     _verify_write,
     _SLOT_TEXT_WIDTH,
+    _check_one_line,
 )
 from gnucash_mcp._format import (
     _GROUP_BY_VALUES,
@@ -57,6 +58,7 @@ from gnucash_mcp._format import (
     _partial_period_labels,
     _period_label,
     _tsv_cell,
+    _one_line,
 )
 
 
@@ -159,7 +161,7 @@ def _format_vendor_spending_compact(
         vendors_list, bills_strs, billed_strs, paid_strs, out_strs,
     ):
         lines.append(
-            f"{v['vendor_name']:<{name_width}}  "
+            f"{_one_line(v['vendor_name']):<{name_width}}  "
             f"{bills:<{bills_width}}  "
             f"{billed:>{billed_w}} billed  "
             f"{paid:>{paid_w}} paid  "
@@ -1181,7 +1183,14 @@ class BusinessMixin:
             txn = split.transaction
             if txn.guid == post_guid or split.reconcile_state == "v":
                 continue
-            if any(o.lot is not None for o in txn.splits if o is not split):
+            # Only a lot-LINK transaction is a credit application. A
+            # payment that also fed a prepayment lot, or a desktop
+            # payment covering several documents, has another leg in
+            # a lot too and was counted as credit, shrinking the
+            # early-payment discount (scoped review 2026-10-06, BM-2).
+            if str(txn.get("trans-txn-type") or "") == "L" and any(
+                o.lot is not None for o in txn.splits if o is not split
+            ):
                 credited += -settlement["sign"] * self._lot_split_amount(
                     split, doc_currency_guid,
                 )
@@ -3470,23 +3479,17 @@ class BusinessMixin:
                     else Decimal(r[5] or 0) / Decimal(r[6] or 1)
                 )
                 stored_sum += qty * price
-            flip = False
-            to_negate = []
-            if _is_invoice_posted(inv) and inv.post_txn is not None:
-                post_split = next(
-                    (sp for sp in inv.post_txn.splits
-                     if sp.account.guid == inv.post_acc_guid), None,
-                )
-                if post_split is not None and stored_sum != 0:
-                    split_sign = 1 if Decimal(str(post_split.value)) > 0 else -1
-                    sum_sign = 1 if stored_sum > 0 else -1
-                    expected = split_sign if customer_side else -split_sign
-                    flip = sum_sign != expected
-            else:
-                # No posting to read: the row says who wrote it.
-                to_negate = [r for r in rows if (r[8] or "") == ""]
-            if flip:
-                to_negate = list(rows)
+            # Posted or not, the row says who wrote it: only a line
+            # carrying the old server's mark is negated. The posted
+            # branch used to compare the sign of the lines' sum with
+            # the posting split's and negate every line when they
+            # disagreed — the C9 guess again, surviving on the posted
+            # path: a credit note whose tax or discount pushes its
+            # total across zero (+100 untaxed, −95 taxed 10%, posting
+            # −4.50 against lines summing −5) had its lines reversed on
+            # the next converting write, by the 1.5 server and by
+            # GnuCash's engine alike (scoped review 2026-10-06, BS-1).
+            to_negate = [r for r in rows if (r[8] or "") == ""]
             if to_negate:
                 for r in to_negate:
                     book.session.execute(
@@ -4386,11 +4389,10 @@ class BusinessMixin:
         # Every free-text argument through the one text gate (scoped
         # review 2026-10-05, I-4): no control characters, GnuCash's
         # column width.
-        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic"):
-            _check_text(
-                locals().get(_field),
-                _SLOT_TEXT_WIDTH if _field == "notes" else _TEXT_WIDTH, _field,
-            )
+        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic", "memo", "action", "billing_id"):
+            _check_text(locals().get(_field), _TEXT_WIDTH, _field)
+            if _field in ("name", "title", "reference", "fullname", "mnemonic", "action", "billing_id"):
+                _check_one_line(locals().get(_field), _field)
         from piecash.business.person import Address
 
         # Cap free-text byte lengths up front.
@@ -4915,11 +4917,10 @@ class BusinessMixin:
         # Every free-text argument through the one text gate (scoped
         # review 2026-10-05, I-4): no control characters, GnuCash's
         # column width.
-        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic"):
-            _check_text(
-                locals().get(_field),
-                _SLOT_TEXT_WIDTH if _field == "notes" else _TEXT_WIDTH, _field,
-            )
+        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic", "memo", "action", "billing_id"):
+            _check_text(locals().get(_field), _TEXT_WIDTH, _field)
+            if _field in ("name", "title", "reference", "fullname", "mnemonic", "action", "billing_id"):
+                _check_one_line(locals().get(_field), _field)
         with self.open(readonly=False) as book:
             customer = self._find_customer(book, customer_id)
             if not customer:
@@ -6074,6 +6075,17 @@ class BusinessMixin:
                     raise ValueError(
                         f"{config['doc_id_param']} must not be blank"
                     )
+                # One line, no padding, GnuCash's column width: a
+                # caller-supplied ID skipped every gate and could
+                # forge a listing row or be stored padded and then
+                # not found (scoped review 2026-10-06, IN-2).
+                _check_one_line(doc_id, config["doc_id_param"])
+                _check_text(doc_id, _TEXT_WIDTH, config["doc_id_param"])
+                if doc_id != doc_id.strip():
+                    raise ValueError(
+                        f"{config['doc_id_param']} {doc_id!r} begins or "
+                        f"ends with whitespace"
+                    )
                 existing = self._find_invoice(
                     book, doc_id, owner_type=owner_type
                 )
@@ -6212,11 +6224,10 @@ class BusinessMixin:
         # Every free-text argument through the one text gate (scoped
         # review 2026-10-05, I-4): no control characters, GnuCash's
         # column width.
-        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic"):
-            _check_text(
-                locals().get(_field),
-                _SLOT_TEXT_WIDTH if _field == "notes" else _TEXT_WIDTH, _field,
-            )
+        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic", "memo", "action", "billing_id"):
+            _check_text(locals().get(_field), _TEXT_WIDTH, _field)
+            if _field in ("name", "title", "reference", "fullname", "mnemonic", "action", "billing_id"):
+                _check_one_line(locals().get(_field), _field)
         return self._create_business_document(
             owner_type=2,
             owner_id=customer_id,
@@ -6258,11 +6269,10 @@ class BusinessMixin:
         # Every free-text argument through the one text gate (scoped
         # review 2026-10-05, I-4): no control characters, GnuCash's
         # column width.
-        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic"):
-            _check_text(
-                locals().get(_field),
-                _SLOT_TEXT_WIDTH if _field == "notes" else _TEXT_WIDTH, _field,
-            )
+        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic", "memo", "action", "billing_id"):
+            _check_text(locals().get(_field), _TEXT_WIDTH, _field)
+            if _field in ("name", "title", "reference", "fullname", "mnemonic", "action", "billing_id"):
+                _check_one_line(locals().get(_field), _field)
         return self._create_business_document(
             owner_type=4,
             owner_id=vendor_id,
@@ -6306,11 +6316,10 @@ class BusinessMixin:
         # Every free-text argument through the one text gate (scoped
         # review 2026-10-05, I-4): no control characters, GnuCash's
         # column width.
-        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic"):
-            _check_text(
-                locals().get(_field),
-                _SLOT_TEXT_WIDTH if _field == "notes" else _TEXT_WIDTH, _field,
-            )
+        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic", "memo", "action", "billing_id"):
+            _check_text(locals().get(_field), _TEXT_WIDTH, _field)
+            if _field in ("name", "title", "reference", "fullname", "mnemonic", "action", "billing_id"):
+                _check_one_line(locals().get(_field), _field)
         return self._create_business_document(
             owner_type=5,
             owner_id=employee_id,
@@ -6431,11 +6440,10 @@ class BusinessMixin:
         # Every free-text argument through the one text gate (scoped
         # review 2026-10-05, I-4): no control characters, GnuCash's
         # column width.
-        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic"):
-            _check_text(
-                locals().get(_field),
-                _SLOT_TEXT_WIDTH if _field == "notes" else _TEXT_WIDTH, _field,
-            )
+        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic", "memo", "action", "billing_id"):
+            _check_text(locals().get(_field), _TEXT_WIDTH, _field)
+            if _field in ("name", "title", "reference", "fullname", "mnemonic", "action", "billing_id"):
+                _check_one_line(locals().get(_field), _field)
         int_owner_type = self._parse_owner_type(owner_type)
         if int_owner_type == 5:
             raise ValueError(
@@ -6734,11 +6742,10 @@ class BusinessMixin:
         # Every free-text argument through the one text gate (scoped
         # review 2026-10-05, I-4): no control characters, GnuCash's
         # column width.
-        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic"):
-            _check_text(
-                locals().get(_field),
-                _SLOT_TEXT_WIDTH if _field == "notes" else _TEXT_WIDTH, _field,
-            )
+        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic", "memo", "action", "billing_id"):
+            _check_text(locals().get(_field), _TEXT_WIDTH, _field)
+            if _field in ("name", "title", "reference", "fullname", "mnemonic", "action", "billing_id"):
+                _check_one_line(locals().get(_field), _field)
         import uuid
         from piecash.business.invoice import Entry
 
@@ -7577,6 +7584,10 @@ class BusinessMixin:
             ValueError: If invoice not found, already posted, no entries,
                         or invalid account type.
         """
+        # Every free-text argument through the one text gate (scoped
+        # review 2026-10-06, IN-3).
+        for _field in ("description", "memo"):
+            _check_text(locals().get(_field), _TEXT_WIDTH, _field)
         from piecash.business.invoice import Invoice
         from piecash.core.transaction import Lot
 
@@ -8300,6 +8311,10 @@ class BusinessMixin:
                 no discount, outside window, amount mismatch,
                 overpayment, credit-note target).
         """
+        # Every free-text argument through the one text gate (scoped
+        # review 2026-10-06, IN-3).
+        for _field in ("description", "memo"):
+            _check_text(locals().get(_field), _TEXT_WIDTH, _field)
         ot = self._parse_owner_type(owner_type)
 
         if from_prepayment:
@@ -9749,15 +9764,23 @@ class BusinessMixin:
                     f"divisible unit."
                 )
 
-            # Customer side: +apply on the CN lot (settles toward
-            # zero), −apply on the target lot. Vendor side symmetric.
-            is_bill_side = self._is_bill_side(cn_eff_ot)
-            if is_bill_side:
-                cn_split_value = -apply_amount
-                target_split_value = apply_amount
-            else:
-                cn_split_value = apply_amount
-                target_split_value = -apply_amount
+            # Each lot moves toward zero: the link split's sign is the
+            # opposite of the lot's balance (gncOwnerCreateLotLink
+            # offsets the two balances). The signs used to be fixed
+            # by side (customer: +apply on the credit note, −apply on
+            # the target), which is right only while the credit note
+            # holds the credit; a credit note whose lines net to a
+            # charge, applied to an overpaid invoice, pushed both lots
+            # further from zero and reported "applied" (scoped review
+            # 2026-10-06, BM-1). The same-sign refusal above (C15)
+            # guarantees the two signs differ, so the values still
+            # sum to zero.
+            cn_balance = self._lot_amount(cn_lot)
+            target_balance = self._lot_amount(target_lot)
+            cn_split_value = -apply_amount if cn_balance > 0 else apply_amount
+            target_split_value = (
+                -apply_amount if target_balance > 0 else apply_amount
+            )
 
             # Quantize to the post-account's commodity.
             quantum = _commodity_quantum(post_acct.commodity)
@@ -10376,11 +10399,10 @@ class BusinessMixin:
         # Every free-text argument through the one text gate (scoped
         # review 2026-10-05, I-4): no control characters, GnuCash's
         # column width.
-        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic"):
-            _check_text(
-                locals().get(_field),
-                _SLOT_TEXT_WIDTH if _field == "notes" else _TEXT_WIDTH, _field,
-            )
+        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic", "memo", "action", "billing_id"):
+            _check_text(locals().get(_field), _TEXT_WIDTH, _field)
+            if _field in ("name", "title", "reference", "fullname", "mnemonic", "action", "billing_id"):
+                _check_one_line(locals().get(_field), _field)
         from piecash.business.invoice import Job
 
         int_owner_type = self._parse_owner_type(owner_type)
@@ -10606,11 +10628,10 @@ class BusinessMixin:
         # Every free-text argument through the one text gate (scoped
         # review 2026-10-05, I-4): no control characters, GnuCash's
         # column width.
-        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic"):
-            _check_text(
-                locals().get(_field),
-                _SLOT_TEXT_WIDTH if _field == "notes" else _TEXT_WIDTH, _field,
-            )
+        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic", "memo", "action", "billing_id"):
+            _check_text(locals().get(_field), _TEXT_WIDTH, _field)
+            if _field in ("name", "title", "reference", "fullname", "mnemonic", "action", "billing_id"):
+                _check_one_line(locals().get(_field), _field)
         if name is None and reference is None and active is None:
             raise ValueError(
                 "update_job requires at least one of name, "
@@ -11166,25 +11187,55 @@ class BusinessMixin:
                 billed += amt
         billed = abs(billed)
 
-        # Outstanding = magnitude of the post-lot balance.
+        # Outstanding: what the settlement chokepoint says is due, in
+        # the document's currency, converted at the POSTING rate.
+        # Summing the lot splits' default-currency values mixed a
+        # payment's pay-date amount with the posting's, which only
+        # tied when the server's own FX split sat beside it; a
+        # desktop-paid EUR bill read as 100 outstanding with nothing
+        # due (scoped review 2026-10-06, BM-3).
         outstanding = Decimal(0)
-        post_acct = book.session.query(
-            piecash.Account
-        ).filter_by(guid=bill.post_acc_guid).first()
-        if post_acct:
-            for lot in post_acct.lots:
-                if lot.guid != bill.post_lot_guid:
-                    continue
-                for s in lot.splits:
-                    if s.reconcile_state == "v":
+        settlement = self._document_settlement(book, bill, is_bill=True)
+        if settlement is not None:
+            due = abs(settlement["amount_due"])
+            if bill.currency != default_currency and due:
+                # The posting's own rate; when the posting is entirely
+                # in the bill's currency, the price on file for its day.
+                rate = (
+                    self._rate_from_post_transaction(
+                        bill.post_txn, default_currency,
+                    ) if bill.post_txn is not None else None
+                )
+                if rate is None:
+                    posted = _safe_invoice_date(bill, "date_posted")
+                    as_of = posted.date() if posted is not None else date.today()
+                    rate = self._rates_as_of(
+                        book, as_of, default_currency,
+                    ).get(bill.currency.guid)
+                if rate is None:
+                    converted_ok = False
+                else:
+                    due = due * rate
+            outstanding = due
+        else:
+            # No lot to read: the ledger sum, as before.
+            post_acct = book.session.query(
+                piecash.Account
+            ).filter_by(guid=bill.post_acc_guid).first()
+            if post_acct:
+                for lot in post_acct.lots:
+                    if lot.guid != bill.post_lot_guid:
                         continue
-                    amt, ok = self._posting_split_in_default(
-                        book, s, default_currency,
-                    )
-                    converted_ok = converted_ok and ok
-                    outstanding += amt
-                break
-        outstanding = abs(outstanding)
+                    for s in lot.splits:
+                        if s.reconcile_state == "v":
+                            continue
+                        amt, ok = self._posting_split_in_default(
+                            book, s, default_currency,
+                        )
+                        converted_ok = converted_ok and ok
+                        outstanding += amt
+                    break
+            outstanding = abs(outstanding)
 
         paid = billed - outstanding
         unconverted = None if converted_ok else bill.currency.mnemonic

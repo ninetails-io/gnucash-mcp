@@ -19,6 +19,7 @@ from decimal import Decimal, InvalidOperation
 import piecash
 
 from gnucash_mcp.book._base import _commodity_quantum, _is_voided, _to_decimal
+from gnucash_mcp.book._base import _check_ledger_date
 from gnucash_mcp.book._currency import _CostPool
 from gnucash_mcp._format import (
     _GROUP_BY_VALUES,
@@ -444,6 +445,9 @@ class ReportingMixin:
                 and return a multi-period TSV table (always a string;
                 ``compact`` is ignored — the table is the output).
         """
+        for _f in ("start_date", "end_date", "as_of_date"):
+            if locals().get(_f) != date.max:  # date.max: no upper bound
+                _check_ledger_date(locals().get(_f), _f)
         if group_by is not None:
             if group_by not in _GROUP_BY_VALUES:
                 raise ValueError(
@@ -579,6 +583,9 @@ class ReportingMixin:
                 / ``"quarter"`` / ``"year"`` for a multi-period TSV
                 table — see ``spending_by_category``.
         """
+        for _f in ("start_date", "end_date", "as_of_date"):
+            if locals().get(_f) != date.max:  # date.max: no upper bound
+                _check_ledger_date(locals().get(_f), _f)
         if group_by is not None:
             if group_by not in _GROUP_BY_VALUES:
                 raise ValueError(
@@ -700,6 +707,9 @@ class ReportingMixin:
             equity already includes the Unrealized line so the
             totals balance.
         """
+        for _f in ("start_date", "end_date", "as_of_date"):
+            if locals().get(_f) != date.max:  # date.max: no upper bound
+                _check_ledger_date(locals().get(_f), _f)
         # One SQL-filtered pass over every relevant type, bucketed in
         # memory. Net income (retained-earnings-equivalent) rolls
         # into equity below.
@@ -943,6 +953,9 @@ class ReportingMixin:
         Returns:
             Dict with net worth value or time series.
         """
+        for _f in ("start_date", "end_date", "as_of_date"):
+            if locals().get(_f) != date.max:  # date.max: no upper bound
+                _check_ledger_date(locals().get(_f), _f)
         from dateutil.relativedelta import relativedelta
 
         nw_types = _ASSET_TYPES | _LIABILITY_TYPES
@@ -1168,6 +1181,9 @@ class ReportingMixin:
             the LLM can mention the ``include_transfers`` escape
             hatch). With ``group_by``, a multi-period TSV table.
         """
+        for _f in ("start_date", "end_date", "as_of_date"):
+            if locals().get(_f) != date.max:  # date.max: no upper bound
+                _check_ledger_date(locals().get(_f), _f)
         if group_by is not None and group_by not in _GROUP_BY_VALUES:
             raise ValueError(
                 f"Invalid group_by '{group_by}'. Must be one of: "

@@ -51,6 +51,15 @@ def _parse_prices_tsv(tsv: str) -> list[dict]:
         fields = ln.split("\t")
         while fields and not fields[-1].strip():
             fields.pop()
+        if len(fields) > len(tokens):
+            # A tab inside a value, or a cell past the header: it was
+            # dropped, and "1<TAB>234.56" stored a price of 1 (scoped
+            # review 2026-10-06, IN-6).
+            raise ValueError(
+                f"row {i}: {len(fields)} cells for a {len(tokens)}-column "
+                f"header — a value with a tab in it, or a cell past the "
+                f"header"
+            )
         if len(fields) < 4:
             raise ValueError(
                 f"row {i}: expected at least ref, commodity, date, value"

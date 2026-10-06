@@ -171,7 +171,7 @@ def _format_grouped_tsv(
     lines = ["\t".join([label, *header_labels, "Total", "Avg"])]
     for name, leaf in zip(displayed_names, leaves):
         per = totals.get(name, {})
-        cells = [leaf]
+        cells = [_one_line(leaf)]
         cells += [
             _format_converted(per.get(pl, Decimal('0')), currency)
             for pl in period_labels
@@ -450,7 +450,11 @@ def _tsv_lines(tsv: str, what: str) -> list[str]:
     # exotic as "the header" (review finding); and number the same
     # blank-filtered rows the parse loops number, so this
     # diagnosis and every other row error agree about a line.
-    text = tsv.replace("\r\n", "\n").replace("\r", "\n")
+    # A byte-order mark on the header is invisible, and a parser that
+    # kept it reported "got \ufeffref" as if the header were right
+    # (IV-22; one of four parsers stripped it — scoped review
+    # 2026-10-06, IN-8). Once, here, for all of them.
+    text = tsv.lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
     for ch, name in _EXOTIC_SEPARATORS.items():
         if ch in text:
             prior = text[: text.index(ch)].split("\n")[:-1]
@@ -1143,6 +1147,50 @@ def _redact_uri(uri: str) -> str:
         return "<database>"
 
 
+# Secrets the server has been handed (a book URI's password, its
+# secret query values), raw and percent-encoded. The shape-based
+# scrubber below stops at a quote or a space, so a password holding
+# one went out unmasked when piecash quoted the connection string
+# (scoped review 2026-10-06, CS-1). Masking the known strings first
+# does not depend on the shape of the text around them.
+_KNOWN_SECRETS: set[str] = set()
+
+
+def register_secrets_from_url(uri: str) -> None:
+    """Remember every secret in ``uri`` so ``_scrub_credentials``
+    masks it literally. Best-effort; a URI that does not parse
+    registers nothing (and is never echoed anywhere)."""
+    from urllib.parse import quote, unquote
+
+    try:
+        from sqlalchemy.engine import make_url
+        url = make_url(uri)
+        secrets = set()
+        if url.password:
+            secrets.add(str(url.password))
+        for key, value in (url.query or {}).items():
+            if _SECRET_QUERY_RE.match(f"{key}={value}") and value:
+                secrets.add(str(value))
+    except Exception:
+        return
+    for secret in list(secrets):
+        if len(secret) < 2:
+            continue
+        _KNOWN_SECRETS.add(secret)
+        _KNOWN_SECRETS.add(quote(secret, safe=""))
+        _KNOWN_SECRETS.add(unquote(secret))
+
+
+def _mask_known_secrets(text: str) -> str:
+    if not _KNOWN_SECRETS or not text:
+        return text
+    # Longest first, so a secret that contains another is masked whole.
+    for secret in sorted(_KNOWN_SECRETS, key=len, reverse=True):
+        if secret in text:
+            text = text.replace(secret, "***")
+    return text
+
+
 def _scrub_credentials(text: str) -> str:
     """Mask every connection-string credential inside arbitrary text.
     The one scrubber for text that leaves the server by any road: a
@@ -1159,7 +1207,10 @@ def _scrub_credentials(text: str) -> str:
     Unconditional, like ``_redact_uri``. A URL with no credential in
     it is left exactly as written.
     """
-    if not text or "://" not in text and ":/" not in text:
+    if not text:
+        return text
+    text = _mask_known_secrets(text)
+    if "://" not in text and ":/" not in text:
         return text
 
     def _one(match):

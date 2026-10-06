@@ -33,6 +33,7 @@ from gnucash_mcp._format import (
     _split_match_verdict,
     _tsv_cell,
     _period_label,
+    _one_line,
 )
 
 _debug_logger = logging.getLogger(DEBUG_LOGGER_NAME)
@@ -103,6 +104,8 @@ from gnucash_mcp.book._base import (
     _name_skeleton,
     _is_hidden,
     _check_control_chars,
+    _check_one_line,
+    _check_ledger_date,
 )
 
 
@@ -969,7 +972,7 @@ class CoreMixin:
                         overdue_entries.append((
                             days_overdue,
                             sx.name,
-                            f"Overdue scheduled: {sx.name} "
+                            f"Overdue scheduled: {_one_line(sx.name)} "
                             f"due {next_occ.isoformat()}",
                         ))
                 except Exception as exc:
@@ -1390,7 +1393,7 @@ class CoreMixin:
                         )
                         amount_str = f"{row['amount_due']:,}"
                         msg = (
-                            f"Past due {doc_type}: {owner_name} "
+                            f"Past due {doc_type}: {_one_line(owner_name)} "
                             f"{days_overdue} day"
                             f"{'s' if days_overdue != 1 else ''} overdue, "
                             f"{currency} {amount_str}"
@@ -1403,7 +1406,7 @@ class CoreMixin:
                         )
                         if held is not None:
                             msg += (
-                                f" — {held['owner_name'] or owner_name} "
+                                f" — {_one_line(held['owner_name'] or owner_name)} "
                                 f"has {held['currency']} "
                                 f"{held['amount']:,} in unapplied "
                                 f"payments; settle from them with "
@@ -4565,6 +4568,7 @@ class CoreMixin:
         date_defaulted = trans_date is None
         if trans_date is None:
             trans_date = date.today()
+        _check_ledger_date(trans_date, "trans_date")
 
         # One book-open for the whole create pipeline — preflight signal
         # gathering, write, and post-write consistency warning all live
@@ -4866,14 +4870,7 @@ class CoreMixin:
                     _check_text(txn.get("notes"), _SLOT_TEXT_WIDTH, "notes")
                     _check_text(txn.get("num"), _TEXT_WIDTH, "num")
                     _check_text(txn.get("link"), _SLOT_TEXT_WIDTH, "link")
-                    try:
-                        txn["date"] - timedelta(days=366)
-                        txn["date"] + timedelta(days=366)
-                    except OverflowError:
-                        raise ValueError(
-                            f"date {txn['date'].isoformat()} is outside "
-                            f"the range a ledger can hold"
-                        ) from None
+                    _check_ledger_date(txn["date"], "date")
                     # Row's transaction currency (the ``cur``
                     # column); absent means the book default.
                     row_currency = default_currency
@@ -5378,6 +5375,7 @@ class CoreMixin:
         never silently disables duplicate detection, and vice
         versa.
         """
+        _check_ledger_date(statement_date, "statement_date")
         if not lines:
             raise ValueError(
                 "statement has no lines — for a no-activity "
@@ -6752,6 +6750,8 @@ class CoreMixin:
                 f"Account name contains control characters. "
                 f"Got: {name!r}."
             )
+        _check_control_chars(name, "Account name")
+        _check_one_line(name, "Account name")
         # A name that reads as an account REFERENCE can never be
         # reached by path: ``%abcdef0`` resolves as a short GUID, a
         # 32-hex name as a full one (IV-21).
@@ -7159,6 +7159,18 @@ class CoreMixin:
                     f"Cannot delete account with {len(account.splits)} transaction(s). "
                     f"Move or delete transactions first."
                 )
+            # Desktop refuses to delete an account other objects still
+            # point at and lists them; the server deleted it and left a
+            # schedule that could not instantiate, a draft line and a
+            # tax table pointing at nothing (scoped review 2026-10-06,
+            # CS-4).
+            holders = self._account_references(book, account.guid)
+            if holders:
+                raise ValueError(
+                    f"Cannot delete account '{account.fullname}': it is "
+                    f"still used by {', '.join(holders)}. Repoint or "
+                    f"remove those first."
+                )
 
             # Stage pre-delete state for the audit log.
             self._stage_audit_before(_account_to_dict(account))
@@ -7187,6 +7199,35 @@ class CoreMixin:
             book.save()
 
             return result
+
+    @staticmethod
+    def _account_references(book, guid: str) -> list[str]:
+        """What still points at an account besides its splits and
+        children: schedule templates, document lines, tax tables,
+        posted documents, employees' cards, budget rows."""
+        from sqlalchemy import text
+
+        checks = (
+            ("scheduled transaction template(s)",
+             "SELECT COUNT(*) FROM slots WHERE name = 'sched-xaction/account' "
+             "AND guid_val = :g"),
+            ("document line(s)",
+             "SELECT COUNT(*) FROM entries WHERE i_acct = :g OR b_acct = :g"),
+            ("tax table(s)",
+             "SELECT COUNT(*) FROM taxtable_entries WHERE account = :g"),
+            ("posted document(s)",
+             "SELECT COUNT(*) FROM invoices WHERE post_acc = :g"),
+            ("employee card setting(s)",
+             "SELECT COUNT(*) FROM employees WHERE ccard_guid = :g"),
+            ("budget row(s)",
+             "SELECT COUNT(*) FROM budget_amounts WHERE account_guid = :g"),
+        )
+        out = []
+        for label, sql in checks:
+            n = book.session.execute(text(sql), {"g": guid}).scalar() or 0
+            if n:
+                out.append(f"{n} {label}")
+        return out
 
     def _validate_transaction_deletable(
         self, book, transaction, force: bool,
@@ -7681,6 +7722,7 @@ class CoreMixin:
                         raise ValueError(
                             "row changes nothing — every cell empty"
                         )
+                    _check_ledger_date(u.get("date"), "date")
                     _check_text(u.get("description"), _TEXT_WIDTH, "description")
                     _check_text(u.get("notes"), _SLOT_TEXT_WIDTH, "notes")
                     _check_text(u.get("num"), _TEXT_WIDTH, "num")

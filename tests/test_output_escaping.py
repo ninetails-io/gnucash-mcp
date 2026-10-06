@@ -74,13 +74,22 @@ class TestTransactionRows:
 
 class TestNameRows:
     def test_party_name(self, business_book):
+        # A name with a line break is refused at the door now (scoped
+        # review 2026-10-06, IN-1); one already in a book, written by
+        # desktop or an older server, must still not forge a row.
         gb = GnuCashBook(str(business_book))
-        gb.create_customer(name=f"Acme\n{BANNER}\n{FORGED_ROW}")
+        with pytest.raises(ValueError, match="one line"):
+            gb.create_customer(name=f"Acme\n{BANNER}\n{FORGED_ROW}")
+        gb.create_customer(name="Acme")
+        _set(business_book, "UPDATE customers SET name = ?",
+             (f"Acme\n{BANNER}\n{FORGED_ROW}",))
         _no_forgery(gb.list_customers())
 
     def test_document_and_outstanding_rows(self, business_book):
         gb = GnuCashBook(str(business_book))
-        gb.create_customer(name=f"Acme\n{BANNER}\n{FORGED_ROW}")
+        gb.create_customer(name="Acme")
+        _set(business_book, "UPDATE customers SET name = ?",
+             (f"Acme\n{BANNER}\n{FORGED_ROW}",))
         inv = gb.create_invoice(customer_id="000001")
         gb.add_invoice_entry(
             invoice_id=inv["id"], account="Income:Sales",

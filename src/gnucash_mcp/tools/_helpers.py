@@ -7,6 +7,8 @@ gnucash_mcp/tools/.
 import json
 import logging
 import traceback
+
+from sqlalchemy.exc import StatementError
 from datetime import date
 from functools import wraps
 from typing import Annotated, Callable, Literal
@@ -457,6 +459,29 @@ def safe_tool(func: Callable) -> Callable:
             return _json({
                 "error": redact_paths(str(e)),
                 "error_type": "validation_error",
+            })
+        except StatementError as e:
+            # A refusal raised while binding a value (a transaction
+            # date GnuCash cannot hold, in ``_date_bind``) reaches
+            # here wrapped by SQLAlchemy, with the statement and its
+            # parameters quoted. The inner ValueError is the message;
+            # anything else stays an unexpected error.
+            if isinstance(e.orig, ValueError):
+                logger.warning(
+                    f"Validation error in {func.__name__}: {e.orig}"
+                )
+                return _json({
+                    "error": redact_paths(str(e.orig)),
+                    "error_type": "validation_error",
+                })
+            logger.error(
+                f"Unexpected error in {func.__name__}: {e}\n{traceback.format_exc()}"
+            )
+            return _json({
+                "error": redact_paths(
+                    f"Unexpected error: {type(e).__name__}: {e}"
+                ),
+                "error_type": "unexpected_error",
             })
         except RuntimeError as e:
             # The _verify_* helpers raise RuntimeError for "the

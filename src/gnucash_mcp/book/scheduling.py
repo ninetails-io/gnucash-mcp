@@ -50,6 +50,8 @@ from gnucash_mcp.book._base import (  # noqa: F401 — re-exported ports
     _check_text,
     _TEXT_WIDTH,
     _SLOT_TEXT_WIDTH,
+    _check_one_line,
+    _check_ledger_date,
 )
 from gnucash_mcp._format import _paginate
 
@@ -221,7 +223,9 @@ class SchedulingMixin:
             return None
         if sx.num_occur > 0 and sx.rem_occur <= 0:
             return None
-        ref = last if last is not None else start - timedelta(days=1)
+        ref = last if last is not None else (
+            start - timedelta(days=1) if start > date.min else start
+        )
         candidates = [
             _recurrence_next(pt, mult, anchor, wadj, ref)
             for pt, mult, anchor, wadj in rows
@@ -829,11 +833,13 @@ class SchedulingMixin:
         # Every free-text argument through the one text gate (scoped
         # review 2026-10-05, I-4): no control characters, GnuCash's
         # column width.
-        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic"):
+        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic", "memo", "action"):
             _check_text(
                 locals().get(_field),
                 _SLOT_TEXT_WIDTH if _field == "notes" else _TEXT_WIDTH, _field,
             )
+            if _field in ("name", "title", "reference", "fullname", "mnemonic", "action"):
+                _check_one_line(locals().get(_field), _field)
         if frequency not in self.VALID_FREQUENCIES:
             raise ValueError(
                 f"Invalid frequency: {frequency}. "
@@ -847,6 +853,8 @@ class SchedulingMixin:
         parsed_end = (
             date.fromisoformat(end_date) if end_date else None
         )
+        _check_ledger_date(parsed_start, "start_date")
+        _check_ledger_date(parsed_end, "end_date")
         # A schedule that ends before it starts has no occurrence and
         # was accepted with ``next_occurrence: None`` (C42).
         if parsed_end is not None and parsed_end < parsed_start:
@@ -1758,11 +1766,13 @@ class SchedulingMixin:
         # Every free-text argument through the one text gate (scoped
         # review 2026-10-05, I-4): no control characters, GnuCash's
         # column width.
-        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic"):
+        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic", "memo", "action"):
             _check_text(
                 locals().get(_field),
                 _SLOT_TEXT_WIDTH if _field == "notes" else _TEXT_WIDTH, _field,
             )
+            if _field in ("name", "title", "reference", "fullname", "mnemonic", "action"):
+                _check_one_line(locals().get(_field), _field)
         with self.open(readonly=False) as book:
             sx = self._find_scheduled_transaction(book, guid)
             if not sx:

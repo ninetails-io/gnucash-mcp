@@ -570,11 +570,9 @@ class BackupMixin:
         the state it converted from (adversarial review 2026-09-30,
         C30).
 
-        - A snapshot of exactly this state already exists (the
-          auto-backup just took one): nothing more to copy.
-        - Otherwise a ``manual``-stage snapshot labelled
-          ``pre-1-5-upgrade`` is written. Manual snapshots are never
-          pruned.
+        - A ``manual``-stage snapshot labelled ``pre-1-5-upgrade`` is
+          written, always: manual snapshots are never pruned, and no
+          anchor is trusted to say an existing file holds this state.
         - It cannot be written: the write is REFUSED. Every other
           backup here is best-effort, because a routine write can be
           redone; this one guards a change that cannot.
@@ -588,10 +586,8 @@ class BackupMixin:
         can spill SQLite's page cache and take the exclusive lock
         mid-transaction, after which nothing else can read the file.
 
-        Returns ``{"pre_upgrade_backup": <filename>}``: the file
-        written here, or the auto-backup's copy of this very state
-        under the manual label (a hard link where possible). The
-        marker file names it.
+        Returns ``{"pre_upgrade_backup": <filename>}``, the copy
+        written here; the marker file names it.
         """
         if self._pre_upgrade_checked or not self.source.is_file:
             return {}
@@ -601,42 +597,20 @@ class BackupMixin:
                 self._pre_upgrade_checked = True
                 return {}
             result: dict = {}
-            if not self._book_unchanged_since_last_backup(
-                self._current_book_hash()
-            ):
-                made = self.create_backup(
-                    stage=_MANUAL_STAGE_NAME,
-                    label=self._PRE_UPGRADE_LABEL,
-                    _committed_state=True,
-                )
-                holds = Path(made["path"]).name
-                result["pre_upgrade_backup"] = holds
-            else:
-                # The auto-backup taken moments ago (the first write
-                # of a process) holds the pre-conversion state, but it
-                # is a STAGE file that retention prunes (scoped review
-                # 2026-10-05, S-3). Give it the manual label, as a hard
-                # link where the filesystem allows (no second copy of a
-                # large book) and a copy otherwise: manual snapshots are
-                # never pruned, and the marker names the file a reader
-                # can find (bookkeeper close-out loop, flag 2).
-                newest = self.list_backups()
-                if not newest:
-                    raise RuntimeError(
-                        "the book hash matched the last backup, but no "
-                        "backup file is on disk"
-                    )
-                source = self._backups_dir() / Path(newest[0]["path"]).name
-                target = self._backups_dir() / (
-                    f"{self.book_path.stem}-{_format_ts(_now_utc())}"
-                    f"-{_MANUAL_STAGE_NAME}-{self._PRE_UPGRADE_LABEL}.gnucash"
-                )
-                try:
-                    os.link(source, target)
-                except OSError:
-                    shutil.copy2(source, target)
-                holds = target.name
-                result["pre_upgrade_backup"] = holds
+            # Always a fresh copy of the committed state. The shortcut
+            # that reused the auto-backup's file when the book hash
+            # matched trusted a stale anchor: after a prune the newest
+            # file could hold an OLDER state of the book, and the
+            # irreversible conversion ran with no copy of what it
+            # converted (scoped review 2026-10-06, CS-2). One extra
+            # copy, once per book, is the price of knowing.
+            made = self.create_backup(
+                stage=_MANUAL_STAGE_NAME,
+                label=self._PRE_UPGRADE_LABEL,
+                _committed_state=True,
+            )
+            holds = Path(made["path"]).name
+            result["pre_upgrade_backup"] = holds
             marker.parent.mkdir(parents=True, exist_ok=True)
             marker.write_text(
                 f"{_format_ts(_now_utc())}\nsnapshot: {holds}\n"

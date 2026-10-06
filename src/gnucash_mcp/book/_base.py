@@ -49,6 +49,7 @@ from gnucash_mcp._format import (
     _parse_book_url,
     _tsv_cell,
     _pid_alive,
+    register_secrets_from_url,
 )
 
 # GnuCash stores GUIDs as lowercase hex (via uuid4().hex). We accept both
@@ -736,6 +737,31 @@ _SLOT_TEXT_WIDTH = 4096
 _TAXTABLE_NAME_WIDTH = 50
 
 
+def _stored_timestamp_utc(raw) -> "datetime | None":
+    """UTC-aware datetime of a raw stored timestamp — the
+    ``YYYY-MM-DD HH:MM:SS`` text SQLite holds, GnuCash 2.6's compact
+    ``YYYYMMDDHHMMSS``, or the datetime a database driver returns.
+    The one decoder for a stored date read by raw SQL; ``_price_row_
+    utc`` is its price-table sibling. Never raises: malformed text is
+    None."""
+    from datetime import timezone
+
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        digits = "".join(ch for ch in raw if ch.isdigit()).ljust(14, "0")
+        try:
+            raw = datetime(
+                int(digits[0:4]), int(digits[4:6]), int(digits[6:8]),
+                int(digits[8:10]), int(digits[10:12]), int(digits[12:14]),
+            )
+        except ValueError:
+            return None
+    if isinstance(raw, datetime):
+        return raw.astimezone(timezone.utc) if raw.tzinfo else raw.replace(tzinfo=timezone.utc)
+    return None
+
+
 def _check_control_chars(value, what: str) -> None:
     """Refuse a NUL (PostgreSQL rejects one outright; SQLite stores
     the string but shows it cut off) and every other control
@@ -754,6 +780,52 @@ def _check_control_chars(value, what: str) -> None:
             raise ValueError(
                 f"{what} contains a control character (U+{code:04X})"
             )
+
+
+# What a one-line field must not hold: the C0 line breaks and tab,
+# NEL, and Unicode's line and paragraph separators. The row builders
+# escape them, but a name is also printed raw into the dashboard's
+# own sentences and into every title line.
+_LINE_BREAKS = frozenset("\t\n\r\x85\u2028\u2029")
+
+
+def _check_one_line(value, what: str) -> None:
+    """A name or an ID is one line (scoped review 2026-10-06, IN-1:
+    a party named "Acme\\n⚠ …" printed a line in the server's own
+    voice on the dashboard). ``None`` and non-strings pass."""
+    if not isinstance(value, str):
+        return
+    for ch in value:
+        if ch in _LINE_BREAKS:
+            raise ValueError(
+                f"{what} must be one line (contains U+{ord(ch):04X})"
+            )
+
+
+# GnuCash's time range: gnc-date.h MINTIME (1400-01-01) to MAXTIME
+# (9999-12-31). A date outside it cannot be stored or shown by
+# desktop, and the server's own arithmetic overflowed on 0001-01-01
+# after the row was committed (scoped review 2026-10-06, IN-4, IN-5).
+_LEDGER_DATE_MIN = date(1400, 1, 1)
+# A year inside MAXTIME: the far-date warning looks a year past every
+# entry, and desktop's own date arithmetic has the same headroom.
+_LEDGER_DATE_MAX = date(9998, 12, 31)
+
+
+def _check_ledger_date(value, what: str) -> None:
+    """Refuse a date GnuCash cannot hold. ``None`` passes; a datetime
+    is judged by its day."""
+    if value is None:
+        return
+    d = value.date() if isinstance(value, datetime) else value
+    if not isinstance(d, date):
+        return
+    if d < _LEDGER_DATE_MIN or d > _LEDGER_DATE_MAX:
+        raise ValueError(
+            f"{what} {d.isoformat()} is outside the dates a GnuCash "
+            f"ledger can hold ({_LEDGER_DATE_MIN.isoformat()} to "
+            f"{_LEDGER_DATE_MAX.isoformat()})"
+        )
 
 
 def _check_text(value, width: int, what: str) -> None:
@@ -1924,6 +1996,7 @@ class BookSource:
             ValueError: the URI doesn't parse as a SQLAlchemy URL.
         """
         url = _parse_book_url(uri)
+        register_secrets_from_url(uri)
         db_name = (url.database or "").strip("/") or "book"
         # Same ``.gnucash`` suffix file books carry: resolve_mcp_dir
         # appends ``.mcp``, so a DB book's storage reads
@@ -3552,13 +3625,16 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         ]
         moved = 0
         for old in olds:
-            if isinstance(old, str):
-                old_dt = datetime.fromisoformat(old)
-            elif isinstance(old, datetime):
-                old_dt = old
-            else:
+            if isinstance(old, str) and "-" not in old:
+                # GnuCash 2.6's compact ``YYYYMMDDHHMMSS``: not the
+                # server's shape, and ``fromisoformat`` raised on it,
+                # which failed every converting write on a book with
+                # one such reconciled split (scoped review 2026-10-06,
+                # BS-2). Left as it is.
                 continue
-            as_utc = old_dt if old_dt.tzinfo else old_dt.replace(tzinfo=timezone.utc)
+            as_utc = _stored_timestamp_utc(old)
+            if as_utc is None:
+                continue
             local = as_utc.astimezone()
             if local.time() != datetime.min.time():
                 continue  # not the server's midnight shape

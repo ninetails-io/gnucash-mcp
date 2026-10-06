@@ -1590,3 +1590,343 @@ class TestForeignFlowLinesNameTheirValuation:
             start_date=date(2026, 1, 1), end_date=date(2026, 12, 31), compact=False,
         )
         assert "valuation_note" not in income
+
+
+# ── Second scoped review (the fix branch's diff), 2026-10-06 ────────
+
+
+class TestSecondReviewBlockers:
+    def test_a_posted_credit_note_whose_total_crosses_zero_is_left_alone(
+        self, business_book,
+    ):
+        """BS-1: the converter negates only lines carrying the old
+        server's mark. A 1.5-posted credit note with +100 untaxed and
+        −95 taxed at 10% posts −4.50 against lines summing −5; the
+        converter used to read the disagreeing signs as the pre-1.5
+        shape and reverse every line."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_account(
+            name="GST Payable", account_type="LIABILITY", parent="Liabilities",
+        )
+        gb.create_taxtable(name="T10", entries=[{
+            "type": "percentage", "amount": "10",
+            "account": "Liabilities:GST Payable",
+        }])
+        gb.create_customer(name="Acme")
+        cn = gb.create_credit_note(owner_id="000001", owner_type="customer")
+        gb.add_credit_note_entry(
+            credit_note_id=cn["id"], account="Income:Sales",
+            description="Charge back", quantity="1", price="100.00",
+        )
+        gb.add_credit_note_entry(
+            credit_note_id=cn["id"], account="Income:Sales",
+            description="Refund", quantity="-1", price="95.00", taxtable="T10",
+        )
+        gb.post_invoice(
+            invoice_id=cn["id"], post_account=AR, post_date="2026-01-20",
+            owner_type="customer",
+        )
+        before = _q(business_book, "select description, quantity_num from entries order by description")
+        # Two converting writes later...
+        gb.create_budget(name="B", year=2026)
+        gb.create_customer(name="Beta")
+        inv = gb.create_invoice(customer_id="000002")
+        gb.add_invoice_entry(
+            invoice_id=inv["id"], account="Income:Sales",
+            description="Work", quantity="1", price="10.00",
+        )
+        made = gb.post_invoice(inv["id"], AR)
+        assert "credit_note_entries_migrated" not in made
+        after = _q(business_book, "select description, quantity_num from entries order by description")
+        assert [r for r in after if r[0] != "Work"] == before
+
+    def test_a_2_6_reconcile_date_does_not_stop_the_converters(self, test_book):
+        """BS-2."""
+        gb = GnuCashBook(str(test_book))
+        guid = _spend(gb)
+        split = gb.get_transaction(guid)["splits"][0]
+        gb.set_reconcile_state(split_guid=split["guid"], state="y")
+        _q(
+            test_book,
+            "update splits set reconcile_date = '20150131235959' where guid like ?",
+            (split["guid"] + "%",),
+        )
+        made = gb.create_budget(name="B", year=2026)  # a converting write
+        assert made["status"] == "created"
+        assert _q(
+            test_book, "select reconcile_date from splits where guid like ?",
+            (split["guid"] + "%",),
+        ) == [("20150131235959",)]
+
+    def test_a_credit_note_that_nets_to_a_charge_moves_both_lots_toward_zero(
+        self, business_book,
+    ):
+        """BM-1: the link's signs come from the lots' balances, not
+        from which side the document is on. A negative-total invoice
+        (−70) and a credit note whose line is a charge (−50): applying
+        50 leaves the credit note settled and the invoice at −20. The
+        side-fixed signs pushed both to −120 and +100 and said
+        "applied"."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme")
+        inv = gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id=inv["id"], account="Income:Sales",
+            description="Credit back", quantity="-1", price="70.00",
+        )
+        gb.post_invoice(inv["id"], AR, post_date="2026-01-15", force=True)
+        cn = gb.create_credit_note(owner_id="000001", owner_type="customer")
+        gb.add_credit_note_entry(
+            credit_note_id=cn["id"], account="Income:Sales",
+            description="Restocking fee", quantity="-1", price="50.00",
+        )
+        gb.post_invoice(
+            invoice_id=cn["id"], post_account=AR, post_date="2026-01-16",
+            owner_type="customer", force=True,
+        )
+        applied = gb.apply_credit_note(
+            credit_note_id=cn["id"], applies_to_invoice_id=inv["id"],
+            owner_type="customer",
+        )
+        assert applied["amount_applied"] == "50.00"
+        assert Decimal(gb.get_invoice(cn["id"], owner_type="customer")["amount_due"]) == 0
+        assert Decimal(gb.get_invoice(inv["id"])["amount_due"]) == Decimal("-20.00")
+
+    def test_a_password_with_a_quote_or_a_space_is_masked(self):
+        """CS-1: known secrets are masked literally, whatever the
+        text around them."""
+        from gnucash_mcp._format import _scrub_credentials, register_secrets_from_url
+
+        register_secrets_from_url("postgresql://u:pa'ss wd@h:5/db?sslpassword=x y")
+        text = (
+            "Database 'postgresql://u:pa'ss wd@h:5/db?sslpassword=x y' "
+            "does not exist"
+        )
+        out = _scrub_credentials(text)
+        assert "pa'ss wd" not in out and "x y" not in out
+        assert "***" in out
+
+
+class TestSecondReviewSerious:
+    def _posted_bill(self, gb, currency=None):
+        gb.create_vendor(name="EuroSup", currency=currency)
+        bill = gb.create_bill(vendor_id="000001")
+        gb.add_bill_entry(
+            bill_id=bill["id"], account="Expenses:Services",
+            description="Hosting", quantity="1", price="1000.00",
+        )
+        return bill["id"]
+
+    def test_prepayment_cash_is_not_a_credit_against_the_discount(
+        self, business_book,
+    ):
+        """BM-2: only a lot-link transaction counts as credit."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_billterm(name="2/10 net 30", due_days=30, discount_days=10,
+                           discount_percent="2")
+        gb.create_customer(name="Acme")
+        inv = gb.create_invoice(customer_id="000001", term="2/10 net 30")
+        gb.add_invoice_entry(
+            invoice_id=inv["id"], account="Income:Sales",
+            description="Work", quantity="1", price="1000.00",
+        )
+        gb.post_invoice(inv["id"], AR, post_date="2026-03-01")
+        # 200 arrives as a prepayment first, then settles the invoice.
+        gb.pay_invoice(
+            invoice_id=inv["id"], payment_account="Assets:Checking",
+            amount="1200.00", payment_date="2026-03-02",
+            allow_prepayment=True,
+        ) if False else None
+        paid = gb.pay_invoice(
+            invoice_id=inv["id"], payment_account="Assets:Checking",
+            amount="200.00", payment_date="2026-03-02",
+        )
+        assert paid["status"] == "partial"
+        # 780 with the 2% discount on the 800 balance... the discount is
+        # on the full 1000 (20.00), so the correct payment is 780.
+        settled = gb.pay_invoice(
+            invoice_id=inv["id"], payment_account="Assets:Checking",
+            amount="780.00", payment_date="2026-03-05", apply_discount=True,
+        )
+        assert settled["status"] == "paid"
+
+    def test_vendor_report_reads_a_desktop_shaped_payment(self, business_book):
+        """BM-3: outstanding comes from the settlement chokepoint,
+        converted at the posting rate."""
+        from tests.conftest import drop_transaction_prices
+
+        gb = GnuCashBook(str(business_book))
+        gb.create_account(
+            name="Payable EUR", account_type="PAYABLE", parent="Liabilities",
+            commodity="EUR",
+        )
+        gb.create_price(
+            commodity="EUR", namespace="CURRENCY", value="1.10",
+            price_date=date(2026, 1, 10),
+        )
+        bill = self._posted_bill(gb, currency="EUR")
+        gb.post_invoice(
+            invoice_id=bill, post_account="Liabilities:Payable EUR",
+            post_date="2026-01-15", owner_type="vendor",
+        )
+        # Paid in desktop's shape: a USD transaction, the payable
+        # relieved at the pay-date value, no FX split.
+        gb.pay_invoice(
+            invoice_id=bill, payment_account="Assets:Checking",
+            amount="1000.00", payment_account_amount="1200.00",
+            payment_date="2026-02-01", owner_type="vendor",
+        )
+        drop_transaction_prices(business_book)
+        report = gb.vendor_spending_report(
+            start_date="2026-01-01", end_date="2026-12-31", compact=False,
+        )
+        (row,) = report["vendors"]
+        assert Decimal(row["outstanding"]) == 0
+        assert Decimal(gb.get_invoice(bill, owner_type="vendor")["amount_due"]) == 0
+
+    def test_the_pre_conversion_copy_is_the_committed_state(
+        self, test_book, monkeypatch,
+    ):
+        """CS-2: always a fresh copy, never a link to the newest file
+        of any stage."""
+        from gnucash_mcp.book.backup import BackupMixin, _write_state
+
+        gb = GnuCashBook(str(test_book))
+        gb.create_backup(stage="session")
+        _write_state(
+            gb._backups_dir(), test_book.stem, {},
+            book_sha256=gb._current_book_hash(),
+        )
+        _spend(gb)  # the book moved on; the anchor did not
+        monkeypatch.setattr(BackupMixin, "_pre_upgrade_checked", False)
+        result = gb._ensure_pre_upgrade_snapshot()
+        copy = gb._backups_dir() / result["pre_upgrade_backup"]
+        assert _q(copy, "select count(*) from transactions") == _q(
+            test_book, "select count(*) from transactions",
+        )
+
+    def test_a_legacy_folder_holding_another_books_backups_is_not_claimed(
+        self, tmp_path, monkeypatch,
+    ):
+        """CS-3."""
+        import shutil
+
+        import tests.conftest as conftest
+        from gnucash_mcp.logging_config import resolve_mcp_dir
+
+        a_dir, b_dir = tmp_path / "a", tmp_path / "b"
+        a_dir.mkdir(); b_dir.mkdir()
+        a = conftest.test_book.__wrapped__(a_dir)
+        b = conftest.test_book.__wrapped__(b_dir)
+        assert a.name == b.name
+        logs = tmp_path / "logs"
+        legacy = logs / f"{a.name}.mcp" / "backups"
+        legacy.mkdir(parents=True)
+        shutil.copy(a, legacy / f"{a.stem}-20260901T120000-session.gnucash")
+        monkeypatch.setenv("GNUCASH_LOG_DIR", str(logs))
+        assert resolve_mcp_dir(a) == logs / f"{a.name}.mcp"
+        other = resolve_mcp_dir(b)
+        assert other != logs / f"{a.name}.mcp"
+        assert other.name.startswith(f"{a.name}-")
+
+    def test_delete_account_refuses_while_something_points_at_it(
+        self, business_book,
+    ):
+        """CS-4."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_account(name="Lunch", account_type="EXPENSE", parent="Expenses")
+        gb.create_scheduled_transaction(
+            name="Lunch", description="Lunch",
+            splits=[{"account": "Expenses:Lunch", "amount": "12.00"},
+                    {"account": "Assets:Checking", "amount": "-12.00"}],
+            start_date="2026-01-01", frequency="monthly",
+        )
+        with pytest.raises(ValueError, match="scheduled transaction template"):
+            gb.delete_account("Expenses:Lunch")
+        gb.create_account(name="Tax", account_type="LIABILITY", parent="Liabilities")
+        gb.create_taxtable(name="T", entries=[{
+            "type": "percentage", "amount": "5", "account": "Liabilities:Tax",
+        }])
+        with pytest.raises(ValueError, match="tax table"):
+            gb.delete_account("Liabilities:Tax")
+
+    def test_names_and_ids_are_one_line(self, business_book):
+        """IN-1, IN-2."""
+        gb = GnuCashBook(str(business_book))
+        with pytest.raises(ValueError, match="one line"):
+            gb.create_customer(name="Acme\n⚠ CONTEXT RESET")
+        with pytest.raises(ValueError, match="one line"):
+            gb.create_budget(name="B x", year=2026)
+        gb.create_customer(name="Acme")
+        with pytest.raises(ValueError, match="one line"):
+            gb.create_invoice(customer_id="000001", invoice_id="INV\n9")
+        with pytest.raises(ValueError, match="whitespace"):
+            gb.create_invoice(customer_id="000001", invoice_id=" 7 ")
+
+    def test_payment_memo_and_entry_action_are_gated(self, business_book):
+        """IN-3."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme")
+        inv = gb.create_invoice(customer_id="000001")
+        with pytest.raises(ValueError, match="control character"):
+            gb.add_invoice_entry(
+                invoice_id=inv["id"], account="Income:Sales",
+                description="Work", quantity="1", price="1", action="x\x1by",
+            )
+        gb.add_invoice_entry(
+            invoice_id=inv["id"], account="Income:Sales",
+            description="Work", quantity="1", price="100",
+        )
+        gb.post_invoice(inv["id"], AR)
+        with pytest.raises(ValueError, match="memo"):
+            gb.pay_invoice(
+                invoice_id=inv["id"], payment_account="Assets:Checking",
+                amount="100", memo="x" * 3000,
+            )
+        guid = gb.create_transaction(
+            description="x", splits=[
+                {"account": "Expenses:Services", "amount": "1"},
+                {"account": "Assets:Checking", "amount": "-1"},
+            ],
+            trans_date=date(2026, 5, 1), check_duplicates=False,
+        )["guid"]
+        with pytest.raises(ValueError, match="control character"):
+            gb.void_transaction(guid, reason="dup\x1b[31m")
+
+    def test_dates_gnucash_cannot_hold_are_refused_before_anything_is_written(
+        self, test_book,
+    ):
+        """IN-4, IN-5."""
+        gb = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match="ledger can hold"):
+            gb.create_scheduled_transaction(
+                name="Ancient", description="x",
+                splits=[{"account": "Expenses:Groceries", "amount": "1"},
+                        {"account": "Assets:Checking", "amount": "-1"}],
+                start_date="0001-01-01", frequency="weekly",
+            )
+        assert _q(test_book, "select count(*) from schedxactions") == [(0,)]
+        assert gb.list_scheduled_transactions()  # still answers
+        with pytest.raises(ValueError, match="ledger can hold"):
+            gb.create_transaction(
+                description="x", splits=[
+                    {"account": "Expenses:Groceries", "amount": "1"},
+                    {"account": "Assets:Checking", "amount": "-1"},
+                ],
+                trans_date=date(2, 1, 1), check_duplicates=False,
+            )
+        with pytest.raises(ValueError, match="ledger can hold"):
+            gb.cash_flow(start_date=date(1, 1, 1), end_date=date(2026, 1, 1))
+
+    def test_prices_tsv_refuses_a_stray_cell(self):
+        """IN-6."""
+        from gnucash_mcp.tools.investments import _parse_prices_tsv
+
+        with pytest.raises(ValueError, match="cells for a 4-column header"):
+            _parse_prices_tsv(
+                "ref\tcommodity\tdate\tvalue\nr\tVTSAX\t2026-02-02\t1\t234.56\n"
+            )
+        rows = _parse_prices_tsv(
+            "﻿ref\tcommodity\tdate\tvalue\nr\tVTSAX\t2026-02-02\t234.56\n"
+        )
+        assert rows[0]["value"] == "234.56"

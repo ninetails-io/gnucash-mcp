@@ -573,8 +573,9 @@ def _date_bind(self, value, dialect):
     if value is not None and self.neutral_time:
         from datetime import timezone
 
-        from gnucash_mcp.book._base import _neutral_time
+        from gnucash_mcp.book._base import _check_ledger_date, _neutral_time
 
+        _check_ledger_date(value, "Transaction date")
         return _neutral_time(value).astimezone(timezone.utc).replace(tzinfo=None)
     return _piecash_date_bind(self, value, dialect)
 

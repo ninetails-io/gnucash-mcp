@@ -1145,7 +1145,7 @@ class TestSlippedYearIsFlaggedAtEntry:
             }
         return [
             row("future", date(2062, 1, 5)),
-            row("ancient", date(26, 1, 5)),
+            row("ancient", date(1500, 1, 5)),  # GnuCash holds 1400 on
             row("old", date(2019, 3, 1)),       # a real historical import
             row("now", date.today()),
         ]

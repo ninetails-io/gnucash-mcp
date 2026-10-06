@@ -397,6 +397,48 @@ def _check_mcp_dir_entry(mcp_dir: Path, alternative: str) -> None:
         pass
 
 
+def _book_guid_in(path) -> str | None:
+    """The ``books.guid`` of a SQLite book file, or None."""
+    import sqlite3
+    from urllib.parse import quote
+
+    try:
+        con = sqlite3.connect(
+            f"file:{quote(str(path))}?mode=ro", uri=True, timeout=1,
+        )
+        try:
+            row = con.execute("SELECT guid FROM books").fetchone()
+        finally:
+            con.close()
+    except Exception:
+        return None
+    return row[0] if row else None
+
+
+def _legacy_folder_may_belong_to(mcp_dir: Path, book_path) -> bool:
+    """May an UNCLAIMED per-book folder under ``GNUCASH_LOG_DIR`` be
+    this book's? A pre-1.5 folder has no ``.owner``; the first
+    same-named book to write claimed it, and its retention then pruned
+    the other book's snapshots (scoped review 2026-10-06, CS-3). The
+    folder's backups are copies of the book they belong to, so their
+    ``books.guid`` is positive evidence: a folder whose backups hold
+    another book's GUID is not this book's. A folder with no backups,
+    or unreadable ones, cannot be told apart and is claimed as
+    before."""
+    backups = Path(mcp_dir) / "backups"
+    if not backups.is_dir() or not Path(str(book_path)).is_file():
+        return True
+    mine = _book_guid_in(book_path)
+    if mine is None:
+        return True
+    for copy in sorted(backups.glob("*.gnucash"), reverse=True)[:3]:
+        theirs = _book_guid_in(copy)
+        if theirs is None:
+            continue
+        return theirs == mine
+    return True
+
+
 def _read_log_dir_owner(mcp_dir: Path) -> str | None:
     try:
         return (mcp_dir / _LOG_DIR_OWNER_FILE).read_text(
@@ -418,6 +460,8 @@ def claim_log_dir(mcp_dir: Path, book_path: Path | str,
     owner_file = mcp_dir / _LOG_DIR_OWNER_FILE
     try:
         if owner_file.exists():
+            return
+        if not _legacy_folder_may_belong_to(mcp_dir, book_path):
             return
         mcp_dir.mkdir(parents=True, exist_ok=True)
         write_private_file(
@@ -491,7 +535,9 @@ def resolve_mcp_dir(
         plain = base / f"{name}.mcp"
         owner = _read_log_dir_owner(plain)
         mine = _log_dir_identity(book_path, identity)
-        if owner is None or owner == mine:
+        if owner == mine or (
+            owner is None and _legacy_folder_may_belong_to(plain, book_path)
+        ):
             chosen = plain
         else:
             import hashlib

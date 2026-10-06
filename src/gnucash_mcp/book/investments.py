@@ -21,6 +21,7 @@ from piecash.core.transaction import Lot
 
 from gnucash_mcp.book._currency import _price_row_utc, _price_tie_rank
 from gnucash_mcp.book._base import _commodity_quantum
+from gnucash_mcp.book._base import _check_one_line
 from gnucash_mcp.book._base import (
     _format_account_amount,
     _lot_cache_flag,
@@ -246,11 +247,13 @@ class InvestmentsMixin:
         # Every free-text argument through the one text gate (scoped
         # review 2026-10-05, I-4): no control characters, GnuCash's
         # column width.
-        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic"):
+        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic", "memo", "action"):
             _check_text(
                 locals().get(_field),
                 _SLOT_TEXT_WIDTH if _field == "notes" else _TEXT_WIDTH, _field,
             )
+            if _field in ("name", "title", "reference", "fullname", "mnemonic", "action"):
+                _check_one_line(locals().get(_field), _field)
         # Validate up front — useful errors instead of an
         # IntegrityError or silent corruption downstream.
         if not mnemonic or not mnemonic.strip():
@@ -1533,11 +1536,13 @@ class InvestmentsMixin:
         # Every free-text argument through the one text gate (scoped
         # review 2026-10-05, I-4): no control characters, GnuCash's
         # column width.
-        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic"):
+        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic", "memo", "action"):
             _check_text(
                 locals().get(_field),
                 _SLOT_TEXT_WIDTH if _field == "notes" else _TEXT_WIDTH, _field,
             )
+            if _field in ("name", "title", "reference", "fullname", "mnemonic", "action"):
+                _check_one_line(locals().get(_field), _field)
 
         with self.open(readonly=False) as book:
             acct = self._resolve_account(book, account)
