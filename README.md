@@ -567,6 +567,10 @@ tie.
 > 1× Consulting at \$1,500.00 = \$1,500.00. Open. Tell me when
 > you're ready to post it.
 
+If you open a server-posted invoice in GnuCash's Process Payment
+dialog, set its "Post To" account to the invoice's receivable first:
+the dialog lists only the documents posted to the selected account.
+
 ### Foreign-currency invoicing
 
 > "Invoice Berlin Digital €4,200 for Q1 retainer, due in 30 days."

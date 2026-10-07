@@ -47,6 +47,11 @@ from gnucash_mcp.book._base import (  # noqa: F401 — re-exported ports
     _verify_composite_write,
     _verify_delete,
     _verify_write,
+    _check_text,
+    _TEXT_WIDTH,
+    _SLOT_TEXT_WIDTH,
+    _check_one_line,
+    _check_ledger_date,
 )
 from gnucash_mcp._format import _paginate
 
@@ -218,7 +223,9 @@ class SchedulingMixin:
             return None
         if sx.num_occur > 0 and sx.rem_occur <= 0:
             return None
-        ref = last if last is not None else start - timedelta(days=1)
+        ref = last if last is not None else (
+            start - timedelta(days=1) if start > date.min else start
+        )
         candidates = [
             _recurrence_next(pt, mult, anchor, wadj, ref)
             for pt, mult, anchor, wadj in rows
@@ -465,12 +472,18 @@ class SchedulingMixin:
         places = len(str(denom)) - 1
         if denom == 10 ** places:
             # Never fewer places than the currency has: the editor
-            # stores 4200.00 reduced, as 4200/1.
+            # stores 4200.00 reduced, as 4200/1. Never more either:
+            # desktop stores "1.001" typed into a USD schedule as
+            # 1001/1000 and Since-Last-Run rounds it half-up to the
+            # currency; the server refused the instance (scoped
+            # review 2026-10-05, M-4).
             unit = len(str(fraction)) - 1
             if fraction == 10 ** unit and places < unit:
                 return Decimal(num).scaleb(-places).quantize(
                     Decimal(1).scaleb(-unit)
                 )
+            if fraction == 10 ** unit and places > unit:
+                return _entry_math.round_half_up(Fraction(num, denom), fraction)
             return Decimal(num).scaleb(-places)
         return _entry_math.round_half_up(Fraction(num, denom), fraction)
 
@@ -817,16 +830,31 @@ class SchedulingMixin:
             ValueError: If invalid frequency, accounts not found,
                        or splits don't balance.
         """
+        # Every free-text argument through the one text gate (scoped
+        # review 2026-10-05, I-4): no control characters, GnuCash's
+        # column width.
+        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic", "memo", "action"):
+            _check_text(
+                locals().get(_field),
+                _SLOT_TEXT_WIDTH if _field == "notes" else _TEXT_WIDTH, _field,
+            )
+            if _field in ("name", "title", "reference", "fullname", "mnemonic", "action"):
+                _check_one_line(locals().get(_field), _field)
         if frequency not in self.VALID_FREQUENCIES:
             raise ValueError(
                 f"Invalid frequency: {frequency}. "
                 f"Valid: {', '.join(sorted(self.VALID_FREQUENCIES))}"
             )
 
+        for leg in splits or []:
+            if isinstance(leg, dict):
+                _check_text(leg.get("memo"), _TEXT_WIDTH, "memo")
         parsed_start = date.fromisoformat(start_date)
         parsed_end = (
             date.fromisoformat(end_date) if end_date else None
         )
+        _check_ledger_date(parsed_start, "start_date")
+        _check_ledger_date(parsed_end, "end_date")
         # A schedule that ends before it starts has no occurrence and
         # was accepted with ``next_occurrence: None`` (C42).
         if parsed_end is not None and parsed_end < parsed_start:
@@ -1656,6 +1684,26 @@ class SchedulingMixin:
             created_guid = txn_result.get("guid")
             if not created_guid or txn_result.get("status") == "rejected":
                 raise
+            # If the advance DID commit and the failure came after it,
+            # the instance must stay: deleting it would skip the
+            # occurrence for good (scoped review 2026-10-06, CS-6).
+            try:
+                with self.open(readonly=True) as check:
+                    sx_now = self._find_scheduled_transaction(check, guid)
+                    advanced = (
+                        sx_now is not None and sx_now.last_occur == txn_date
+                    )
+            except Exception:
+                advanced = False
+            if advanced:
+                raise RuntimeError(
+                    f"'{sx_name}' was entered as transaction "
+                    f"{created_guid} and the schedule advanced to it, "
+                    f"but the reply could not be built "
+                    f"({type(exc).__name__}: {exc}). Nothing needs "
+                    f"redoing; list_scheduled_transactions shows the "
+                    f"new state."
+                ) from exc
             try:
                 self.delete_transaction(created_guid, force=True)
             except Exception:
@@ -1735,6 +1783,16 @@ class SchedulingMixin:
         Raises:
             ValueError: If not found.
         """
+        # Every free-text argument through the one text gate (scoped
+        # review 2026-10-05, I-4): no control characters, GnuCash's
+        # column width.
+        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic", "memo", "action"):
+            _check_text(
+                locals().get(_field),
+                _SLOT_TEXT_WIDTH if _field == "notes" else _TEXT_WIDTH, _field,
+            )
+            if _field in ("name", "title", "reference", "fullname", "mnemonic", "action"):
+                _check_one_line(locals().get(_field), _field)
         with self.open(readonly=False) as book:
             sx = self._find_scheduled_transaction(book, guid)
             if not sx:

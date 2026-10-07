@@ -32,6 +32,8 @@ from gnucash_mcp._format import (
     _signal_strength,
     _split_match_verdict,
     _tsv_cell,
+    _period_label,
+    _one_line,
 )
 
 _debug_logger = logging.getLogger(DEBUG_LOGGER_NAME)
@@ -100,6 +102,10 @@ from gnucash_mcp.book._base import (
     _unique_prefix,
     _INVISIBLE_NAME_CHARS,
     _name_skeleton,
+    _is_hidden,
+    _check_control_chars,
+    _check_one_line,
+    _check_ledger_date,
 )
 
 
@@ -557,7 +563,7 @@ class CoreMixin:
             # dashboard, listed here as excluded. Hidden with money
             # still in it stays visible — that is itself a finding
             # (spec B3).
-            if account.hidden and self._own_splits_balance(
+            if _is_hidden(account) and self._own_splits_balance(
                 account, as_of=today,
             ) == 0:
                 results.append({
@@ -966,7 +972,7 @@ class CoreMixin:
                         overdue_entries.append((
                             days_overdue,
                             sx.name,
-                            f"Overdue scheduled: {sx.name} "
+                            f"Overdue scheduled: {_one_line(sx.name)} "
                             f"due {next_occ.isoformat()}",
                         ))
                 except Exception as exc:
@@ -1387,7 +1393,7 @@ class CoreMixin:
                         )
                         amount_str = f"{row['amount_due']:,}"
                         msg = (
-                            f"Past due {doc_type}: {owner_name} "
+                            f"Past due {doc_type}: {_one_line(owner_name)} "
                             f"{days_overdue} day"
                             f"{'s' if days_overdue != 1 else ''} overdue, "
                             f"{currency} {amount_str}"
@@ -1400,7 +1406,7 @@ class CoreMixin:
                         )
                         if held is not None:
                             msg += (
-                                f" — {held['owner_name'] or owner_name} "
+                                f" — {_one_line(held['owner_name'] or owner_name)} "
                                 f"has {held['currency']} "
                                 f"{held['amount']:,} in unapplied "
                                 f"payments; settle from them with "
@@ -1468,7 +1474,7 @@ class CoreMixin:
                 balance = self._own_splits_balance(a, as_of=today)
                 # A hidden, zero-balance account is closed (spec
                 # B3): it doesn't put its commodity in use.
-                if a.hidden and balance == 0:
+                if _is_hidden(a) and balance == 0:
                     continue
                 in_use[c.guid] = c
                 if c.guid not in held and balance != 0:
@@ -1821,10 +1827,19 @@ class CoreMixin:
         bounds = candidate["bounds"]
         default_currency = self._require_default_currency(book)
 
-        # Targets FX-convert at the period-end rate — raw sums would
-        # be apples-to-oranges against default-currency actuals
-        # (mirrors get_budget_report).
-        factors = self._account_conversion_factors(book, period_end)
+        # A budget line is a FLOW figure: each actual converts at its
+        # own month's close and each target at the close of the month
+        # its period ends in, exactly as get_budget_report does
+        # (MM-12). This headline kept one period-end rate after the
+        # report moved, and the two disagreed on a multi-currency book
+        # (scoped review 2026-10-05, M-1).
+        monthly_factors = self._monthly_conversion_factors(
+            book, period_start, period_end,
+        )
+        period_end_month = {
+            p: _period_label(min(p_end, period_end), "month")
+            for p, (_p_start, p_end) in enumerate(bounds)
+        }
         total_budgeted = Decimal("0")
         targets_by_period: dict[int, Decimal] = {}
         budgeted_accounts: list = []
@@ -1835,7 +1850,9 @@ class CoreMixin:
             # income on its own side.
             if ba.account.type != "EXPENSE":
                 continue
-            factor = factors.get(ba.account.guid)
+            factor = monthly_factors.get(
+                period_end_month.get(ba.period_num, ""), {},
+            ).get(ba.account.guid)
             if factor is not None:
                 ba_amount = ba_amount * factor
             total_budgeted += ba_amount
@@ -1883,7 +1900,8 @@ class CoreMixin:
                 # net into the headline — same convention as
                 # get_budget_report's expenses side.
                 actuals += self._split_in_default_currency(
-                    s, s.account, factors.get(s.account.guid),
+                    s, s.account,
+                    self._monthly_factor(monthly_factors, txn, s.account),
                 )
 
         # Expected by today: elapsed periods in full, the current
@@ -4130,7 +4148,7 @@ class CoreMixin:
                 )
 
                 cand_nums = [txn.num] + (
-                    [s.action for s in txn.splits] if num_on_split else []
+                    self._num_bearing_actions(txn) if num_on_split else []
                 )
                 signal_str = (
                     ("D" if desc_match else "-")
@@ -4550,6 +4568,7 @@ class CoreMixin:
         date_defaulted = trans_date is None
         if trans_date is None:
             trans_date = date.today()
+        _check_ledger_date(trans_date, "trans_date")
 
         # One book-open for the whole create pipeline — preflight signal
         # gathering, write, and post-write consistency warning all live
@@ -4851,14 +4870,7 @@ class CoreMixin:
                     _check_text(txn.get("notes"), _SLOT_TEXT_WIDTH, "notes")
                     _check_text(txn.get("num"), _TEXT_WIDTH, "num")
                     _check_text(txn.get("link"), _SLOT_TEXT_WIDTH, "link")
-                    try:
-                        txn["date"] - timedelta(days=366)
-                        txn["date"] + timedelta(days=366)
-                    except OverflowError:
-                        raise ValueError(
-                            f"date {txn['date'].isoformat()} is outside "
-                            f"the range a ledger can hold"
-                        ) from None
+                    _check_ledger_date(txn["date"], "date")
                     # Row's transaction currency (the ``cur``
                     # column); absent means the book default.
                     row_currency = default_currency
@@ -5150,7 +5162,7 @@ class CoreMixin:
                     for name in sorted(effects):
                         delta, mnemonic = effects[name]
                         out.append(
-                            f"{_tsv_cell(name)}\t{delta}\t"
+                            f"{_one_line(name)}\t{delta}\t"
                             f"{mnemonic}"
                         )
                     effects_tsv = "\n".join(out)
@@ -5363,6 +5375,7 @@ class CoreMixin:
         never silently disables duplicate detection, and vice
         versa.
         """
+        _check_ledger_date(statement_date, "statement_date")
         if not lines:
             raise ValueError(
                 "statement has no lines — for a no-activity "
@@ -5425,6 +5438,16 @@ class CoreMixin:
                     ln.get("link"), _SLOT_TEXT_WIDTH,
                     f"line {ln['ref']}: link",
                 )
+                # The same gate for every text a line carries, in the
+                # dry run, so the commit never rejects a line the
+                # rehearsal called NEW (scoped review 2026-10-05, I-1).
+                for field, width in (
+                    ("description", _TEXT_WIDTH), ("raw", _TEXT_WIDTH),
+                    ("notes", _SLOT_TEXT_WIDTH),
+                ):
+                    _check_text(
+                        ln.get(field), width, f"line {ln['ref']}: {field}",
+                    )
                 amounts[ln["ref"]] = amt
             for label, bal in (
                 ("opening_balance", opening),
@@ -5662,6 +5685,27 @@ class CoreMixin:
         )
 
     @staticmethod
+    def _num_bearing_actions(txn) -> list[str]:
+        """With Num on split actions, the actions that can carry a
+        number a person typed. The engine writes its own words into
+        actions — "Payment" on a payment's receivable leg, the
+        document ID on a posting's, "Lot Link" — and desktop
+        translates them, so they are told apart by what the
+        transaction IS (its ``trans-txn-type``: I, P, L) and by the
+        accounts GnuCash's business and stock code owns, not by the
+        word. Counting them as numbers made a real duplicate of a
+        payment score ``x`` and get created (scoped review
+        2026-10-05, I-2)."""
+        if str(txn.get("trans-txn-type") or "") in ("I", "P", "L"):
+            return []
+        return [
+            s.action for s in txn.splits
+            if s.account.type not in (
+                "RECEIVABLE", "PAYABLE", "TRADING", "STOCK", "MUTUAL",
+            )
+        ]
+
+    @staticmethod
     def _statement_cand_nums(split, num_on_split: bool) -> list[str]:
         """The numbers a statement candidate carries: the
         transaction's Num, plus, when the book keeps the register's
@@ -5670,8 +5714,11 @@ class CoreMixin:
         batch entry writes a number as desktop's CSV importer does;
         the batch screen reads both, so the statement screen must
         too, or a check entered by batch shows no number here."""
-        return [split.transaction.num] + (
-            [split.action] if num_on_split else []
+        txn = split.transaction
+        return [txn.num] + (
+            [split.action]
+            if num_on_split and split.action in
+            CoreMixin._num_bearing_actions(txn) else []
         )
 
     def _statement_prep_create(
@@ -6156,6 +6203,13 @@ class CoreMixin:
                     skipped.append((ln, s))
                     by_ref[ln["ref"]] = {"kind": "overlap", "split": s}
                 else:
+                    # Reconciling a document's posting is fine; writing
+                    # its Num, notes, memo or link is an edit of a
+                    # read-only transaction (scoped review, I-3).
+                    if any(ln.get(k) for k in ("raw", "notes", "num", "link")):
+                        self._refuse_posting_record(
+                            book, s.transaction, "annotate",
+                        )
                     claimed_guids.add(s.guid)
                     claims.append((ln, s))
                     by_ref[ln["ref"]] = {"kind": "claim", "split": s}
@@ -6696,6 +6750,8 @@ class CoreMixin:
                 f"Account name contains control characters. "
                 f"Got: {name!r}."
             )
+        _check_control_chars(name, "Account name")
+        _check_one_line(name, "Account name")
         # A name that reads as an account REFERENCE can never be
         # reached by path: ``%abcdef0`` resolves as a short GUID, a
         # 32-hex name as a full one (IV-21).
@@ -6734,6 +6790,7 @@ class CoreMixin:
 
     @classmethod
     def _validate_account_notes(cls, notes: str) -> None:
+        _check_control_chars(notes, "notes")
         byte_len = len(notes.encode("utf-8"))
         if byte_len > cls._ACCOUNT_NOTES_MAX_BYTES:
             raise ValueError(
@@ -6787,6 +6844,7 @@ class CoreMixin:
         # Validate the account name (shared chokepoint with
         # update_account's rename branch).
         self._validate_account_name(name)
+        _check_text(description, _TEXT_WIDTH, "description")
         if notes:
             self._validate_account_notes(notes)
 
@@ -6944,6 +7002,7 @@ class CoreMixin:
                 changed["name"] = new_name
 
             if description is not None and description != account.description:
+                _check_text(description, _TEXT_WIDTH, "description")
                 account.description = description
                 changed["description"] = description
 
@@ -7055,6 +7114,7 @@ class CoreMixin:
                     raise ValueError(
                         f"Account '{account.name}' already exists under '{new_parent}'"
                     )
+                self._refuse_lookalike_name(account.name, sibling.name, new_parent)
 
             account.parent = new_parent_account
 
@@ -7099,6 +7159,18 @@ class CoreMixin:
                     f"Cannot delete account with {len(account.splits)} transaction(s). "
                     f"Move or delete transactions first."
                 )
+            # Desktop refuses to delete an account other objects still
+            # point at and lists them; the server deleted it and left a
+            # schedule that could not instantiate, a draft line and a
+            # tax table pointing at nothing (scoped review 2026-10-06,
+            # CS-4).
+            holders = self._account_references(book, account.guid)
+            if holders:
+                raise ValueError(
+                    f"Cannot delete account '{account.fullname}': it is "
+                    f"still used by {', '.join(holders)}. Repoint or "
+                    f"remove those first."
+                )
 
             # Stage pre-delete state for the audit log.
             self._stage_audit_before(_account_to_dict(account))
@@ -7127,6 +7199,56 @@ class CoreMixin:
             book.save()
 
             return result
+
+    @staticmethod
+    def _account_references(book, guid: str) -> list[str]:
+        """What still points at an account besides its splits and
+        children, each kind counted and NAMED: schedule templates,
+        document lines, tax tables, posted documents, employees'
+        cards, budget rows. A count alone sent the bookkeeper
+        looking for which schedule (second-review loop, step 8)."""
+        from sqlalchemy import text
+
+        checks = (
+            ("scheduled transaction template(s)",
+             # The account slot sits inside the split's
+             # ``sched-xaction`` frame: child row → frame row (its
+             # guid_val is the child's obj_guid) → template split →
+             # the schedule whose template account holds it.
+             "SELECT DISTINCT sx.name FROM slots c "
+             "JOIN slots f ON f.guid_val = c.obj_guid "
+             "AND f.name = 'sched-xaction' "
+             "JOIN splits sp ON sp.guid = f.obj_guid "
+             "JOIN schedxactions sx ON sx.template_act_guid = sp.account_guid "
+             "WHERE c.name = 'sched-xaction/account' AND c.guid_val = :g"),
+            ("document(s) with line(s)",
+             "SELECT DISTINCT i.id FROM entries e "
+             "JOIN invoices i ON i.guid = e.invoice OR i.guid = e.bill "
+             "WHERE e.i_acct = :g OR e.b_acct = :g"),
+            ("tax table(s)",
+             "SELECT DISTINCT tt.name FROM taxtable_entries te "
+             "JOIN taxtables tt ON tt.guid = te.taxtable "
+             "WHERE te.account = :g"),
+            ("posted document(s)",
+             "SELECT id FROM invoices WHERE post_acc = :g"),
+            ("employee card setting(s)",
+             "SELECT id FROM employees WHERE ccard_guid = :g"),
+            ("budget(s)",
+             "SELECT DISTINCT b.name FROM budget_amounts ba "
+             "JOIN budgets b ON b.guid = ba.budget_guid "
+             "WHERE ba.account_guid = :g"),
+        )
+        out = []
+        for label, sql in checks:
+            names = sorted(
+                _one_line(str(r[0])) for r in
+                book.session.execute(text(sql), {"g": guid}).fetchall()
+                if r[0] is not None
+            )
+            if names:
+                shown = ", ".join(names[:5]) + ("…" if len(names) > 5 else "")
+                out.append(f"{len(names)} {label}: {shown}")
+        return out
 
     def _validate_transaction_deletable(
         self, book, transaction, force: bool,
@@ -7621,6 +7743,9 @@ class CoreMixin:
                         raise ValueError(
                             "row changes nothing — every cell empty"
                         )
+                    _check_ledger_date(u.get("date"), "date")
+                    _check_text(u.get("description"), _TEXT_WIDTH, "description")
+                    _check_text(u.get("notes"), _SLOT_TEXT_WIDTH, "notes")
                     _check_text(u.get("num"), _TEXT_WIDTH, "num")
                     _check_text(u.get("link"), _SLOT_TEXT_WIDTH, "link")
                     txn = self._find_transaction(book, key)

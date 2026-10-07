@@ -23,6 +23,7 @@ from gnucash_mcp._format import (
     _book_display_name,
     _format_exact,
     _scrub_credentials,
+    _pid_alive as _format_pid_alive,
 )
 
 AUDIT_LOGGER_NAME = "gnucash_mcp.audit"
@@ -290,7 +291,7 @@ def redact_paths(text: str) -> str:
     # A file URL is a path with a scheme on it, not a connection
     # string to keep whole.
     text = re.sub(
-        r"file://(/[^\s'\"<>]+)",
+        r"(?:file|sqlite)://(/[^\s'\"<>?]+)",
         lambda m: m.group(1).rstrip("/").rsplit("/", 1)[-1], text,
     )
     text = _DB_URI_IN_TEXT_RE.sub(hold, text)
@@ -344,18 +345,25 @@ def write_private_file(path: Path, text: str) -> None:
     pointed at (adversarial review 2026-09-30, C53). A stale temp
     file from a crashed write is removed first; the exclusive create
     then fails loudly if something reappears in between."""
+    import tempfile
+
     path = Path(path)
-    tmp = path.with_name(path.name + ".tmp")
+    # A unique temp name per write: a fixed one let two processes
+    # remove each other's half-written file (scoped review, S-6).
+    # mkstemp creates exclusively, 0600, and never follows a link.
+    fd, tmp = tempfile.mkstemp(
+        dir=str(path.parent), prefix=path.name + ".", suffix=".tmp",
+    )
     try:
-        os.unlink(tmp)  # the link itself, never its target
-    except FileNotFoundError:
-        pass
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    flags |= getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(tmp, flags, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(text)
-    os.replace(tmp, path)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _check_mcp_dir_entry(mcp_dir: Path, alternative: str) -> None:
@@ -389,6 +397,85 @@ def _check_mcp_dir_entry(mcp_dir: Path, alternative: str) -> None:
         pass
 
 
+def _book_guid_in(path) -> str | None:
+    """The ``books.guid`` of a SQLite book file, or None."""
+    import sqlite3
+    from urllib.parse import quote
+
+    try:
+        con = sqlite3.connect(
+            f"file:{quote(str(path))}?mode=ro", uri=True, timeout=1,
+        )
+        try:
+            row = con.execute("SELECT guid FROM books").fetchone()
+        finally:
+            con.close()
+    except Exception:
+        return None
+    return row[0] if row else None
+
+
+def _audit_header_book(mcp_dir: Path) -> str | None:
+    """The ``Book:`` line of the newest audit file in a per-book
+    folder, or None when there is none to read."""
+    audit = Path(mcp_dir) / "audit"
+    if not audit.is_dir():
+        return None
+    for log in sorted(audit.glob("*.log"), reverse=True)[:3]:
+        try:
+            with open(log, encoding="utf-8", errors="replace") as fh:
+                for _ in range(8):
+                    line = fh.readline()
+                    if not line:
+                        break
+                    if line.startswith("Book: "):
+                        return line[len("Book: "):].strip() or None
+        except OSError:
+            continue
+    return None
+
+
+def _legacy_folder_may_belong_to(mcp_dir: Path, book_path) -> bool:
+    """May an UNCLAIMED per-book folder under ``GNUCASH_LOG_DIR`` be
+    this book's? A pre-1.5 folder has no ``.owner``; the first
+    same-named book to write claimed it, and its retention then pruned
+    the other book's snapshots (scoped review 2026-10-06, CS-3). The
+    folder's own contents are the evidence, in this order:
+
+    - its backups are copies of the book they belong to, so their
+      ``books.guid`` decides: another book's GUID means not ours;
+    - failing a readable backup, the ``Book:`` line of its newest
+      audit file names the path that wrote it: another path that
+      still exists means not ours (bookkeeper, second-review loop,
+      Q2: a folder that can prove another owner is never adopted).
+
+    A folder with neither — nothing to prune and nothing to
+    interleave — is claimed as before, so the single-book user's
+    folder keeps its name."""
+    mcp_dir = Path(mcp_dir)
+    book_file = Path(str(book_path))
+    backups = mcp_dir / "backups"
+    if not book_file.is_file():
+        return True
+    if backups.is_dir():
+        mine = _book_guid_in(book_file)
+        if mine is not None:
+            for copy in sorted(backups.glob("*.gnucash"), reverse=True)[:3]:
+                theirs = _book_guid_in(copy)
+                if theirs is None:
+                    continue
+                return theirs == mine
+    named = _audit_header_book(mcp_dir)
+    if named:
+        try:
+            other = Path(named).expanduser()
+            if other.is_file():
+                return other.resolve() == book_file.resolve()
+        except (OSError, ValueError):
+            pass
+    return True
+
+
 def _read_log_dir_owner(mcp_dir: Path) -> str | None:
     try:
         return (mcp_dir / _LOG_DIR_OWNER_FILE).read_text(
@@ -410,6 +497,8 @@ def claim_log_dir(mcp_dir: Path, book_path: Path | str,
     owner_file = mcp_dir / _LOG_DIR_OWNER_FILE
     try:
         if owner_file.exists():
+            return
+        if not _legacy_folder_may_belong_to(mcp_dir, book_path):
             return
         mcp_dir.mkdir(parents=True, exist_ok=True)
         write_private_file(
@@ -483,7 +572,9 @@ def resolve_mcp_dir(
         plain = base / f"{name}.mcp"
         owner = _read_log_dir_owner(plain)
         mine = _log_dir_identity(book_path, identity)
-        if owner is None or owner == mine:
+        if owner == mine or (
+            owner is None and _legacy_folder_may_belong_to(plain, book_path)
+        ):
             chosen = plain
         else:
             import hashlib
@@ -1216,6 +1307,8 @@ def _fmt_transaction_void(entry: dict) -> list[str]:
         f"{time_part}  VOID TRANSACTION  guid:{guid}",
         f'{_INDENT}Reason: "{params.get("reason", "")}"',
     ]
+    if params.get("force"):
+        lines.append(f"{_INDENT}Forced: reconciled split(s) voided")
     if before:
         desc = before.get("description", "")
         date_str = before.get("date", "")
@@ -1394,7 +1487,9 @@ def _fmt_account_update(entry: dict) -> list[str]:
                 key, False if key == "hidden" else None,
             ):
                 lines.append(
-                    f"{_INDENT}{label}: {before.get(key)} → {after[key]}"
+                    f"{_INDENT}{label}: "
+                    f"{before.get(key, False if key == 'hidden' else None)} "
+                    f"→ {after[key]}"
                 )
         # ``notes`` is a diff-echo key: present in after_state only
         # when the update changed it ("" = cleared).
@@ -3235,7 +3330,15 @@ def _extract_after_state(result: str, entity_type: str | None) -> dict | None:
 # A file found later, whose process is gone, becomes an INTERRUPTED
 # line naming the tool and what it was asked to do.
 
-_INTENT_NAME = ".pending-write.json"
+_INTENT_PREFIX = ".pending-write"
+_INTENT_SUFFIX = ".json"
+
+
+def _intent_name(pid: int) -> str:
+    """One intent file per process: two servers on one book (a
+    desktop client and a terminal, say) must not overwrite or clear
+    each other's (scoped review 2026-10-05, S-6)."""
+    return f"{_INTENT_PREFIX}-{pid}{_INTENT_SUFFIX}"
 _INTENT_PARAMS_MAX = 2000
 
 
@@ -3246,14 +3349,10 @@ def _audit_directory() -> "Path | None":
     return None
 
 
-def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except (PermissionError, OSError):
-        return True
-    return True
+def _pid_alive(pid) -> bool:
+    """A process that cannot be shown dead is treated as alive (an
+    intent of a running twin is left alone)."""
+    return _format_pid_alive(pid) is not False
 
 
 def _report_interrupted_write() -> None:
@@ -3264,32 +3363,32 @@ def _report_interrupted_write() -> None:
     directory = _audit_directory()
     if directory is None:
         return
-    path = directory / _INTENT_NAME
-    try:
-        with path.open() as f:
-            left = json.load(f)
-    except FileNotFoundError:
-        return
-    except (OSError, json.JSONDecodeError):
-        left = {}
-    pid = left.get("pid")
-    if isinstance(pid, int) and pid != os.getpid() and _pid_alive(pid):
-        return
-    try:
-        path.unlink()
-    except OSError:
-        pass
-    logger = logging.getLogger(AUDIT_LOGGER_NAME)
-    stamp = datetime.now().astimezone().isoformat().split("T")[1][:8]
-    text = (
-        f"{left.get('tool', '(unknown tool)')} started "
-        f"{left.get('timestamp', '(time unknown)')} and the server "
-        f"stopped before its audit entry was written. The write may "
-        f"have been committed. Asked for: {left.get('params', '?')}"
-    )
-    logger.info(f"{stamp}  INTERRUPTED  {_escape_audit_value(text)}")
-    logger.info("")
-    _flush_logger(logger)
+    for path in sorted(directory.glob(f"{_INTENT_PREFIX}*{_INTENT_SUFFIX}")):
+        try:
+            with path.open() as f:
+                left = json.load(f)
+        except FileNotFoundError:
+            continue
+        except (OSError, json.JSONDecodeError):
+            left = {}
+        pid = left.get("pid")
+        if isinstance(pid, int) and pid != os.getpid() and _pid_alive(pid):
+            continue
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        logger = logging.getLogger(AUDIT_LOGGER_NAME)
+        stamp = datetime.now().astimezone().isoformat().split("T")[1][:8]
+        text = (
+            f"{left.get('tool', '(unknown tool)')} started "
+            f"{left.get('timestamp', '(time unknown)')} and the server "
+            f"stopped before its audit entry was written. The write may "
+            f"have been committed. Asked for: {left.get('params', '?')}"
+        )
+        logger.info(f"{stamp}  INTERRUPTED  {_escape_audit_value(text)}")
+        logger.info("")
+        _flush_logger(logger)
 
 
 def _write_intent(tool: str, params, timestamp: str) -> "Path | None":
@@ -3300,7 +3399,7 @@ def _write_intent(tool: str, params, timestamp: str) -> "Path | None":
         if directory is None:
             return None
         _report_interrupted_write()
-        path = directory / _INTENT_NAME
+        path = directory / _intent_name(os.getpid())
         payload = json.dumps({
             "pid": os.getpid(),
             "tool": tool,

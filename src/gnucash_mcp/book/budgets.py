@@ -33,12 +33,18 @@ from gnucash_mcp.book._base import (
     _unique_prefix,
     _verify_composite_write,
     _verify_write,
+    _check_text,
+    _TEXT_WIDTH,
+    _SLOT_TEXT_WIDTH,
+    _check_one_line,
+    _check_ledger_date,
 )
 from gnucash_mcp._format import (
     _format_exact,
     _paginate,
     _period_label,
     _round_converted,
+    _one_line,
 )
 
 
@@ -121,7 +127,7 @@ def _format_budget_report_compact(report: dict) -> str:
     budget_name = report.get("budget", "?")
     period_info = report.get("period", "")
 
-    header_line = f"{budget_name} — {period_info}"
+    header_line = f"{_one_line(budget_name)} — {period_info}"
     if not accounts:
         return f"{header_line}\n(no budgeted accounts)"
 
@@ -248,7 +254,7 @@ def _format_get_budget_compact(
     period_type = info.get("period_type", "")
     start = info.get("start_date", "?")
     header = (
-        f"{name}  {num_periods} periods"
+        f"{_one_line(name)}  {num_periods} periods"
         + (f" ({period_type})" if period_type else "")
         + f"  starts:{start}"
     )
@@ -464,7 +470,7 @@ class BudgetsMixin:
                 start = d.get("start_date", "?")
                 ptype_str = f" ({ptype})" if ptype else ""
                 lines.append(
-                    f"{d['name']:<{name_width}}  "
+                    f"{_one_line(d['name']):<{name_width}}  "
                     f"{periods} periods{ptype_str}  starts:{start}"
                 )
             return "\n".join(lines)
@@ -584,6 +590,16 @@ class BudgetsMixin:
             ValueError: duplicate name, invalid period_type /
                 num_periods / start_date.
         """
+        # Every free-text argument through the one text gate (scoped
+        # review 2026-10-05, I-4): no control characters, GnuCash's
+        # column width.
+        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic", "memo", "action"):
+            _check_text(
+                locals().get(_field),
+                _SLOT_TEXT_WIDTH if _field == "notes" else _TEXT_WIDTH, _field,
+            )
+            if _field in ("name", "title", "reference", "fullname", "mnemonic", "action"):
+                _check_one_line(locals().get(_field), _field)
         import uuid
 
 
@@ -607,6 +623,7 @@ class BudgetsMixin:
         if start_date is not None:
             try:
                 period_start = date.fromisoformat(start_date)
+                _check_ledger_date(period_start, "start_date")
             except ValueError as e:
                 raise ValueError(
                     f"Invalid start_date {start_date!r}: must be "
@@ -615,6 +632,8 @@ class BudgetsMixin:
         else:
             if year is None:
                 year = date.today().year
+            if not 1400 <= year <= 9999:
+                raise ValueError(f"year {year} is outside 1400..9999")
             period_start = date(year, 1, 1)
 
         recurrence_map = {

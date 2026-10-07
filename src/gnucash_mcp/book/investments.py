@@ -13,13 +13,15 @@ Depends on shared helpers from BaseGnuCashBook:
 """
 
 from datetime import date, datetime
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 
 import piecash
 from piecash.core.commodity import Price
 from piecash.core.transaction import Lot
 
 from gnucash_mcp.book._currency import _price_row_utc, _price_tie_rank
+from gnucash_mcp.book._base import _commodity_quantum
+from gnucash_mcp.book._base import _check_one_line
 from gnucash_mcp.book._base import (
     _format_account_amount,
     _lot_cache_flag,
@@ -37,12 +39,16 @@ from gnucash_mcp.book._base import (
     _to_date,
     _to_decimal,
     _unique_prefix,
+    _check_text,
+    _TEXT_WIDTH,
+    _SLOT_TEXT_WIDTH,
 )
 from gnucash_mcp._format import (
     _format_converted,
     _format_number,
     _format_price,
     _paginate,
+    _round_converted,
 )
 
 
@@ -238,6 +244,16 @@ class InvestmentsMixin:
         Raises:
             ValueError: If commodity already exists in that namespace.
         """
+        # Every free-text argument through the one text gate (scoped
+        # review 2026-10-05, I-4): no control characters, GnuCash's
+        # column width.
+        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic", "memo", "action"):
+            _check_text(
+                locals().get(_field),
+                _SLOT_TEXT_WIDTH if _field == "notes" else _TEXT_WIDTH, _field,
+            )
+            if _field in ("name", "title", "reference", "fullname", "mnemonic", "action"):
+                _check_one_line(locals().get(_field), _field)
         # Validate up front — useful errors instead of an
         # IntegrityError or silent corruption downstream.
         if not mnemonic or not mnemonic.strip():
@@ -256,6 +272,24 @@ class InvestmentsMixin:
                     f"Commodity {label} contains control characters. "
                     f"Got: {value!r}."
                 )
+        if ":" in namespace or ":" in mnemonic:
+            # "NYSE:X" + "QQ" and "NYSE" + "X:QQ" both list as
+            # NYSE:X:QQ (scoped review 2026-10-06, IN-12).
+            raise ValueError(
+                "Commodity namespace and mnemonic cannot contain ':' "
+                "(it separates the two)"
+            )
+        if namespace.upper() in ("CURRENCY", "ISO4217") and namespace != "CURRENCY":
+            raise ValueError(
+                f"Namespace {namespace!r}: currencies live in CURRENCY, "
+                f"which this tool does not create (GnuCash's come from "
+                f"the ISO 4217 table)"
+            )
+        if namespace.lower() == "template" or mnemonic.lower() == "template":
+            raise ValueError(
+                "'template' is GnuCash's own commodity for scheduled "
+                "transactions and cannot be created"
+            )
         if cusip is not None and any(
             ord(ch) < 0x20 or ord(ch) == 0x7f for ch in cusip
         ):
@@ -424,6 +458,13 @@ class InvestmentsMixin:
         ).fetchall()
         for guid, src, raw, num, denom, ptype, comm_guid, curr_guid in rows:
             src = src or ""
+            # A source GnuCash does not write is the old server's mark
+            # on a price row. The date and value passes used to run on
+            # every row by shape, and the Price Editor of GnuCash 2.6
+            # through 4.0 stamped local midnight too, while
+            # Finance::Quote stores unreduced values (scoped review
+            # 2026-10-06, BS-5): those are desktop's rows, left alone.
+            server_row = src not in self._GNC_PRICE_SOURCES
             if src not in self._GNC_PRICE_SOURCES:
                 new_src = self._PRICE_SOURCE_ALIASES.get(src, "user:price")
                 book.session.execute(
@@ -438,11 +479,16 @@ class InvestmentsMixin:
                 sources += 1
             as_utc = _price_row_utc(raw)
             local = as_utc.astimezone() if as_utc is not None else None
-            move_date = local is not None and local.time() == datetime.min.time()
+            midnight = local is not None and local.time() == datetime.min.time()
             implied = ptype == "transaction"
+            # piecash's implied price is the other row only the old
+            # server made: ``record_price`` stamps the neutral time, so
+            # a split-register implied row at local midnight is piecash's.
+            piecash_implied = implied and src == "user:split-register"
+            move_date = (server_row or piecash_implied) and midnight
             stored = Fraction(int(num), int(denom)) if denom else None
             reduce_value = (
-                not implied and stored is not None
+                server_row and not implied and stored is not None
                 and stored.denominator != int(denom)
             )
             if move_date or reduce_value:
@@ -454,7 +500,10 @@ class InvestmentsMixin:
                 dates += int(move_date)
                 values += int(bool(reduce_value))
             if (
-                implied and move_date and stored is not None
+                # piecash's implied price: local midnight under the
+                # split-register source. record_price stamps the
+                # neutral time, so midnight here is piecash's alone.
+                implied and midnight and stored is not None
                 and src == "user:split-register"
             ):
                 if split_index is None:
@@ -1517,6 +1566,16 @@ class InvestmentsMixin:
         Raises:
             ValueError: If account not found.
         """
+        # Every free-text argument through the one text gate (scoped
+        # review 2026-10-05, I-4): no control characters, GnuCash's
+        # column width.
+        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic", "memo", "action"):
+            _check_text(
+                locals().get(_field),
+                _SLOT_TEXT_WIDTH if _field == "notes" else _TEXT_WIDTH, _field,
+            )
+            if _field in ("name", "title", "reference", "fullname", "mnemonic", "action"):
+                _check_one_line(locals().get(_field), _field)
 
         with self.open(readonly=False) as book:
             acct = self._resolve_account(book, account)
@@ -1872,7 +1931,16 @@ class InvestmentsMixin:
                 purchase_value_default * shares_to_sell
                 / raw["purchase_quantity"]
             )
-            proceeds = price * shares_to_sell
+            # Proceeds are what a sale split would store: rounded
+            # half-up to the currency, as a split is. The cost is a
+            # converted figure, rounded once. The gain is their
+            # difference, so the three lines agree (scoped review
+            # 2026-10-05, M-3).
+            quantum = _commodity_quantum(default_ccy)
+            proceeds = (price * shares_to_sell).quantize(
+                quantum, rounding=ROUND_HALF_UP,
+            )
+            cost_basis = _round_converted(cost_basis, default_ccy)
             gain = proceeds - cost_basis
             gain_pct = (gain / cost_basis * 100) if cost_basis else Decimal(0)
 

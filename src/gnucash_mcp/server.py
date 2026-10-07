@@ -1279,7 +1279,9 @@ def _book_tables_error(path: Path) -> str | None:
     from piecash.core.session import version_supported
 
     try:
-        con = sqlite3.connect(f"file:{quote(str(path))}?mode=ro", uri=True)
+        con = sqlite3.connect(
+            f"file:{quote(str(path))}?mode=ro", uri=True, timeout=1,
+        )
         try:
             has_table = con.execute(
                 "SELECT 1 FROM sqlite_master "

@@ -27,6 +27,7 @@ from gnucash_mcp.book._base import (
     _transaction_to_dict,
     _unique_prefix,
     _unreconciled_split_to_compact_line,
+    _check_control_chars,
 )
 from gnucash_mcp._format import _paginate
 
@@ -583,6 +584,7 @@ class ReconciliationMixin:
         """
         if not reason or not reason.strip():
             raise ValueError("Void reason is required")
+        _check_control_chars(reason, "reason")
         # 4 KiB byte-cap (not chars — unicode payloads can't sneak
         # past): room for any real explanation, no runaway bloat.
         _VOID_REASON_MAX_BYTES = 4 * 1024

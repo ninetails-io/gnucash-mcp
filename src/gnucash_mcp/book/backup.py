@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import re
 import shlex
 import sqlite3
@@ -569,11 +570,9 @@ class BackupMixin:
         the state it converted from (adversarial review 2026-09-30,
         C30).
 
-        - A snapshot of exactly this state already exists (the
-          auto-backup just took one): nothing more to copy.
-        - Otherwise a ``manual``-stage snapshot labelled
-          ``pre-1-5-upgrade`` is written. Manual snapshots are never
-          pruned.
+        - A ``manual``-stage snapshot labelled ``pre-1-5-upgrade`` is
+          written, always: manual snapshots are never pruned, and no
+          anchor is trusted to say an existing file holds this state.
         - It cannot be written: the write is REFUSED. Every other
           backup here is best-effort, because a routine write can be
           redone; this one guards a change that cannot.
@@ -587,10 +586,8 @@ class BackupMixin:
         can spill SQLite's page cache and take the exclusive lock
         mid-transaction, after which nothing else can read the file.
 
-        Returns ``{"pre_upgrade_backup": <filename>}`` when it wrote
-        one, ``{"pre_upgrade_backup_existing": <filename>}`` when the
-        auto-backup just taken already holds this state, else ``{}``.
-        The marker file names that snapshot either way.
+        Returns ``{"pre_upgrade_backup": <filename>}``, the copy
+        written here; the marker file names it.
         """
         if self._pre_upgrade_checked or not self.source.is_file:
             return {}
@@ -600,28 +597,23 @@ class BackupMixin:
                 self._pre_upgrade_checked = True
                 return {}
             result: dict = {}
-            if not self._book_unchanged_since_last_backup(
-                self._current_book_hash()
-            ):
-                made = self.create_backup(
-                    stage=_MANUAL_STAGE_NAME,
-                    label=self._PRE_UPGRADE_LABEL,
-                    _committed_state=True,
-                )
-                holds = Path(made["path"]).name
-                result["pre_upgrade_backup"] = holds
-            else:
-                # The auto-backup taken moments ago (the first write
-                # of a process) IS the pre-conversion copy. Name it,
-                # here and in the marker: a reader of the folder could
-                # not otherwise tell which file holds that state
-                # (bookkeeper close-out loop, 2026-10-05, flag 2).
-                newest = self.list_backups()
-                holds = Path(newest[0]["path"]).name if newest else "?"
-                result["pre_upgrade_backup_existing"] = holds
+            # Always a fresh copy of the committed state. The shortcut
+            # that reused the auto-backup's file when the book hash
+            # matched trusted a stale anchor: after a prune the newest
+            # file could hold an OLDER state of the book, and the
+            # irreversible conversion ran with no copy of what it
+            # converted (scoped review 2026-10-06, CS-2). One extra
+            # copy, once per book, is the price of knowing.
+            made = self.create_backup(
+                stage=_MANUAL_STAGE_NAME,
+                label=self._PRE_UPGRADE_LABEL,
+                _committed_state=True,
+            )
+            holds = Path(made["path"]).name
+            result["pre_upgrade_backup"] = holds
             marker.parent.mkdir(parents=True, exist_ok=True)
-            marker.write_text(
-                f"{_format_ts(_now_utc())}\nsnapshot: {holds}\n"
+            write_private_file(
+                marker, f"{_format_ts(_now_utc())}\nsnapshot: {holds}\n",
             )
         except Exception as e:
             raise ValueError(
@@ -656,6 +648,17 @@ class BackupMixin:
             debug_logger.warning(
                 f"Unneeded pre-upgrade snapshot not removed: {e}"
             )
+            return
+        # The marker named that file (close-out flag 2); say instead
+        # that nothing needed a copy (scoped review, S-4 / M-6).
+        try:
+            marker = self._pre_upgrade_marker()
+            stamp = marker.read_text().splitlines()[0]
+            write_private_file(
+                marker, f"{stamp}\nsnapshot: none (nothing to convert)\n",
+            )
+        except (OSError, IndexError):
+            pass
 
     def create_backup(
         self,
@@ -722,7 +725,12 @@ class BackupMixin:
                     "size_bytes": held.stat().st_size,
                     "note": (
                         "The book has not changed since this backup "
-                        "was taken; no new copy was written."
+                        "was taken; no new copy was written"
+                        + (
+                            f", so the label {safe_label!r} was not applied"
+                            if safe_label else ""
+                        )
+                        + "."
                     ),
                     "restore_hint": redact_paths(
                         self._restore_hint(held)

@@ -1143,14 +1143,24 @@ class TestPreUpgradeSnapshot:
 
         result = self._convert(gb)
 
-        assert "pre_upgrade_backup" not in result
-        assert self._snapshots(multi_currency_book) == []
+        # The auto-backup's copy serves, under the manual label so
+        # retention never prunes it (scoped review 2026-10-05, S-3);
+        # no second copy of the book was read.
+        assert result["pre_upgrade_backup"].endswith(
+            "-manual-pre-1-5-upgrade.gnucash"
+        )
+        (linked,) = self._snapshots(multi_currency_book)
+        (auto,) = [
+            p for p in linked.parent.glob("*.gnucash")
+            if "-manual-" not in p.name
+        ]
+        assert linked.read_bytes() == auto.read_bytes()
         # ...and it does not come back once the book has changed.
         later = gb.create_price(
             "EUR", "CURRENCY", "1.11", price_date=date(2026, 9, 2),
         )
         assert "pre_upgrade_backup" not in later
-        assert self._snapshots(multi_currency_book) == []
+        assert len(self._snapshots(multi_currency_book)) == 1
 
     def test_a_changed_book_since_the_last_backup_gets_its_own(
         self, multi_currency_book,

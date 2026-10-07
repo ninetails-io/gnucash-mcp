@@ -82,7 +82,10 @@ def _parse_transactions_tsv(tsv: str) -> list[dict]:
         # a format error, never a silent default to today — the
         # results table carries no date, so a defaulted row would
         # leave no trace of what it was booked on.
-        trans_date = _parse_iso_date(dt)
+        try:
+            trans_date = _parse_iso_date(dt)
+        except ValueError as e:
+            raise ValueError(f"row {i} (ref {ref!r}): {e}") from None
         if trans_date is None:
             raise ValueError(
                 f"row {i} (ref {ref!r}): date {dt!r} is not a valid "
@@ -941,7 +944,10 @@ def register(mcp, get_book) -> None:
         rows = _parse_update_tsv(updates)
         for r in rows:
             if "date" in r:
-                r["date"] = date.fromisoformat(r["date"])
+                try:
+                    r["date"] = _parse_iso_date(r["date"])
+                except ValueError as e:
+                    raise ValueError(f"guid {r.get('guid')!r}: {e}") from None
         result = book.update_transactions(
             updates=rows, on_error=on_error, force=force,
         )

@@ -65,7 +65,7 @@ from fractions import Fraction
 from piecash._common import GncValidationError
 from piecash.core.commodity import Price
 from piecash.core.transaction import Split, Transaction
-from piecash.sa_extra import pure_slot_property
+from piecash.sa_extra import _DateAsDateTime, pure_slot_property
 
 from gnucash_mcp.book._currency import (
     CurrencyMixin,
@@ -559,6 +559,29 @@ def _use_gnucash_slot_fillers() -> None:
     epoch._set_parent_with_dispatch(table.c.timespec_val)
 
 
+_piecash_date_bind = _DateAsDateTime.process_bind_param
+
+
+def _date_bind(self, value, dialect):
+    """piecash binds a transaction's date at a flat 10:59 UTC. GnuCash
+    adjusts that stamp beyond UTC-10 / UTC+13 so it still reads as
+    the intended day locally (``_neutral_time``, review C25); the
+    server applied the adjustment to documents and prices but let
+    piecash stamp transactions, so in Pago Pago or on Kiritimati a
+    transaction decoded a day off and fell into the wrong period
+    (scoped review 2026-10-05, M-5)."""
+    if value is not None and self.neutral_time:
+        from datetime import timezone
+
+        from gnucash_mcp.book._base import _check_ledger_date, _neutral_time
+
+        _check_ledger_date(value, "Transaction date")
+        return _neutral_time(value).astimezone(timezone.utc).replace(tzinfo=None)
+    return _piecash_date_bind(self, value, dialect)
+
+
+_DateAsDateTime.process_bind_param = _date_bind
+
 _piecash_transaction_validate = Transaction.validate
 
 
@@ -578,22 +601,28 @@ def _transaction_validate(self) -> None:
     ):
         book = self.book
         if book is not None and book.use_trading_accounts:
-            commodities = {
-                sp.account.commodity for sp in self.splits
-                if sp.account is not None and sp.account.type != "TRADING"
-            }
-            if len(commodities) > 1 or (
-                commodities and self.currency not in commodities
-            ):
-                names = ", ".join(sorted(c.mnemonic for c in commodities))
+            # Exactly piecash's own trigger for adding trading splits:
+            # a non-zero quantity imbalance in some commodity. A void
+            # (every quantity zero), an unvoid of a desktop-made
+            # transaction (its trading splits already balance each
+            # commodity), and a schedule template (zero splits on the
+            # ``template`` pseudo-commodity) all pass; the first cut
+            # compared commodity SETS and refused all three (scoped
+            # review 2026-10-05, S-2, S-7, I-8).
+            _value, imbalances = self.calculate_imbalances()
+            unbalanced = sorted(
+                c.mnemonic for c, q in imbalances.items() if q
+            )
+            if unbalanced:
                 raise ValueError(
                     f"This book uses trading accounts, and this "
-                    f"transaction spans more than one commodity "
-                    f"({names}). The server does not yet write the "
-                    f"trading splits GnuCash writes for it, so the "
-                    f"write is refused; nothing changed. Enter it in "
-                    f"GnuCash desktop. Same-currency entries are "
-                    f"unaffected."
+                    f"transaction leaves a quantity imbalance in "
+                    f"{', '.join(unbalanced)} that GnuCash would settle "
+                    f"with trading splits. The server does not yet "
+                    f"write those the way GnuCash does, so the write is "
+                    f"refused; nothing changed. Enter it in GnuCash "
+                    f"desktop. Same-currency entries, voids, and edits "
+                    f"that leave the amounts alone are unaffected."
                 )
     _piecash_transaction_validate(self)
 

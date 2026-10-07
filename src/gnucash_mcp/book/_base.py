@@ -48,6 +48,8 @@ from gnucash_mcp._format import (
     _one_line,
     _parse_book_url,
     _tsv_cell,
+    _pid_alive,
+    register_secrets_from_url,
 )
 
 # GnuCash stores GUIDs as lowercase hex (via uuid4().hex). We accept both
@@ -735,6 +737,97 @@ _SLOT_TEXT_WIDTH = 4096
 _TAXTABLE_NAME_WIDTH = 50
 
 
+def _stored_timestamp_utc(raw) -> "datetime | None":
+    """UTC-aware datetime of a raw stored timestamp — the
+    ``YYYY-MM-DD HH:MM:SS`` text SQLite holds, GnuCash 2.6's compact
+    ``YYYYMMDDHHMMSS``, or the datetime a database driver returns.
+    The one decoder for a stored date read by raw SQL; ``_price_row_
+    utc`` is its price-table sibling. Never raises: malformed text is
+    None."""
+    from datetime import timezone
+
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        digits = "".join(ch for ch in raw if ch.isdigit()).ljust(14, "0")
+        try:
+            raw = datetime(
+                int(digits[0:4]), int(digits[4:6]), int(digits[6:8]),
+                int(digits[8:10]), int(digits[10:12]), int(digits[12:14]),
+            )
+        except ValueError:
+            return None
+    if isinstance(raw, datetime):
+        return raw.astimezone(timezone.utc) if raw.tzinfo else raw.replace(tzinfo=timezone.utc)
+    return None
+
+
+def _check_control_chars(value, what: str) -> None:
+    """Refuse a NUL (PostgreSQL rejects one outright; SQLite stores
+    the string but shows it cut off) and every other control
+    character: nothing a person types, and a terminal escape or a
+    backspace in a description rewrites what the next reader of the
+    register or the audit log sees. Tab, newline and carriage return
+    stay: notes are multi-line, and the row builders escape them
+    (IV-20). ``None`` and non-strings pass."""
+    if not isinstance(value, str):
+        return
+    if "\x00" in value:
+        raise ValueError(f"{what} contains a NUL character")
+    for ch in value:
+        code = ord(ch)
+        if (code < 0x20 and ch not in "\t\n\r") or 0x7F <= code <= 0x9F:
+            raise ValueError(
+                f"{what} contains a control character (U+{code:04X})"
+            )
+
+
+# What a one-line field must not hold: the C0 line breaks and tab,
+# NEL, and Unicode's line and paragraph separators. The row builders
+# escape them, but a name is also printed raw into the dashboard's
+# own sentences and into every title line.
+_LINE_BREAKS = frozenset("\t\n\r\x85\u2028\u2029")
+
+
+def _check_one_line(value, what: str) -> None:
+    """A name or an ID is one line (scoped review 2026-10-06, IN-1:
+    a party named "Acme\\n⚠ …" printed a line in the server's own
+    voice on the dashboard). ``None`` and non-strings pass."""
+    if not isinstance(value, str):
+        return
+    for ch in value:
+        if ch in _LINE_BREAKS:
+            raise ValueError(
+                f"{what} must be one line (contains U+{ord(ch):04X})"
+            )
+
+
+# GnuCash's time range: gnc-date.h MINTIME (1400-01-01) to MAXTIME
+# (9999-12-31). A date outside it cannot be stored or shown by
+# desktop, and the server's own arithmetic overflowed on 0001-01-01
+# after the row was committed (scoped review 2026-10-06, IN-4, IN-5).
+_LEDGER_DATE_MIN = date(1400, 1, 1)
+# A year inside MAXTIME: the far-date warning looks a year past every
+# entry, and desktop's own date arithmetic has the same headroom.
+_LEDGER_DATE_MAX = date(9998, 12, 31)
+
+
+def _check_ledger_date(value, what: str) -> None:
+    """Refuse a date GnuCash cannot hold. ``None`` passes; a datetime
+    is judged by its day."""
+    if value is None:
+        return
+    d = value.date() if isinstance(value, datetime) else value
+    if not isinstance(d, date):
+        return
+    if d < _LEDGER_DATE_MIN or d > _LEDGER_DATE_MAX:
+        raise ValueError(
+            f"{what} {d.isoformat()} is outside the dates a GnuCash "
+            f"ledger can hold ({_LEDGER_DATE_MIN.isoformat()} to "
+            f"{_LEDGER_DATE_MAX.isoformat()})"
+        )
+
+
 def _check_text(value, width: int, what: str) -> None:
     """Refuse text GnuCash's schema cannot hold: longer than the
     column, or carrying a NUL (PostgreSQL rejects one outright, and
@@ -743,19 +836,7 @@ def _check_text(value, width: int, what: str) -> None:
     C65 / IV-19 / IV-20."""
     if not isinstance(value, str):
         return
-    if "\x00" in value:
-        raise ValueError(f"{what} contains a NUL character")
-    # The other control characters: nothing a person types, and a
-    # terminal escape or a backspace in a description rewrites what
-    # the next reader of the register or the audit log sees. Tab,
-    # newline and carriage return stay: notes are multi-line, and the
-    # row builders escape them (IV-20, the remainder).
-    for ch in value:
-        code = ord(ch)
-        if (code < 0x20 and ch not in "\t\n\r") or 0x7F <= code <= 0x9F:
-            raise ValueError(
-                f"{what} contains a control character (U+{code:04X})"
-            )
+    _check_control_chars(value, what)
     if len(value) > width:
         raise ValueError(
             f"{what} is {len(value)} characters; GnuCash stores at "
@@ -777,21 +858,74 @@ _INVISIBLE_NAME_CHARS = frozenset(
 
 
 def _name_skeleton(name: str) -> str:
-    """What a name looks like: every format character (Unicode
-    category Cf: zero-width joiners, direction marks) dropped, then
-    NFC. Two names with one skeleton are indistinguishable on screen
-    (IV-21, the remainder)."""
+    """What a name looks like, for telling two apart (IV-21).
+
+    NFC, then every character that cannot show on its own is dropped
+    and every space-like character becomes one space. A joiner (ZWJ,
+    ZWNJ) is kept where it changes what is drawn — between Arabic,
+    Indic or emoji characters — and dropped between letters of
+    scripts where it draws nothing (Latin, Greek, Cyrillic); tag
+    characters stay, since they make one flag out of another. So a
+    Persian word with and without its ZWNJ, an emoji family and its
+    three members, and England's flag and Scotland's are different
+    names, while "Gro<ZWJ>ceries" is "Groceries" (scoped review
+    2026-10-05, I-5, I-6)."""
     import unicodedata
 
-    return unicodedata.normalize(
-        "NFC",
-        "".join(ch for ch in name if unicodedata.category(ch) != "Cf"),
-    )
+    text = unicodedata.normalize("NFC", name)
+    out = []
+    for i, ch in enumerate(text):
+        code = ord(ch)
+        if ch in ("\u200c", "\u200d"):
+            prev = text[i - 1] if i else ""
+            nxt = text[i + 1] if i + 1 < len(text) else ""
+            if _joiner_can_show(prev) or _joiner_can_show(nxt):
+                out.append(ch)
+            continue
+        if 0xE0000 <= code <= 0xE007F:  # tag characters
+            out.append(ch)
+            continue
+        if ch in _INVISIBLE_LOOKALIKES or unicodedata.category(ch) == "Cf":
+            continue
+        if unicodedata.category(ch) == "Zs":
+            out.append(" ")
+            continue
+        out.append(ch)
+    return "".join(out)
+
+
+# Characters that draw nothing or draw a blank and are not spaces:
+# the combining grapheme joiner, variation selectors, Hangul fillers,
+# the braille blank.
+_INVISIBLE_LOOKALIKES = frozenset(
+    "\u034f\u115f\u1160\u3164\uffa0\u2800"
+) | frozenset(chr(c) for c in range(0xFE00, 0xFE10))
+
+
+def _joiner_can_show(ch: str) -> bool:
+    """Does a ZWJ/ZWNJ next to ``ch`` change what is drawn? Yes for
+    anything outside the Latin, Greek and Cyrillic blocks and ASCII
+    punctuation: Arabic and Indic shaping, and emoji sequences."""
+    import unicodedata
+
+    if not ch or unicodedata.category(ch) in ("Cf", "Zs", "Cc"):
+        return False
+    code = ord(ch)
+    return code >= 0x0530 and not (0x1E00 <= code <= 0x1FFF)
 
 
 _PLAIN_NUMBER = re.compile(
     r"[+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?"
 )
+
+
+def _plain_decimal(d: Decimal) -> Decimal:
+    """``Decimal("1e3")`` echoes back as ``1E+3``; the same value with
+    a non-positive exponent prints plainly (scoped review 2026-10-06,
+    IN-16). Value unchanged."""
+    if d.is_finite() and d.as_tuple().exponent > 0:
+        return Decimal(format(d, "f"))
+    return d
 
 
 def _to_decimal(value) -> Decimal:
@@ -823,7 +957,7 @@ def _to_decimal(value) -> Decimal:
             raise ValueError(
                 f"amount must be a finite number, got {value!r}"
             )
-        return d
+        return _plain_decimal(d)
     try:
         d = Decimal(str(value))
     except InvalidOperation:
@@ -856,7 +990,7 @@ def _to_decimal(value) -> Decimal:
             f"amount {value!r} has more decimal places than can be "
             f"stored (18 at most)"
         )
-    return d
+    return _plain_decimal(d)
 
 
 def _verify_write(session, table, guid: str, label: str) -> None:
@@ -1174,6 +1308,19 @@ def _slot_bool(entity, key: str) -> bool | None:
     return None
 
 
+def _is_hidden(account) -> bool:
+    """``xaccAccountIsHidden``: an account is hidden when it or any
+    ancestor carries the flag. The server read each account's own
+    flag, so hiding a parent left its children in the dashboard
+    (scoped review 2026-10-05, I-13)."""
+    a = account
+    while a is not None and a.type != "ROOT":
+        if a.hidden:
+            return True
+        a = a.parent
+    return False
+
+
 def _account_to_compact_line(account: piecash.Account) -> str:
     """Convert a piecash Account to a compact one-line string.
 
@@ -1196,6 +1343,8 @@ def _account_to_compact_line(account: piecash.Account) -> str:
         annotations.append(account.type)
     if account.placeholder:
         annotations.append("PLACEHOLDER")
+    if account.hidden:
+        annotations.append("HIDDEN")
 
     # Book text goes into a one-line row: escaped, so a name holding
     # a newline or tab cannot start a row of its own, and left
@@ -1856,6 +2005,7 @@ class BookSource:
             ValueError: the URI doesn't parse as a SQLAlchemy URL.
         """
         url = _parse_book_url(uri)
+        register_secrets_from_url(uri)
         db_name = (url.database or "").strip("/") or "book"
         # Same ``.gnucash`` suffix file books carry: resolve_mcp_dir
         # appends ``.mcp``, so a DB book's storage reads
@@ -2125,15 +2275,18 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
             yield book
         finally:
             close_start = time.time()
-            book.close()
-            # piecash binds a fresh engine to every open_book and
-            # never disposes it, so the pool keeps a connection
-            # checked in after close. On PostgreSQL that is one
-            # server slot per tool call until the cyclic GC happens
-            # to reclaim the engine (measured: 15 opens, 15 open
-            # connections). Dispose explicitly; the engine is
-            # single-use by construction here.
-            book.session.get_bind().dispose()
+            try:
+                book.close()
+            finally:
+                # piecash binds a fresh engine to every open_book and
+                # never disposes it, so the pool keeps a connection
+                # checked in after close. On PostgreSQL that is one
+                # server slot per tool call until the cyclic GC
+                # happens to reclaim the engine (measured: 15 opens,
+                # 15 open connections). Dispose explicitly, even when
+                # close raised (scoped review, S-8); the engine is
+                # single-use by construction here.
+                book.session.get_bind().dispose()
             close_elapsed = (time.time() - close_start) * 1000
             debug_logger.debug(f"Book closed in {close_elapsed:.0f}ms")
 
@@ -2213,7 +2366,8 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
 
         try:
             con = sqlite3.connect(
-                f"file:{self.book_path}?mode=ro", uri=True, timeout=1,
+                f"file:{quote(str(self.book_path))}?mode=ro", uri=True,
+                timeout=1,
             )
             try:
                 rows = con.execute("SELECT * FROM gnclock").fetchall()
@@ -2230,17 +2384,17 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
                 socket.gethostname().split(".")[0].lower()
             )
             if local:
-                try:
-                    os.kill(int(pid), 0)
-                    note += ", which is still running."
-                except ProcessLookupError:
+                alive = _pid_alive(pid)
+                if alive is False:
                     note += (
                         ", which is no longer running: a stale lock "
                         "left by a crash. Open the book in GnuCash, "
                         "choose \"Open Anyway\", and close it again "
                         "to clear it."
                     )
-                except (PermissionError, ValueError, OverflowError):
+                elif alive:
+                    note += ", which is still running."
+                else:
                     note += "."
             else:
                 note += " (another machine)."
@@ -2998,8 +3152,8 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
             f"A server older than 1.5 has written to this book since "
             f"version {converted_by} converted it: it left shapes only "
             f"the old server writes, which were converted again. Budget "
-            f"amounts that server set on income, liability, or equity "
-            f"accounts are stored with the wrong sign and cannot be "
+            f"amounts that server set on income, liability, credit card, "
+            f"payable, or equity accounts are stored with the wrong sign and cannot be "
             f"told apart from correct ones; review them with "
             f"get_budget. Do not point both versions at one book."
         )
@@ -3020,8 +3174,9 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         return (
             f"An older server (1.4.x) wrote to this book after its "
             f"conversion (seen {when.isoformat()}): budget amounts it "
-            f"set on income, liability, or equity accounts may carry "
-            f"the wrong sign — review them with get_budget"
+            f"set on income, liability, credit card, payable, or equity "
+            f"accounts may carry the wrong sign — review them with "
+            f"get_budget"
         )
 
     def _upgrade_book_shapes(self, book) -> dict:
@@ -3081,7 +3236,7 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         if n:
             out["split_reconcile_dates_filled"] = n
         out.update(self._migrate_reconcile_conventions(book))
-        n = self._migrate_slot_fillers(book)
+        n = self._migrate_slot_fillers(book, keep_business_marks=biz is None)
         if n:
             out["slot_fillers_normalized"] = n
         prices = getattr(self, "_migrate_price_shapes", None)
@@ -3102,9 +3257,15 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         # pre-1.5 shape found in a book already marked was written by
         # an old server after the conversion (FC-20): say so here, and
         # on the dashboard for a while (_OLD_SERVER_WRITE_KEY).
+        # What counts as a conversion: anything a converter changed.
+        # GnuCash's natural-sign stamp on a book's FIRST budget is
+        # what desktop itself does, not a conversion of an old shape
+        # (scoped review 2026-10-05, M-7); it counts only beside a
+        # scrub.
         converted = {
             k: v for k, v in out.items()
-            if k not in ("pre_upgrade_backup", "pre_upgrade_backup_existing")
+            if k != "pre_upgrade_backup"
+            and not (k == "book_stamped" and not out.get("book_scrubbed"))
         }
         # A snapshot taken above for a book that then had nothing to
         # convert guarded nothing: withdraw it rather than leave a
@@ -3248,7 +3409,7 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         return out
 
     @staticmethod
-    def _migrate_slot_fillers(book) -> int:
+    def _migrate_slot_fillers(book, keep_business_marks: bool = False) -> int:
         """Write path only: every slot the ORM wrote before
         2026-09-30 carries piecash's filler columns (``double_val``
         0.0, ``timespec_val`` NULL); GnuCash's SQL backend writes
@@ -3259,22 +3420,31 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
 
         # KVP_TYPE_DOUBLE = 2 and KVP_TYPE_TIMESPEC = 6 own those
         # columns; their values are data, not filler.
+        # The business converter reads piecash's fillers on a payment's
+        # ``date-posted`` slot and a lot's ``notes`` slot as the old
+        # server's mark. With the business module off, this pass used
+        # to wipe them first, and the rows were never converted once
+        # the module was back (scoped review 2026-10-06, BS-3).
+        keep = (
+            " AND name NOT IN ('date-posted', 'notes')"
+            if keep_business_marks else ""
+        )
         stale = (
             "SELECT COUNT(*) FROM slots WHERE "
-            "(double_val = 0 AND slot_type <> 2) OR "
-            "(timespec_val IS NULL AND slot_type <> 6)"
+            "((double_val = 0 AND slot_type <> 2) OR "
+            f"(timespec_val IS NULL AND slot_type <> 6)){keep}"
         )
         n = book.session.execute(text(stale)).scalar()
         if not n:
             return 0
         book.session.execute(text(
             "UPDATE slots SET double_val = NULL "
-            "WHERE double_val = 0 AND slot_type <> 2"
+            f"WHERE double_val = 0 AND slot_type <> 2{keep}"
         ))
         book.session.execute(
             text(
                 "UPDATE slots SET timespec_val = :epoch "
-                "WHERE timespec_val IS NULL AND slot_type <> 6"
+                f"WHERE timespec_val IS NULL AND slot_type <> 6{keep}"
             ),
             {"epoch": "1970-01-01 00:00:00"},
         )
@@ -3474,13 +3644,16 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         ]
         moved = 0
         for old in olds:
-            if isinstance(old, str):
-                old_dt = datetime.fromisoformat(old)
-            elif isinstance(old, datetime):
-                old_dt = old
-            else:
+            if isinstance(old, str) and "-" not in old:
+                # GnuCash 2.6's compact ``YYYYMMDDHHMMSS``: not the
+                # server's shape, and ``fromisoformat`` raised on it,
+                # which failed every converting write on a book with
+                # one such reconciled split (scoped review 2026-10-06,
+                # BS-2). Left as it is.
                 continue
-            as_utc = old_dt if old_dt.tzinfo else old_dt.replace(tzinfo=timezone.utc)
+            as_utc = _stored_timestamp_utc(old)
+            if as_utc is None:
+                continue
             local = as_utc.astimezone()
             if local.time() != datetime.min.time():
                 continue  # not the server's midnight shape
@@ -3753,6 +3926,7 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
     def _read_only_period_note(
         self, book, dates, action: str, threshold: "date | None" = None,
         dialog: "str | None" = None,
+        outcome: str = "its register will show this transaction as read-only",
     ) -> "str | None":
         """The one sentence every transaction write attaches when it
         touches the book's read-only period (review C69, ruled a
@@ -3794,8 +3968,7 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
                 f"read-only date {threshold.isoformat()} (the book "
                 f"option \"Day Threshold for Read-Only Transactions\" "
                 f"is {days} days). GnuCash's {dialog} does not check "
-                f"the option either; its register will show this "
-                f"transaction as read-only. Check that the closed "
+                f"the option either; {outcome}. Check that the closed "
                 f"period was meant to change"
             )
         return (
