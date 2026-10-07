@@ -782,8 +782,13 @@ def write_bulk(out_path: Path, txns: list[dict]) -> int:
     ``notes`` (optional) is the transaction's double-line note — the
     statement-style descriptions keep the payee clean and put the
     interpretation here (audit C6). ``enter_date`` is the post day
-    (``_enter_stamp``), never the build moment.
+    (``_enter_stamp``), never the build moment. ``sx`` (optional) names
+    the schedule the transaction is an instance of; it is stamped with
+    ``from-sched-xaction`` once saved.
     """
+    from continuation import write_sx_stamps
+
+    tagged: list[tuple[object, str]] = []
     book = piecash.open_book(str(out_path), readonly=False, do_backup=False)
     count = 0
     try:
@@ -804,7 +809,7 @@ def write_bulk(out_path: Path, txns: list[dict]) -> int:
                     splits.append(piecash.Split(
                         account=acct[path], value=value,
                     ))
-            piecash.Transaction(
+            txn = piecash.Transaction(
                 currency=cur,
                 description=t["description"],
                 notes=t.get("notes") or "",
@@ -812,10 +817,16 @@ def write_bulk(out_path: Path, txns: list[dict]) -> int:
                 enter_date=_enter_stamp(t["date"]),
                 splits=splits,
             )
+            if t.get("sx"):
+                tagged.append((txn, t["sx"]))
             count += 1
         book.save()
+        sx_by_name = {sx.name: sx.guid for sx in
+                      book.session.query(piecash.ScheduledTransaction)}
+        pairs = [(txn.guid, sx_by_name[name]) for txn, name in tagged]
     finally:
         book.close()
+    write_sx_stamps(out_path, pairs)
     return count
 
 
@@ -1535,6 +1546,7 @@ def _bo_tax_plan(through: date) -> list[dict]:
                 "date": due,
                 "description": ("WA DOR — B&O excise tax" if net > 0
                                 else "WA DOR — B&O excise return"),
+                "sx": "WA B&O Tax",
                 "notes": basis + (f" — net ${net:,.2f} due" if net > 0 else
                                   " — net $0 due; return filed, no payment"),
                 "amount": net,
@@ -1609,7 +1621,7 @@ def gen_recurring(through: date) -> list[dict]:
             notes += " — first check at the 3.5% step"
         splits = _paycheck_splits(gross, overtime, d)
         txns.append({"description": desc, "date": d, "notes": notes,
-                     "splits": splits})
+                     "splits": splits, "sx": "Robin's Paycheck"})
         hsa_contribs.append((d, FIXED_HSA))
         uwrp_contribs.append((d, sum((amt for path, amt in splits
                                       if path == UWRP), D("0"))))
@@ -1633,6 +1645,7 @@ def gen_recurring(through: date) -> list[dict]:
                 "description": "Mortgage Payment", "date": first,
                 "splits": [(CHECKING, -(m_int + m_pri)),
                            (EXP_MORTGAGE_INT, m_int), (MORTGAGE, m_pri)],
+                "sx": "Mortgage Payment",
             })
         seventh = _next_bday(_clamp_day(yr, m, 7))
         if seventh <= through and auto_bal > 0:
@@ -1642,6 +1655,7 @@ def gen_recurring(through: date) -> list[dict]:
                 "description": "Auto Loan Payment", "date": seventh,
                 "splits": [(CHECKING, -(a_int + a_pri)),
                            (EXP_AUTO_INT, a_int), (AUTO_LOAN, a_pri)],
+                "sx": "Auto Loan Payment",
             })
 
     # Genuinely-fixed monthly bills (contractual / autopay flat rates) — these
@@ -1650,16 +1664,19 @@ def gen_recurring(through: date) -> list[dict]:
     # roll off weekends; the WeWork membership is a card charge and
     # posts on its calendar day.
     fixed_bills = [
-        ("HOA Dues", CHECKING, EXP_HOA, D("425.00"), 1, True),
-        ("Streaming Bundle", CHECKING, EXP_STREAMING, D("45.97"), 8, True),
+        ("HOA Dues", CHECKING, EXP_HOA, D("425.00"), 1, True, "HOA Dues"),
+        ("Streaming Bundle", CHECKING, EXP_STREAMING, D("45.97"), 8, True,
+         "Streaming Bundle"),
         ("PEMCO Insurance — auto policy", CHECKING, EXP_AUTO_INS,
-         AUTO_INSURANCE, 6, True),
+         AUTO_INSURANCE, 6, True, "Auto Insurance (PEMCO)"),
         ("Safeco — HO-6 condo policy", CHECKING, EXP_HOME_INS,
-         HO6_INSURANCE, 11, True),
-        ("Pet Food - Chewy", CHECKING, EXP_PET_FOOD, D("48.00"), 18, True),
-        ("WeWork Coworking", AMEX, EXP_COWORKING, D("250.00"), 4, False),
+         HO6_INSURANCE, 11, True, "Condo Insurance (HO-6)"),
+        ("Pet Food - Chewy", CHECKING, EXP_PET_FOOD, D("48.00"), 18, True,
+         "Pet Food (Chewy)"),
+        ("WeWork Coworking", AMEX, EXP_COWORKING, D("250.00"), 4, False,
+         "Coworking (WeWork)"),
     ]
-    for desc, src, dst, amt, day, ach in fixed_bills:
+    for desc, src, dst, amt, day, ach, sx_name in fixed_bills:
         for yr, m in _month_iter(date(YEAR, 1, 1), through):
             when = _clamp_day(yr, m, day)
             if ach:
@@ -1668,6 +1685,7 @@ def gen_recurring(through: date) -> list[dict]:
                 txns.append({
                     "description": desc, "date": when,
                     "splits": [(src, -amt), (dst, amt)],
+                    "sx": sx_name,
                 })
 
     # Utilities + telecom DRIFT month to month (the bookkeeper's "too uniform"
@@ -1692,11 +1710,14 @@ def gen_recurring(through: date) -> list[dict]:
         return D(str(round(val, 2)))
 
     seasonal_utils = [
-        ("Electric - Seattle City Light", EXP_ELECTRIC, 95.0, ELEC_SEASON, 9),
-        ("Gas - Puget Sound Energy", EXP_GAS, 65.0, GAS_SEASON, 19),
-        ("Water/Sewer - SPU", EXP_WATER, 55.0, WATER_SEASON, 22),
+        ("Electric - Seattle City Light", EXP_ELECTRIC, 95.0, ELEC_SEASON, 9,
+         "Electric"),
+        ("Gas - Puget Sound Energy", EXP_GAS, 65.0, GAS_SEASON, 19,
+         "Gas Utility"),
+        ("Water/Sewer - SPU", EXP_WATER, 55.0, WATER_SEASON, 22,
+         "Water/Sewer"),
     ]
-    for desc, dst, base, season, day in seasonal_utils:
+    for desc, dst, base, season, day, sx_name in seasonal_utils:
         for yr, m in _month_iter(date(YEAR, 1, 1), through):
             when = _next_bday(_clamp_day(yr, m, day))
             if when <= through:
@@ -1704,6 +1725,7 @@ def gen_recurring(through: date) -> list[dict]:
                 txns.append({
                     "description": desc, "date": when,
                     "splits": [(CHECKING, -amt), (dst, amt)],
+                    "sx": sx_name,
                 })
 
     # Internet + phone: nominally flat, but real bills drift — promo
@@ -1719,6 +1741,7 @@ def gen_recurring(through: date) -> list[dict]:
             txns.append({
                 "description": "Internet - Comcast", "date": when,
                 "splits": [(CHECKING, -amt), (EXP_INTERNET, amt)],
+                "sx": "Internet",
             })
         when = _next_bday(_clamp_day(yr, m, 12))
         if when <= through:
@@ -1726,6 +1749,7 @@ def gen_recurring(through: date) -> list[dict]:
             txns.append({
                 "description": "Phone - T-Mobile", "date": when,
                 "splits": [(CHECKING, -amt), (EXP_PHONE, amt)],
+                "sx": "Phone",
             })
         when = _clamp_day(yr, m, 2)
         if when <= through:
@@ -1734,6 +1758,7 @@ def gen_recurring(through: date) -> list[dict]:
                 "description": "AWS Cloud Hosting", "date": when,
                 "notes": f"Usage billing, {date(yr, m, 1).strftime('%B %Y')}",
                 "splits": [(AMEX, -amt), (EXP_CLOUD, amt)],
+                "sx": "Cloud Hosting (AWS)",
             })
 
     # Quarterly umbrella insurance (Jan/Apr/Jul/Oct, 21st — off the
@@ -1747,6 +1772,7 @@ def gen_recurring(through: date) -> list[dict]:
                     "date": when,
                     "splits": [(CHECKING, D("-125.00")),
                                (EXP_UMBRELLA, D("125.00"))],
+                    "sx": "Umbrella Insurance",
                 })
 
     # Property tax halves, every year (Apr 30 / Oct 31), to the cent and
@@ -1761,6 +1787,7 @@ def gen_recurring(through: date) -> list[dict]:
                     "date": when,
                     "notes": f"{yr} levy, parcel statement — {label} half",
                     "splits": [(CHECKING, -half), (EXP_PROP_TAX, half)],
+                    "sx": f"Property Tax ({label} Half)",
                 })
 
     # Estimated federal tax at the real IRS deadlines, sized from
@@ -1776,6 +1803,7 @@ def gen_recurring(through: date) -> list[dict]:
             "splits": [(CHECKING, -total),
                        (EXP_EST_TAX, est["income_part"]),
                        (EXP_SE_TAX, est["se_part"])],
+            "sx": "Estimated Tax Payment",
         })
 
     # Washington B&O, the Seattle license, the SOS annual report — the
@@ -1786,6 +1814,7 @@ def gen_recurring(through: date) -> list[dict]:
             "description": item["description"], "date": item["date"],
             "notes": item["notes"],
             "splits": [(LLC_CHECKING, -amt), (EXP_BIZ_TAXES, amt)],
+            "sx": item.get("sx"),
         })
 
     # Solo 401(k) employer contribution each December (audit B7).
