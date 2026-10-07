@@ -3815,67 +3815,32 @@ def stamp_entry_dates(out_path: Path) -> int:
 
 # ── Scheduled-transaction state (kept ENABLED) ──────────────────
 
-def _sx_instances(ledger, template_desc: str) -> list:
-    """The ledger transactions that are instances of a schedule: same
-    description, or the description plus a parenthesised suffix (the
-    overtime months of the payslip)."""
-    return [t for t in ledger
-            if (t.description == template_desc
-                or t.description.startswith(template_desc + " ("))
-            and t.post_date <= THROUGH]
-
-
 def set_schedule_state(out_path: Path) -> dict:
     """``last_occur`` = the latest POSTED instance of each schedule, and
     every instance stamped with GnuCash's ``from-sched-xaction`` slot
     (audit A3: 经营所得 季度预缴 sat at 2026-06-14 with its September
     instance in the ledger, so the dashboard called it overdue). A
-    schedule with no instance yet keeps ``last_occur`` empty."""
+    schedule with no instance yet keeps ``last_occur`` empty. Instances
+    are found, and stamped, by continuation's shared matcher."""
+    from continuation import stamp_sx_instances, sx_instances
+
     info = {"schedules": 0, "instances": 0, "unposted": []}
-    stamps: list[tuple[str, str]] = []   # (txn guid, sx guid)
+    instances = sx_instances(out_path, THROUGH)
     gc = piecash.open_book(str(out_path), readonly=False, do_backup=False)
     try:
-        ledger = _ledger_txns(gc)
         for sx in gc.session.query(piecash.ScheduledTransaction).all():
-            tmpl = sx.template_account
-            tmpl_txns = {sp.transaction for sp in tmpl.splits}
-            desc = (next(iter(tmpl_txns)).description
-                    if tmpl_txns else sx.name)
-            instances = _sx_instances(ledger, desc)
+            rows = instances.get(sx.guid, [])
             sx.enabled = 1
-            sx.last_occur = (max(t.post_date for t in instances)
-                             if instances else None)
-            if not instances:
+            sx.last_occur = rows[-1][1] if rows else None
+            if not rows:
                 info["unposted"].append(sx.name)
-            stamps.extend((t.guid, sx.guid) for t in instances)
             info["schedules"] += 1
         gc.save()
     finally:
         gc.close()
-    # The instance stamp, exactly as desktop (and the server's
-    # create_transaction_from_scheduled) writes it: a bare GUID slot.
-    con = sqlite3.connect(str(out_path))
-    try:
-        have = {row[0] for row in con.execute(
-            "SELECT obj_guid FROM slots WHERE name = 'from-sched-xaction'")}
-        for txn_guid, sx_guid in stamps:
-            if txn_guid in have:
-                continue
-            # Type 5 (GUID) with the filler columns GnuCash leaves,
-            # row for row what the server's _slot_insert writes.
-            con.execute(
-                "INSERT INTO slots (obj_guid, name, slot_type, int64_val, "
-                "timespec_val, guid_val, numeric_val_num, numeric_val_denom) "
-                "VALUES (?, 'from-sched-xaction', 5, 0, "
-                "'1970-01-01 00:00:00', ?, 0, 1)", (txn_guid, sx_guid))
-            info["instances"] += 1
-        con.commit()
-    finally:
-        con.close()
+    info["instances"] = stamp_sx_instances(out_path, THROUGH)
     return info
 
-
-# ── Verification ────────────────────────────────────────────────
 
 def _parse_money(s) -> Decimal:
     """Parse a comma-formatted money string (or Decimal) to Decimal."""
@@ -4263,15 +4228,14 @@ def _verify_invariants(out_path: Path, tax_summary: dict) -> None:
                              f"{implied} ({dev:.1f}%)")
 
     # A3: every schedule's cursor is its latest posted instance.
+    from continuation import sx_instances
+    instances = sx_instances(out_path, THROUGH)
     gc = piecash.open_book(str(out_path), readonly=True, open_if_lock=True)
     try:
-        ledger = _ledger_txns(gc)
         bad = []
         for sx in gc.session.query(piecash.ScheduledTransaction).all():
-            tmpl_txns = {sp.transaction for sp in sx.template_account.splits}
-            desc = next(iter(tmpl_txns)).description if tmpl_txns else sx.name
-            inst = _sx_instances(ledger, desc)
-            want = max((t.post_date for t in inst), default=None)
+            inst = instances.get(sx.guid, [])
+            want = inst[-1][1] if inst else None
             have = sx.last_occur
             if hasattr(have, "date") and have is not None:
                 have = have.date()

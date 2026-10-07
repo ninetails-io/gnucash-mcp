@@ -1001,6 +1001,88 @@ def stamp_enter_dates(book_path: Path, after: date | None = None) -> int:
 
 # ── Scheduled-transaction cursors (bookkeeper review §2) ────────
 
+def sx_instances(book_path: Path, through: date) -> dict[str, list[tuple[str, date]]]:
+    """Each schedule's instances in the ledger: ``{sx guid: [(txn guid,
+    post date)]}``, oldest first. An instance carries the template's
+    description, either alone, with a parenthesised suffix (Lin Wei's
+    overtime payslips), or after the schedule's name ("Electric -
+    Seattle City Light", Alex's statement style), and touches every
+    account the template's legs name. Template transactions are not
+    ledger rows."""
+    con = sqlite3.connect(f"file:{book_path}?mode=ro", uri=True)
+    try:
+        templates = {}
+        for sx_guid, name, desc, acct in con.execute("""
+            SELECT s.guid, s.name, t.description, sa.guid_val
+            FROM schedxactions s
+            JOIN splits sp ON sp.account_guid = s.template_act_guid
+            JOIN transactions t ON t.guid = sp.tx_guid
+            JOIN slots f ON f.obj_guid = sp.guid AND f.name = 'sched-xaction'
+            JOIN slots sa ON sa.obj_guid = f.guid_val
+                         AND sa.name = 'sched-xaction/account'
+        """):
+            entry = templates.setdefault(sx_guid, (name, desc, set()))
+            entry[2].add(acct)
+        template_txns = {row[0] for row in con.execute("""
+            SELECT sp.tx_guid FROM splits sp
+            JOIN accounts a ON a.guid = sp.account_guid
+            JOIN commodities c ON c.guid = a.commodity_guid
+            WHERE c.namespace = 'template'
+        """)}
+        ledger: dict[str, tuple[str, date, set]] = {}
+        for guid, desc, posted, acct in con.execute("""
+            SELECT t.guid, t.description, date(t.post_date), sp.account_guid
+            FROM transactions t JOIN splits sp ON sp.tx_guid = t.guid
+            WHERE date(t.post_date) <= ?
+        """, (through.isoformat(),)):
+            if guid in template_txns:
+                continue
+            entry = ledger.setdefault(
+                guid, (desc, date.fromisoformat(posted), set()))
+            entry[2].add(acct)
+    finally:
+        con.close()
+    found: dict[str, list[tuple[str, date]]] = {}
+    for sx_guid, (name, desc, accts) in templates.items():
+        forms = (desc, f"{name} - {desc}")
+        found[sx_guid] = sorted(
+            ((guid, posted) for guid, (tdesc, posted, taccts) in ledger.items()
+             if (tdesc in forms or tdesc.startswith(desc + " ("))
+             and accts <= taccts),
+            key=lambda r: (r[1], r[0]),
+        )
+    return found
+
+
+def stamp_sx_instances(book_path: Path, through: date) -> int:
+    """Stamp every instance with its schedule, as desktop's Since Last
+    Run and the server's create_transaction_from_scheduled do: a
+    ``from-sched-xaction`` GUID slot (type 5) with the filler columns
+    GnuCash leaves. Already-stamped transactions are skipped. Returns
+    the number of stamps written."""
+    instances = sx_instances(book_path, through)
+    con = sqlite3.connect(str(book_path))
+    try:
+        have = {row[0] for row in con.execute(
+            "SELECT obj_guid FROM slots WHERE name = 'from-sched-xaction'")}
+        n = 0
+        for sx_guid, rows in instances.items():
+            for txn_guid, _posted in rows:
+                if txn_guid in have:
+                    continue
+                con.execute(
+                    "INSERT INTO slots (obj_guid, name, slot_type, int64_val, "
+                    "timespec_val, guid_val, numeric_val_num, "
+                    "numeric_val_denom) VALUES (?, 'from-sched-xaction', 5, "
+                    "0, '1970-01-01 00:00:00', ?, 0, 1)", (txn_guid, sx_guid))
+                have.add(txn_guid)
+                n += 1
+        con.commit()
+    finally:
+        con.close()
+    return n
+
+
 def advance_sx(book_path: Path, through: date) -> dict:
     """Stamp every enabled SX's ``last_occur`` so its next occurrence
     is upcoming — with AT MOST ONE schedule per book left overdue, and
@@ -1075,6 +1157,7 @@ def advance_sx(book_path: Path, through: date) -> dict:
         book.save()
     finally:
         book.close()
+    info["stamped"] = stamp_sx_instances(book_path, through)
     return info
 
 
