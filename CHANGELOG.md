@@ -1,61 +1,62 @@
 # Changelog
 
-Entries are terse by design: what changed, one line each, PR numbers where they exist. Rationale lives in the PRs, the specs, and the bookkeeper rulings recorded under `specs/`.
+Notable changes in each release. Pull request numbers are given where they exist.
 
-## Unreleased
+## v1.5.0 - Every database GnuCash speaks
 
-The server's rows are GnuCash's rows. A book can live in PostgreSQL or MySQL as well as a SQLite file; every object the server stores (schedules, budgets, invoice links, credit notes, payments, prices, voids, lots, reconcile state) is now written the way GnuCash desktop writes it and checked against GnuCash's own engine; one write converts an existing book, with a snapshot taken first. Two adversarial reviews and four bookkeeper loops ran before the bump.
+Books can live in PostgreSQL or MySQL/MariaDB as well as a SQLite file, and everything the server stores is now written the way GnuCash desktop writes it, so the two can share a book.
+
+### Upgrading from 1.2–1.4.4
+- The first write that touches schedules, budgets, business documents, prices, voids, or reconciliation converts the whole book to GnuCash's own storage. It posts nothing, reports what it converted, and cannot be undone.
+- Before converting, the server copies the book to its backups folder (labelled `pre-1-5-upgrade`, never pruned) and refuses the write if the copy cannot be made. For a database book, run `pg_dump` or `mysqldump` first.
+- Make that first write before opening the book in GnuCash desktop again. Until it is converted, a schedule created by an earlier version crashes GnuCash 5.12's Scheduled Transaction Editor.
+- Don't point a 1.4.x server and a 1.5 server at the same book. A 1.4.x write to a converted book is detected and reported.
 
 ### Added
-- **Database-backed books** — `GNUCASH_BOOK_URI` / `--book-uri` serve a book GnuCash keeps in PostgreSQL or MySQL/MariaDB; every tool works unchanged. Extras: `gnucash-mcp[postgres]`, `gnucash-mcp[mysql]`. CI runs the suite against `postgres:16` and `mariadb:11`. PostgreSQL by @vchatela (#175, from #174); MySQL/MariaDB in #181. Backup refusals name the dialect's dump tool; `docs/RESTORE_FROM_BACKUP.md` covers both.
-- **Num and the document link** — read and written on every transaction tool (`num`, `link` columns; `search_transactions(field="num")`; `num:` cell in lists). Statement entry follows "Use Split Action Field for Number". A matching number is a duplicate signal (`N`), a differing one a caution (`x`) that never blocks. Gap found by @wernerwws's fork.
-- **Prepayments** — `pay_document` takes `allow_prepayment` (the excess is held as the party's unapplied payment, as desktop splits it), `from_prepayment` (settle a document from money already paid, including a prepayment entered in desktop), and `payment_account_amount` (what the bank actually moved on a cross-currency payment). `unpost_document` keeps payments as `gncInvoiceUnpost` does. Unapplied payments show in `get_outstanding_documents`, `get_document`, and the dashboard.
-- `update_account(hidden=…)`; `update_scheduled_transaction(start_date=…)`; `reconcile_account(closing_balance=…)`; `post_document` / `get_document` report `charged_to_card` for voucher lines paid by company card.
-- Dashboard: `Overdrawn:` per negative cash account, `Low cash:` when the week's scheduled bills exceed the balance, unbalanced transactions flagged, and a check that fails says so on its own line instead of reading as a clean book.
-- Audit trail: a write the server did not live to log becomes an `INTERRUPTED` line; `create_backup` leaves a line; a locked book's error names the lock's holder and whether it is still running.
-- Startup reads a SQLite book's `versions` table and names a non-GnuCash file, a 2.6-era book, or an unreadable schema with what to do. The README states the minimum GnuCash version, 3.8.
+- **PostgreSQL and MySQL/MariaDB books** through `GNUCASH_BOOK_URI` (#175, #181). Install the `postgres` or `mysql` extra. CI tests both against real database servers. A database book is single-book, needs `GNUCASH_LOG_DIR`, and is backed up with the database's own dump tool, not by the server.
+- **Num and document link** on every transaction tool. A matching Num is used as a duplicate signal.
+- **Prepayments.** `pay_document` can record an overpayment as the party's unapplied payment, settle a document from earlier unapplied payments, and take the exact bank amount of a cross-currency payment. Unposting a paid document keeps its payments.
+- `update_account(hidden=…)` and `update_scheduled_transaction(start_date=…)`.
+- Dashboard warnings for overdrawn cash accounts, scheduled bills that exceed the week's cash, and unbalanced transactions. A dashboard check that fails says so instead of being skipped.
+- An `INTERRUPTED` audit entry for a write the server was stopped before logging.
 
 ### Changed
-- **Every stored shape is desktop's.** Schedules are template transactions with `sched-xaction` slots, their next occurrence from a port of `Recurrence.cpp` (#176, #179). Budgets use GnuCash 3.8+'s natural-sign storage (#177, #178). Invoice links sit under `gncInvoice/invoice-guid` (#180). A credit note's quantities are stored negated and applied by a `Lot Link` transaction; posted documents point at a hidden copy of their billing term; due dates are written in the slot shape desktop reads, from a port of `gncBillTerm.c`. Reconcile dates, `reconcile-info`, slot filler columns, lot flags, and voids (`xaccTransVoid` key for key) match desktop's rows. Verified by parity twins (the same flow in desktop, diffed row by row) and engine twins (`gnucash-cli` driving the engine headlessly); the twins are tests.
-- **Upgrading from 1.2–1.4.4:** the first schedule, budget, business, price, void, or reconcile write converts the whole book at once, posts nothing, and reports what it converted. Do it before your next desktop session: opening a server-made schedule in desktop's editor crashes GnuCash 5.12 until then, and the dashboard says so. A copy of the book is written to the backups folder first, labelled `pre-1-5-upgrade` and never pruned, and the write is refused if that copy cannot be made. A converter touches only rows an earlier server wrote; the book is marked, and a later write by a 1.4.x server is reported. Database books: run `pg_dump` or `mysqldump` first.
-- **Prices.** One price per pair per day, as `gnc_pricedb_add_price` keeps them; which price is current follows `compare_prices_by_date`; the `type='transaction'` row a cross-currency transaction leaves is a price and is valued by, as desktop does (#94 skip overturned). Sources must be ones the price editor recognizes; dates at GnuCash's neutral time; values reduced. Every price read goes through `_find_prices` (#186, on @bhbrunt's #182), and read tools issue a fixed number of queries whatever the book's size.
-- **Money.** Invoices total the way GnuCash totals them (`gncEntryComputeValueInt` ported; the server disagreed by a cent on a third of multi-line taxed invoices). A posted document's total is read from its posting, not recomputed. A cross-currency payment is booked in the transfer account's currency, with realized FX as an ordinary balanced amount. Converted balances round once per account, so every statement's lines add up to its total. Amounts print at their commodity's own places. Flow reports value each split at its month's close (the GB-1 convention) and say so in a footer when a foreign-currency line is present.
-- **Refusals, as desktop refuses.** A document's posting transaction is read-only on every path, no `force`. A trading-accounts book refuses a cross-commodity write until the server writes trading splits as GnuCash does. A document in a currency its owner does not use needs `force`. The payment account is never a receivable or payable. Text refuses control characters, over-width values (GnuCash's column widths), names of more than one line, and account names that read like a sibling's or like a GUID; dates outside 1400–9998; prices that are zero, negative, or self-referential. The book's read-only period is named, as a warning, on every write that lands in it.
-- `--modules=bookkeeper` is everything but business; `--modules=business` is one module (#173). `party_type` is the one name on every business tool. `get_document` carries `status`, `amount_paid`, `amount_due`; new response fields are additive throughout.
-- Dashboard accuracy pass (`specs/v1.5/DASHBOARD_ACCURACY_SPEC.md`): overdue reads the settlement chokepoint, "last entry" stops at today, monthly net converts at each month's close, staleness names the rate actually used, reconciliation "behind" is measured from the last reconcile and follows desktop's statement cycle, budget pace follows the budget's own periods.
-- Audit and debug files open by path on every entry; logs, backups, and the Docker image's process are owner-only; connection strings are password-masked on every road out of the server. URI mode is single-book and requires `GNUCASH_LOG_DIR`.
+- **GnuCash desktop compatibility.** Schedules, budgets, invoice links, credit notes, billing terms, due dates, prices, voids, lots, and reconciliation state are stored as GnuCash desktop stores them, verified against GnuCash 5.12 (#176–#181). Schedules created here run in desktop's Since Last Run, and desktop can unvoid a transaction the server voided.
+- **Invoice totals match GnuCash** to the cent, including its tax rounding and line discounts entered in desktop. A posted document's total is read from its posting, so later tax-table edits don't change it.
+- **Cross-currency payments** are booked in the paying account's currency, as GnuCash books them.
+- **Prices.** One price per currency pair per day. Same-day ties, and the rates implied by cross-currency transactions, are resolved the way GnuCash resolves them. Read tools issue a fixed number of queries whatever the book's size (#182, #186).
+- Report totals equal the sum of their lines on multi-currency books, and amounts print with each commodity's own decimal places.
+- Dashboard: overdue invoices use GnuCash's billing-term due dates, reconciliation lag follows desktop's statement cycle, budget pace follows the budget's own periods, and stale-price warnings name the rate actually used.
+- A write dated inside the book's read-only period carries a warning.
+- In a book that uses trading accounts, transactions across currencies or commodities are refused (see Known limitations).
+- `--modules=business` is one module; `freelancer` and `business_complete` are accepted as retired aliases (#173). New response fields are additive.
+- Logs and backups are created readable by their owner only. The Docker image runs as a non-root user.
 
 ### Fixed
-- **Pre-release adversarial review** (`specs/v1.5/testing/ADVERSARIAL_REVIEW_1.5.md`): seven hostile passes returned NO-SHIP on seven blockers; every blocker and serious item is fixed, the minors are in `tests/test_review_minor.py`. **Two scoped reviews** of the fixes (`specs/v1.5.1/review/`, 81 findings) are fixed except nine listed below, each cleared by a bookkeeper loop and a desktop gate.
-- An unpriced holding is worth its remaining cost basis; a sold-out position is exactly zero (#184 by @DrSkippy, #185).
-- Invoice lookups and tax-bearing drafts work on PostgreSQL: a SQLite-only heal and a SQLite-only `MAX` had aborted every document call there (#189, @JamesRao98).
-- Intel Macs install without Rust: `cryptography` pinned to 48.0.1 on macOS x86_64 only (#183).
-- A credit note at zero reads `applied`; `close_lot` closes only an empty lot; job-attached documents are named by their kind (#173, #181).
-- A schedule desktop stored as a fraction (`100/3`) no longer takes the dashboard down; ID counters GnuCash 5.0/5.1 saved as doubles auto-number again; a credit note raised on a job in desktop can be edited and applied.
-- The converters change only rows the old server wrote (they used to rewrite desktop's credit notes, line dates, and bill-term counts, and raise on a GnuCash 2.6 timestamp).
-- Deleting a transaction, split, account, or document no longer sweeps another entity's slots through piecash's GUID cascade.
-- Report date ranges are decided on the decoded date; a book file replaced mid-write is not reported as a failed write; automatic backups keep running in a long session; two same-named books under one `GNUCASH_LOG_DIR` keep separate folders; a database password never appears in an error or log, whatever characters it holds.
-- The early-payment discount is measured on what credit notes have not settled and counts from the posting date; the budget report converts month by month like the spending report; a scheduled transaction picks its rate the way a posting does.
-- Audit: `get_audit_log` no longer returns the book's full path; account-update entries list only what changed; a failed render never replaces a committed write's result.
-- A statement line a year off its statement, a far-future batch date, and a `create_price` suggestion that would not have worked are each caught where they are entered.
+- An invoice's posting transaction can no longer be voided, rewritten, or re-dated; unpost the invoice instead.
+- Deleting a transaction, account, or document no longer removes metadata belonging to other records.
+- A database password is masked in every error message and log.
+- Invoice lookups and deleting a taxed draft on PostgreSQL (#189).
+- A sold-out holding with no price is valued at zero (#184, #185).
+- Report date boundaries, automatic backups in long-running sessions, and two books with the same filename under one `GNUCASH_LOG_DIR`.
+- Input validation: control characters, over-length text, multi-line names, look-alike account names, out-of-range dates, and zero or negative prices are refused.
+- Intel Macs install without a Rust toolchain (#183).
 
 ### Known limitations
-Numbers refer to the review documents; `specs/v1.5.1/README.md` keeps the full list.
-- The server takes no `gnclock` row of its own; do not edit in desktop and the server at once (C11).
-- The read-only period is a warning, not a refusal (C69). Credit notes do not stamp the `Credit Notes` feature flag, which only GnuCash before 2.5 reads (C62).
-- In a book with "Use Trading Accounts" on, stock and fund purchases as well as currency transfers must be entered in desktop; ticking the option in desktop rewrites the book's history with trading splits, which is desktop's doing.
-- GnuCash's Balance Sheet does not foot on a multi-currency book without trading accounts; payments booked by 1.2–1.4.4 across currencies add to that gap, 1.5's do not. See `samples/README.md`.
-- Foreign-currency flows are valued at their month's closing rate, not at the cash paid; `cash_flow` reports the cash (SR-B1).
-- The bundled demo books are piecash-made, not GnuCash-made (FC-18); the suite also runs on a book `gnucash-cli` creates (FC-19).
-- A book path containing `?` cannot be opened (S-9). Under `GNUCASH_LOG_DIR`, a book reached by a differently-cased or moved path gets a new log folder (CS-9); a pre-1.5 folder that names another owner is left in place with its history.
-- A currency whose smallest fraction is not a power of ten (MGA) can receive a converted amount off its grid on the business module's conversion paths (BM-9). An amount whose numerator does not fit 64 bits passes the dry run and fails at commit (IN-7).
-- Engine strings ("Lot Link", "Voided transaction", document titles) are written in English (BS-8). A desktop document to which a 1.4.x server added a line is treated as the old server's by the document-level converter passes, without changing a value (BS-7); rows a 1.4.x server writes after the conversion are converted without a second snapshot and named (BS-9).
-- Only `create_transactions` warns about a far-future date (IN-5); a report whose start is after its end answers an empty total (IN-20).
+- The server does not lock the book. Don't edit in GnuCash desktop and through the server at the same time.
+- The book's read-only period produces a warning, not a refusal.
+- In a book with "Use Trading Accounts" on, enter cross-currency and stock or fund transactions in GnuCash desktop.
+- GnuCash's Balance Sheet does not balance on a multi-currency book without trading accounts; cross-currency payments made by 1.2–1.4.4 add to the gap. See `samples/README.md`.
+- Foreign-currency spending and income are valued at each month's closing rate, not the cash paid; `cash_flow` reports the cash.
+- A book whose path contains `?` cannot be opened.
+- Fixed strings that GnuCash writes in the user's language ("Lot Link", "Voided transaction") are written in English.
 
 ### Credits
-- @vchatela — the database backend (#175), the largest outside code contribution to date.
-- @DrSkippy — the closed-position valuation bug and its regression test (#184).
-- @bhbrunt (#182), @JamesRao98 (#189), @wernerwws — findings and fixes credited above.
+- @vchatela — PostgreSQL support (#175), the largest outside code contribution to date.
+- @DrSkippy — the closed-position valuation fix (#184).
+- @bhbrunt — price-lookup performance (#182).
+- @JamesRao98 — the PostgreSQL invoice-lookup fix (#189).
+- @wernerwws — the Num and document-link gap.
 
 ## v1.4.4 - The statement is the call
 
@@ -67,18 +68,18 @@ A complete bank statement enters, claims its matches, and reconciles in one atom
 - `pay_document` `dry_run` — proposed splits, projected remaining balance, FX/discount treatment, and any account the real call would auto-create; one shared computation with the booking path.
 - `create_transactions` dry-run gains the statement surface: summary header, `review_required` status, self-contained duplicate comparisons with deltas and split-match verdicts, candidate reconcile state.
 - **MCPB bundle (#153)** — download, double-click, Claude Desktop runs the server; book file picker; demo books behind one checkbox. Built and attached by CI on every PR (tests locked on Python 3.10 and 3.13).
-- MCP ToolAnnotations on every tool, derived from the audit-log classification at one chokepoint, with a contract test (#150).
+- MCP tool annotations on every tool, marking read-only and destructive tools (#150).
 - `get_outstanding_documents` (renamed from `get_outstanding_invoices`) — the one-call answer to "what is actually unpaid?"
 - Dashboard: warning rollups past three items (overdue-scheduled and stale-price collapse to one aggregate line each); staleness linkage ("time-based warnings below may reflect unentered activity"); reconciliation backlog line carries net unreconciled amount beside the split count.
 - Demo books are living books: a closed-loop continuation engine (`scripts/synthetic_book/continue_book.py`) extends each sample from its committed history through the build date, deriving every flow from the book itself; CI runs the same updater so the bundle ships demo books current as of build day. Every book opens with zero dashboard warnings, reconciled through the last full month, current month open.
 - Business transactions carry desktop's own split actions — `Invoice`, `Credit Note`, `Payment` — on every leg (forward-only; existing transactions untouched).
 - Price sources rank in three tiers (manual quote > other user sources > feeds); `create_price` / `create_prices` report when a recorded price loses its date's tie.
 - `apply_credit_note` against a document other than the one referenced is allowed and says so in the response and audit log.
-- `debt_payoff_plan` confesses balance-carrying debts that lack an `apr` slot.
+- `debt_payoff_plan` lists balance-carrying debts that lack an `apr` slot.
 - Transaction-entry defaults resolve loudly (date echoed when defaulted to today).
 
 ### Changed
-- **Business surface consolidated, 48 tools → 27:** five `*_party` tools replace fifteen (`party_type: customer|vendor|employee`); nine `*_document` tools replace eighteen (`document_type: invoice|bill|voucher|credit_note`); jobs and taxtables fold `get_` into `list_(id=...)`. Audit entries render identically. Docstrings lead with the species.
+- **Business surface consolidated, 48 tools → 27:** five `*_party` tools replace fifteen (`party_type: customer|vendor|employee`); nine `*_document` tools replace eighteen (`document_type: invoice|bill|voucher|credit_note`); jobs and taxtables fold `get_` into `list_(id=...)`. Audit entries render identically.
 - Installer asks one module question — "Do you invoice clients?" Budgets, scheduled transactions, and investment tracking are always on; the Advanced field remains the full `--modules` escape hatch.
 - Invoice/bill status vocabulary defined once: open / posted / paid / outstanding.
 - CLI arguments reject unknown values instead of silently no-oping (`--modules all` means what it says) (#151).
@@ -86,9 +87,9 @@ A complete bank statement enters, claims its matches, and reconciles in one atom
 - Credit notes are `type: "credit_note"` on every surface, with no due date.
 - Every error message and docstring names the consolidated surface.
 - Batch entry runs one signal sweep per batch instead of up to two per row — the 7-second p95 tail is gone.
-- **Restart safety (bookkeeper ruling 6):** first tool result of every process names the active book; with 2+ books configured, mutating tools are disarmed after a (re)start until `switch_book` confirms the target (a no-op "already on it" counts); every mutating response in a multi-book session names the book it wrote to. Reads are never gated; a refused write consumes no rate-limit token, triggers no backup, writes no audit line.
-- **Discount-account auto-create refuses on localized books (ruling 4b):** no more English default leaf in a localized chart. Existing accounts remain adoptable through every resolution layer. Role-based resolution (4a) is the destination that lifts the refusal.
-- **BEHAVIOR BREAK — currency-mismatch posting is a refusal (ruling 1 sunset):** posting a document to an A/R or A/P account in a different commodity refuses (desktop GnuCash does the same), pointing at the per-currency subledger fix. Warning-era books are unaffected: their lots still settle via FX and the downstream guards stay.
+- **Restart safety:** the first tool result of every process names the active book; with 2+ books configured, mutating tools are disarmed after a (re)start until `switch_book` confirms the target (a no-op "already on it" counts); every mutating response in a multi-book session names the book it wrote to. Reads are never gated; a refused write consumes no rate-limit token, triggers no backup, writes no audit line.
+- **Discount-account auto-create refuses on localized books:** no English-named account is created in a localized chart. Existing discount accounts are still found and used.
+- **Behavior change — currency-mismatch posting is refused:** posting a document to an A/R or A/P account in a different currency is refused, as in GnuCash desktop; the error points to a per-currency A/R or A/P account. Documents already posted that way still settle.
 - Test suite (2,100+ tests) runs parallel by default via pytest-xdist; full suite under 40 seconds.
 - `cryptography` 49 → 50.0.1 (#155).
 
@@ -101,15 +102,11 @@ A complete bank statement enters, claims its matches, and reconciles in one atom
 - Signed amounts reach the duplicate scorer — a refund no longer blocks as its payment's twin.
 - Invisible Unicode separators in TSV input reject by name and row.
 - Credit-note identity survives the piecash slot-sweep on transaction delete; owner-mismatch errors name the per-type ID collision; voucher posting reachable (#152).
-- Release code review (8 angles, 10 confirmed findings, 10 fixes): the FX resolver gains the same fail-safe locale gate as discounts; `delete_document` regains the credit-note `party_type` disambiguator; `create_document` refuses type-inapplicable `job_id` / `applies_to_id`; the retired freelancer toggle is honored (its surface never joined the always-on base); the multi-book write disarm no longer caches a blind fail-open; `GNUCASH_REDACT_PATHS` fails closed through the toggle chokepoint.
-- Statement/batch hot path: three N+1 query patterns eliminated (candidate universe, signal sweep, split-prefix map); the query budget is contract-locked.
-- Demo continuation: revolver interest can't date into the frozen prefix, and the updater independently verifies the prefix's row count, failing loud.
-- `text()`-form raw SQL is now visible to the write-verification contract lock.
+- The FX account resolver refuses to auto-create on localized books, as the discount resolver does; `create_document` refuses a `job_id` or `applies_to_id` that doesn't apply to the document type; the multi-book write guard and `GNUCASH_REDACT_PATHS` fail safe.
+- Statement and batch entry: three N+1 query patterns eliminated.
+- Demo-book continuation no longer dates interest into the books' committed history.
 - Credit note nets against a job-grouped invoice from the same customer (owner check compared a Job GUID against a Customer GUID) (#165).
 - Payment dry runs render as `PAY INVOICE (dry run)` in the audit log; partial payments report `partial`, not `paid` (#165).
-
-### Validation
-- Three live bookkeeper probe rounds on `enter_statement`; full business-module battery on the German sample book (#165); the deferred battery rulings' six-call live loop (one FAIL found, fixed, re-probed to signoff); demo-fleet review with all findings closed and signoff on the record.
 
 ## v1.4.2 - One call wide, every surface honest
 
@@ -117,7 +114,7 @@ The bulk grammar is complete — updates, prices, currency, and reconciliation a
 
 ### Added
 - `update_transactions` — per-row bulk edits via TSV (description, notes, date), one book open, one save, abort/skip semantics; `update_transaction` takes a guid list to broadcast one change (#145).
-- `create_prices` — batch quote entry with `create_price`'s upsert semantics via a shared chokepoint, plus a stale-price work list (#143).
+- `create_prices` — batch quote entry with `create_price`'s upsert behavior, plus a stale-price work list (#143).
 - Per-transaction currency: a `cur` column in batch entry and scheduled-transaction templates (#141).
 - Split `action` field on every transaction create path (#142).
 - `get_reconciliation_status` — per-account drill-down behind the dashboard's counts (behind / never / current / dormant / excluded), same classification as the dashboard (#146).
@@ -128,13 +125,12 @@ The bulk grammar is complete — updates, prices, currency, and reconciliation a
 - **Behavior change:** moving the posting date of a transaction with reconciled splits requires `force=true` on the single, broadcast, and batch update paths (#148).
 - Dormant accounts ($0, fully reconciled, idle) collapse into one aggregate line; carried balances with months of silence stay individually warned (#146).
 - Bulk-reconcile audit entries render what actually happened; reconcile errors teach — did-you-mean account suggestions, `through_date` hints, placeholder-children warnings (#137, #144).
-- Five dashboard clarity fixes from live review; notes convention pass (template notes, audit truth, leg preservation) (#138, #139).
+- Five dashboard clarity fixes; notes convention pass (template notes, audit truth, leg preservation) (#138, #139).
 - Release policy: sample books ship frozen and regenerate on demand via `scripts/synthetic_book/`.
-- Contributor guide documents the chokepoint pattern with the established chokepoints named.
 
 ### Fixed
 - `reconcile_all` honors the statement-date bound its docstring always promised — splits after the statement date stay unreconciled (#144).
-- `get_book_summary` on a 33k-split, 10-commodity GBP book never completed; price lookups now memoized per commodity pair and the split graph bulk-loaded — under 10 seconds on that book, ~45% faster on small books. Contributed by @bhbrunt (#126). Follow-ups: `create_prices` invalidates the price memo, a SQL-count regression test guards the preload, a final `guid` sort key makes the price tie-break deterministic (#147).
+- `get_book_summary` on a 33k-split, 10-commodity GBP book never completed; price lookups now memoized per commodity pair and the split graph bulk-loaded — under 10 seconds on that book, ~45% faster on small books. Contributed by @bhbrunt (#126, follow-ups in #147).
 - User-controlled text (descriptions, memos, payee strings) is escaped before reaching the audit file — a crafted newline pair could previously forge an audit entry or smuggle instructions to the model reading `get_audit_log` (#148).
 - `create_prices` dry-run and live execution agree on duplicate identities (#148).
 
@@ -153,7 +149,7 @@ The bulk grammar is complete — updates, prices, currency, and reconciliation a
 - One-command sample-book rebuild through today.
 
 ### Changed
-- Monthly-close valuation (GB-1): flow reports value every split at its own month's closing rate in single-period and `group_by` modes, so totals agree at every granularity; stock reports keep as-of semantics; partial sub-periods marked `*`.
+- Monthly-close valuation: flow reports value every split at its own month's closing rate in single-period and `group_by` modes, so totals agree at every granularity; stock reports keep as-of semantics; partial sub-periods marked `*`.
 - Retirement accounts classify via an `is_retirement` slot, not English name-sniffing; Imbalance/Orphan matching requires the exact word or `-CUR` shape.
 
 ### Fixed
@@ -199,7 +195,6 @@ The bulk grammar is complete — updates, prices, currency, and reconciliation a
 - FX staleness cap (`GNUCASH_FX_STALENESS_DAYS`, default 90); invoice post/pay raise `StaleFXRateError` instead of posting on a stale rate (override with `force`).
 - Intermediate-currency valuation via a pivot currency, with provenance (`via USD`). Reported by @alhosani-abdulla (#94).
 - `create_budget` accepts `start_date` for retroactive budgets.
-- Pathological-shapes fixture book (parents/placeholders with direct splits, overpaid lot, voided transaction, desktop SX template, foreign A/R, future-dated entry) run against every report surface.
 
 ### Changed
 - `--modules` partition is role-aligned: `core` (29, group alias for nine sub-modules), `bookkeeper` (17), `investor` (12: `portfolio` + `tax_lots`), `freelancer` (19), `business` (29); `get_server_config` renders groups as `core[accounts, audit, ...]`.
@@ -209,7 +204,7 @@ The bulk grammar is complete — updates, prices, currency, and reconciliation a
 - Token trimming: 8-char GUID prefixes in `get_transaction` and verbose `list_transactions`; business-object `guid` fields stripped from responses (`transaction_guid` kept, as a short prefix).
 - Book directory path redacted from `get_server_config` / `get_book_summary` (filename only); tool errors route through `redact_paths()`.
 - **Net worth restated:** RECEIVABLE and PAYABLE accounts now sit in their natural balance-sheet buckets across `balance_sheet`, `net_worth`, and the summary trajectory — outstanding A/R minus A/P is included; historical anchors shift accordingly.
-- Internal: `CurrencyMixin` extraction, `_compute_fx_gain_loss` helper, `get_book_summary` decomposed into `_render_*` helpers (~30% faster on large books), `QueryMixin` finders.
+- `get_book_summary` ~30% faster on large books.
 
 ### Fixed
 - A = L + E holds by construction across `balance_sheet`, `net_worth`, and the summary.
@@ -248,7 +243,6 @@ The bulk grammar is complete — updates, prices, currency, and reconciliation a
 - Short collision-safe GUIDs (`%xxxxxxx`) accepted everywhere a path is.
 - `delete_price` with source disambiguation.
 - Sample books ship with the repo: `samples/alex-chen-morales.gnucash` (USD), `samples/lin-wei.gnucash` (CNY).
-- Self-conducted code review ([specs/CODE_REVIEW.md](specs/CODE_REVIEW.md)): 3 critical, 12 high, 26 medium, 18 low findings; all criticals, all highs, all real-bug mediums, and 11 of 18 lows closed in this release.
 
 ### Fixed
 - `balance_sheet`, `net_worth`, `cash_flow`, `get_book_summary` value foreign-currency holdings at shares × latest price (cost-basis fallback) — Alex's net worth was understated by ~$57K.
@@ -256,12 +250,12 @@ The bulk grammar is complete — updates, prices, currency, and reconciliation a
 - `create_price` and `get_latest_price` default to the book's currency, not USD.
 - `debt_payoff_plan` uses the amortization formula for LIABILITY accounts (a ¥2.7M mortgage at 3.85% asked ¥54,590/mo instead of ~¥14,800).
 - `unpost_invoice` ignores voided payment splits; `void_transaction` warns when reconciled splits are zeroed; `list_lots` skips empty lots; `owner_type` validated at all six entry points.
-- Criticals: silent budget-amount truncation; backup filename collision and auto-backup gate race; swallowed auto-backup failures (summary now surfaces chain status).
-- Highs: investment cost-basis precision; scheduling month-end drift; tri-currency FX gain/loss; pay-invoice A/R-side conversion; per-commodity precision (JPY, BHD/KWD); audit before-state staging; write verification on `update_transaction` / `replace_splits`; `delete_account` dangling handle; audit before-state pre-clear; `prune_backups(keep_last_n=0, manual)` refuses to wipe every manual snapshot.
-- Mediums/lows: vendor bills render `POST BILL` / `PAY BILL` in the audit log; entries reject wrong account types; statement-balance comparison quantizes to commodity fraction; `unvoid_transaction` validates slot completeness; audit files written `0o600`; `_resolve_guid` per-table dispatch covering prices and entries; write-verification failures get their own `error_type`; `set_account_slot` rejects slash keys; `_describe_age` rounds.
+- Silent budget-amount truncation; backup filename collision and auto-backup gate race; swallowed auto-backup failures (summary now surfaces chain status).
+- Investment cost-basis precision; scheduling month-end drift; tri-currency FX gain/loss; pay-invoice A/R-side conversion; per-commodity precision (JPY, BHD/KWD); audit before-state staging; write verification on `update_transaction` / `replace_splits`; `delete_account` dangling handle; audit before-state pre-clear; `prune_backups(keep_last_n=0, manual)` refuses to wipe every manual snapshot.
+- Vendor bills render `POST BILL` / `PAY BILL` in the audit log; entries reject wrong account types; statement-balance comparison quantizes to commodity fraction; `unvoid_transaction` validates slot completeness; audit files written `0o600`; `_resolve_guid` per-table dispatch covering prices and entries; write-verification failures get their own `error_type`; `set_account_slot` rejects slash keys; `_describe_age` rounds.
 
 ### Tests
-- 1,114 passing (was 540). Roadmap for 1.3: [specs/NEXT_STEPS_1_3.md](specs/NEXT_STEPS_1_3.md).
+- 1,114 passing (was 540).
 
 ## v1.2.0 — Business module debut
 
