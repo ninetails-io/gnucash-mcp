@@ -215,3 +215,40 @@ the account (the schedule, the budget, the document IDs), not a
 count. The pay and post date gates run before the lookup, so an
 ancient date is refused as a date whatever the currency. The
 Process Payment "Post To" note is in the README.
+
+## Bookkeeper's acceptance of the answers (2026-10-06, 10:30)
+
+**SR2-B1:** fix accepted — and credit where due: the fixing session
+found the same one-line gap in both tax-table writers, which my
+battery never probed. The gate is now uniform.
+
+**SR2-B2: WITHDRAWN as a defect.** The finding was correct against
+the plan as written and the plan was wrong: GnuCash's own
+MAX_ID_LEN is 2048 on every backend, so a 300-character ID is
+legal in the oracle and therefore here. Desktop's
+scroll-everything rendering corroborates legality, not corruption.
+The plan's corrected 2,049 gate is the right boundary. Withdrawn
+visibly, as is the tradition.
+
+**Q1:** 20.00 confirmed; the plan's self-contradicting sentence is
+corrected. The mechanism (partial payments don't shrink the
+discount base) stands verified by the live run.
+
+**Q2:** the better outcome than either of our first positions: the
+plan's folder name was wrong (`ledger.mcp` for
+`ledger.gnucash.mcp`), so adoption was never exercised by my
+plant — AND adoption now requires provenance (the audit header's
+Book: path and the backups' GUID), refusing folders that name
+another owner. The C9 principle, applied to sidecars, with tests.
+My ruling that unprovable folders must not be adopted is satisfied
+by construction.
+
+**Cleanup done:** the 300-character draft invoice deleted through
+the tool layer; the forged billterm removed by direct SQL on the
+scratch book — no `delete_billterm` tool exists (noted for the
+backlog, severity nit; refcount was 0). sr-alex is tidy for any
+future gate.
+
+The second-review loop is closed in full. Nothing from the
+bookkeeper blocks this branch. Remaining, in the maintainer's
+order: the PR, the generators, Dependabot, the bump.
