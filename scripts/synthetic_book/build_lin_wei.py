@@ -73,7 +73,7 @@ from gnucash_mcp.book import GnuCashBook
 # whether this script is launched as a module or by path.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from market_data import MarketData  # noqa: E402
-from base_book import record_prices  # noqa: E402
+from base_book import new_split, record_prices  # noqa: E402
 
 
 # ── Configuration ───────────────────────────────────────────────
@@ -1021,10 +1021,10 @@ def opening_balances(out_path: Path) -> None:
         splits = []
         total = D("0")
         for path, bal in OPENING_BALANCES:
-            splits.append(piecash.Split(account=acct[path], value=bal))
+            splits.append(new_split(account=acct[path], value=bal))
             total += bal
         # Equity absorbs the residual so the transaction balances.
-        splits.append(piecash.Split(account=acct[OPENING], value=-total))
+        splits.append(new_split(account=acct[OPENING], value=-total))
         piecash.Transaction(
             currency=cny,
             description="期初余额 (Opening Balances)",
@@ -1043,10 +1043,10 @@ def opening_balances(out_path: Path) -> None:
                 notes=f"期初持仓 {units} 份 @ ¥{price} (opening position)",
                 is_closed=0,
             )
-            inv_split = piecash.Split(
+            inv_split = new_split(
                 account=inv_acct, value=cost, quantity=units,
             )
-            eq_split = piecash.Split(account=acct[OPENING], value=-cost)
+            eq_split = new_split(account=acct[OPENING], value=-cost)
             piecash.Transaction(
                 currency=cny,
                 description=f"期初持仓 — {title}",
@@ -1081,12 +1081,12 @@ def write_bulk(out_path: Path, txns: list[dict]) -> int:
             for sp in t["splits"]:
                 if len(sp) == 3:
                     path, value, qty = sp
-                    splits.append(piecash.Split(
+                    splits.append(new_split(
                         account=acct[path], value=value, quantity=qty,
                     ))
                 else:
                     path, value = sp
-                    splits.append(piecash.Split(
+                    splits.append(new_split(
                         account=acct[path], value=value,
                     ))
             piecash.Transaction(
@@ -3012,9 +3012,9 @@ def run_investments(out_path: Path, since: date | None = None,
                     title=f"{sym} DCA {yy}-{m:02d}", account=inv_acct,
                     notes=f"定投 {units} 份 @ ¥{price}", is_closed=0,
                 )
-                inv_split = piecash.Split(
+                inv_split = new_split(
                     account=inv_acct, value=cost, quantity=units)
-                cash_split = piecash.Split(account=acct[CHECKING], value=-cost)
+                cash_split = new_split(account=acct[CHECKING], value=-cost)
                 piecash.Transaction(
                     currency=cny, description=f"定投 {sym}",
                     post_date=d,
@@ -3041,13 +3041,13 @@ def run_investments(out_path: Path, since: date | None = None,
                         f"，佣金 ¥{fee}" if fee else ""),
                     is_closed=0,
                 )
-                inv_split = piecash.Split(
+                inv_split = new_split(
                     account=inv_acct, value=cny_amt, quantity=shares)
-                cash_split = piecash.Split(account=acct[CHECKING],
+                cash_split = new_split(account=acct[CHECKING],
                                            value=-(cny_amt + fee))
                 splits = [inv_split, cash_split]
                 if fee:
-                    splits.append(piecash.Split(account=acct[EXP_TRADING_FEES],
+                    splits.append(new_split(account=acct[EXP_TRADING_FEES],
                                                 value=fee))
                 piecash.Transaction(
                     currency=cny, description=f"买入 {shares} {sym} @ ¥{price}",
@@ -3077,15 +3077,15 @@ def run_investments(out_path: Path, since: date | None = None,
                 stamp = ((cny_amt * STAMP_DUTY_RATE).quantize(D("0.01"))
                          if is_stock else D("0"))
                 fees = stamp + fee
-                inv_split = piecash.Split(
+                inv_split = new_split(
                     account=inv_acct, value=-cost_basis, quantity=-shares)
-                cash_split = piecash.Split(account=acct[CHECKING],
+                cash_split = new_split(account=acct[CHECKING],
                                            value=cny_amt - fees)
-                gain_split = piecash.Split(
+                gain_split = new_split(
                     account=acct[CAPITAL_GAINS], value=-realized_pl)
                 splits = [inv_split, cash_split, gain_split]
                 if fees:
-                    splits.append(piecash.Split(account=acct[EXP_TRADING_FEES],
+                    splits.append(new_split(account=acct[EXP_TRADING_FEES],
                                                 value=fees))
                 # Defensive: the synthetic data must balance to the fen.
                 assert (-cost_basis) + (cny_amt - fees) + (-realized_pl) + fees == 0
@@ -3107,8 +3107,8 @@ def run_investments(out_path: Path, since: date | None = None,
             piecash.Transaction(
                 currency=cny, description=desc, post_date=date(YEAR, m, day),
                 splits=[
-                    piecash.Split(account=acct[CHECKING], value=amt),
-                    piecash.Split(account=acct[DIVIDENDS], value=-amt),
+                    new_split(account=acct[CHECKING], value=amt),
+                    new_split(account=acct[DIVIDENDS], value=-amt),
                 ],
             )
             counts["txns"] += 1
@@ -4586,9 +4586,9 @@ def continuation_invest(out_path: Path, when: date, amount: Decimal,
             title=f"510300 {kind} {when.isoformat()}",
             account=acct[CSI300],
             notes=f"{kind} {units} 份 @ ¥{price}", is_closed=0)
-        inv_split = piecash.Split(account=acct[CSI300], value=cost,
+        inv_split = new_split(account=acct[CSI300], value=cost,
                                   quantity=units)
-        cash_split = piecash.Split(account=acct[source_path], value=-cost)
+        cash_split = new_split(account=acct[source_path], value=-cost)
         piecash.Transaction(
             currency=cny, description=f"买入 510300（{kind}）",
             post_date=when, splits=[inv_split, cash_split])

@@ -94,7 +94,7 @@ from dateutil.easter import easter
 
 from gnucash_mcp.book import GnuCashBook
 from market_data import MarketData
-from base_book import record_prices
+from base_book import new_split, record_prices
 
 SEED = 20250101
 YEAR = 2025
@@ -623,14 +623,14 @@ def _etf_buy(book, acct: dict, when: date, amount: D, source_path: str,
     units = (amount / etf_price(when)).quantize(D("0.0001"), ROUND_HALF_UP)
     lot = piecash.Lot(title=lot_title, account=acct[ETF], notes=lot_notes,
                       is_closed=0)
-    isp = piecash.Split(account=acct[ETF], value=amount, quantity=units)
+    isp = new_split(account=acct[ETF], value=amount, quantity=units)
     piecash.Transaction(
         currency=book.default_currency, description=description,
         post_date=when,
-        splits=[piecash.Split(account=acct[source_path], value=-amount),
-                piecash.Split(account=acct[PRIV_DRAW], value=amount),
+        splits=[new_split(account=acct[source_path], value=-amount),
+                new_split(account=acct[PRIV_DRAW], value=amount),
                 isp,
-                piecash.Split(account=acct[PRIV_KAPITAL], value=-amount)])
+                new_split(account=acct[PRIV_KAPITAL], value=-amount)])
     isp.lot = lot
 
 
@@ -645,17 +645,17 @@ def opening_balances(out_path: Path) -> None:
                 (OPENING_PRIVATE, PRIV_KAPITAL, "Anfangsbestand 01.01.2025 (privat)", "")):
             splits, total = [], D("0")
             for path, bal in rows:
-                splits.append(piecash.Split(account=acct[path], value=bal))
+                splits.append(new_split(account=acct[path], value=bal))
                 total += bal
-            splits.append(piecash.Split(account=acct[equity], value=-total))
+            splits.append(new_split(account=acct[equity], value=-total))
             piecash.Transaction(currency=eur, description=desc, notes=note,
                                 post_date=jan1, splits=splits)
         # ETF opening lot — private, so against Privatkapital.
         etf_cost = (etf_price(jan1) * ETF_UNITS).quantize(D("0.01"), ROUND_HALF_UP)
         lot = piecash.Lot(title="MSCI World ETF — Sparplan-Bestand",
                           account=acct[ETF], notes="Eröffnungsbestand", is_closed=0)
-        inv = piecash.Split(account=acct[ETF], value=etf_cost, quantity=ETF_UNITS)
-        eqs = piecash.Split(account=acct[PRIV_KAPITAL], value=-etf_cost)
+        inv = new_split(account=acct[ETF], value=etf_cost, quantity=ETF_UNITS)
+        eqs = new_split(account=acct[PRIV_KAPITAL], value=-etf_cost)
         piecash.Transaction(currency=eur, description="Anfangsbestand — MSCI World ETF (privat)",
                             post_date=jan1, splits=[inv, eqs])
         inv.lot = lot
@@ -1884,8 +1884,8 @@ def run_ust_va(out_path: Path, since: date | None = None) -> int:
             # Debits on the output accounts minus the credits on the
             # input accounts: >0 pays the Finanzamt, <0 is its refund.
             zahllast = sum(v for _, v in clearing)
-            splits = [piecash.Split(account=acct[p], value=v) for p, v in clearing]
-            splits.append(piecash.Split(account=acct[BANKKONTO], value=-zahllast))
+            splits = [new_split(account=acct[p], value=v) for p, v in clearing]
+            splits.append(new_split(account=acct[BANKKONTO], value=-zahllast))
             piecash.Transaction(currency=eur, description=f"{UST_VA_DESC} {label}",
                                 post_date=due, splits=splits,
                                 notes=f"Voranmeldungszeitraum {label}; Kz. 81/86 Umsätze, "
@@ -2082,8 +2082,8 @@ def run_est(out_path: Path, since: date | None = None) -> int:
                 piecash.Transaction(
                     currency=eur, description=desc, post_date=bankday_back(first_due - timedelta(days=1)),
                     notes=f"Deckung des Bankkontos aus der Steuerrücklage für: {covered}",
-                    splits=[piecash.Split(account=acct[POSTBANK], value=-total),
-                            piecash.Split(account=acct[BANKKONTO], value=total)])
+                    splits=[new_split(account=acct[POSTBANK], value=-total),
+                            new_split(account=acct[BANKKONTO], value=total)])
                 n += 1
             for when, desc, amount in rows:
                 if not _due(when) or desc in done:
@@ -2094,8 +2094,8 @@ def run_est(out_path: Path, since: date | None = None) -> int:
                     currency=eur, description=desc, post_date=when,
                     notes="Einkommensteuer, Solidaritätszuschlag und Kirchensteuer — "
                           "privat (§12 Nr. 3 EStG), Lastschrift Finanzamt",
-                    splits=[piecash.Split(account=acct[BANKKONTO], value=-amount),
-                            piecash.Split(account=acct[PRIV_STEUERN], value=amount)])
+                    splits=[new_split(account=acct[BANKKONTO], value=-amount),
+                            new_split(account=acct[PRIV_STEUERN], value=amount)])
                 n += 1
             book.save()
         finally:
@@ -2115,7 +2115,7 @@ def write_bulk(out_path: Path, txns: list[dict]) -> int:
         eur = book.default_currency
         acct = {a.fullname: a for a in book.accounts}
         for t in txns:
-            splits = [piecash.Split(account=acct[p], value=v) for p, v in t["splits"]]
+            splits = [new_split(account=acct[p], value=v) for p, v in t["splits"]]
             piecash.Transaction(currency=eur, description=t["description"],
                                 notes=t.get("notes") or "",
                                 post_date=t["date"], splits=splits)

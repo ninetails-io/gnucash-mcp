@@ -1,5 +1,5 @@
-"""Helpers shared by the builders: the server's price writer, and
-``--chart-only`` mode.
+"""Helpers shared by the builders: the server's split constructor and
+price writer, and ``--chart-only`` mode.
 
 A chart-only book holds commodities, the chart of accounts, and
 account slots — nothing dated. It is a fast validity check on a
@@ -13,6 +13,22 @@ import sqlite3
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
+
+
+def new_split(account, value, quantity=None, currency=None):
+    """A split through the server's one constructor, ``_new_split``:
+    the value rounded to the transaction currency's unit, the quantity
+    to the account's, and an unreconciled ``reconcile_date`` at the
+    epoch as GnuCash stores it (piecash leaves it NULL). ``currency``
+    defaults to the book's; every builder transaction currency has two
+    decimal places. ``quantity`` defaults to ``value`` (same-commodity
+    split), as piecash's did."""
+    from gnucash_mcp.book._base import _new_split
+
+    return _new_split(
+        account, value, value if quantity is None else quantity,
+        currency or account.book.default_currency,
+    )
 
 
 def record_prices(

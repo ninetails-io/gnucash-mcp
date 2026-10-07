@@ -89,13 +89,13 @@ from gnucash_mcp.book import GnuCashBook
 # module or as a path because uv adds the script dir to sys.path.
 try:
     from market_data import MarketData
-    from base_book import record_prices
+    from base_book import new_split, record_prices
     from continuation import business_day, federal_holidays, is_business_day
 except ImportError:  # pragma: no cover - fallback for package-style import
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from market_data import MarketData
-    from base_book import record_prices
+    from base_book import new_split, record_prices
     from continuation import business_day, federal_holidays, is_business_day
 
 
@@ -691,9 +691,9 @@ def opening_balances(out_path: Path) -> None:
         splits = []
         total = D("0")
         for path, bal in OPENING_BALANCES:
-            splits.append(piecash.Split(account=acct[path], value=bal))
+            splits.append(new_split(account=acct[path], value=bal))
             total += bal
-        splits.append(piecash.Split(account=acct[OPENING], value=-total))
+        splits.append(new_split(account=acct[OPENING], value=-total))
         piecash.Transaction(
             currency=usd,
             description="Opening Balances",
@@ -714,8 +714,8 @@ def opening_balances(out_path: Path) -> None:
             post_date=date(YEAR, 1, 2),
             enter_date=_enter_stamp(date(YEAR, 1, 2)),
             splits=[
-                piecash.Split(account=acct[LLC_CHECKING], value=LLC_OPENING),
-                piecash.Split(account=acct[CHECKING], value=-LLC_OPENING),
+                new_split(account=acct[LLC_CHECKING], value=LLC_OPENING),
+                new_split(account=acct[CHECKING], value=-LLC_OPENING),
             ],
         )
 
@@ -729,10 +729,10 @@ def opening_balances(out_path: Path) -> None:
                       f"{units} sh, basis ${cost} (${per_share}/sh)",
                 is_closed=0,
             )
-            inv_split = piecash.Split(
+            inv_split = new_split(
                 account=inv_acct, value=cost, quantity=units,
             )
-            eq_split = piecash.Split(account=acct[OPENING], value=-cost)
+            eq_split = new_split(account=acct[OPENING], value=-cost)
             piecash.Transaction(
                 currency=usd,
                 description=f"Opening position — {title}",
@@ -801,12 +801,12 @@ def write_bulk(out_path: Path, txns: list[dict]) -> int:
             for sp in t["splits"]:
                 if len(sp) == 3:
                     path, value, qty = sp
-                    splits.append(piecash.Split(
+                    splits.append(new_split(
                         account=acct[path], value=value, quantity=qty,
                     ))
                 else:
                     path, value = sp
-                    splits.append(piecash.Split(
+                    splits.append(new_split(
                         account=acct[path], value=value,
                     ))
             txn = piecash.Transaction(
@@ -3304,9 +3304,9 @@ def run_investments(out_path: Path, through: date,
                     title=f"{sym} DCA {d.isoformat()}", account=inv_acct,
                     notes=f"Monthly auto-invest — ${amt} @ ${price}", is_closed=0,
                 )
-                inv_split = piecash.Split(
+                inv_split = new_split(
                     account=inv_acct, value=amt, quantity=shares)
-                cash_split = piecash.Split(account=acct[CHECKING], value=-amt)
+                cash_split = new_split(account=acct[CHECKING], value=-amt)
                 piecash.Transaction(
                     currency=usd, description=f"{who} — Buy {sym}",
                     notes=f"Auto-invest ${amt} @ ${price} = {shares} sh",
@@ -3324,9 +3324,9 @@ def run_investments(out_path: Path, through: date,
                     title=f"{sym} buy {d.isoformat()}", account=inv_acct,
                     notes=f"{shares} sh @ ${price}", is_closed=0,
                 )
-                inv_split = piecash.Split(
+                inv_split = new_split(
                     account=inv_acct, value=usd_amt, quantity=shares)
-                cash_split = piecash.Split(
+                cash_split = new_split(
                     account=acct[CHECKING], value=-usd_amt)
                 note = f"{shares} sh @ ${price} = ${usd_amt:,.2f}"
                 piecash.Transaction(
@@ -3355,10 +3355,10 @@ def run_investments(out_path: Path, through: date,
                 #   (−cost_basis) + usd_amt + (−gain)
                 #   = −cost_basis + usd_amt − (usd_amt − cost_basis) = 0.
                 gain = usd_amt - cost_basis
-                inv_split = piecash.Split(
+                inv_split = new_split(
                     account=inv_acct, value=-cost_basis, quantity=-shares)
-                cash_split = piecash.Split(account=acct[CHECKING], value=usd_amt)
-                gain_split = piecash.Split(
+                cash_split = new_split(account=acct[CHECKING], value=usd_amt)
+                gain_split = new_split(
                     account=acct[CAPITAL_GAINS], value=-gain)
                 assert (-cost_basis) + usd_amt + (-gain) == 0
                 kind_word = "gain" if gain >= 0 else "loss"
@@ -3380,9 +3380,9 @@ def run_investments(out_path: Path, through: date,
                     continue
                 if sym in ("AAPL", "MSFT"):
                     # Cash dividend → Checking (no new shares).
-                    cash_split = piecash.Split(
+                    cash_split = new_split(
                         account=acct[CHECKING], value=amt)
-                    income_split = piecash.Split(
+                    income_split = new_split(
                         account=acct[DIVIDENDS], value=-amt)
                     piecash.Transaction(
                         currency=usd,
@@ -3400,9 +3400,9 @@ def run_investments(out_path: Path, through: date,
                         notes=f"Reinvested distribution — ${amt} @ ${price}",
                         is_closed=0,
                     )
-                    inv_split = piecash.Split(
+                    inv_split = new_split(
                         account=inv_acct, value=amt, quantity=shares)
-                    income_split = piecash.Split(
+                    income_split = new_split(
                         account=acct[DIVIDENDS], value=-amt)
                     piecash.Transaction(
                         currency=usd,
@@ -3775,11 +3775,8 @@ def run_reconciliation(out_path: Path, through: date) -> list[str]:
 # ── Scheduled-transaction state (stay ENABLED, realistic timing) ─
 
 def set_schedule_state(out_path: Path, through: date) -> dict:
-    """Stamp SX cursors via the shared engine rule: everything current,
-    at most ONE schedule overdue and only when it "just came due" (3–7
-    days — bookkeeper review §2). The old always-overdue Estimated Tax
-    hook aged into looking like neglect; the due-soon line is Alex's
-    hook now."""
+    """Stamp SX cursors via the shared engine rule: every schedule
+    current to the close, none overdue."""
     from continuation import advance_sx
     return advance_sx(out_path, through)
 
@@ -4556,9 +4553,9 @@ def continuation_invest(out_path: Path, when: date, amount: Decimal,
         lot = piecash.Lot(
             title=f"VTSAX {kind} {when.isoformat()}", account=acct[VTSAX],
             notes=f"{kind.capitalize()} — ${amount} @ ${price}", is_closed=0)
-        inv_split = piecash.Split(account=acct[VTSAX], value=amount,
+        inv_split = new_split(account=acct[VTSAX], value=amount,
                                   quantity=shares)
-        cash_split = piecash.Split(account=acct[source_path], value=-amount)
+        cash_split = new_split(account=acct[source_path], value=-amount)
         piecash.Transaction(
             currency=usd, description="Vanguard — Buy VTSAX",
             notes=f"{kind.capitalize()} ${amount} @ ${price} = {shares} sh",

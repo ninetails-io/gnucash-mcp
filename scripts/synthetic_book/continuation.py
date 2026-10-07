@@ -1093,12 +1093,10 @@ def stamp_sx_instances(book_path: Path, through: date) -> int:
 
 
 def advance_sx(book_path: Path, through: date) -> dict:
-    """Stamp every enabled SX's ``last_occur`` so its next occurrence
-    is upcoming — with AT MOST ONE schedule per book left overdue, and
-    only when its missed occurrence fell 3–7 days before ``through``
-    ("just came due", the bookkeeper's review §2). Books where no schedule
-    lands in that window get zero overdue and rely on the due-soon
-    line as the hook.
+    """Stamp every enabled SX's ``last_occur`` at its last occurrence on
+    or before ``through``, so every next occurrence is upcoming: the
+    books are current to the close, with no schedule overdue. Then
+    stamp the instances (``stamp_sx_instances``).
 
     Set directly via piecash: ``last_occur`` is GnuCash desktop's
     "Since Last Run" cursor, deliberately not exposed by the public
@@ -1113,7 +1111,7 @@ def advance_sx(book_path: Path, through: date) -> dict:
         "quarterly": relativedelta(months=3),
         "yearly": relativedelta(years=1),
     }
-    info = {"enabled": 0, "upcoming": 0, "overdue": 0}
+    info = {"enabled": 0, "upcoming": 0}
 
     book = piecash.open_book(str(book_path), readonly=False, do_backup=False)
     try:
@@ -1142,21 +1140,11 @@ def advance_sx(book_path: Path, through: date) -> dict:
                 cur = cur + period[freq]
             rows.append((sx, occs))
 
-        # The one just-came-due hook: closest miss inside the window,
-        # name as the deterministic tie-break.
-        window = [
-            (sx, occs) for sx, occs in rows
-            if len(occs) >= 2 and 3 <= (through - occs[-1]).days <= 7
-        ]
-        window.sort(key=lambda r: ((through - r[1][-1]).days, r[0].name))
-        overdue_sx = window[0][0] if window else None
-
+        # Every cursor at its last occurrence on or before ``through``:
+        # the books are current to the close, nothing overdue.
         for sx, occs in rows:
             if not occs:
                 last = None
-            elif sx is overdue_sx:
-                last = occs[-2]
-                info["overdue"] += 1
             else:
                 last = occs[-1]
                 info["upcoming"] += 1
