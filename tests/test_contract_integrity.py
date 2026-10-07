@@ -36,6 +36,7 @@ contract, the bug class is open again.
 from __future__ import annotations
 
 import ast
+import re
 from pathlib import Path
 
 import pytest
@@ -550,7 +551,7 @@ class TestWriteVerificationCoverage:
     def test_every_raw_sql_dml_site_has_paired_verify(self):
         import re
         verify_pattern = re.compile(
-            r"_verify_(write|composite_write|delete)\b"
+            r"_verify_(write|composite_write|delete|none_remaining)\b"
         )
         missing: list[str] = []
         for path, line_no, table, op in self._scan_dml_sites():
@@ -679,6 +680,162 @@ class TestBackendPortabilityChokepoints:
         assert base.count("st_mtime_ns") >= 1
         assert "_gnc_bool" in (self._BOOK_DIR / "core.py").read_text()
         assert "_gnc_bool" in (self._BOOK_DIR / "business.py").read_text()
+
+    # SQLite accepts each of these; PostgreSQL and/or MySQL reject it.
+    # Pattern → the portable form to write instead.
+    _SQLITE_ONLY_SQL = (
+        (r"\bMAX\s*\(\s*[^()]*,", "scalar MAX(a, b): write CASE / GREATEST"),
+        (r"\bMIN\s*\(\s*[^()]*,", "scalar MIN(a, b): write CASE / LEAST"),
+        (r"\bstrftime\s*\(", "strftime(): compute the date in Python"),
+        (r"\bjulianday\s*\(", "julianday(): compute the date in Python"),
+        (r"\bdatetime\s*\(", "datetime(): compute the date in Python"),
+        (r"\bifnull\s*\(", "IFNULL(): write COALESCE"),
+        (r"\bINSERT\s+OR\b", "INSERT OR ...: not portable"),
+        (r"\bGLOB\b", "GLOB: write LIKE"),
+        (r"\bPRAGMA\b", "PRAGMA: SQLite-only"),
+        (r"\btypeof\s*\(", "typeof(): SQLite-only"),
+        (r"\|\|", "|| concatenation: MySQL reads it as OR"),
+        (r"(=|<>|!=|\bIS\b|\bIS\s+NOT\b)\s*''", "typed column vs '': only SQLite's dynamic typing allows the comparison"),
+    )
+
+    def test_raw_sql_avoids_sqlite_only_constructs(self):
+        """Every ``text(...)`` statement runs unchanged on all three
+        backends.
+
+        SQLite is the permissive dialect, and it is the one every
+        hermetic test runs on — so a statement only SQLite accepts
+        passes the whole suite and fails the first database book it
+        meets. Two shipped that way: the taxtable refcount clamp
+        ``MAX(0, refcount - :n)`` (PostgreSQL and MySQL know MAX only
+        as an aggregate; no tax-bearing draft could be deleted on a
+        database book) and ``_find_invoice``'s ``date_posted = ''``
+        heal, which aborted every PostgreSQL invoice lookup (#189).
+
+        A statement that genuinely must be one backend's is allowed
+        when it sits inside a ``_dialect_name(book) == "sqlite"``
+        guard, which is how the heal is written now.
+        """
+        import ast
+
+        offenders = []
+        for path in self._book_sources():
+            source = path.read_text()
+            lines = source.splitlines()
+            tree = ast.parse(source, filename=str(path))
+            for node in ast.walk(tree):
+                if not (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "text"
+                    and node.args
+                ):
+                    continue
+                pieces = [
+                    sub.value
+                    for sub in ast.walk(node.args[0])
+                    if isinstance(sub, ast.Constant) and isinstance(sub.value, str)
+                ]
+                sql = " ".join(pieces)
+                guarded = any(
+                    '_dialect_name(book) == "sqlite"' in ln
+                    for ln in lines[max(0, node.lineno - 30): node.lineno]
+                )
+                for pattern, advice in self._SQLITE_ONLY_SQL:
+                    if re.search(pattern, sql, flags=re.IGNORECASE) and not guarded:
+                        offenders.append(
+                            f"{path.name}:{node.lineno}: {advice}\n"
+                            f"      {sql.strip()[:110]}"
+                        )
+        assert not offenders, (
+            "SQLite-only SQL in a raw text() statement. The hermetic "
+            "suite runs on SQLite and cannot see this; PostgreSQL / "
+            "MySQL reject it at runtime. Write the portable form, or "
+            "gate the statement on _dialect_name(book) == \"sqlite\".\n"
+            + "\n".join(f"  {o}" for o in offenders)
+        )
+
+
+class TestDashboardHonestFailure:
+    """Every ``except`` in the three dashboard collectors routes
+    through ``_check_failed`` — spec:
+    specs/v1.5/DASHBOARD_HONEST_FAILURE_SPEC.md.
+
+    A handler that swallows on its own reports a failed check as a
+    clean book, and on PostgreSQL leaves the transaction aborted for
+    every collector after it. The ``ImportError`` guards (business or
+    scheduling module not loaded) are the one exemption: that is
+    configuration, not failure.
+    """
+
+    _CORE = _REPO_ROOT / "src" / "gnucash_mcp" / "book" / "core.py"
+    _COLLECTORS = (
+        "_open_documents",
+        "_business_summary_counts",
+        "_overdue_scheduled_warnings",
+        "_collect_warnings",
+    )
+
+    def test_every_collector_handler_calls_check_failed(self):
+        tree = ast.parse(self._CORE.read_text(), filename=str(self._CORE))
+        seen = set()
+        offenders = []
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.FunctionDef)
+                and node.name in self._COLLECTORS
+            ):
+                continue
+            seen.add(node.name)
+            for handler in ast.walk(node):
+                if not isinstance(handler, ast.ExceptHandler):
+                    continue
+                if (
+                    isinstance(handler.type, ast.Name)
+                    and handler.type.id == "ImportError"
+                ):
+                    continue
+                routed = any(
+                    isinstance(sub, ast.Call)
+                    and isinstance(sub.func, ast.Attribute)
+                    and sub.func.attr == "_check_failed"
+                    for sub in ast.walk(handler)
+                )
+                if not routed:
+                    offenders.append(f"{node.name}:{handler.lineno}")
+        assert seen == set(self._COLLECTORS), f"collectors not found: {seen}"
+        assert not offenders, (
+            "dashboard collector handler that does not call "
+            "_check_failed — a failed check must clear an aborted "
+            "transaction and render its reason, never fall silent:\n"
+            + "\n".join(f"  {o}" for o in offenders)
+        )
+
+    def test_stale_price_collector_reads_the_valuation_rate(self):
+        """Dashboard-accuracy spec A5: the stale-price warning reads
+        ``_rates_as_of_dated`` — the map valuation uses — never a
+        commodity's own price rows via ``_find_prices``. Keyed on
+        price rows, a EUR book's USD accounts read "no price on
+        file" forever while valuing correctly off the inverse."""
+        tree = ast.parse(self._CORE.read_text(), filename=str(self._CORE))
+        fn = next(
+            n for n in ast.walk(tree)
+            if isinstance(n, ast.FunctionDef) and n.name == "_collect_warnings"
+        )
+        called = {
+            sub.func.attr for sub in ast.walk(fn)
+            if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute)
+        }
+        assert "_find_prices" not in called
+        assert "_rates_as_of_dated" in called
+
+    def test_core_never_reads_a_lot_balance_directly(self):
+        """Dashboard-accuracy spec A1: every paid/due answer on the
+        dashboard comes from ``_document_settlement``. A direct
+        ``_calculate_lot_balance`` in core is the bug class where
+        an overpaid invoice rendered as past due (``abs()`` over
+        the raw balance) and the count disagreed with
+        get_outstanding_documents."""
+        assert "_calculate_lot_balance" not in self._CORE.read_text()
 
 
 def _enclosing_def(path: Path, lineno: int) -> str:

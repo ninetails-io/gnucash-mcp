@@ -413,7 +413,7 @@ class TestCreateJob:
 
     def test_invalid_owner_type_rejected(self, business_book):
         gb = GnuCashBook(str(business_book))
-        with pytest.raises(ValueError, match="Invalid owner_type"):
+        with pytest.raises(ValueError, match="Invalid party_type"):
             gb.create_job(
                 owner_id="000001", owner_type="custmer", name="x",
             )
@@ -500,7 +500,7 @@ class TestListJobs:
         would be ambiguous."""
         gb = GnuCashBook(str(business_book))
         with pytest.raises(
-            ValueError, match="owner_id requires owner_type",
+            ValueError, match="owner_id requires party_type",
         ):
             gb.list_jobs(owner_id="000001")
 
@@ -827,6 +827,7 @@ class TestGetJobReport:
         # EUR invoice
         inv_eur = gb.create_invoice(
             customer_id="000001", job_id=job["id"], currency="EUR",
+            force=True,  # not the party's currency (review C48)
         )
         gb.add_invoice_entry(
             invoice_id=inv_eur["id"], account="Income:Sales",
@@ -1876,38 +1877,51 @@ class TestCreateTaxtable:
                           "account": gst}],
             )
 
-    def test_zero_amount_rejected(self, business_book):
+    def test_zero_and_negative_rates_are_accepted_as_gnucash_accepts_them(
+        self, business_book,
+    ):
+        """GnuCash's tax-table editor takes any percentage from -100
+        to 100: zero-rated supplies are a rate, and a reverse-charge
+        table pairs +20 with -20 so the tax nets to nothing. The
+        server refused all of it (adversarial review 2026-09-30,
+        C51)."""
         gb = GnuCashBook(str(business_book))
-        gst, _ = _add_tax_accounts(gb)
-        with pytest.raises(ValueError, match="amount must be > 0"):
-            gb.create_taxtable(
-                name="Zero",
-                entries=[{"type": "percentage", "amount": "0",
-                          "account": gst}],
-            )
+        gst, pst = _add_tax_accounts(gb)
+        gb.create_taxtable(
+            name="Zero rated",
+            entries=[{"type": "percentage", "amount": "0", "account": gst}],
+        )
+        gb.create_taxtable(
+            name="Reverse charge",
+            entries=[
+                {"type": "percentage", "amount": "20", "account": gst},
+                {"type": "percentage", "amount": "-20", "account": pst},
+            ],
+        )
+        gb.create_taxtable(
+            name="All of it",
+            entries=[{"type": "percentage", "amount": "100", "account": gst}],
+        )
+        # A reverse-charged line totals its net: the two taxes cancel.
+        gb.create_customer(name="Acme Corp")
+        inv = gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id=inv["id"], account="Income:Sales",
+            description="Work", quantity="1", price="100.00",
+            taxtable="Reverse charge",
+        )
+        assert gb.get_invoice(inv["id"], owner_type="customer")["total"] == "100.00"
 
-    def test_negative_amount_rejected(self, business_book):
+    def test_a_percentage_beyond_100_either_way_is_refused(self, business_book):
         gb = GnuCashBook(str(business_book))
         gst, _ = _add_tax_accounts(gb)
-        with pytest.raises(ValueError, match="amount must be > 0"):
-            gb.create_taxtable(
-                name="Neg",
-                entries=[{"type": "percentage", "amount": "-5",
-                          "account": gst}],
-            )
-
-    def test_high_percentage_rejected(self, business_book):
-        gb = GnuCashBook(str(business_book))
-        gst, _ = _add_tax_accounts(gb)
-        # 100%+ rate almost certainly indicates the user expressed
-        # the rate as a fraction (0.05) and we're seeing 5.0 — but
-        # also 100% itself is a likely user error.
-        with pytest.raises(ValueError, match="user error"):
-            gb.create_taxtable(
-                name="Too high",
-                entries=[{"type": "percentage", "amount": "150",
-                          "account": gst}],
-            )
+        for amount in ("150", "100.01", "-100.5"):
+            with pytest.raises(ValueError, match="outside -100 to 100"):
+                gb.create_taxtable(
+                    name="Out of range",
+                    entries=[{"type": "percentage", "amount": amount,
+                              "account": gst}],
+                )
 
     def test_missing_account_rejected(self, business_book):
         gb = GnuCashBook(str(business_book))
@@ -2382,13 +2396,44 @@ class TestTaxtableRefcount:
 
 
 class TestTaxtableMath:
-    """Tests for ``_compute_entry_tax`` — the per-quadrant tax
-    math helper. Pure function, no book fixture required."""
+    """One taxed line, quadrant by quadrant, through ``_entry_math``
+    (GnuCash's ``gncEntryComputeValueInt`` and
+    ``gncInvoiceGetNetAndTaxesInternal``, ported). Pure functions, no
+    book fixture required.
 
-    # The helper is a staticmethod on BusinessMixin; we reach
-    # through GnuCashBook (which mixes it in).
-    from gnucash_mcp.book import GnuCashBook as _GB
-    _fn = staticmethod(_GB._compute_entry_tax)
+    These cases were written against the server's own per-line math
+    (``_compute_entry_tax``, retired by the 1.5 adversarial review,
+    C1). Their subject — what one line comes to in each quadrant —
+    survives; they now ask it of the port, as a one-line document.
+    The cases that pinned the old rounding (half-to-even, and a
+    residual cent forced onto the largest rate so a tax-included
+    line's gross equalled its price) assert desktop's numbers
+    instead. The full parity table is ``tests/test_entry_math.py``.
+    """
+
+    @staticmethod
+    def _fn(quantity, price, taxable, tax_included, taxtable_entries,
+            quantum):
+        from fractions import Fraction
+        from gnucash_mcp.book import _entry_math as em
+        entries = [
+            em.TaxEntry(
+                em.AMT_PERCENT if e["type"] == "percentage"
+                else em.AMT_VALUE,
+                Fraction(e["amount"]), e["account_guid"],
+            )
+            for e in taxtable_entries
+        ] if taxable else None
+        values = em.entry_values(
+            Fraction(quantity), Fraction(price), entries, tax_included,
+        )
+        doc = em.document_totals([("income", values)], int(1 / quantum))
+        return {
+            "pretax": doc.net,
+            "tax_total": doc.tax,
+            "tax_by_acct": doc.tax_by_account,
+            "gross": doc.total,
+        }
 
     USD_QUANTUM = Decimal("0.01")
     JPY_QUANTUM = Decimal("1")
@@ -2543,78 +2588,48 @@ class TestTaxtableMath:
         assert r["gross"] == Decimal("112.00")
         assert r["pretax"] + r["tax_total"] == r["gross"]
 
-    def test_q3_residual_to_largest_rate(self):
-        # Gross $100 with GST 5% + PST 7% has no clean integer
-        # pretax. pretax = 100 / 1.12 = 89.2857... → 89.29.
-        # Per-entry independent rounding: 89.29 * 0.05 = 4.4645
-        # → 4.46, 89.29 * 0.07 = 6.2503 → 6.25.
-        # Sum: 4.46 + 6.25 = 10.71. Residual:
-        # 100.00 - 89.29 - 10.71 = 0.00 → no adjustment needed
-        # in this case. Let's pick numbers that DO show residual.
-        # Gross $100.07 with GST 5%: pretax = 100.07/1.05
-        # = 95.30476... → 95.30. tax = 95.30*0.05 = 4.765 → 4.77
-        # (with banker's; 4.765 → 4.76 because 6 is even).
-        # 95.30 + 4.76 = 100.06; residual = 100.07 - 100.06 = 0.01.
-        # Residual goes to the largest-rate (only) entry.
+    def test_q3_tax_included_rounds_net_and_tax_separately(self):
+        # Gross $100.07 with GST 5% included.
+        # pretax = 100.07 / 1.05 = 95.304761…  → net 95.30
+        # tax    = 95.304761… × 0.05 = 4.765238… → 4.77 (half-up,
+        # on the UNROUNDED pretax — the old math taxed the rounded
+        # 95.30, got 4.765, and banker's-rounded it to 4.76).
+        # 95.30 + 4.77 = 100.07: here the two roundings happen to
+        # add back to the price.
         r = self._fn(
             quantity=Decimal("1"), price=Decimal("100.07"),
             taxable=True, tax_included=True,
             taxtable_entries=[self._gst_5()],
             quantum=self.USD_QUANTUM,
         )
-        # The residual identity is the contract — the math may
-        # round either way under banker's, but the identity
-        # MUST hold.
-        assert r["pretax"] + r["tax_total"] == r["gross"]
-        # And the gross is preserved exactly.
+        assert r["pretax"] == Decimal("95.30")
+        assert r["tax_total"] == Decimal("4.77")
         assert r["gross"] == Decimal("100.07")
 
-    def test_q3_residual_routes_to_largest_percentage(self):
-        # Construct a case where the residual is non-zero and
-        # verify the per-account allocation puts the residual on
-        # the largest-rate entry. Pick numbers that produce a
-        # one-cent residual under banker's rounding.
-        # Gross $10.05 with GST 5% + PST 7%:
-        # pretax = 10.05 / 1.12 = 8.973214... → 8.97
-        # GST: 8.97 * 0.05 = 0.4485 → 0.45 (banker's: 5 even)
-        # PST: 8.97 * 0.07 = 0.6279 → 0.63
-        # Sum tax: 1.08. pretax + tax = 10.05 → no residual.
-        # Try gross $10.06:
-        # pretax = 10.06 / 1.12 = 8.982142... → 8.98
-        # GST: 8.98 * 0.05 = 0.449 → 0.45
-        # PST: 8.98 * 0.07 = 0.6286 → 0.63
-        # Sum: 1.08; pretax + tax = 10.06 → no residual.
-        # Try gross $10.13:
-        # pretax = 10.13 / 1.12 = 9.04464... → 9.04
-        # GST: 9.04 * 0.05 = 0.452 → 0.45
-        # PST: 9.04 * 0.07 = 0.6328 → 0.63
-        # Sum: 1.08; pretax + tax = 10.12 → residual 0.01.
-        # → PST is largest rate, gets the +0.01.
+    def test_q3_tax_included_total_can_differ_from_the_price(self):
+        # Gross $10.13 with GST 5% + PST 7% included.
+        # pretax = 10.13 / 1.12 = 9.044642…  → net 9.04
+        # GST    = 9.044642… × 0.05 = 0.452232… → 0.45
+        # PST    = 9.044642… × 0.07 = 0.633125  → 0.63
+        # total  = 9.04 + 0.45 + 0.63 = 10.12 — a cent under the
+        # line's price. GnuCash rounds the net and each tax account
+        # independently and adds them (gncInvoiceGetTotalInternal);
+        # it has no step that forces the sum back to the price. The
+        # server used to push the missing cent onto the largest
+        # rate (PST 0.64) so the gross read 10.13, and posted a
+        # different PST liability than desktop computes.
         r = self._fn(
             quantity=Decimal("1"), price=Decimal("10.13"),
             taxable=True, tax_included=True,
             taxtable_entries=[self._gst_5(), self._pst_7()],
             quantum=self.USD_QUANTUM,
         )
-        # Contract: identity holds, residual targets PST (the
-        # 7% entry, which has the higher rate).
+        assert r["pretax"] == Decimal("9.04")
+        assert r["tax_by_acct"][self.GST_GUID] == Decimal("0.45")
+        assert r["tax_by_acct"][self.PST_GUID] == Decimal("0.63")
+        assert r["gross"] == Decimal("10.12")
+        # What posts still balances: the A/R leg is the total.
         assert r["pretax"] + r["tax_total"] == r["gross"]
-        assert r["gross"] == Decimal("10.13")
-        # PST tax should be slightly more than the "clean"
-        # per-entry calculation; GST should be the clean amount.
-        gst = r["tax_by_acct"][self.GST_GUID]
-        pst = r["tax_by_acct"][self.PST_GUID]
-        # GST gets the clean 5% (4.5 mils → 0.45 under banker's,
-        # though either rounding direction is acceptable).
-        # PST absorbs the residual.
-        assert gst == Decimal("0.45")
-        # PST is "0.63 + residual", testing that the residual
-        # landed there: PST > pretax * 0.07 quantized.
-        pretax = r["pretax"]
-        pst_clean = (pretax * Decimal("7") / Decimal("100")).quantize(
-            self.USD_QUANTUM
-        )
-        assert pst >= pst_clean
 
     # ── Quadrant 4: tax-inclusive, mixed value + percentage ────
 
@@ -3582,6 +3597,7 @@ class TestTaxtableCrossCurrency:
         gb.create_customer(name="EUR Client")
         gb.create_invoice(
             customer_id="000001", currency="EUR",
+            force=True,  # not the party's currency (review C48)
         )
         return gb
 
@@ -3678,7 +3694,10 @@ class TestTaxtableCrossCurrency:
                       "account": "Liabilities:GST Payable"}],
         )
         gb.create_customer(name="EUR Client")
-        gb.create_invoice(customer_id="000001", currency="EUR")
+        gb.create_invoice(
+            customer_id="000001", currency="EUR",
+            force=True,  # not the party's currency (review C48)
+        )
         gb.add_invoice_entry(
             invoice_id="000001",
             account="Income:Sales",
@@ -3961,23 +3980,65 @@ class TestCreateInvoice:
         inv = gb.get_invoice(result["id"])
         assert inv["currency"] == "EUR"
 
-    def test_explicit_currency_overrides_customer_currency(
+    def test_a_currency_that_is_not_the_customers_is_refused_unless_forced(
         self, business_book,
     ):
-        """An explicit ``currency`` parameter wins over the
-        customer's currency. Edge case but supported — callers
-        sometimes record cross-currency invoices intentionally."""
+        """GnuCash keeps a document in its owner's currency, and
+        leaves one that isn't out of the party's balance: asked what
+        a USD customer owed with 220 in USD invoices and an unpaid
+        EUR 100 one, the engine said 220 (adversarial review
+        2026-09-30, C48). The explicit pick used to win silently. It
+        is refused now, naming the two ordinary ways to bill in
+        another currency; ``force`` still creates it, with the
+        divergence in the response."""
         import piecash
         gb = GnuCashBook(str(business_book))
         with gb.open(readonly=False) as book:
             book.session.add(piecash.factories.create_currency_from_ISO("EUR"))
             book.save()
         gb.create_customer(name="Berlin Digital", currency="EUR")
+
+        with pytest.raises(ValueError) as refusal:
+            gb.create_invoice(customer_id="000001", currency="USD")
+        message = str(refusal.value)
+        assert "not Berlin Digital's currency (EUR)" in message
+        assert "left out of it" in message
+        assert "create_party" in message and "force=true" in message
+        # Nothing was created.
+        assert gb.list_invoices(compact=False)["invoices"] == []
+
         result = gb.create_invoice(
-            customer_id="000001", currency="USD",
+            customer_id="000001", currency="USD", force=True,
         )
+        assert "Berlin Digital's currency is EUR" in result["warnings"][0]
         inv = gb.get_invoice(result["id"])
         assert inv["currency"] == "USD"
+
+    def test_the_customers_own_currency_named_explicitly_is_fine(
+        self, business_book,
+    ):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Berlin Digital", currency="EUR")
+        result = gb.create_invoice(customer_id="000001", currency="EUR")
+        assert "warnings" not in result
+
+    def test_a_credit_note_follows_a_forced_documents_currency(
+        self, business_book,
+    ):
+        """The source was created in that currency on purpose; its
+        credit note needs no second ``force``."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        src = gb.create_invoice(
+            customer_id="000001", currency="EUR", force=True,
+        )
+        cn = gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+            applies_to_invoice_id=src["id"],
+        )
+        assert gb.get_invoice(
+            cn["id"], owner_type="customer",
+        )["currency"] == "EUR"
 
 
 class TestCreateBill:
@@ -4248,19 +4309,22 @@ class TestCreateBill:
         bill = gb.get_invoice(result["id"])
         assert bill["currency"] == "USD"
 
-    def test_explicit_currency_overrides_vendor_currency(
+    def test_a_currency_that_is_not_the_vendors_is_refused_unless_forced(
         self, business_book,
     ):
-        """Explicit ``currency`` wins over the vendor's currency."""
+        """The bill side of the same rule (review C48)."""
         import piecash
         gb = GnuCashBook(str(business_book))
         with gb.open(readonly=False) as book:
             book.session.add(piecash.factories.create_currency_from_ISO("EUR"))
             book.save()
         gb.create_vendor(name="JetBrains", currency="USD")
+        with pytest.raises(ValueError, match="not JetBrains's currency"):
+            gb.create_bill(vendor_id="000001", currency="EUR")
         result = gb.create_bill(
-            vendor_id="000001", currency="EUR",
+            vendor_id="000001", currency="EUR", force=True,
         )
+        assert "warnings" in result
         bill = gb.get_invoice(result["id"])
         assert bill["currency"] == "EUR"
 
@@ -4645,32 +4709,20 @@ class TestCreditNoteSlotHelpers:
             inv = book.session.query(Invoice).filter_by(id="000001").first()
             assert BusinessMixin._get_is_credit_note(inv) is True
 
-    def test_set_false_clears_slot(self, business_book):
-        """``_set_is_credit_note(False)`` removes the slot entirely
-        (not stores ``0``). Important: the "absent-means-False"
-        convention is what GnuCash desktop reads — storing 0 would
-        be a non-standard state."""
-        from gnucash_mcp.book.business import BusinessMixin
+    def test_set_false_stores_zero(self, business_book):
+        """gncInvoiceSetIsCreditNote(FALSE) stores int64 0, as desktop
+        does on every plain document (billterm twin, 2026-09-29);
+        the reader treats 0 and absence alike."""
         gb = GnuCashBook(str(business_book))
-        self._new_invoice(gb)
+        gb.create_customer(name="Acme")
+        cn = gb.create_credit_note(owner_id="000001", owner_type="customer")
         with gb.open(readonly=False) as book:
-            from piecash.business.invoice import Invoice
-            inv = book.session.query(Invoice).filter_by(id="000001").first()
-            BusinessMixin._set_is_credit_note(inv, True)
+            inv = gb._find_invoice(book, cn["id"], owner_type=2)
+            assert gb._get_is_credit_note(inv) is True
+            gb._set_is_credit_note(inv, False)
+            assert gb._get_is_credit_note(inv) is False
+            assert int(str(inv["credit-note"].value)) == 0
             book.save()
-        with gb.open(readonly=False) as book:
-            from piecash.business.invoice import Invoice
-            inv = book.session.query(Invoice).filter_by(id="000001").first()
-            BusinessMixin._set_is_credit_note(inv, False)
-            book.save()
-        # Slot should be gone — re-read returns False AND the
-        # underlying access raises KeyError on direct lookup.
-        with gb.open(readonly=True) as book:
-            from piecash.business.invoice import Invoice
-            inv = book.session.query(Invoice).filter_by(id="000001").first()
-            assert BusinessMixin._get_is_credit_note(inv) is False
-            with pytest.raises(KeyError):
-                inv[BusinessMixin._CREDIT_NOTE_SLOT_KEY]
 
     def test_set_false_on_unflagged_is_idempotent(self, business_book):
         """Clearing a slot that was never set must not raise.
@@ -4931,7 +4983,7 @@ class TestCreateCreditNote:
         """Typos / unknown owner types rejected via the standard
         _parse_owner_type path."""
         gb = GnuCashBook(str(business_book))
-        with pytest.raises(ValueError, match="Invalid owner_type"):
+        with pytest.raises(ValueError, match="Invalid party_type"):
             gb.create_credit_note(
                 owner_id="000001", owner_type="custmer",
             )
@@ -5828,7 +5880,10 @@ class TestCreditNotePr87ReviewFollowups:
         gb.create_customer(name="Berlin GmbH", currency="EUR")
         # Post both documents matched (USD invoice → USD A/R) —
         # the only door the current code leaves open…
-        src = gb.create_invoice(customer_id="000001", currency="USD")
+        src = gb.create_invoice(
+            customer_id="000001", currency="USD",
+            force=True,  # not the party's currency (review C48)
+        )
         gb.add_invoice_entry(
             invoice_id=src["id"], account="Income:Sales",
             description="x", quantity="1", price="500",
@@ -5903,13 +5958,20 @@ class TestCreditNotePr87ReviewFollowups:
             post_account="Assets:Accounts Receivable",
             owner_type="customer",
         )
-        with pytest.raises(
-            ValueError, match="quantizes to zero",
-        ):
+        # Refused as finer than the currency's unit — the rule every
+        # other money input follows — before it can round to zero.
+        with pytest.raises(ValueError, match="Apply amount"):
             gb.apply_credit_note(
                 credit_note_id=cn["id"],
                 applies_to_invoice_id=src["id"],
                 amount="0.001",
+            )
+        # …and so is one that would have rounded to something.
+        with pytest.raises(ValueError, match="Apply amount"):
+            gb.apply_credit_note(
+                credit_note_id=cn["id"],
+                applies_to_invoice_id=src["id"],
+                amount="50.005",
             )
 
 
@@ -6032,7 +6094,6 @@ class TestCreditNoteDisplayPolish:
         assert cn_row["type"] == "credit_note"
         assert cn_row["due_date"] is None
         assert cn_row["days_past_due"] is None
-        assert cn_row["no_terms"] is False
 
     def test_dashboard_ar_nets_credit_notes_against_invoices(
         self, business_book,
@@ -6127,7 +6188,7 @@ class TestEntryNotesAction:
         gb = GnuCashBook(str(business_book))
         gb.create_customer(name="Acme Corp")
         gb.create_invoice(customer_id="000001")
-        with pytest.raises(ValueError, match="notes exceeds"):
+        with pytest.raises(ValueError, match="notes is 5000 characters"):
             gb.add_invoice_entry(
                 invoice_id="000001",
                 account="Income:Sales",
@@ -6247,10 +6308,11 @@ class TestAddInvoiceEntry:
         fetched = gb.get_invoice("000001")
         assert fetched["entries"][0]["date"] == "2026-08-15"
 
-    def test_entry_date_stored_at_neutral_time(self, business_book):
-        """The raw stored value sits at GnuCash's neutral 10:59 —
-        timezone-proof for the raw-SQL display path (which
-        truncates the stored string) in every real-world zone."""
+    def test_entry_date_stored_at_local_noon(self, business_book):
+        """The raw stored value is desktop's: the entry ledger stores a
+        line's date at LOCAL noon (datecell-gnome.c, gnc_mktime of the
+        cell's tm; the parity twin's PDT specimen reads 19:00:00 UTC),
+        unlike the document dates, which sit at the neutral 10:59 UTC."""
         import sqlite3
 
         gb = GnuCashBook(str(business_book))
@@ -6270,7 +6332,9 @@ class TestAddInvoiceEntry:
             ).fetchone()[0]
         finally:
             conn.close()
-        assert raw == "2026-08-15 10:59:00"
+        from datetime import datetime as _dt, time as _time, timezone as _tz
+        expected = _dt.combine(date(2026, 8, 15), _time(12, 0)).astimezone(_tz.utc)
+        assert raw == expected.strftime("%Y-%m-%d %H:%M:%S")
 
     def test_rejects_non_income_account(self, business_book):
         """Invoice entries must post to INCOME accounts. Pre-fix any
@@ -6602,7 +6666,7 @@ class TestInvoiceBillIdCollision:
         assert "vendor bill" in msg
         # The coaching must name parameters the document tools
         # actually expose. The bookkeeper followed an earlier
-        # version that said "pass owner_type" into a schema
+        # version that said "pass party_type" into a schema
         # rejection: those tools take party_type / document_type.
         assert "document_type" in msg
         assert "party_type" in msg
@@ -6657,7 +6721,7 @@ class TestOwnerTypeValidation:
         with pytest.raises(ValueError) as exc_info:
             gb.get_invoice("000001", owner_type="custmer")
         msg = str(exc_info.value)
-        assert "Invalid owner_type" in msg
+        assert "Invalid party_type" in msg
         assert "'custmer'" in msg
         # All three valid options should appear in the hint.
         assert "customer" in msg
@@ -6689,7 +6753,7 @@ class TestOwnerTypeValidation:
         rejected here too."""
         gb = GnuCashBook(str(business_book))
         gb.create_customer(name="Acme Corp")
-        with pytest.raises(ValueError, match="Invalid owner_type"):
+        with pytest.raises(ValueError, match="Invalid party_type"):
             gb.pay_invoice(
                 invoice_id="000001",
                 payment_account="Assets:Checking",
@@ -6702,7 +6766,7 @@ class TestOwnerTypeValidation:
     ):
         """The reads validate the same way the writes do."""
         gb = GnuCashBook(str(business_book))
-        with pytest.raises(ValueError, match="Invalid owner_type"):
+        with pytest.raises(ValueError, match="Invalid party_type"):
             gb.list_invoices(owner_type="bogus")
 
 
@@ -7022,10 +7086,12 @@ class TestPostInvoice:
             assert child is not None, "missing gncInvoice/invoice-guid child slot"
             assert child[1] == 5, "child slot should be GUID type (5)"
 
-            # Due date slot
+            # Due date slot — a timespec (6), as xaccTransSetDateDue
+            # stores a Time64; the GDate row (10) this asserted
+            # before was the shape desktop could not read.
             assert "trans-date-due" in slot_dict, "missing trans-date-due slot"
-            assert slot_dict["trans-date-due"][1] == 10, (
-                "trans-date-due should be GDATE type (10)"
+            assert slot_dict["trans-date-due"][1] == 6, (
+                "trans-date-due should be TIMESPEC type (6), GnuCash's Time64"
             )
 
             # gncInvoice frame slot on lot
@@ -7379,22 +7445,32 @@ class TestUnpostInvoice:
         assert result["status"] == "posted"
         assert result["post_date"] == "2026-05-15"
 
-    def test_unpost_rejects_invoice_with_payment_applied(
+    def test_unpost_keeps_the_payment_as_the_customers(
         self, business_book,
     ):
-        """Unposting an invoice that has any payment applied would
-        orphan the payment splits. Force the user to void payments
-        first."""
+        """Unposting a paid invoice used to be refused ("void
+        payments first"), which sent callers to void a bank line
+        that may already be reconciled. GnuCash keeps the payment:
+        the lot becomes the customer's, and the re-posted document
+        is settled from it (adversarial review 2026-09-30, C49;
+        the rows are pinned in test_parity_prepayment.py)."""
         gb = GnuCashBook(str(business_book))
         posted = self._post_invoice(gb)
-        gb.pay_invoice(
+        paid = gb.pay_invoice(
             invoice_id=posted["id"],
             payment_account="Assets:Checking",
             amount="100.00",
         )
 
-        with pytest.raises(ValueError, match="has payments applied"):
-            gb.unpost_invoice(invoice_id=posted["id"])
+        result = gb.unpost_invoice(invoice_id=posted["id"])
+
+        assert result["status"] == "unposted"
+        assert [p["amount"] for p in result["payments_kept"]] == ["100.00"]
+        assert result["payments_kept"][0]["guid"] == paid["transaction_guid"]
+        assert "from_prepayment" in result["note"]
+        # The bank line is untouched.
+        txn = gb.get_transaction(paid["transaction_guid"])
+        assert "void" not in str(txn).lower()
 
     def test_unpost_succeeds_when_payment_was_voided(
         self, business_book,
@@ -7622,9 +7698,9 @@ class TestPayInvoice:
         assert second["status"] == "paid"
         assert Decimal(second["remaining_balance"]) == Decimal("0")
 
-    def test_memo_lands_on_bank_split_only(self, business_book):
-        """User memo annotates the cash movement; the A/R//A/P split
-        keeps its action='Payment' convention with an empty memo."""
+    def test_memo_lands_on_both_splits(self, business_book):
+        """Desktop's Process Payment puts the memo on both legs of the
+        payment (parity twin); so does pay_invoice."""
         gb = GnuCashBook(str(business_book))
         self._post_invoice(gb, "500.00")
         result = gb.pay_invoice(
@@ -7636,7 +7712,7 @@ class TestPayInvoice:
         txn = gb.get_transaction(result["transaction_guid"])
         memos = {s["account"]: s.get("memo", "") for s in txn["splits"]}
         assert memos["Assets:Checking"] == "check #1042"
-        assert memos["Assets:Accounts Receivable"] == ""
+        assert memos["Assets:Accounts Receivable"] == "check #1042"
 
     def test_no_memo_keeps_prior_shape(self, business_book):
         gb = GnuCashBook(str(business_book))
@@ -7801,20 +7877,23 @@ class TestPayInvoice:
             amount="500",
         )
 
-        # Check lot is_closed = 1 in the database — the value GnuCash
-        # caches for a zero-balance lot (gnc_lot_get_balance). -1 is
-        # LOT_CLOSED_UNKNOWN, which desktop would recompute.
+        # The stored flag is desktop's -1 (LOT_CLOSED_UNKNOWN: GnuCash
+        # resets it on every split change and recomputes on read);
+        # closed-ness is the computed answer, read the way desktop
+        # reads it.
+        from gnucash_mcp.book._base import _lot_is_closed
         conn = sqlite3.connect(str(business_book))
         try:
             lots = conn.execute(
                 "SELECT is_closed FROM lots WHERE account_guid IN "
                 "(SELECT guid FROM accounts WHERE name = 'Accounts Receivable')"
             ).fetchall()
-            assert any(
-                row[0] == 1 for row in lots
-            ), "lot should be closed with is_closed=1"
+            assert all(row[0] == -1 for row in lots), lots
         finally:
             conn.close()
+        with gb.open(readonly=True) as book:
+            ar = next(a for a in book.accounts if a.name == "Accounts Receivable")
+            assert all(_lot_is_closed(lot) for lot in ar.lots)
 
     def test_partial_payment_does_not_close_lot(self, business_book):
         """Partial payment leaves lot open."""
@@ -7834,11 +7913,13 @@ class TestPayInvoice:
                 "SELECT is_closed FROM lots WHERE account_guid IN "
                 "(SELECT guid FROM accounts WHERE name = 'Accounts Receivable')"
             ).fetchall()
-            assert all(
-                row[0] == 0 for row in lots
-            ), "lot should remain open after partial payment"
+            assert all(row[0] == -1 for row in lots), lots
         finally:
             conn.close()
+        from gnucash_mcp.book._base import _lot_is_closed
+        with gb.open(readonly=True) as book:
+            ar = next(a for a in book.accounts if a.name == "Accounts Receivable")
+            assert not any(_lot_is_closed(lot) for lot in ar.lots)
 
     def test_cross_currency_payment_uses_price_table(self, business_book):
         """EUR invoice paid from USD Checking converts at book.prices rate.
@@ -8496,7 +8577,10 @@ class TestPayInvoice:
             from piecash.business.invoice import Invoice
             inv = book.session.query(Invoice).filter_by(id="000001").first()
             post_txn_guid = inv.post_txn.guid
-        gb.void_transaction(guid=post_txn_guid, reason="test")
+        # void_transaction refuses a posting record since 1.5; books
+        # voided before then still hold this state.
+        from tests.conftest import void_posting_record
+        void_posting_record(gb, post_txn_guid)
 
         with pytest.raises(ValueError, match="posting transaction has been voided"):
             gb.pay_invoice(
@@ -8512,7 +8596,17 @@ class TestPayInvoice:
         from gnucash_mcp.book.business import BusinessMixin
         from decimal import Decimal as D
 
+        class _Same:
+            """One currency for the split's account and transaction."""
+
+        usd = _Same()
+
+        class _Holder:
+            currency = commodity = usd
+
         class _Split:
+            transaction = account = _Holder()
+
             def __init__(self, value, reconcile_state):
                 self.value = value
                 self.reconcile_state = reconcile_state
@@ -8738,6 +8832,7 @@ class TestPayInvoice:
         gb.create_invoice(
             customer_id="000001", currency="USD",
             date_opened="2026-03-10",
+            force=True,  # not the party's currency (review C48)
         )
         gb.add_invoice_entry(
             invoice_id="000001",
@@ -9247,6 +9342,11 @@ class TestOverpaymentGuard:
                 if a.fullname == "Assets:Checking"
             )
             lot_obj = ar.lots[0]
+            # The stored flag is -1 (desktop's); piecash's guard reads
+            # -1 as "closed", so cache the computed answer first, as
+            # every server write path does.
+            from gnucash_mcp.book._base import _lot_cache_flag
+            _lot_cache_flag(lot_obj)
             ar_split = piecash.Split(
                 account=ar, value=Decimal("-300"),
             )
@@ -9720,6 +9820,56 @@ class TestPayInvoiceEarlyPaymentDiscount:
         assert "discount_expired" in result
         assert "discount_available" not in result
 
+    def test_discount_window_counts_from_post_date(self, business_book):
+        """C46: a document opened weeks before it is posted keeps its
+        whole discount window, counted from the posting date as the
+        due date is. Anchored on date_opened, the window had closed
+        before the document existed in A/R."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_billterm(
+            name="2/10 Net 30", due_days=30,
+            discount_days=10, discount_percent="2",
+        )
+        gb.create_invoice(
+            customer_id="000001", term="2/10 Net 30",
+            date_opened="2026-05-01",
+        )
+        gb.add_invoice_entry(
+            invoice_id="000001", account="Income:Sales",
+            description="Consulting", quantity="1", price="1000.00",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+            post_date="2026-06-01",
+        )
+        result = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="980",
+            payment_date="2026-06-08",
+            apply_discount=True,
+        )
+        assert result["status"] == "paid"
+        assert Decimal(result["discount"]["amount"]) == Decimal("20.00")
+
+    def test_discount_window_on_a_proximo_term(self):
+        """A proximo term's discount days name a day of the month,
+        through the same compute_time as its due days."""
+        from types import SimpleNamespace
+        from gnucash_mcp.book.business import BusinessMixin
+        term = SimpleNamespace(
+            type=BusinessMixin._TERM_TYPE_PROXIMO,
+            duedays=20, discountdays=10, cutoff=19,
+        )
+        assert BusinessMixin._billterm_discount_date(
+            term, date(2010, 6, 14),
+        ) == date(2010, 7, 10)
+        assert BusinessMixin._billterm_due_date(
+            term, date(2010, 6, 14),
+        ) == date(2010, 7, 20)
+
 
 # ============== _compute_fx_gain_loss Unit Tests ==============
 
@@ -10149,14 +10299,13 @@ class TestPhase3CommsContracts:
         assert "Acme Corp" in compact
         assert "due:2026-02-01" in compact
         assert "posted:2026-01-01" in compact
-        # By 2026-04-28 (test fixture's "today") this is 86 days past
-        # an explicit due date — no "30-day default" annotation.
         assert "past due" in compact
-        assert "30-day default" not in compact
 
-    def test_outstanding_compact_no_terms_annotates_default(
+    def test_outstanding_compact_no_terms_due_on_posting(
         self, business_book,
     ):
+        """No due_date and no billterm: due on the posting date, as
+        desktop computes it (spec A2) — no '30-day default'."""
         gb = GnuCashBook(str(business_book))
         gb.create_customer(name="Acme Corp")
         gb.create_invoice(customer_id="000001")
@@ -10168,10 +10317,12 @@ class TestPhase3CommsContracts:
             invoice_id="000001",
             post_account="Assets:Accounts Receivable",
             post_date="2026-01-01",
-            # no due_date and no billterm — falls back to 30-day default
+            # no due_date and no billterm — due on the posting date
         )
         compact = gb.get_outstanding_invoices()
-        assert "30-day default" in compact
+        assert "due:2026-01-01" in compact
+        assert "days past due" in compact
+        assert "30-day default" not in compact
 
     def test_outstanding_compact_marks_bill_with_tag(
         self, business_book,
@@ -10725,8 +10876,7 @@ class TestCnyBugReportFollowups:
     ):
         """The compact-format ``get_outstanding_invoices`` template
         was concatenating "days past " with " past due" and producing
-        "X days past past due". Should read either "X days past due"
-        (contractual) or "X days past 30-day default" (no terms)."""
+        "X days past past due". Should read "X days past due"."""
         gb = GnuCashBook(str(business_book))
         gb.create_customer(name="Acme Corp")
         gb.create_invoice(customer_id="000001")
@@ -10749,11 +10899,11 @@ class TestCnyBugReportFollowups:
         # And the correct form is present.
         assert "past due" in compact
 
-    def test_outstanding_invoices_no_terms_renders_30_day_default(
+    def test_outstanding_invoices_no_terms_renders_past_due(
         self, business_book,
     ):
-        """No-terms branch should annotate as ``"X days past 30-day
-        default"`` — also doesn't have the duplicated word."""
+        """No terms: due on the posting date, rendered ``"X days
+        past due"`` — and never the duplicated word."""
         gb = GnuCashBook(str(business_book))
         gb.create_customer(name="Acme Corp")
         gb.create_invoice(customer_id="000001")
@@ -10761,7 +10911,7 @@ class TestCnyBugReportFollowups:
             invoice_id="000001", account="Income:Sales",
             description="Consulting", quantity="1", price="500.00",
         )
-        # No due_date and no billterm — falls to 30-day default.
+        # No due_date and no billterm — due on the posting date.
         gb.post_invoice(
             invoice_id="000001",
             post_account="Assets:Accounts Receivable",
@@ -10769,7 +10919,8 @@ class TestCnyBugReportFollowups:
         )
         compact = gb.get_outstanding_invoices()
         assert "past past" not in compact
-        assert "30-day default" in compact
+        assert "days past due" in compact
+        assert "30-day default" not in compact
 
     # ── Bug 2: pay_invoice should reuse existing FX accounts ─────
 
@@ -10936,8 +11087,16 @@ class TestBusinessFreeTextCaps:
         """Direct ``GnuCashBook.create_customer`` call with 5000-byte
         notes should raise immediately — bypasses MCP boundary."""
         gb = GnuCashBook(str(test_book))
-        with pytest.raises(ValueError, match=r"notes exceeds 4096-byte cap"):
+        # The cap is GnuCash's own column width now (2048 characters;
+        # a longer note was a raw DataError on PostgreSQL and MySQL —
+        # adversarial review 2026-09-30, C65). The byte cap still
+        # guards multi-byte text.
+        with pytest.raises(ValueError, match=r"notes is 5000 characters"):
             gb.create_customer(name="Test", notes="X" * 5000)
+        with pytest.raises(ValueError, match=r"notes exceeds 4096-byte cap"):
+            gb.create_customer(name="Test", notes="語" * 1500)
+        with pytest.raises(ValueError, match=r"NUL"):
+            gb.create_customer(name="Test", notes="a\x00b")
 
     def test_book_layer_rejects_oversize_address_field(
         self, test_book: Path,
@@ -10954,7 +11113,7 @@ class TestBusinessFreeTextCaps:
     def test_book_layer_accepts_under_cap(self, test_book: Path):
         gb = GnuCashBook(str(test_book))
         result = gb.create_customer(
-            name="UnderCap", notes="X" * 4096,
+            name="UnderCap", notes="X" * 2048,
             address={"addr1": "Y" * 1024},
         )
         assert result["status"] == "created"
@@ -11345,6 +11504,7 @@ class TestCrossCommodityArRelief:
         gb.create_invoice(
             customer_id="000001", currency="USD",
             date_opened="2026-03-10",
+            force=True,  # not the party's currency (review C48)
         )
         gb.add_invoice_entry(
             invoice_id="000001",
@@ -11944,7 +12104,18 @@ class TestPayInvoiceDryRun:
             if s["account"] == "Income:Foreign Exchange Gain/Loss"
         ]
         assert len(fx_rows) == 1
-        assert Decimal(fx_rows[0]["value"]) == Decimal("0")
+        # The payment is a USD transaction (the pay account's
+        # currency, desktop's rule since 2026-09-30), so the gain is
+        # a real credit, and the receivable is relieved at the
+        # $1,100 it was carried at.
+        assert Decimal(fx_rows[0]["value"]) == Decimal("-100")
+        assert Decimal(fx_rows[0]["quantity"]) == Decimal("-100")
+        ar_row = result["proposed_splits"][0]
+        assert Decimal(ar_row["value"]) == Decimal("-1100")
+        assert Decimal(ar_row["quantity"]) == Decimal("-1000")
+        assert sum(
+            Decimal(r["value"]) for r in result["proposed_splits"]
+        ) == 0
         # Nothing created, nothing designated, nothing paid.
         accounts = gb.list_accounts()
         assert "Foreign Exchange" not in str(accounts)
@@ -12141,6 +12312,151 @@ class TestDocumentPaymentState:
         assert doc["amount_due"] == "300.00"
         assert doc["amount_paid"] == "200.00"
 
+    def test_list_status_agrees_with_get_invoice(self, business_book):
+        """The list's status column speaks the shared vocabulary its
+        docstring defines — a settled invoice reads ``paid`` there
+        too, not ``posted``. The ``status`` filter stays document
+        state: ``posted`` still returns it."""
+        gb = GnuCashBook(str(business_book))
+        self._post_invoice(gb, "500.00")
+
+        def row_status():
+            lines = gb.list_invoices().splitlines()
+            row = next(r for r in lines if r.startswith("000001"))
+            return row.split("\t")[-1]
+
+        gb.pay_invoice(
+            invoice_id="000001", payment_account="Assets:Checking",
+            amount="200",
+        )
+        assert row_status() == "posted" == gb.get_invoice("000001")["status"]
+        gb.pay_invoice(
+            invoice_id="000001", payment_account="Assets:Checking",
+            amount="300",
+        )
+        assert row_status() == "paid" == gb.get_invoice("000001")["status"]
+        verbose = gb.list_invoices(compact=False)["invoices"][0]
+        assert verbose["status"] == "paid"
+        assert "000001" in gb.list_invoices(status="posted")
+
+    def test_get_invoice_names_its_payments(self, business_book):
+        """Each settlement in the document's lot is listed with a
+        transaction guid the caller can void or delete directly —
+        the "bounced payment" workflow no longer means searching by
+        customer and guessing by date and amount. Voided payments
+        drop out, as they do from the balance."""
+        gb = GnuCashBook(str(business_book))
+        self._post_invoice(gb, "500.00")
+        first = gb.pay_invoice(
+            invoice_id="000001", payment_account="Assets:Checking",
+            amount="200",
+        )["transaction_guid"]
+        gb.pay_invoice(
+            invoice_id="000001", payment_account="Assets:Checking",
+            amount="300",
+        )
+        payments = gb.get_invoice("000001")["payments"]
+        assert sorted(p["amount"] for p in payments) == ["200.00", "300.00"]
+        assert {p["from"] for p in payments} == {"Assets:Checking"}
+        for p in payments:
+            assert gb.get_transaction(p["guid"]) is not None
+        assert first in {p["guid"] for p in payments}
+
+        gb.void_transaction(first, reason="bounced")
+        doc = gb.get_invoice("000001")
+        assert [p["amount"] for p in doc["payments"]] == ["300.00"]
+        assert doc["amount_due"] == "200.00"
+
+    def test_unpaid_invoice_lists_no_payments(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        self._post_invoice(gb, "500.00")
+        assert gb.get_invoice("000001")["payments"] == []
+
+    def test_credit_application_names_the_other_document(
+        self, business_book,
+    ):
+        """A credit note settles an invoice with no cash leg; its
+        entry names the document on the other side, both ways."""
+        gb = GnuCashBook(str(business_book))
+        self._post_invoice(gb, "500.00")
+        cn = gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+            applies_to_invoice_id="000001",
+        )["id"]
+        gb.add_credit_note_entry(
+            credit_note_id=cn, account="Income:Sales",
+            description="Disputed line", quantity="1", price="100",
+        )
+        gb.post_invoice(
+            invoice_id=cn, post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        gb.apply_credit_note(
+            credit_note_id=cn, applies_to_invoice_id="000001",
+        )
+
+        [inv_side] = gb.get_invoice("000001")["payments"]
+        assert inv_side["amount"] == "100.00"
+        assert inv_side["from"] == f"Credit Note {cn}"
+        [cn_side] = gb.get_invoice(cn)["payments"]
+        assert cn_side["amount"] == "100.00"
+        assert cn_side["from"] == "Invoice 000001"
+        assert cn_side["guid"] == inv_side["guid"]
+
+    def test_list_status_reads_settlements_in_fixed_queries(
+        self, business_book,
+    ):
+        """Status per row reads each document's lot. The listing
+        preloads posting accounts, lots, and lot splits once, so those
+        reads don't grow with the page: 2 documents or 5, the same
+        count."""
+        import re
+
+        from sqlalchemy import event
+        from sqlalchemy.engine import Engine
+
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+
+        def post_and_pay(n):
+            for _ in range(n):
+                inv = gb.create_invoice(customer_id="000001")["id"]
+                gb.add_invoice_entry(
+                    invoice_id=inv, account="Income:Sales",
+                    description="Work", quantity="1", price="100",
+                )
+                gb.post_invoice(
+                    invoice_id=inv,
+                    post_account="Assets:Accounts Receivable",
+                )
+                gb.pay_invoice(
+                    invoice_id=inv, payment_account="Assets:Checking",
+                    amount="100",
+                )
+
+        def settlement_reads():
+            statements: list[str] = []
+
+            def _record(conn, cursor, statement, *args):
+                statements.append(statement)
+
+            event.listen(Engine, "before_cursor_execute", _record)
+            try:
+                out = gb.list_invoices()
+            finally:
+                event.remove(Engine, "before_cursor_execute", _record)
+            assert out.count("\tpaid") == out.count("\n")
+            return sum(
+                1 for s in statements
+                if re.search(r"\bFROM (accounts|lots|splits)\b", s)
+            )
+
+        post_and_pay(2)
+        few = settlement_reads()
+        post_and_pay(3)
+        many = settlement_reads()
+        assert many == few <= 3, (few, many)
+
     def test_paid_document_keeps_amounts_after_leaving_unpaid_list(
         self, business_book,
     ):
@@ -12156,6 +12472,55 @@ class TestDocumentPaymentState:
         assert doc["status"] == "paid"
         assert Decimal(doc["amount_paid"]) == Decimal("500")
         assert Decimal(doc["amount_due"]) == Decimal("0")
+
+    def test_deleting_a_payment_needs_force_and_reopens_the_invoice(
+        self, business_book,
+    ):
+        """A payment's A/R split sits in the invoice's lot. Deleting
+        it unpays the invoice, so it takes force; once forced, every
+        surface says the money is owed again."""
+        gb = GnuCashBook(str(business_book))
+        self._post_invoice(gb, "500.00")
+        payment = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="500",
+        )
+        txn = payment["transaction_guid"]
+
+        with pytest.raises(ValueError, match="splits in lots"):
+            gb.delete_transaction(txn)
+        assert gb.get_invoice("000001")["status"] == "paid"
+
+        result = gb.delete_transaction(txn, force=True)
+        assert result["lot_splits_affected"] == 1
+        doc = gb.get_invoice("000001")
+        assert doc["status"] == "posted"
+        assert Decimal(doc["amount_due"]) == Decimal("500")
+        rows = gb.get_outstanding_invoices(compact=False)["invoices"]
+        assert [r["amount_due"] for r in rows] == ["500.00"]
+
+    def test_editing_a_payment_amount_needs_force(self, business_book):
+        """Shrinking a payment through update_transaction changes what
+        the invoice has been paid, so it takes force like delete."""
+        gb = GnuCashBook(str(business_book))
+        self._post_invoice(gb, "500.00")
+        txn = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="500",
+        )["transaction_guid"]
+        smaller = [
+            {"account": "Assets:Checking", "amount": "300.00"},
+            {"account": "Assets:Accounts Receivable", "amount": "-300.00"},
+        ]
+
+        with pytest.raises(ValueError, match="splits in lots"):
+            gb.update_transaction(txn, splits=smaller)
+        assert gb.get_invoice("000001")["status"] == "paid"
+
+        gb.update_transaction(txn, splits=smaller, force=True)
+        assert Decimal(gb.get_invoice("000001")["amount_due"]) == Decimal("200")
 
     def test_pay_invoice_reports_payment_and_cumulative_total(
         self, business_book,
@@ -12307,3 +12672,230 @@ class TestDocumentTypeStrings:
             actions = {s.action for s in row.post_txn.splits}
         assert title == f"Bill {bill['id']}"
         assert actions == {"Bill"}
+
+
+class TestFindInvoiceDialectGuard:
+    """``_find_invoice``'s ``date_posted=''`` self-heal is SQLite-only.
+
+    The heal exists because SQLite's dynamic typing lets an empty
+    string land in a datetime column. PostgreSQL types ``date_posted``
+    as ``timestamp`` and rejects ``''`` outright, so the heal's
+    ``WHERE date_posted = ''`` raised InvalidDatetimeFormat, which
+    aborts the whole PostgreSQL transaction — and the ORM query two
+    lines later then failed with the *generic*
+    ``InFailedSqlTransaction`` message, naming only the SELECT. Every
+    ``get_invoice`` and every explicit-id ``create_invoice`` failed on
+    every PostgreSQL book, for every ID, with an error that pointed at
+    the wrong statement. Found and fixed by @JamesRao98 on the
+    10xtechnology fork; the live-dialect half of this contract is
+    ``_RealDatabaseTests.test_document_lifecycle``.
+    """
+
+    @staticmethod
+    def _record_statements():
+        """Capture every SQL statement executed until ``stop`` is
+        called."""
+        from sqlalchemy import event
+        from sqlalchemy.engine import Engine
+
+        seen: list[str] = []
+
+        def _on_execute(conn, cursor, statement, params, context, executemany):
+            seen.append(statement)
+
+        event.listen(Engine, "before_cursor_execute", _on_execute)
+        return seen, lambda: event.remove(
+            Engine, "before_cursor_execute", _on_execute
+        )
+
+    def test_heal_runs_on_sqlite_when_there_is_a_row_to_heal(
+        self, business_book,
+    ):
+        """The repair is looked for before it is written: the UPDATE
+        used to run on every lookup, and an UPDATE takes SQLite's
+        write lock whether or not a row matches (adversarial review
+        2026-09-30, DS-12)."""
+        import sqlite3
+
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Heal Co")
+        inv = gb.create_invoice(customer_id="000001")
+        heal = "UPDATE invoices SET date_posted = NULL"
+
+        seen, stop = self._record_statements()
+        try:
+            gb.get_invoice(inv["id"], owner_type="customer")
+        finally:
+            stop()
+        assert not any(heal in s for s in seen)
+        assert any("WHERE date_posted = ''" in s for s in seen)
+
+        con = sqlite3.connect(str(business_book))
+        con.execute("update invoices set date_posted = ''")
+        con.commit()
+        con.close()
+        seen, stop = self._record_statements()
+        try:
+            gb.add_invoice_entry(
+                invoice_id=inv["id"], account="Income:Sales",
+                description="x", quantity="1", price="1.00",
+            )
+        finally:
+            stop()
+        assert any(heal in s for s in seen)
+        con = sqlite3.connect(str(business_book))
+        assert con.execute("select date_posted from invoices").fetchall() == [
+            (None,)
+        ]
+        con.close()
+
+    def test_heal_skipped_on_non_sqlite(self, business_book, monkeypatch):
+        """Under a PostgreSQL dialect the heal must not be emitted at
+        all — the guard is what keeps the lookup alive, since the
+        statement poisons the transaction rather than failing in
+        isolation."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Heal Co")
+        inv = gb.create_invoice(customer_id="000001")
+
+        monkeypatch.setattr(
+            "gnucash_mcp.book.business._dialect_name",
+            lambda book: "postgresql",
+        )
+        seen, stop = self._record_statements()
+        try:
+            found = gb.get_invoice(inv["id"], owner_type="customer")
+        finally:
+            stop()
+        assert found["id"] == inv["id"]
+        assert not any(
+            "UPDATE invoices SET date_posted = NULL" in s for s in seen
+        )
+
+    def test_lookup_survives_a_failing_heal(self, business_book, monkeypatch):
+        """Even on SQLite, a heal that raises must not take the
+        lookup down with it — the caller asked for an invoice, not
+        for a repair."""
+        from sqlalchemy.orm import Session
+
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Heal Co")
+        inv = gb.create_invoice(customer_id="000001")
+
+        real_execute = Session.execute
+
+        def boom(self, statement, *args, **kwargs):
+            if "date_posted = NULL" in str(statement):
+                raise RuntimeError("heal exploded")
+            return real_execute(self, statement, *args, **kwargs)
+
+        monkeypatch.setattr(Session, "execute", boom)
+        assert gb.get_invoice(inv["id"], owner_type="customer")["id"] == inv["id"]
+
+
+class TestRollbackIfAborted:
+    """``_rollback_if_aborted`` — the guard that keeps a swallowed
+    database error from being reported as somebody else's failure.
+
+    PostgreSQL marks a transaction aborted after any failed statement
+    and answers everything afterwards with ``InFailedSqlTransaction``.
+    A best-effort block that swallows its own error without clearing
+    that state hands the next statement a misleading exception, which
+    is exactly how ``_find_invoice``'s heal hid behind the SELECT
+    below it. The fakes here model SQLAlchemy 1.4's pool proxy; the
+    real-driver half is ``_RealDatabaseTests.test_rollback_if_aborted``.
+    """
+
+    INERROR = 3   # libpq PQTRANS_INERROR
+    INTRANS = 2   # libpq PQTRANS_INTRANS
+
+    class _Info:
+        def __init__(self, status):
+            self.transaction_status = status
+
+    class _Driver:
+        def __init__(self, status):
+            self.info = TestRollbackIfAborted._Info(status)
+
+    class _Proxy:
+        """SQLAlchemy's ``_ConnectionFairy``: its own ``.info`` is a
+        plain dict, the driver hangs off ``dbapi_connection``."""
+
+        def __init__(self, status, *, legacy=False):
+            self.info = {}
+            driver = TestRollbackIfAborted._Driver(status)
+            if legacy:
+                self.connection = driver
+            else:
+                self.dbapi_connection = driver
+
+    class _Conn:
+        def __init__(self, proxy):
+            self.connection = proxy
+
+    class _Session:
+        def __init__(self, proxy):
+            self._proxy = proxy
+            self.rolled_back = False
+
+        def connection(self):
+            return TestRollbackIfAborted._Conn(self._proxy)
+
+        def rollback(self):
+            self.rolled_back = True
+
+    def test_rolls_back_an_aborted_transaction(self):
+        from gnucash_mcp.book._base import _rollback_if_aborted
+
+        session = self._Session(self._Proxy(self.INERROR))
+        assert _rollback_if_aborted(session) is True
+        assert session.rolled_back is True
+
+    def test_reads_the_driver_not_the_pool_proxy(self):
+        """The proxy's ``.info`` is SQLAlchemy's dict, which has no
+        transaction status; reading it there would never see the
+        aborted state and the helper would be a silent no-op."""
+        from gnucash_mcp.book._base import _rollback_if_aborted
+
+        proxy = self._Proxy(self.INERROR)
+        proxy.info = {"decoy": True}
+        session = self._Session(proxy)
+        assert _rollback_if_aborted(session) is True
+
+    def test_legacy_connection_attribute(self):
+        """Older pool proxies expose the driver as ``.connection``."""
+        from gnucash_mcp.book._base import _rollback_if_aborted
+
+        session = self._Session(self._Proxy(self.INERROR, legacy=True))
+        assert _rollback_if_aborted(session) is True
+
+    def test_leaves_a_healthy_transaction_alone(self):
+        """A best-effort block that failed for a harmless reason (a
+        readonly session refusing to flush, say) must keep whatever
+        the caller already has pending — rolling back unconditionally
+        would discard real work to clean up a non-problem."""
+        from gnucash_mcp.book._base import _rollback_if_aborted
+
+        session = self._Session(self._Proxy(self.INTRANS))
+        assert _rollback_if_aborted(session) is False
+        assert session.rolled_back is False
+
+    def test_never_raises_on_a_broken_session(self):
+        """It runs inside ``except`` blocks; raising there would
+        replace the original failure with its own."""
+        from gnucash_mcp.book._base import _rollback_if_aborted
+
+        class _Broken:
+            def connection(self):
+                raise RuntimeError("connection gone")
+
+        assert _rollback_if_aborted(_Broken()) is False
+
+    def test_sqlite_session_is_left_alone(self, business_book):
+        """A real sqlite3 connection has no ``info``; the helper
+        answers False without touching the session."""
+        from gnucash_mcp.book._base import _rollback_if_aborted
+
+        gb = GnuCashBook(str(business_book))
+        with gb.open(readonly=True) as book:
+            assert _rollback_if_aborted(book.session) is False

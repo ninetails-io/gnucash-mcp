@@ -160,10 +160,12 @@ class TestResolveAccountTemplateFilter:
 
 
 class TestMarketPriceFilter:
-    """SB-11: ``list_commodities`` and ``calculate_lot_gain`` must
-    skip piecash's ``type='transaction'`` auto-placeholder prices,
-    and ``calculate_lot_gain`` must filter to the book's default
-    currency.
+    """SB-11: ``list_commodities`` and ``calculate_lot_gain`` pick
+    the current price through ``_find_prices``, and
+    ``calculate_lot_gain`` must filter to the book's default
+    currency. (Since the 2026-09-29 ruling ``type='transaction'``
+    rows count as prices, as in desktop; only the staleness markers
+    read quotes alone.)
 
     Pre-fix both methods walked ``book.prices`` raw. A placeholder
     newer than the user's last ``nav`` quote shadowed it as the
@@ -173,10 +175,10 @@ class TestMarketPriceFilter:
     ``specs/branch_1_captures/pre/*/50_list_commodities.json`` and
     ``…/51_calculate_lot_gain.json``.
 
-    Post-fix both routes through ``CurrencyMixin._find_prices`` with
-    ``market_only=True`` (and currency filter where applicable),
-    making the chokepoint the single source of truth for "give me
-    the right prices for this commodity."
+    Post-fix both route through ``CurrencyMixin._find_prices`` (with
+    a currency filter where applicable), making the chokepoint the
+    single source of truth for "give me the right prices for this
+    commodity."
     """
 
     @pytest.fixture
@@ -269,52 +271,73 @@ class TestMarketPriceFilter:
             )
             book.save()
 
-    def test_list_commodities_skips_transaction_placeholders(
+    def test_list_commodities_counts_transaction_prices_like_desktop(
         self, book_with_vtsax_lot,
     ):
-        """A ``type='transaction'`` placeholder newer than the user's
-        last ``nav`` quote must NOT appear as ``latest_price`` on the
-        commodity. Pre-fix it did — the iteration over ``book.prices``
-        picked whatever was newest regardless of type."""
+        """A ``type='transaction'`` row newer than the user's last
+        ``nav`` quote IS ``latest_price``. GnuCash's lookups never
+        filter on price type; maintainer ruling 2026-09-29 overturned
+        the issue #94 skip so the server agrees with desktop on the
+        current price. Staleness (``stale_days``) keys on that same
+        latest row — one window for all sources (bookkeeper ruling,
+        2026-09-29 evening); ``no_price`` only when no row of any
+        type is left."""
+        from sqlalchemy import text
+
         book_path, _ = book_with_vtsax_lot
-        # Placeholder dated 2026-06-01, ~5 months past the 2026-01-15
-        # nav of $125. Pre-fix the placeholder would win.
+        # A later buy's implied rate, dated 2026-06-01 — ~5 months
+        # past the 2026-01-15 nav of $125.
         self._add_vtsax_price(
-            book_path, value="0.99", p_date=date(2026, 6, 1),
+            book_path, value="131.40", p_date=date(2026, 6, 1),
             p_type="transaction",
         )
 
-        gb = GnuCashBook(str(book_path))
-        result = gb.list_commodities(compact=False)
-        vtsax_entry = next(
-            e for entries in result["commodities"].values()
-            for e in entries if e["mnemonic"] == "VTSAX"
-        )
-        assert vtsax_entry["latest_price"]["date"] == "2026-01-15", (
-            f"placeholder shadowed real nav quote: "
-            f"{vtsax_entry['latest_price']}"
-        )
+        def vtsax_entry(gb, **kw):
+            result = gb.list_commodities(compact=False, **kw)
+            return next(
+                e for entries in result["commodities"].values()
+                for e in entries if e["mnemonic"] == "VTSAX"
+            )
 
-    def test_calculate_lot_gain_skips_transaction_placeholders(
+        gb = GnuCashBook(str(book_path))
+        entry = vtsax_entry(gb)
+        assert entry["latest_price"] == {
+            "value": "131.4", "currency": "USD", "date": "2026-06-01",
+        }, entry
+
+        entry = vtsax_entry(gb, stale_days=1)
+        assert entry["latest_price"]["date"] == "2026-06-01"
+        assert entry["days_stale"] == (date.today() - date(2026, 6, 1)).days
+        assert "no_price" not in entry
+
+        # Delete the only quote: the transaction row still values
+        # VTSAX and still dates its staleness.
+        with gb.open(readonly=False) as book:
+            book.session.execute(text("DELETE FROM prices WHERE type = 'nav'"))
+            book.save()
+        entry = vtsax_entry(gb, stale_days=1)
+        assert entry["latest_price"]["date"] == "2026-06-01"
+        assert entry["days_stale"] == (date.today() - date(2026, 6, 1)).days
+        assert "no_price" not in entry
+
+    def test_calculate_lot_gain_counts_transaction_prices_like_desktop(
         self, book_with_vtsax_lot,
     ):
-        """``calculate_lot_gain`` must skip placeholders when picking
-        the default sale price. Pre-fix a $0.99 placeholder would
-        produce nonsense proceeds; post-fix the $125 nav wins."""
+        """``calculate_lot_gain``'s default sale price is the most
+        current row, a ``type='transaction'`` row newer than the nav
+        quote included. GnuCash's lookups never filter on price type;
+        maintainer ruling 2026-09-29 overturned the issue #94 skip so
+        the server agrees with desktop on the current price."""
         book_path, lot_guid = book_with_vtsax_lot
         self._add_vtsax_price(
-            book_path, value="0.99", p_date=date(2026, 6, 1),
+            book_path, value="131.40", p_date=date(2026, 6, 1),
             p_type="transaction",
         )
 
         gb = GnuCashBook(str(book_path))
         result = gb.calculate_lot_gain(lot_guid=lot_guid)
-        # Expected proceeds: 10 shares × $125 = $1250.
-        # Placeholder-shadowed: 10 × $0.99 = $9.90.
-        proceeds = Decimal(result["sale_proceeds"])
-        assert proceeds > Decimal("1000"), (
-            f"placeholder was used for proceeds: {result}"
-        )
+        # 10 shares × $131.40 (the transaction row), not × $125 (nav).
+        assert Decimal(result["sale_proceeds"]) == Decimal("1314.00"), result
 
     def test_calculate_lot_gain_filters_to_default_currency(
         self, book_with_vtsax_lot,
@@ -488,15 +511,16 @@ class TestIsVoidedConsistency:
     def test_reconciliation_backlog_counts_pre_latest_y_date(
         self, test_book: Path,
     ):
-        """HP-8: the dashboard's reconciliation backlog count must
-        include unreconciled splits that PREDATE the last
-        reconciled ('y') split — they're the ones most likely to
-        be problems (skipped during a partial reconciliation,
-        opening balances never stamped, edge cases that fell
-        through). Pre-fix the count was scoped to "splits after
-        latest_y_date" which silently dropped them, breaking the
-        invariant that the dashboard count equals
-        ``get_unreconciled_splits``'s count.
+        """HP-8: unreconciled splits that PREDATE the last
+        reconciled ('y') split must never vanish from the dashboard
+        — they're the ones most likely to be problems (skipped
+        during a partial reconciliation, opening balances never
+        stamped). Pre-fix the count was scoped to "splits after
+        latest_y_date" and silently dropped them. Since spec B2 the
+        dashboard carries them as OUTSTANDING ITEMS beside the
+        backlog, so the invariant is: backlog + outstanding equals
+        ``get_unreconciled_splits``'s count, and the pre-reconcile
+        splits land in the outstanding bucket, not nowhere.
         """
         from datetime import datetime as _dt
         gb = GnuCashBook(str(test_book))
@@ -544,15 +568,18 @@ class TestIsVoidedConsistency:
             r for r in results if r["account"] == "Assets:Checking"
         )
 
-        assert checking_entry["unreconciled_count"] == detail_count, (
-            f"dashboard ({checking_entry['unreconciled_count']}) "
-            f"disagrees with get_unreconciled_splits ({detail_count}) "
-            f"— bookkeeper's first instinct will be 'the book is "
-            f"wrong'"
+        dashboard_total = (
+            checking_entry["unreconciled_count"]
+            + checking_entry.get("outstanding_count", 0)
         )
-        # And confirm the pre-fix bug-shape: at least one
-        # unreconciled split predates ``latest_y_date``.
-        assert detail_count >= 1, (
+        assert dashboard_total == detail_count, (
+            f"dashboard ({dashboard_total}) disagrees with "
+            f"get_unreconciled_splits ({detail_count}) — bookkeeper's "
+            f"first instinct will be 'the book is wrong'"
+        )
+        # And confirm the pre-fix bug-shape: the splits predating
+        # ``latest_y_date`` are surfaced as outstanding items.
+        assert checking_entry.get("outstanding_count", 0) >= 1, (
             "fixture didn't produce the pre-latest_y_date "
             "unreconciled scenario this test is meant to lock"
         )
@@ -1282,6 +1309,16 @@ class TestHistoricalAnchorChainRates:
             commodity=eur, currency=usd, date=date(2025, 9, 1),
             value="1.10", source="user:test", type="nav"))
         book.save()
+        # The USD buy left a direct GFUND/USD implied-rate row, which
+        # values the fund ahead of any chain since the 2026-09-29
+        # ruling (desktop counts it). The subject is the chain's
+        # anchor, so delete it: a book with no direct row is real.
+        from sqlalchemy import text
+
+        assert book.session.execute(
+            text("DELETE FROM prices WHERE type = 'transaction'")
+        ).rowcount == 1
+        book.save()
         return bp
 
     def test_past_anchor_never_uses_future_chain_rate(
@@ -1336,6 +1373,111 @@ class TestAccountNotFoundGoesThroughSuggestions:
         assert not offenders, offenders
 
 
+class TestSplitValidatorChokepoint:
+    """``_validate_transaction_splits`` is the one place the split
+    input rules are enforced — sum to zero, cross-commodity quantity
+    required, quantity and value same-signed. ``replace_splits`` once
+    carried its own copy (three of the quantity rule, counting its
+    pairing pre-pass), checked after deleting the old splits."""
+
+    RULES = (
+        "Splits do not balance",
+        "requires 'quantity'",
+        "must have same sign",
+    )
+
+    def test_each_rule_is_worded_once(self):
+        import gnucash_mcp.book as pkg
+        text = "\n".join(
+            p.read_text()
+            for p in sorted(Path(pkg.__file__).parent.glob("*.py"))
+        )
+        counts = {rule: text.count(rule) for rule in self.RULES}
+        assert counts == {rule: 1 for rule in self.RULES}, counts
+
+
+class TestPriceWalkChokepoint:
+    """``_find_prices`` is the one reader of price history: indexed
+    per pair, memoized per open, newest-first with the same-date
+    tie-break every valuation path shares. A raw ``for p in
+    book.prices`` walk skips all three, and the last two such walks
+    (``list_commodities``, ``get_latest_price``) answered same-date
+    ties by storage order — a different row per backend, and a
+    different row than the reports priced by (#186)."""
+
+    def test_no_raw_book_prices_walk_anywhere(self):
+        import gnucash_mcp.book as pkg
+        raw = re.compile(r"^\s*for \w+ in book\.prices\b")
+        offenders = []
+        for path in sorted(Path(pkg.__file__).parent.glob("*.py")):
+            for lineno, line in enumerate(
+                path.read_text().splitlines(), start=1,
+            ):
+                if raw.search(line):
+                    offenders.append(f"{path.name}:{lineno}")
+        assert not offenders, offenders
+
+    def test_latest_price_surfaces_agree_on_same_date_tie(self, tmp_path):
+        """Two market quotes on one day at the same stored time: the
+        smaller GUID wins everywhere (GnuCash's own tie order, since
+        the price twin of 2026-09-29), and the tool that shows the
+        operator 'the rate on file' shows the rate the reports use."""
+        path = tmp_path / "tie.gnucash"
+        book = piecash.create_book(str(path), currency="USD", overwrite=True)
+        usd = book.default_currency
+        aaa = piecash.Commodity(
+            namespace="NASDAQ", mnemonic="AAA", fullname="AAA", fraction=10000,
+        )
+        book.session.add(aaa)
+        assets = piecash.Account(
+            name="Assets", type="ASSET", commodity=usd,
+            parent=book.root_account, placeholder=True,
+        )
+        piecash.Account(name="AAA", type="STOCK", commodity=aaa, parent=assets)
+        # A second holding with no quote at all: the verbose listing
+        # must say so with an explicit null, not omit the key.
+        zzz = piecash.Commodity(
+            namespace="NASDAQ", mnemonic="ZZZ", fullname="ZZZ", fraction=10000,
+        )
+        book.session.add(zzz)
+        piecash.Account(name="ZZZ", type="STOCK", commodity=zzz, parent=assets)
+        # Feed row written first, manual quote second: storage order
+        # and rank order disagree, which is the case that matters.
+        feed = piecash.Price(
+            commodity=aaa, currency=usd, date=date(2026, 1, 15),
+            value=Decimal("50"), source="Finance::Quote", type="last",
+        )
+        manual = piecash.Price(
+            commodity=aaa, currency=usd, date=date(2026, 1, 15),
+            value=Decimal("80"), source="user:price", type="last",
+        )
+        book.session.add(feed)
+        book.session.add(manual)
+        book.save()
+        aaa_guid = aaa.guid
+        expected = Decimal("50") if feed.guid < manual.guid else Decimal("80")
+        book.close()
+
+        gb = GnuCashBook(str(path))
+        with gb.open(readonly=True) as b:
+            report_rate = gb._rates_as_of(b, date(2026, 9, 1))[aaa_guid]
+        assert report_rate == expected
+        assert Decimal(
+            gb.get_latest_price("AAA", "NASDAQ")["value"]
+        ) == report_rate
+        listing = gb.list_commodities(compact=False)
+        row = next(
+            c for c in listing["commodities"]["NASDAQ"]
+            if c["mnemonic"] == "AAA"
+        )
+        assert Decimal(row["latest_price"]["value"]) == report_rate
+        unpriced = next(
+            c for c in listing["commodities"]["NASDAQ"]
+            if c["mnemonic"] == "ZZZ"
+        )
+        assert "latest_price" in unpriced and unpriced["latest_price"] is None
+
+
 class TestBudgetSignChokepoint:
     """``_budget_targets`` is the one reader of budget amounts and
     ``_budget_stored_sign`` the one writer-side sign; a site that
@@ -1355,3 +1497,31 @@ class TestBudgetSignChokepoint:
                 if raw.search(line):
                     offenders.append(f"{path.name}:{lineno}")
         assert not offenders, offenders
+
+
+class TestDocumentOwnerTypeChokepoint:
+    """The document tools' party_type / document_type → owner side
+    rule lives in ``_document_owner_type``; it was copied into five
+    tool wrappers."""
+
+    def test_the_rule(self):
+        from gnucash_mcp.tools.business import _document_owner_type
+
+        assert _document_owner_type("invoice", None) == "customer"
+        assert _document_owner_type("bill", None) == "vendor"
+        assert _document_owner_type("voucher", None) == "employee"
+        # A credit note exists on both sides; no type says nothing.
+        assert _document_owner_type("credit_note", None) is None
+        assert _document_owner_type(None, None) is None
+        # An explicit party_type always wins.
+        assert _document_owner_type("invoice", "vendor") == "vendor"
+        assert _document_owner_type(None, "customer") == "customer"
+
+    def test_the_mapping_is_written_once(self):
+        import gnucash_mcp.tools as tools_pkg
+
+        text = "\n".join(
+            p.read_text()
+            for p in sorted(Path(tools_pkg.__file__).parent.glob("*.py"))
+        )
+        assert text.count('"invoice": "customer"') == 1

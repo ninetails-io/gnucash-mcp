@@ -101,3 +101,27 @@ Audited as German tax books four times, 2026-09-01 to 09-17
 (`specs/v1.5/testing/AUDIT_SABINE_COLD_R3_2026-09-17.md`: would sign).
 The i18n oracle: numbered accounts defeat English-name matching, so
 every server path that resolves accounts by type is exercised here.
+
+---
+
+## GnuCash's Balance Sheet on the multi-currency books
+
+Open a multi-currency sample in GnuCash desktop and run the Balance
+Sheet: Total Assets and Total Liabilities & Equity differ by a few
+hundred dollars. The books are
+balanced. Every transaction balances, and the server's own
+`balance_sheet` foots.
+
+The difference is how that report values one kind of split when a
+book does not use trading accounts. An invoice in EUR or CAD posted
+to a USD income account is a foreign-currency transaction whose
+income split holds a fixed USD amount. The report revalues that
+split at the report date's exchange rate instead, so the gap moves
+whenever a new EUR or CAD price is entered. GnuCash's own invoice
+post writes the same rows, and a book kept entirely in desktop shows
+the same gap. GnuCash's answer is the book option "Use Trading
+Accounts".
+
+The full trace, to the cent, is in
+`specs/v1.5/testing/BOOKKEEPER_REPORT_SIDE_FINDING_13.md`.
+

@@ -381,7 +381,7 @@ def add_prices(out_path: Path) -> int:
             seen.add(key)
             piecash.Price(
                 commodity=comm_by_mnemonic[mnemonic], currency=usd,
-                date=pdate, value=value, type="last", source="user:market_data",
+                date=pdate, value=value, type="last", source="Finance::Quote",
             )
             count += 1
 
@@ -442,7 +442,7 @@ def add_event_prices(out_path: Path, events: list[tuple[str, date]]) -> int:
                 value = MD.fx(sym, "USD", when).quantize(D("0.0001"))
             piecash.Price(
                 commodity=comm, currency=usd, date=when,
-                value=value, type="last", source="user:market_data",
+                value=value, type="last", source="Finance::Quote",
             )
             count += 1
         book.save()

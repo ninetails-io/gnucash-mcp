@@ -18,13 +18,19 @@ from decimal import Decimal, InvalidOperation
 
 import piecash
 
-from gnucash_mcp.book._base import _is_voided, _to_decimal
+from gnucash_mcp.book._base import _commodity_quantum, _is_voided, _to_decimal
+from gnucash_mcp.book._base import _check_ledger_date
+from gnucash_mcp.book._currency import _CostPool
 from gnucash_mcp._format import (
     _GROUP_BY_VALUES,
     _PARTIAL_FOOTNOTE,
     _enumerate_periods,
+    _commodity_display,
+    _format_amount,
+    _format_converted,
     _format_grouped_tsv,
-    _format_number,
+    _round_converted,
+    _format_rate,
     _mark_partial,
     _partial_period_labels,
     _period_label,
@@ -44,7 +50,37 @@ _NET_INCOME_TYPES = frozenset({"INCOME", "EXPENSE"})
 _CASH_TYPES = frozenset({"BANK", "CASH"})
 
 
-def _format_breakdown_tsv(rows: list[dict], total: Decimal, label_key: str) -> str:
+# A flow line in a foreign-commodity account is valued at its month's
+# closing rate (GB-1; GnuCash's Income Statement does the same at one
+# report-end rate), not at the cash that paid for it. A reader who
+# paid 133.40 and reads 153.46 should learn why where it happens
+# (bookkeeper ruling 2026-10-06 on SR-B1, rider 2).
+_FOREIGN_FLOW_NOTE = (
+    "Foreign-currency categories are valued at monthly closing rates; "
+    "amounts actually paid are in cash_flow."
+)
+
+
+def _has_foreign_line(rows, default_currency) -> bool:
+    return any(
+        account.commodity != default_currency for _s, _t, account in rows
+    )
+
+
+def _sum_rounded_cells(cells: dict, currency) -> dict[str, Decimal]:
+    """``{(name, month): amount}`` → ``{name: total}`` with each cell
+    rounded once to the currency's unit first (M-2)."""
+    totals: dict[str, Decimal] = {}
+    for (name, _month), amount in cells.items():
+        totals[name] = totals.get(name, Decimal("0")) + _round_converted(
+            amount, currency,
+        )
+    return totals
+
+
+def _format_breakdown_tsv(
+    rows: list[dict], total: Decimal, label_key: str, currency=None,
+) -> str:
     """Render a category/source breakdown as a compact aligned table.
 
     Format::
@@ -56,7 +92,7 @@ def _format_breakdown_tsv(rows: list[dict], total: Decimal, label_key: str) -> s
     shares it; columns are width-aligned.
     """
     if not rows:
-        return f"TOTAL  {total:,.2f}"
+        return f"TOTAL  {_format_converted(total, currency, separators=True)}"
 
     # Strip a common leading "Expenses:" / "Income:" prefix when every
     # row shares it. This keeps the leaf-name column readable without
@@ -71,7 +107,10 @@ def _format_breakdown_tsv(rows: list[dict], total: Decimal, label_key: str) -> s
     leaves = [n[len(common_prefix):] for n in full_names]
 
     name_width = max(len(n) for n in leaves) if leaves else 0
-    amount_strs = [f"{Decimal(r['amount']):,.2f}" for r in rows]
+    amount_strs = [
+        _format_converted(r["amount"], currency, separators=True)
+        for r in rows
+    ]
     amount_width = max(len(a) for a in amount_strs) if amount_strs else 0
 
     lines = []
@@ -80,8 +119,9 @@ def _format_breakdown_tsv(rows: list[dict], total: Decimal, label_key: str) -> s
         lines.append(
             f"{leaf:<{name_width}}  {amt_str:>{amount_width}}  {percent}%"
         )
+    total_str = _format_converted(total, currency, separators=True)
     lines.append(
-        f"{'TOTAL':<{name_width}}  {total:>{amount_width},.2f}"
+        f"{'TOTAL':<{name_width}}  {total_str:>{amount_width}}"
     )
     return "\n".join(lines)
 
@@ -94,6 +134,7 @@ def _format_grouped_cashflow_tsv(
     account_label: str,
     transfers_excluded: int,
     partial_labels: set[str] | None = None,
+    currency=None,
 ) -> str:
     """Render a multi-period cash-flow trend as a TSV table.
 
@@ -108,10 +149,15 @@ def _format_grouped_cashflow_tsv(
 
     def _row(name: str, values: dict[str, Decimal]) -> str:
         cells = [name]
-        cells += [f"{values[pl]:.2f}" for pl in period_labels]
+        cells += [
+            _format_converted(values[pl], currency) for pl in period_labels
+        ]
         tot = sum(values.values(), Decimal("0"))
         avg = tot / num_periods if num_periods else Decimal("0")
-        cells += [f"{tot:.2f}", f"{avg:.2f}"]
+        cells += [
+            _format_converted(tot, currency),
+            _format_converted(avg, currency),
+        ]
         return "\t".join(cells)
 
     lines = [
@@ -136,17 +182,21 @@ def _format_grouped_cashflow_tsv(
     return out
 
 
-def _money_compact(value: Decimal, currency: str = "USD") -> str:
+def _money_compact(value: Decimal, currency) -> str:
     """Format a monetary amount for compact-mode reports.
 
     Whole values render without decimals (``"USD 13,091"``), partial
-    with two; negatives use leading-minus. ``currency`` is the book
-    default mnemonic — a hardcoded ``$`` breaks non-USD books.
+    at the currency's own places; negatives use leading-minus.
+    ``currency`` is the book default commodity — a hardcoded ``$``
+    breaks non-USD books, and two places break BHD and JPY.
     """
-    quantized = value.quantize(Decimal("0.01"))
+    quantized = _round_converted(value, currency)
     if quantized == quantized.to_integral_value():
-        return f"{currency} {int(quantized):,}"
-    return f"{currency} {quantized:,.2f}"
+        return f"{currency.mnemonic} {int(quantized):,}"
+    return (
+        f"{currency.mnemonic} "
+        f"{_format_amount(quantized, currency, separators=True)}"
+    )
 
 
 def _format_debt_payoff_compact(
@@ -161,7 +211,7 @@ def _format_debt_payoff_compact(
     yeti_multiplier: Decimal,
     purchase_amount: Decimal,
     true_cost: Decimal,
-    currency: str = "USD",
+    currency,
 ) -> str:
     """Render the avalanche-payoff plan as a compact text table.
 
@@ -252,54 +302,6 @@ class ReportingMixin:
 
     # ── Period breakdowns ─────────────────────────────────────────────
 
-    def _monthly_conversion_factors(
-        self,
-        book: piecash.Book,
-        start_date: date,
-        end_date: date,
-    ) -> dict[str, dict[str, Decimal | None]]:
-        """``{YYYY-MM: {account_guid: factor}}`` covering the range —
-        the FLOW-report valuation quantum (GB-1 ruling, 2026-07-07).
-
-        Flow reports (spending / income / cash_flow) value every
-        split at its own MONTH's closing rate, in single-period and
-        group_by modes alike. Month is the quantum because it makes
-        totals granularity-invariant (quarter/year/single are sums of
-        month-valued splits), matches the ``group_by="month"``
-        numbers users had already seen before unification, and is a
-        recognizable accounting convention (monthly close). Anchors
-        clamp to ``end_date`` via ``_enumerate_periods``, so a
-        partial final month values at the range end and the
-        forecast-price convention (``_anchor_for_as_of``) applies
-        through ``_account_conversion_factors`` as everywhere else.
-
-        STOCK reports (balance_sheet, net_worth) are deliberately
-        different: they value holdings as of their report date, not
-        per flow month.
-        """
-        return {
-            pl: self._account_conversion_factors(book, anchor)
-            for pl, anchor in _enumerate_periods(
-                start_date, end_date, "month",
-            )
-        }
-
-    @staticmethod
-    def _monthly_factor(
-        monthly_factors: dict[str, dict[str, Decimal | None]],
-        txn,
-        account,
-    ) -> Decimal | None:
-        """The conversion factor for one split under the monthly
-        quantum: its transaction's month, its account. ``None`` (no
-        rate on file that month, or a month outside the built range)
-        falls back to ``split.value`` in
-        ``_split_in_default_currency`` — the same degradation as
-        every other missing-rate path.
-        """
-        month = _period_label(txn.post_date, "month")
-        return monthly_factors.get(month, {}).get(account.guid)
-
     def _grouped_breakdown(
         self,
         book: piecash.Book,
@@ -346,6 +348,7 @@ class ReportingMixin:
         # category fullname → {period_label: signed Decimal}
         label_set = set(period_labels)
         totals: dict[str, dict[str, Decimal]] = {}
+        month_cells: dict[tuple[str, str, str], Decimal] = {}
         for split, txn, account in rows:
             plabel = _period_label(txn.post_date, group_by)
             if plabel not in label_set:
@@ -364,8 +367,18 @@ class ReportingMixin:
                 split, account, factor,
             )
             group_account = self._get_account_at_depth(account, depth)
-            bucket = totals.setdefault(group_account.fullname, {})
-            bucket[plabel] = bucket.get(plabel, Decimal("0")) + amount
+            month = _period_label(txn.post_date, "month")
+            key = (group_account.fullname, plabel, month)
+            month_cells[key] = month_cells.get(key, Decimal("0")) + amount
+        # The (category, month) cell is the rounding grain everywhere
+        # (M-2): a quarter or year cell is the sum of its rounded
+        # months, so this table's totals equal the single-period
+        # report's.
+        for (name, plabel, _month), amount in month_cells.items():
+            bucket = totals.setdefault(name, {})
+            bucket[plabel] = bucket.get(plabel, Decimal("0")) + _round_converted(
+                amount, book.default_currency,
+            )
 
         cat_totals = {
             name: sum(per.values(), Decimal("0"))
@@ -387,7 +400,7 @@ class ReportingMixin:
                 period_totals[pl] += v
         grand_total = sum(cat_totals.values(), Decimal("0"))
 
-        return _format_grouped_tsv(
+        out = _format_grouped_tsv(
             period_labels=period_labels,
             displayed_names=displayed_names,
             totals=totals,
@@ -399,7 +412,11 @@ class ReportingMixin:
             partial_labels=_partial_period_labels(
                 start_date, end_date, group_by,
             ),
+            currency=book.default_currency,
         )
+        if _has_foreign_line(rows, book.default_currency):
+            out += f"\n({_FOREIGN_FLOW_NOTE})"
+        return out
 
     def spending_by_category(
         self,
@@ -428,6 +445,9 @@ class ReportingMixin:
                 and return a multi-period TSV table (always a string;
                 ``compact`` is ignored — the table is the output).
         """
+        for _f in ("start_date", "end_date", "as_of_date"):
+            if locals().get(_f) != date.max:  # date.max: no upper bound
+                _check_ledger_date(locals().get(_f), _f)
         if group_by is not None:
             if group_by not in _GROUP_BY_VALUES:
                 raise ValueError(
@@ -462,11 +482,15 @@ class ReportingMixin:
                 book, start_date, end_date,
             )
 
-            totals: dict[str, Decimal] = {}
+            # Accumulate SIGNED amounts so refunds net against
+            # spending within a category — dropping negatives would
+            # report GROSS spend. The grain is the (category, month)
+            # cell: each is rounded once to the currency's unit and
+            # every figure is a sum of cells, so the lines add up to
+            # the TOTAL and the grouped table's grand total is this
+            # one (scoped review 2026-10-05, M-2; TestModeAgreement).
+            cells: dict[tuple[str, str], Decimal] = {}
             for split, txn, account in rows:
-                # Accumulate SIGNED amounts so refunds net against
-                # spending within a category — dropping negatives
-                # would report GROSS spend.
                 amount = self._split_in_default_currency(
                     split, account,
                     self._monthly_factor(monthly_factors, txn, account),
@@ -478,10 +502,9 @@ class ReportingMixin:
                 group_account = self._get_account_at_depth(
                     account, depth
                 )
-                account_name = group_account.fullname
-                totals[account_name] = totals.get(
-                    account_name, Decimal("0")
-                ) + amount
+                key = (group_account.fullname, _period_label(txn.post_date, "month"))
+                cells[key] = cells.get(key, Decimal("0")) + amount
+            totals = _sum_rounded_cells(cells, book.default_currency)
 
             # Net decision AFTER aggregation: a net-refunded category
             # isn't a spend LINE but still belongs in the TOTAL —
@@ -502,19 +525,25 @@ class ReportingMixin:
                 )
                 categories.append({
                     "account": account_name,
-                    "amount": str(amount),
+                    "amount": _format_converted(amount, book.default_currency),
                     "percent": str(percent.quantize(Decimal("0.1"))),
                 })
             excluded_rows = [
-                {"account": n, "amount": str(a)}
+                {"account": n, "amount": _format_converted(a, book.default_currency)}
                 for n, a in sorted(excluded.items(), key=lambda x: x[1])
             ]
 
+            foreign = _has_foreign_line(rows, book.default_currency)
             if compact:
-                out = _format_breakdown_tsv(categories, total, "account")
+                out = _format_breakdown_tsv(
+                    categories, total, "account", book.default_currency,
+                )
+                if foreign:
+                    out += f"\n({_FOREIGN_FLOW_NOTE})"
                 if excluded_rows:
                     netted = ", ".join(
-                        f"{r['account']} {Decimal(r['amount']):,.2f}"
+                        f"{r['account']} "
+                        f"{_format_converted(r['amount'], book.default_currency, separators=True)}"
                         for r in excluded_rows
                     )
                     out += (
@@ -524,11 +553,13 @@ class ReportingMixin:
                 return out
             # period is an input echo — LLM supplied start/end dates.
             result = {
-                "total": str(total),
+                "total": _format_converted(total, book.default_currency),
                 "categories": categories,
             }
             if excluded_rows:
                 result["net_negative_netted"] = excluded_rows
+            if foreign:
+                result["valuation_note"] = _FOREIGN_FLOW_NOTE
             return result
 
     def income_by_source(
@@ -552,6 +583,9 @@ class ReportingMixin:
                 / ``"quarter"`` / ``"year"`` for a multi-period TSV
                 table — see ``spending_by_category``.
         """
+        for _f in ("start_date", "end_date", "as_of_date"):
+            if locals().get(_f) != date.max:  # date.max: no upper bound
+                _check_ledger_date(locals().get(_f), _f)
         if group_by is not None:
             if group_by not in _GROUP_BY_VALUES:
                 raise ValueError(
@@ -584,27 +618,19 @@ class ReportingMixin:
                 book, start_date, end_date,
             )
 
-            totals: dict[str, Decimal] = {}
+            # (category, month) cells, each rounded once, as in
+            # spending_by_category (M-2).
+            cells: dict[tuple[str, str], Decimal] = {}
             for split, txn, account in rows:
-                # Income is stored negative; flip. Signed
-                # accumulation so losses/clawbacks net against gains
-                # within a source — see spending_by_category.
                 amount = -self._split_in_default_currency(
                     split, account,
                     self._monthly_factor(monthly_factors, txn, account),
                 )
-                # ``depth`` not ``depth - 1`` — same off-by-one
-                # hazard as spending_by_category.
-                group_account = self._get_account_at_depth(
-                    account, depth
-                )
-                account_name = group_account.fullname
-                totals[account_name] = totals.get(
-                    account_name, Decimal("0")
-                ) + amount
+                group_account = self._get_account_at_depth(account, depth)
+                key = (group_account.fullname, _period_label(txn.post_date, "month"))
+                cells[key] = cells.get(key, Decimal("0")) + amount
+            totals = _sum_rounded_cells(cells, book.default_currency)
 
-            # Net decision AFTER aggregation — see
-            # spending_by_category.
             displayed = {n: a for n, a in totals.items() if a > 0}
             excluded = {n: a for n, a in totals.items() if a < 0}
             total = (
@@ -623,15 +649,21 @@ class ReportingMixin:
                     "percent": str(percent.quantize(Decimal("0.1"))),
                 })
             excluded_rows = [
-                {"account": n, "amount": str(a)}
+                {"account": n, "amount": _format_converted(a, book.default_currency)}
                 for n, a in sorted(excluded.items(), key=lambda x: x[1])
             ]
 
+            foreign = _has_foreign_line(rows, book.default_currency)
             if compact:
-                out = _format_breakdown_tsv(sources, total, "account")
+                out = _format_breakdown_tsv(
+                    sources, total, "account", book.default_currency,
+                )
+                if foreign:
+                    out += f"\n({_FOREIGN_FLOW_NOTE})"
                 if excluded_rows:
                     netted = ", ".join(
-                        f"{r['account']} {Decimal(r['amount']):,.2f}"
+                        f"{r['account']} "
+                        f"{_format_converted(r['amount'], book.default_currency, separators=True)}"
                         for r in excluded_rows
                     )
                     out += (
@@ -641,11 +673,13 @@ class ReportingMixin:
                 return out
             # period is an input echo — LLM supplied start/end dates.
             result = {
-                "total": str(total),
+                "total": _format_converted(total, book.default_currency),
                 "sources": sources,
             }
             if excluded_rows:
                 result["net_negative_netted"] = excluded_rows
+            if foreign:
+                result["valuation_note"] = _FOREIGN_FLOW_NOTE
             return result
 
     # ── Balance sheet and net worth ──────────────────────────────────
@@ -673,6 +707,9 @@ class ReportingMixin:
             equity already includes the Unrealized line so the
             totals balance.
         """
+        for _f in ("start_date", "end_date", "as_of_date"):
+            if locals().get(_f) != date.max:  # date.max: no upper bound
+                _check_ledger_date(locals().get(_f), _f)
         # One SQL-filtered pass over every relevant type, bucketed in
         # memory. Net income (retained-earnings-equivalent) rolls
         # into equity below.
@@ -693,6 +730,9 @@ class ReportingMixin:
             # commodity for the "230.76 VTSAX @ 156.23 (USD …)"
             # triplet on non-default-currency rows.
             balances: dict[str, dict] = {}
+            # Unpriced holdings (no factor): legs collected here and
+            # valued at remaining cost basis after the pass.
+            unpriced: dict[str, list] = {}
             net_income = Decimal("0")
             for split, _txn, account in rows:
                 # Voided by state, not value: a well-formed void
@@ -709,8 +749,9 @@ class ReportingMixin:
                 # balancing-residual equity line it silently deletes
                 # the dropped asset instead. Same own-splits rule as
                 # ``net_worth`` and ``_compute_net_worth_at``.
+                factor = factors.get(account.guid)
                 amt = self._split_in_default_currency(
-                    split, account, factors.get(account.guid)
+                    split, account, factor
                 )
                 if account.type in _NET_INCOME_TYPES:
                     # Income is stored negative, expenses positive; net
@@ -727,8 +768,37 @@ class ReportingMixin:
                     }
                 balances[key]["usd"] += amt
                 balances[key]["quantity"] += split.quantity
+                if factor is None:
+                    unpriced.setdefault(key, []).append(split)
 
             default_currency = self._require_default_currency(book)
+
+            # An unpriced holding is worth its remaining cost basis
+            # (``_unpriced_cost_basis``): remaining units at the
+            # running average cost of the legs that acquired them, so
+            # a fully sold position is exactly zero and a partly sold
+            # one carries none of its realized gain. The per-split sum
+            # above is cost minus proceeds for such an account, which
+            # is what left a sold-out altcoin on the sheet as a
+            # phantom holding (#184, #185). Same rule as the
+            # ``_market_value`` fallback behind the dashboard and
+            # net_worth, so the surfaces agree by construction.
+            for key, legs in unpriced.items():
+                balances[key]["usd"] = self._unpriced_cost_basis(
+                    book, legs,
+                    default_currency=default_currency, as_of=as_of_date,
+                )
+
+            # Each account's converted balance is rounded to the
+            # currency's unit once, here, as GnuCash rounds a
+            # conversion, and every total below is a sum of rounded
+            # lines: the sheet's lines add up to its totals, and
+            # assets minus liabilities is net_worth's figure exactly
+            # (``_market_value`` rounds per account the same way).
+            for info in balances.values():
+                info["usd"] = _round_converted(info["usd"], default_currency)
+            net_income = _round_converted(net_income, default_currency)
+
             # Display rates anchored to the report date, market
             # prices only (see _rates_as_of).
             latest_rates = self._rates_as_of(book, as_of_date)
@@ -742,7 +812,9 @@ class ReportingMixin:
             equity: dict[str, dict] = {}
             for name, info in balances.items():
                 bal = info["usd"]
-                if bal == 0:
+                # A holding worth less than half a unit still shows,
+                # at zero, while any of it is held.
+                if bal == 0 and info["quantity"] == 0:
                     continue
                 if info["type"] in _ASSET_TYPES:
                     assets[name] = info
@@ -786,15 +858,18 @@ class ReportingMixin:
                 Non-currency accounts: ``balance`` is the readable
                 triplet ``"230.76 VTSAX @ 156.23 (USD 36,043.66)"``
                 and ``default_currency_value`` carries the parseable
-                number. Numbers flow through ``_format_number`` so
-                responses don't leak Decimal precision noise.
+                number. A default-currency balance is exact and
+                prints at the currency's places; a converted one is
+                rounded as GnuCash rounds a conversion first
+                (``_format_converted``); a quantity prints at its
+                commodity's places (review C20).
                 """
                 ccy_mnemonic = default_currency.mnemonic
                 rows = []
                 for name, info in sorted(accounts_dict.items()):
                     commodity = info["commodity"]
-                    default_value_rounded = _format_number(
-                        info["usd"], decimals=2
+                    default_value_rounded = _format_converted(
+                        info["usd"], default_currency,
                     )
                     if commodity == default_currency:
                         rows.append({
@@ -804,13 +879,14 @@ class ReportingMixin:
                     else:
                         rate = latest_rates.get(commodity.guid)
                         sym = commodity.mnemonic
-                        qty = info["quantity"]
+                        qty = _format_amount(info["quantity"], commodity)
                         if rate is not None:
                             via = rate_via.get(commodity.guid)
                             via_note = f", {via}" if via else ""
                             balance_str = (
-                                f"{qty} {sym} @ {rate} "
-                                f"({ccy_mnemonic} {info['usd']:,.2f}"
+                                f"{qty} {sym} @ {_format_rate(rate)} "
+                                f"({ccy_mnemonic} "
+                                f"{_format_converted(info['usd'], default_currency, separators=True)}"
                                 f"{via_note})"
                             )
                         else:
@@ -818,7 +894,8 @@ class ReportingMixin:
                             # accumulated in info['usd'].
                             balance_str = (
                                 f"{qty} {sym} ({ccy_mnemonic} "
-                                f"{info['usd']:,.2f}, no price data)"
+                                f"{_format_converted(info['usd'], default_currency, separators=True)}"
+                                f", no price data)"
                             )
                         rows.append({
                             "account": name,
@@ -833,19 +910,19 @@ class ReportingMixin:
             return {
                 "as_of_date": as_of_date.isoformat(),
                 "assets": {
-                    "total": _format_number(assets_total, decimals=2),
+                    "total": _format_converted(assets_total, default_currency),
                     "accounts": format_accounts(assets),
                 },
                 "liabilities": {
-                    "total": _format_number(liabilities_total, decimals=2),
+                    "total": _format_converted(liabilities_total, default_currency),
                     "accounts": format_accounts(liabilities),
                 },
                 "equity": {
-                    "total": _format_number(equity_total, decimals=2),
+                    "total": _format_converted(equity_total, default_currency),
                     "accounts": format_accounts(equity) + (
                         [{
                             "account": "Retained Earnings",
-                            "balance": _format_number(net_income, decimals=2),
+                            "balance": _format_converted(net_income, default_currency),
                         }]
                         if net_income != 0 else []
                     ) + (
@@ -853,7 +930,7 @@ class ReportingMixin:
                         # unrealized gain (see docstring).
                         [{
                             "account": "Unrealized Gain/Loss",
-                            "balance": _format_number(unrealized, decimals=2),
+                            "balance": _format_converted(unrealized, default_currency),
                         }]
                         if unrealized != 0 else []
                     ),
@@ -876,11 +953,15 @@ class ReportingMixin:
         Returns:
             Dict with net worth value or time series.
         """
+        for _f in ("start_date", "end_date", "as_of_date"):
+            if locals().get(_f) != date.max:  # date.max: no upper bound
+                _check_ledger_date(locals().get(_f), _f)
         from dateutil.relativedelta import relativedelta
 
         nw_types = _ASSET_TYPES | _LIABILITY_TYPES
 
         with self.open(readonly=True) as book:
+            default_currency = self._require_default_currency(book)
             # --- Point-in-time: one filtered SQL query, sum in Python.
             if not start_date or not interval:
                 factors = self._account_conversion_factors(book, end_date)
@@ -889,18 +970,43 @@ class ReportingMixin:
                     end_date=end_date,
                     account_types=nw_types,
                 )
-                total = Decimal("0")
+                # Per account, each rounded to the currency's unit
+                # once and then summed: the figure balance_sheet's
+                # lines add up to (see the note there).
+                per_account: dict[str, Decimal] = {}
+                # Unpriced holdings: legs collected, valued at
+                # remaining cost basis below — the same rule as
+                # balance_sheet and the dashboard (#185).
+                unpriced: dict[str, list] = {}
                 for split, _txn, account in rows:
                     if _is_voided(split):
                         continue
+                    factor = factors.get(account.guid)
+                    if factor is None:
+                        unpriced.setdefault(account.guid, []).append(split)
+                        continue
                     # Liabilities are stored negative, so a direct
                     # sum gives assets minus liabilities.
-                    total += self._split_in_default_currency(
-                        split, account, factors.get(account.guid)
+                    per_account[account.guid] = per_account.get(
+                        account.guid, Decimal("0"),
+                    ) + self._split_in_default_currency(
+                        split, account, factor
                     )
+                for guid, legs in unpriced.items():
+                    per_account[guid] = self._unpriced_cost_basis(
+                        book, legs,
+                        default_currency=default_currency, as_of=end_date,
+                    )
+                total = sum(
+                    (
+                        _round_converted(v, default_currency)
+                        for v in per_account.values()
+                    ),
+                    Decimal("0"),
+                )
                 return {
                     "as_of_date": end_date.isoformat(),
-                    "net_worth": str(total),
+                    "net_worth": _format_converted(total, default_currency),
                 }
 
             # --- Time series: single sweep, per-boundary valuation.
@@ -936,9 +1042,9 @@ class ReportingMixin:
 
             # Single pass in post_date order. Under per-boundary
             # rates a single running total can't be carried forward;
-            # track per-account quantity AND value totals and convert
-            # at snapshot time with that boundary's factors. Cost:
-            # O(splits + boundaries × accounts_with_splits).
+            # track per-account quantity AND a running cost pool and
+            # convert at snapshot time with that boundary's factors.
+            # Cost: O(splits + boundaries × accounts_with_splits).
             rows = self._query_filtered_splits(
                 book,
                 end_date=end_date,
@@ -947,21 +1053,25 @@ class ReportingMixin:
             )
 
             running_qty: dict[str, Decimal] = {}
-            running_value: dict[str, Decimal] = {}
+            running_pool: dict[str, _CostPool] = {}
 
             def _snapshot_at(boundary: date) -> Decimal:
                 """Net worth at ``boundary`` using that date's
-                factors: per-account factor × quantity, cost-basis
-                fallback — ``_split_in_default_currency``'s
-                disambiguation lifted to account level."""
+                factors: per-account factor × quantity, else the
+                account's remaining cost basis — the same
+                ``_CostPool`` arithmetic ``_unpriced_cost_basis``
+                applies, carried incrementally so each boundary reads
+                the basis as of its own date."""
                 factors_here = factors_by_boundary[boundary]
                 total = Decimal("0")
                 for acct_guid, qty in running_qty.items():
                     factor = factors_here.get(acct_guid)
                     if factor is not None:
-                        total += qty * factor
+                        value = qty * factor
                     else:
-                        total += running_value[acct_guid]
+                        value = running_pool[acct_guid].basis
+                    # Per account, as the point-in-time figure is.
+                    total += _round_converted(value, default_currency)
                 return total
 
             series: list[dict] = []
@@ -988,7 +1098,9 @@ class ReportingMixin:
                 ):
                     series.append({
                         "date": boundaries[b_idx].isoformat(),
-                        "net_worth": str(_snapshot_at(boundaries[b_idx])),
+                        "net_worth": _format_converted(
+                            _snapshot_at(boundaries[b_idx]), default_currency,
+                        ),
                     })
                     b_idx += 1
                 # Voided filter placed after the boundary advance so
@@ -997,13 +1109,18 @@ class ReportingMixin:
                 if _is_voided(split):
                     continue
                 acct_guid = account.guid
+                qty = Decimal(str(split.quantity))
                 running_qty[acct_guid] = (
-                    running_qty.get(acct_guid, Decimal("0"))
-                    + Decimal(str(split.quantity))
+                    running_qty.get(acct_guid, Decimal("0")) + qty
                 )
-                running_value[acct_guid] = (
-                    running_value.get(acct_guid, Decimal("0"))
-                    + Decimal(str(split.value))
+                pool = running_pool.get(acct_guid)
+                if pool is None:
+                    pool = running_pool[acct_guid] = _CostPool()
+                pool.apply(
+                    qty,
+                    self._leg_value_in_default(
+                        book, split, default_currency,
+                    ),
                 )
 
             # Drain boundaries past the last split — each still uses
@@ -1011,7 +1128,9 @@ class ReportingMixin:
             while b_idx < len(boundaries):
                 series.append({
                     "date": boundaries[b_idx].isoformat(),
-                    "net_worth": str(_snapshot_at(boundaries[b_idx])),
+                    "net_worth": _format_converted(
+                        _snapshot_at(boundaries[b_idx]), default_currency,
+                    ),
                 })
                 b_idx += 1
 
@@ -1062,6 +1181,9 @@ class ReportingMixin:
             the LLM can mention the ``include_transfers`` escape
             hatch). With ``group_by``, a multi-period TSV table.
         """
+        for _f in ("start_date", "end_date", "as_of_date"):
+            if locals().get(_f) != date.max:  # date.max: no upper bound
+                _check_ledger_date(locals().get(_f), _f)
         if group_by is not None and group_by not in _GROUP_BY_VALUES:
             raise ValueError(
                 f"Invalid group_by '{group_by}'. Must be one of: "
@@ -1114,8 +1236,10 @@ class ReportingMixin:
             monthly_factors = self._monthly_conversion_factors(
                 book, start_date, end_date,
             )
-            inflows = Decimal("0")
-            outflows = Decimal("0")
+            # Per-month cells, rounded once (M-2), as the grouped
+            # table's are.
+            in_cells: dict[str, Decimal] = {}
+            out_cells: dict[str, Decimal] = {}
             transfers_excluded: set[str] = set()
             for split, txn, acct in rows:
                 # Skip voided splits BEFORE the transfer-vs-real
@@ -1132,17 +1256,27 @@ class ReportingMixin:
                     self._monthly_factor(monthly_factors, txn, acct),
                 )
                 if amt > 0:
-                    inflows += amt
+                    m = _period_label(txn.post_date, "month")
+                    in_cells[m] = in_cells.get(m, Decimal("0")) + amt
                 elif amt < 0:
-                    outflows += -amt
+                    m = _period_label(txn.post_date, "month")
+                    out_cells[m] = out_cells.get(m, Decimal("0")) - amt
 
             # period (input echo) and net (derivable) are dropped.
             # The canonical fullname is echoed so %short/GUID input
             # still yields a readable name.
+            inflows = sum(
+                (_round_converted(v, book.default_currency) for v in in_cells.values()),
+                Decimal("0"),
+            )
+            outflows = sum(
+                (_round_converted(v, book.default_currency) for v in out_cells.values()),
+                Decimal("0"),
+            )
             result = {
                 "account": account_label,
-                "inflows": str(inflows),
-                "outflows": str(outflows),
+                "inflows": _format_converted(inflows, book.default_currency),
+                "outflows": _format_converted(outflows, book.default_currency),
             }
             if transfers_excluded:
                 result["transfers_excluded"] = len(transfers_excluded)
@@ -1178,6 +1312,8 @@ class ReportingMixin:
 
         inflows = {pl: Decimal("0") for pl in period_labels}
         outflows = {pl: Decimal("0") for pl in period_labels}
+        in_months: dict[tuple[str, str], Decimal] = {}
+        out_months: dict[tuple[str, str], Decimal] = {}
         transfers_excluded: set[str] = set()
         for split, txn, acct in rows:
             if _is_voided(split):
@@ -1200,10 +1336,18 @@ class ReportingMixin:
                 split, acct,
                 self._monthly_factor(monthly_factors, txn, acct),
             )
+            month = _period_label(txn.post_date, "month")
             if amt > 0:
-                inflows[plabel] += amt
+                k = (plabel, month)
+                in_months[k] = in_months.get(k, Decimal("0")) + amt
             elif amt < 0:
-                outflows[plabel] += -amt
+                k = (plabel, month)
+                out_months[k] = out_months.get(k, Decimal("0")) - amt
+        # Rounded per month, summed into the period (M-2).
+        for (plabel, _m), v in in_months.items():
+            inflows[plabel] += _round_converted(v, book.default_currency)
+        for (plabel, _m), v in out_months.items():
+            outflows[plabel] += _round_converted(v, book.default_currency)
 
         return _format_grouped_cashflow_tsv(
             period_labels=period_labels,
@@ -1214,6 +1358,7 @@ class ReportingMixin:
             partial_labels=_partial_period_labels(
                 start_date, end_date, group_by,
             ),
+            currency=book.default_currency,
         )
 
     def _cashflow_txn_guids(
@@ -1269,7 +1414,8 @@ class ReportingMixin:
 
     @staticmethod
     def _run_avalanche(
-        debts: list[dict], monthly_budget: Decimal
+        debts: list[dict], monthly_budget: Decimal,
+        unit: Decimal = Decimal("0.01"),
     ) -> tuple[list[dict], int, Decimal]:
         """Simulate avalanche-method debt payoff month by month.
 
@@ -1277,6 +1423,8 @@ class ReportingMixin:
             debts: List of dicts with 'name', 'balance', 'apr', 'min_payment'.
                    Balances should be positive numbers representing amount owed.
             monthly_budget: Total monthly amount available for all debt payments.
+            unit: The book currency's smallest unit; interest accrues
+                in it.
 
         Returns:
             Tuple of (debt_results, total_months, total_interest) where
@@ -1305,7 +1453,7 @@ class ReportingMixin:
             for d in working:
                 if d["balance"] <= 0:
                     continue
-                interest = (d["balance"] * d["monthly_rate"]).quantize(Decimal("0.01"))
+                interest = (d["balance"] * d["monthly_rate"]).quantize(unit)
                 d["balance"] += interest
                 d["interest_paid"] += interest
 
@@ -1379,7 +1527,13 @@ class ReportingMixin:
 
         with self.open(readonly=True) as book:
             default_currency = self._require_default_currency(book)
+            # A detached copy for the figures rendered after the book
+            # closes.
+            display_currency = _commodity_display(default_currency)
             default_currency_mnemonic = default_currency.mnemonic
+            # Money in the plan is the book currency's: interest
+            # accrues, and figures are stated, in its smallest unit.
+            unit = _commodity_quantum(default_currency)
             debt_types = {"CREDIT", "LIABILITY"}
             debts = []
             # Foreign-currency debts with no FX rate on file can't be
@@ -1491,7 +1645,7 @@ class ReportingMixin:
                     if slot_factor is not None and slot_factor != 1:
                         min_payment = (
                             min_payment * slot_factor
-                        ).quantize(Decimal("0.01"))
+                        ).quantize(unit)
 
                 # 2. Type-aware fallback: CREDIT cards charge ~2% of
                 #    balance; LIABILITY loans amortize. Applying the
@@ -1502,7 +1656,7 @@ class ReportingMixin:
                     if account.type == "CREDIT":
                         two_percent = (
                             balance * Decimal("0.02")
-                        ).quantize(Decimal("0.01"))
+                        ).quantize(unit)
                         min_payment = max(two_percent, Decimal("25"))
                         if balance < Decimal("25"):
                             min_payment = balance
@@ -1528,9 +1682,14 @@ class ReportingMixin:
                                     if hasattr(lt_val, "value")
                                     else str(lt_val)
                                 )
-                                parsed = int(Decimal(lt_str))
-                                if parsed > 0:
-                                    term_months = parsed
+                                # A term is months, not 1e1000000:
+                                # that slot value held the tool for
+                                # 46 seconds raising a rate to it
+                                # (adversarial review 2026-09-30,
+                                # C58). A century is 1,200.
+                                term = Decimal(lt_str)
+                                if term.is_finite() and 0 < term <= 1200:
+                                    term_months = int(term)
                             except (InvalidOperation, ValueError):
                                 pass
                         if term_months is None:
@@ -1542,7 +1701,7 @@ class ReportingMixin:
                         factor = (Decimal("1") + monthly_rate) ** term_months
                         min_payment = (
                             balance * monthly_rate * factor / (factor - Decimal("1"))
-                        ).quantize(Decimal("0.01"))
+                        ).quantize(unit)
                         # Cap at balance for tiny remainders where the
                         # formula could over-shoot a near-paid-off loan.
                         if min_payment > balance:
@@ -1558,7 +1717,7 @@ class ReportingMixin:
                         if slot_factor is not None and slot_factor != 1:
                             credit_limit = (
                                 credit_limit * slot_factor
-                            ).quantize(Decimal("0.01"))
+                            ).quantize(unit)
                     except InvalidOperation:
                         pass
 
@@ -1667,7 +1826,9 @@ class ReportingMixin:
 
         total_balance = sum(d["balance"] for d in debts)
 
-        results, total_months, total_interest = self._run_avalanche(debts, budget)
+        results, total_months, total_interest = self._run_avalanche(
+            debts, budget, unit,
+        )
         total_paid = total_balance + total_interest
 
         from dateutil.relativedelta import relativedelta
@@ -1683,10 +1844,12 @@ class ReportingMixin:
         debts_with_purchase.sort(key=lambda d: d["apr"], reverse=True)
         debts_with_purchase[0]["balance"] += purchase_amount
 
-        _, _, interest_with_purchase = self._run_avalanche(debts_with_purchase, budget)
+        _, _, interest_with_purchase = self._run_avalanche(
+            debts_with_purchase, budget, unit,
+        )
         total_paid_with_purchase = total_balance + purchase_amount + interest_with_purchase
         true_cost = total_paid_with_purchase - total_paid
-        yeti_multiplier = (true_cost / purchase_amount).quantize(Decimal("0.01"))
+        yeti_multiplier = (true_cost / purchase_amount).quantize(Decimal("0.01"))  # a ratio
 
         results.sort(key=lambda d: d["apr"], reverse=True)
         payoff_order = [d["name"] for d in results]
@@ -1697,10 +1860,10 @@ class ReportingMixin:
         for d in results:
             detail = {
                 "account": d["name"],
-                "balance": str(orig_balances[d["name"]].quantize(Decimal("0.01"))),
+                "balance": str(orig_balances[d["name"]].quantize(unit)),
                 "apr": str(d["apr"]),
                 "minimum_payment": str(d["min_payment"]),
-                "interest_paid": str(d["interest_paid"].quantize(Decimal("0.01"))),
+                "interest_paid": str(d["interest_paid"].quantize(unit)),
                 "payoff_month": d["payoff_month"],
             }
             if d.get("credit_limit") is not None:
@@ -1710,20 +1873,20 @@ class ReportingMixin:
         full = {
             "debts": debt_details,
             "payoff_order": payoff_order,
-            "total_balance": str(total_balance.quantize(Decimal("0.01"))),
-            "total_interest": str(total_interest.quantize(Decimal("0.01"))),
-            "total_paid": str(total_paid.quantize(Decimal("0.01"))),
+            "total_balance": str(total_balance.quantize(unit)),
+            "total_interest": str(total_interest.quantize(unit)),
+            "total_paid": str(total_paid.quantize(unit)),
             "payoff_months": total_months,
             "payoff_date": payoff_date.isoformat(),
             "monthly_budget": monthly_budget,
             "yeti": {
                 "multiplier": str(yeti_multiplier),
                 "purchase_amount": str(purchase_amount),
-                "true_cost": str(true_cost.quantize(Decimal("0.01"))),
+                "true_cost": str(true_cost.quantize(unit)),
                 "explanation": (
                     f"A {default_currency_mnemonic} {purchase_amount} purchase "
                     f"will cost you {default_currency_mnemonic} "
-                    f"{true_cost.quantize(Decimal('0.01'))} by the time your "
+                    f"{true_cost.quantize(unit)} by the time your "
                     f"debt is paid off"
                 ),
             },
@@ -1755,7 +1918,7 @@ class ReportingMixin:
             yeti_multiplier=yeti_multiplier,
             purchase_amount=purchase_amount,
             true_cost=true_cost,
-            currency=default_currency_mnemonic,
+            currency=display_currency,
         )
         if excluded_warning:
             compact_out += f"\n⚠ {excluded_warning}"

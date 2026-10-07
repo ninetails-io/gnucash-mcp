@@ -1,12 +1,14 @@
 """Tests for GnuCashBook wrapper."""
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
 import piecash
 from piecash import factories
 import pytest
+
+from tests.conftest import leak_same_day_price
 
 from gnucash_mcp.book import GnuCashBook, GnuCashLockError
 
@@ -261,7 +263,7 @@ class TestGetBookSummary:
 
         result = gc_book.get_book_summary()
         # 1000 EUR × 1.20 = $1200. Decimal("1.20") stringifies as "1.2".
-        assert "1000 EUR @ 1.2" in result
+        assert "1000.00 EUR @ 1.2" in result
         assert "(USD 1200.00)" in result
 
     def test_investment_no_price_falls_back_to_cost_basis(
@@ -272,10 +274,17 @@ class TestGetBookSummary:
 
         In the fixture the cross-currency transfer booked value=1100 USD
         on the EUR side, so the fallback cost basis is $1,100.
+
+        The transfer's implied-rate price row values EUR since the
+        2026-09-29 ruling (desktop counts it); a book with no price
+        row of any type is still real, so drop it to reach that state.
         """
+        from tests.conftest import drop_transaction_prices
+
+        assert drop_transaction_prices(multi_currency_book) > 0
         gc_book = GnuCashBook(str(multi_currency_book))
         result = gc_book.get_book_summary()
-        assert "1000 EUR — no price data" in result
+        assert "1000.00 EUR — no price data" in result
         assert "(USD 1100.00)" in result or "(USD 1100)" in result
 
     def test_business_entities_line(self, business_book: Path):
@@ -1357,6 +1366,31 @@ class TestGetBookSummaryMonthlyNet:
         oldest_label = self._months_ago(5).strftime("%b %Y")
         assert oldest_label in rows[5]
 
+    def test_mtd_stops_at_today(self, test_book: Path):
+        """Dashboard-accuracy spec A7: the MTD bucket summed through
+        month-end, so a bill posted ahead to the 28th already
+        counted on the 25th. A future-dated expense in the current
+        month must not move the MTD row."""
+        today = date.today()
+        tomorrow = today + timedelta(days=1)
+        if tomorrow.month != today.month:
+            pytest.skip("no future date left in the current month")
+        gc = GnuCashBook(str(test_book))
+        self._seed_income(gc, "1000", today)
+        before = gc.get_book_summary()
+        self._seed_expense(gc, "5000", tomorrow, "Posted ahead")
+        after = gc.get_book_summary()
+
+        def mtd_row(result: str) -> str:
+            section = result.split(
+                "Monthly net (income - expenses, last 6 months):\n", 1,
+            )[1]
+            return section.split("\n", 1)[0]
+
+        assert "(MTD)" in mtd_row(before)
+        assert "+1,000" in mtd_row(before)
+        assert mtd_row(after) == mtd_row(before)
+
     def test_current_month_marked_mtd(self, test_book: Path):
         """The current calendar month is partial — its row carries
         a (MTD) suffix on the label."""
@@ -1505,6 +1539,142 @@ class TestGetBookSummaryMonthlyNet:
         assert "+811" in prior_row
 
 
+class TestRunwayCashBurn:
+    """Runway's burn is cash leaving its own liquid pool — a fact
+    the ledger transcribes, not a spending model (bookkeeper
+    ruling, 2026-09-24). The expense-sum burn it replaced counted
+    payroll withholding that never touches the pool (~$73/day on
+    a live book) and missed card/loan payments that drain it."""
+
+    def test_burn_counts_what_leaves_the_pool(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        gc.create_account(name="Savings", account_type="BANK",
+                          parent="Assets")
+        gc.create_account(name="Retirement Cash", account_type="BANK",
+                          parent="Assets")
+        gc.create_account(name="Card", account_type="CREDIT",
+                          parent="Liabilities")
+        gc.create_account(name="Taxes", account_type="EXPENSE",
+                          parent="Expenses")
+        when = date.today() - timedelta(days=10)
+        for desc, splits in [
+            # Withholding never reaches checking: no cash out.
+            ("Paycheck", [("Assets:Checking", "2000"),
+                          ("Expenses:Taxes", "500"),
+                          ("Income:Salary", "-2500")]),
+            # A card charge moves no cash until it's paid.
+            ("Card charge", [("Expenses:Groceries", "100"),
+                             ("Liabilities:Card", "-100")]),
+            ("Card payment", [("Liabilities:Card", "300"),
+                              ("Assets:Checking", "-300")]),
+            # Pool-internal move nets to zero.
+            ("Sweep", [("Assets:Checking", "-400"),
+                       ("Assets:Savings", "400")]),
+            # Into retirement leaves the pool...
+            ("IRA contribution", [("Assets:Checking", "-250"),
+                                  ("Assets:Retirement Cash", "250")]),
+            # ...and spending from retirement never was in it.
+            ("From IRA", [("Expenses:Groceries", "50"),
+                          ("Assets:Retirement Cash", "-50")]),
+        ]:
+            gc.create_transaction(
+                description=desc,
+                splits=[{"account": a, "amount": v} for a, v in splits],
+                trans_date=when, check_duplicates=False,
+            )
+        with gc.open(readonly=True) as book:
+            burn = gc._daily_cash_burn(book, list(book.transactions))
+        # Card payment 300 + IRA contribution 250. The expense-sum
+        # burn would have read 650 (taxes 500 + groceries 150).
+        assert (burn * 180).quantize(Decimal("0.01")) == Decimal("550")
+
+    def test_burn_is_cash_leaving_a_cash_account(self, test_book: Path):
+        """Spec B7: selling shares into ASSET-typed brokerage cash
+        netted as money leaving the pool (the STOCK leg is liquid,
+        the ASSET cash leg is not). Burn now needs cash to have
+        left the pool AND a BANK/CASH account: the smaller of the
+        two outflows."""
+        gc = GnuCashBook(str(test_book))
+        gc.create_account(name="Brokerage Cash", account_type="ASSET",
+                          parent="Assets")
+        gc.create_commodity(mnemonic="VTI", fullname="Vanguard Total",
+                            namespace="FUND")
+        gc.create_account(name="VTI", account_type="STOCK", parent="Assets",
+                          commodity="VTI", commodity_namespace="FUND")
+        gc.create_account(name="Rent", account_type="EXPENSE", parent="Expenses")
+        when = date.today() - timedelta(days=10)
+        # Buy 10 VTI at 100 from checking, then sell them into
+        # brokerage cash: neither burns.
+        gc.create_transaction(
+            description="Buy",
+            splits=[
+                {"account": "Assets:VTI", "amount": "1000", "quantity": "10"},
+                {"account": "Assets:Checking", "amount": "-1000"},
+            ],
+            trans_date=when, check_duplicates=False,
+        )
+        gc.create_transaction(
+            description="Sell into brokerage cash",
+            splits=[
+                {"account": "Assets:VTI", "amount": "-1000", "quantity": "-10"},
+                {"account": "Assets:Brokerage Cash", "amount": "1000"},
+            ],
+            trans_date=when, check_duplicates=False,
+        )
+        # Rent from checking burns the rent.
+        gc.create_transaction(
+            description="Rent",
+            splits=[
+                {"account": "Expenses:Rent", "amount": "1500"},
+                {"account": "Assets:Checking", "amount": "-1500"},
+            ],
+            trans_date=when, check_duplicates=False,
+        )
+        with gc.open(readonly=True) as book:
+            burn = gc._daily_cash_burn(book, list(book.transactions))
+        assert (burn * 180).quantize(Decimal("0.01")) == Decimal("1500")
+
+    def test_cards_owed_shown_beside_runway(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        gc.create_account(name="Card", account_type="CREDIT", parent="Liabilities")
+        when = date.today() - timedelta(days=10)
+        gc.create_transaction(
+            description="Card charge",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "1234"},
+                {"account": "Liabilities:Card", "amount": "-1234"},
+            ],
+            trans_date=when, check_duplicates=False,
+        )
+        gc.create_transaction(
+            description="Rent",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "300"},
+                {"account": "Assets:Checking", "amount": "-300"},
+            ],
+            trans_date=when, check_duplicates=False,
+        )
+        line = next(
+            ln for ln in gc.get_book_summary().splitlines()
+            if ln.startswith("Runway:")
+        )
+        assert line.endswith("-day avg; cards owe USD 1,234)"), line
+        # Not subtracted: liquid is the fixture's checking minus rent.
+        assert "cards owe" in line and "liquid" in line
+
+    def test_numerator_and_burn_share_one_pool(self):
+        """Runway's liquid sum and the burn read the same predicate
+        — the pool can't be edited in one place and not the other.
+
+        Taxable brokerage positions are liquid; retirement-wrapped
+        holdings are not — decided, not inherited (bookkeeper
+        ruling, 2026-09-24)."""
+        import inspect
+        from gnucash_mcp.book.core import CoreMixin
+        for fn in (CoreMixin._runway_metrics, CoreMixin._daily_cash_burn):
+            assert "_is_runway_liquid(" in inspect.getsource(fn)
+
+
 class TestGetBookSummaryRunway:
     """Runway section in get_book_summary.
 
@@ -1568,14 +1738,15 @@ class TestGetBookSummaryRunway:
         assert "days" in runway_line
         assert "USD" in runway_line
         assert "liquid" in runway_line
-        assert "/day burn" in runway_line
+        assert "/day cash out incl. debt paydown" in runway_line
         # Burn-averaging window is disclosed (book-age clamped,
         # so the exact day count varies with the fixture's age).
         assert "-day avg)" in runway_line
         # Comma-separated for the liquid (2,670).
         assert "2,670" in runway_line
-        # No decimals.
-        assert "." not in runway_line
+        # No decimals (the label's "incl." is prose, not a number).
+        import re
+        assert not re.search(r"\d\.\d", runway_line)
 
     def test_warning_below_60_days(self, test_book: Path):
         """Runway < 60 days → ⚠ marker."""
@@ -2037,9 +2208,54 @@ class TestGetBookSummaryBudgetHeadline:
         result = gc.get_book_summary()
         assert "Budget (Annual Test):" in result
 
+    def test_actuals_stop_at_today(self, budget_book: Path):
+        """Dashboard-accuracy spec A7: budget actuals summed through
+        the budget's end date, so a pre-entered bill already read
+        as "used". A future-dated expense inside the budget span
+        must not move the headline."""
+        today = date.today()
+        tomorrow = today + timedelta(days=1)
+        if tomorrow.year != today.year:
+            pytest.skip("no future date left in this year's budget")
+        gc = GnuCashBook(str(budget_book))
+        self._make_budget_covering_today(gc, "Ahead")
+        gc.set_budget_amount(
+            budget_name="Ahead", account="Expenses:Groceries",
+            amount="500",
+        )
+
+        def headline(result: str) -> str:
+            return next(
+                l for l in result.split("\n") if l.startswith("Budget (")
+            )
+
+        before = headline(gc.get_book_summary())
+        gc.create_transaction(
+            description="Pre-entered bill",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "4000"},
+                {"account": "Assets:Checking", "amount": "-4000"},
+            ],
+            trans_date=tomorrow,
+            check_duplicates=False,
+        )
+        assert headline(gc.get_book_summary()) == before
+        # The same entry dated today does count.
+        gc.create_transaction(
+            description="Bill today",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "4000"},
+                {"account": "Assets:Checking", "amount": "-4000"},
+            ],
+            trans_date=today,
+            check_duplicates=False,
+        )
+        assert headline(gc.get_book_summary()) != before
+
     def test_format_components(self, budget_book: Path):
-        """Headline format: name, % used, % elapsed, variance,
-        optional ⚠. Currency-free, all percentage values."""
+        """Headline format (spec B5): name, spent, expected by
+        today from the budget's own per-period targets, variance
+        against expected, optional ⚠."""
         gc = GnuCashBook(str(budget_book))
         self._make_budget_covering_today(gc, "Test Budget")
         gc.set_budget_amount(
@@ -2049,35 +2265,24 @@ class TestGetBookSummaryBudgetHeadline:
         )
         result = gc.get_book_summary()
         budget_line = next(
-            l for l in result.split("\n") if l.startswith("Budget (")
+            ln for ln in result.split("\n") if ln.startswith("Budget (")
         )
-        # Format pieces — no currency markers (this is %).
-        assert "% used" in budget_line
-        assert "% elapsed" in budget_line
-        # Either "+X% over pace" / "X% under pace" / "on pace" form.
-        assert (
-            "over pace" in budget_line
-            or "under pace" in budget_line
-            or "on pace" in budget_line
-        )
+        assert "USD" in budget_line and " spent / " in budget_line
+        assert "expected by today" in budget_line
+        assert "%)" in budget_line or "(on pace)" in budget_line
 
     def test_overspend_variance_warns_at_10_pct(
         self, budget_book: Path,
     ):
-        """Variance > +10% (used% ahead of elapsed% by more than
-        10 points) earns a ⚠ marker."""
-        # Build a fresh budget book where we control exact numbers.
+        """Spending more than 10% ahead of expected-by-today earns
+        a ⚠ marker."""
         gc = GnuCashBook(str(budget_book))
-        # Anchor the budget to start of current year, num_periods=12
-        # → covers ~all of this calendar year.
         self._make_budget_covering_today(gc, "Overspend")
-        # Tiny budget target → easy to exceed.
         gc.set_budget_amount(
             budget_name="Overspend",
             account="Expenses:Groceries",
             amount="100",  # $100/month × 12 = $1,200 total
         )
-        # Big actual spend in the budget's accounts.
         gc.create_transaction(
             description="Massive grocery run",
             splits=[
@@ -2089,15 +2294,15 @@ class TestGetBookSummaryBudgetHeadline:
         )
         result = gc.get_book_summary()
         budget_line = next(
-            l for l in result.split("\n") if l.startswith("Budget (")
+            ln for ln in result.split("\n") if ln.startswith("Budget (")
         )
-        # Used: 5000 / 1200 = 416% (capped semantically by intent).
-        # Variance vs elapsed = ~416 - elapsed%, well over +10.
+        assert " spent / " in budget_line
         assert "⚠" in budget_line
-        assert "over pace" in budget_line
+        assert "(+" in budget_line
 
     def test_underspend_no_warning(self, budget_book: Path):
-        """Variance ≤ +10% (under pace or close) → no warning marker."""
+        """Nothing spent against a positive expected → negative
+        variance, no warning marker."""
         gc = GnuCashBook(str(budget_book))
         self._make_budget_covering_today(gc, "Underspend")
         gc.set_budget_amount(
@@ -2105,15 +2310,97 @@ class TestGetBookSummaryBudgetHeadline:
             account="Expenses:Groceries",
             amount="10000",
         )
-        # No actuals at all in the budgeted account during the
-        # budget period.
         result = gc.get_book_summary()
         budget_line = next(
-            l for l in result.split("\n") if l.startswith("Budget (")
+            ln for ln in result.split("\n") if ln.startswith("Budget (")
         )
         assert "⚠" not in budget_line
-        # 0% used vs ~partial-year% elapsed → "under pace".
-        assert "under pace" in budget_line
+        assert "(-" in budget_line
+
+    def test_pace_follows_per_period_targets(self, budget_book: Path):
+        """Spec B5: January insurance budgeted only in period 0 and
+        paid in January is ON pace all year — not "over pace"
+        because the linear model spread it across twelve months.
+        A December-only target expects nothing before December."""
+        today = date.today()
+        if today.month == 1 or today.month == 12:
+            pytest.skip("needs a month strictly between January and December")
+        gc = GnuCashBook(str(budget_book))
+        # Fresh accounts: the fixture already spends on Groceries.
+        gc.create_account(name="Insurance", account_type="EXPENSE", parent="Expenses")
+        gc.create_account(name="Gifts", account_type="EXPENSE", parent="Expenses")
+        self._make_budget_covering_today(gc, "Lumpy")
+        gc.set_budget_amount(
+            budget_name="Lumpy", account="Expenses:Insurance",
+            amount="1200", period=0,
+        )
+        gc.set_budget_amount(
+            budget_name="Lumpy", account="Expenses:Gifts",
+            amount="900", period=11,
+        )
+        gc.create_transaction(
+            description="Annual insurance",
+            splits=[
+                {"account": "Expenses:Insurance", "amount": "1200"},
+                {"account": "Assets:Checking", "amount": "-1200"},
+            ],
+            trans_date=date(today.year, 1, 15),
+            check_duplicates=False,
+        )
+        line = next(
+            ln for ln in gc.get_book_summary().split("\n")
+            if ln.startswith("Budget (")
+        )
+        assert line == (
+            "Budget (Lumpy): USD 1,200 spent / USD 1,200 expected by today "
+            "(on pace)"
+        ), line
+
+    def test_yearly_recurrence_paces(self, budget_book: Path):
+        """A yearly budget (one period) pro-rates its target by the
+        day of the year — the Recurrence.cpp port handles every
+        period type, not just month and week."""
+        today = date.today()
+        gc = GnuCashBook(str(budget_book))
+        gc.create_budget(name="Annual", year=today.year, num_periods=1)
+        with gc.open(readonly=False) as book:
+            from piecash.budget import Budget
+            b = book.session.query(Budget).filter_by(name="Annual").one()
+            b.recurrence.recurrence_period_type = "year"
+            b.recurrence.recurrence_mult = 1
+            book.save()
+        gc.set_budget_amount(
+            budget_name="Annual", account="Expenses:Groceries", amount="3650",
+        )
+        line = next(
+            ln for ln in gc.get_book_summary().split("\n")
+            if ln.startswith("Budget (Annual)")
+        )
+        days_in_year = (date(today.year, 12, 31) - date(today.year, 1, 1)).days + 1
+        expected = int(
+            (Decimal(3650) * (today.timetuple().tm_yday) / days_in_year)
+            .quantize(Decimal("1"))
+        )
+        assert f"USD {expected:,} expected by today" in line, line
+
+    def test_unsupported_period_type_is_named_not_omitted(
+        self, budget_book: Path,
+    ):
+        gc = GnuCashBook(str(budget_book))
+        self._make_budget_covering_today(gc, "Odd")
+        gc.set_budget_amount(
+            budget_name="Odd", account="Expenses:Groceries", amount="10",
+        )
+        with gc.open(readonly=False) as book:
+            from piecash.budget import Budget
+            b = book.session.query(Budget).filter_by(name="Odd").one()
+            b.recurrence.recurrence_period_type = "once"
+            book.save()
+        result = gc.get_book_summary()
+        assert (
+            "Budget (Odd): period type 'once' is not one the server can "
+            "pace — no headline computed"
+        ) in result
 
     def test_multiple_budgets_picks_latest_start(
         self, budget_book: Path,
@@ -2170,6 +2457,26 @@ class TestGetBookSummaryWarnings:
     ``specs/GET_BOOK_SUMMARY_SPEC.md`` §5.
     """
 
+
+    @staticmethod
+    def _hold_shares(gc, account, shares="2", cost="250"):
+        """Put a nonzero position in ``account`` — the stale-price
+        check only nags about securities someone actually holds."""
+        with gc.open(readonly=False) as book:
+            sec = gc._find_account(book, account)
+            checking = gc._find_account(book, "Assets:Checking")
+            book.session.add(piecash.Transaction(
+                currency=book.default_currency,
+                description=f"Buy {account}",
+                post_date=date.today() - timedelta(days=5),
+                splits=[
+                    piecash.Split(account=sec, value=Decimal(cost),
+                                  quantity=Decimal(shares)),
+                    piecash.Split(account=checking,
+                                  value=-Decimal(cost)),
+                ],
+            ))
+            book.save()
     def test_section_omitted_when_no_warnings(self, test_book: Path):
         """No warnings → no header, no body — absence is the signal.
         The fixture is a clean book with no integrity issues, no
@@ -2283,7 +2590,14 @@ class TestGetBookSummaryWarnings:
         line. The investment_book fixture has VTSAX with a
         single price on 2026-01-15, which is now well past the
         30-day cutoff."""
+        from tests.conftest import drop_transaction_prices
+
         gc = GnuCashBook(str(investment_book))
+        self._hold_shares(gc, "Assets:Investments:VTSAX")
+        # The buy's implied-rate row is fresh and would value VTSAX
+        # (ruling 2026-09-29); the subject is the stale QUOTE, so
+        # the row goes, as desktop's Price Editor can make it go.
+        assert drop_transaction_prices(investment_book) == 1
         result = gc.get_book_summary()
         assert "Warnings:" in result
         warnings_block = result.split("Warnings:")[1].split(
@@ -2293,11 +2607,36 @@ class TestGetBookSummaryWarnings:
         assert "Stale price" in warnings_block
         assert "days ago" in warnings_block
 
+    def test_stale_price_skips_security_nobody_holds(
+        self, investment_book: Path,
+    ):
+        """A fund swapped out to zero keeps its account and
+        commodity, but a quote for it values nothing — no warning
+        (live book, 2026-09-24: an emptied 401k fund nagged for a
+        price). Holding any shares brings the warning back."""
+        from tests.conftest import drop_transaction_prices
+
+        gc = GnuCashBook(str(investment_book))
+        assert "Stale price" not in gc.get_book_summary()
+        self._hold_shares(gc, "Assets:Investments:VTSAX")
+        # The buy's implied-rate row is fresh and would value VTSAX
+        # (ruling 2026-09-29); the subject is the stale QUOTE, so
+        # the row goes, as desktop's Price Editor can make it go.
+        assert drop_transaction_prices(investment_book) == 1
+        assert "Stale price: VTSAX" in gc.get_book_summary()
+
     def test_unpriced_commodity_in_use_warns_no_price_on_file(
         self, test_book: Path,
     ):
         """A commodity referenced by an account but with no price
-        record at all → 'no price on file' warning."""
+        record at all → 'no price on file' warning.
+
+        Since the 2026-09-29 ruling the purchase's implied-rate row
+        values WILD as desktop does, and a fresh rate warns of
+        nothing; deleting the row — a real state, e.g. after
+        desktop's Price Editor — brings the warning."""
+        from tests.conftest import drop_transaction_prices
+
         gc = GnuCashBook(str(test_book))
         with gc.open(readonly=False) as book:
             from piecash import Commodity
@@ -2316,13 +2655,20 @@ class TestGetBookSummaryWarnings:
                 commodity=wild,
             )
             book.save()
+        self._hold_shares(gc, "Assets:WILD")
+        # The buy's implied rate is 5 days old: valuation uses it,
+        # nothing is stale, and silence is earned by freshness
+        # (bookkeeper ruling, 2026-09-29 evening).
+        result = gc.get_book_summary()
+        assert "Stale price: WILD" not in result
+
+        assert drop_transaction_prices(test_book) > 0
         result = gc.get_book_summary()
         assert "Warnings:" in result
         warnings_block = result.split("Warnings:")[1].split(
             "Accounts:"
         )[0]
-        assert "WILD" in warnings_block
-        assert "no price on file" in warnings_block
+        assert "Stale price: WILD no price on file" in warnings_block
 
     def test_iso_currency_in_use_with_stale_rate_warns(
         self, tmp_path: Path,
@@ -2371,6 +2717,18 @@ class TestGetBookSummaryWarnings:
             commodity=usd,
         )
         b.session.add(opening)
+        # The receivable holds a balance — a currency nobody holds
+        # and nobody has used lately is not checked (spec B1).
+        b.session.add(piecash.Transaction(
+            currency=eur, description="open",
+            post_date=date.today() - timedelta(days=400),
+            splits=[
+                piecash.Split(account=ar_eur, value=Decimal("100"),
+                              quantity=Decimal("100")),
+                piecash.Split(account=opening, value=Decimal("-100"),
+                              quantity=Decimal("-100")),
+            ],
+        ))
         b.save()
 
         # Seed an old EUR price (well past the 30-day staleness
@@ -2484,39 +2842,77 @@ class TestGetBookSummaryWarnings:
             )[0]
             assert "Disabled Schedule" not in warnings_block
 
-    def test_low_cash_below_one_day_burn_warns(
-        self, test_book: Path,
-    ):
-        """A BANK / CASH account whose balance falls below one day
-        of daily expense burn earns a 'Critically low cash:'
-        warning. Threshold scales with the user's actual spending,
-        not a fixed dollar floor.
-
-        Regression for the cousin's report on Alex's $6 Savings
-        account at $683/day burn — relative threshold catches it
-        cleanly."""
-        gc = GnuCashBook(str(test_book))
-        # Seed enough expense activity that daily_burn is high
-        # enough to flag fixture's tiny accounts. With $36,000
-        # over 180 days → $200/day burn. Fixture's Savings doesn't
-        # exist, so add one with a $5 balance.
-        gc.create_account(
-            name="Savings", account_type="BANK", parent="Assets",
-        )
+    def _fund(self, gc, account, amount, days_ago):
         with gc.open(readonly=False) as book:
-            savings = gc._find_account(book, "Assets:Savings")
+            acct = gc._find_account(book, account)
             opening = gc._find_account(book, "Equity:Opening Balance")
             book.session.add(piecash.Transaction(
                 currency=book.default_currency,
-                description="Token deposit",
-                post_date=date.today() - timedelta(days=20),
+                description=f"Fund {account}",
+                post_date=date.today() - timedelta(days=days_ago),
                 splits=[
-                    piecash.Split(account=savings, value=Decimal("5")),
-                    piecash.Split(account=opening, value=Decimal("-5")),
+                    piecash.Split(account=acct, value=Decimal(amount)),
+                    piecash.Split(account=opening,
+                                  value=-Decimal(amount)),
                 ],
             ))
             book.save()
-        # Seed $36,000 of expenses → $200/day burn.
+
+    def test_low_cash_below_one_day_of_own_outflow_warns(
+        self, test_book: Path,
+    ):
+        """A BANK / CASH account whose balance is under one day of
+        its OWN outflow earns a 'Critically low cash:' warning —
+        it's about to run dry at the pace it's actually drawn on."""
+        gc = GnuCashBook(str(test_book))
+        gc.create_account(
+            name="Savings", account_type="BANK", parent="Assets",
+        )
+        self._fund(gc, "Assets:Savings", "1000", 170)
+        # $995 out over the window → ~$5.53/day; $5 left.
+        gc.create_transaction(
+            description="Drawdown",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "995"},
+                {"account": "Assets:Savings", "amount": "-995"},
+            ],
+            trans_date=date.today() - timedelta(days=30),
+            check_duplicates=False,
+        )
+        result = gc.get_book_summary()
+        warnings_block = result.split("Warnings:")[1].split(
+            "Accounts:"
+        )[0]
+        assert "Critically low cash: Savings" in warnings_block
+        assert "under 1 day of its own outflow" in warnings_block
+
+    def test_thin_spillway_does_not_warn_against_household_burn(
+        self, test_book: Path,
+    ):
+        """A small payments account measured against the whole
+        household's burn read "critical" while checking held
+        thousands (live book, 2026-09-24: Cash App at $299 vs
+        $309/day). Against its own $26/day it has 11 days; an
+        account with no outflow at all (a wallet) never fires."""
+        gc = GnuCashBook(str(test_book))
+        gc.create_account(
+            name="Cash App", account_type="BANK", parent="Assets",
+        )
+        gc.create_account(
+            name="Wallet", account_type="CASH", parent="Assets",
+        )
+        self._fund(gc, "Assets:Cash App", "180", 100)  # $150 left
+        self._fund(gc, "Assets:Wallet", "40", 100)
+        gc.create_transaction(
+            description="Small spend",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "30"},
+                {"account": "Assets:Cash App", "amount": "-30"},
+            ],
+            trans_date=date.today() - timedelta(days=20),
+            check_duplicates=False,
+        )
+        # Household burn of $200/day dwarfs both balances.
         gc.create_transaction(
             description="Burn",
             splits=[
@@ -2526,15 +2922,9 @@ class TestGetBookSummaryWarnings:
             trans_date=date.today() - timedelta(days=30),
             check_duplicates=False,
         )
-
         result = gc.get_book_summary()
-        assert "Warnings:" in result
-        warnings_block = result.split("Warnings:")[1].split(
-            "Accounts:"
-        )[0]
-        assert "Critically low cash" in warnings_block
-        assert "Savings" in warnings_block
-        assert "under 1 day of burn" in warnings_block
+        assert "Critically low cash: Cash App" not in result
+        assert "Critically low cash: Wallet" not in result
 
     def test_low_cash_above_one_day_burn_does_not_warn(
         self, test_book: Path,
@@ -2680,9 +3070,8 @@ class TestGetBookSummaryWarnings:
             assert "uncleared suspense balance" in warnings_block
 
     def test_low_cash_skipped_when_no_burn(self, test_book: Path):
-        """When the book has no expense activity in the burn
-        window, there's no daily-burn benchmark. Skip the
-        low-cash check entirely rather than guess a threshold."""
+        """An account with no outflow in the window has no pace to
+        run out at — a deposit-only account never fires."""
         gc = GnuCashBook(str(test_book))
         gc.create_account(
             name="Empty Savings", account_type="BANK", parent="Assets",
@@ -2773,15 +3162,14 @@ class TestGetBookSummaryWarnings:
         assert "Office Depot" in warnings_block
         assert "15 days overdue" in warnings_block
 
-    def test_past_due_invoice_without_terms_falls_back_to_30_days(
+    def test_past_due_invoice_without_terms_is_due_on_posting(
         self, business_book: Path,
     ):
         """An invoice posted without an explicit due_date AND
-        without a billterm falls back to date_posted + 30 days.
-        The warning anchors the days count to that assumption
-        ('N days past 30-day default') and tags '(no term set)'
-        so the bookkeeper sees both the duration and the data
-        gap without the string reading as contractual."""
+        without a billterm is due on its posting date — what
+        desktop does (gncBillTermComputeDueDate(NULL, post) is the
+        posting date). The pre-1.5 30-day default and its
+        '(no term set)' wording are gone (spec A2)."""
         gc = GnuCashBook(str(business_book))
         gc.create_customer(name="No Terms Co", currency="USD")
         gc.create_invoice(
@@ -2795,8 +3183,7 @@ class TestGetBookSummaryWarnings:
             quantity="1",
             price="1500",
         )
-        # post_date 50 days ago + 30-day fallback = 20 days past.
-        # No due_date passed → falls back.
+        # post_date 50 days ago, no due_date, no terms: due that day.
         gc.post_invoice(
             invoice_id="000001",
             post_account="Assets:Accounts Receivable",
@@ -2809,10 +3196,10 @@ class TestGetBookSummaryWarnings:
         )[0]
         assert "Past due invoice" in warnings_block
         assert "No Terms Co" in warnings_block
-        assert "20 days past 30-day default" in warnings_block
-        assert "(no term set)" in warnings_block
-        # Regression: the old wording shouldn't reappear.
-        assert "20 days overdue" not in warnings_block
+        assert "50 days overdue" in warnings_block
+        # The old wording is gone for good.
+        assert "30-day default" not in warnings_block
+        assert "(no term set)" not in warnings_block
         assert "(posted without terms)" not in warnings_block
 
     def test_credit_note_never_ages_into_dashboard_warnings(
@@ -2953,12 +3340,780 @@ class TestGetBookSummaryWarnings:
     ):
         """When emitted, Warnings appears above Accounts — that's
         the scan-first ordering the spec calls for."""
+        from tests.conftest import drop_transaction_prices
+
         gc = GnuCashBook(str(investment_book))
+        self._hold_shares(gc, "Assets:Investments:VTSAX")
+        # The buy's implied-rate row is fresh and would value VTSAX
+        # (ruling 2026-09-29); the subject is the stale QUOTE, so
+        # the row goes, as desktop's Price Editor can make it go.
+        assert drop_transaction_prices(investment_book) == 1
         result = gc.get_book_summary()
         assert "Warnings:" in result
         warnings_idx = result.index("Warnings:")
         accounts_idx = result.index("Accounts:")
         assert warnings_idx < accounts_idx
+
+
+class TestStalePriceReadsValuationRate:
+    """Dashboard-accuracy spec A5: the stale-price collector keyed
+    on ``p.commodity`` only, while ``_rates_as_of`` also rates a
+    commodity that appears only as the QUOTE side of a pair and
+    chains through a pivot. Staleness is now the date of the rate
+    valuation actually uses."""
+
+    @staticmethod
+    def _stale_lines(result: str) -> list[str]:
+        return [
+            ln.strip() for ln in result.splitlines() if "Stale price" in ln
+        ]
+
+    @staticmethod
+    def _book(path, default: str, held: list[tuple]):
+        """``default``-currency book with one BANK account per
+        ``(currency, balance)`` in ``held``, opened from equity.
+
+        An optional third element is the opening's cost in
+        ``default``: the equity leg's quantity, so the implied-rate
+        price row the transaction leaves (which values the holding
+        since the 2026-09-29 ruling) carries a realistic rate. Without
+        it the leg's quantity equals its value — an implied rate of 1."""
+        book = piecash.create_book(str(path), currency=default, overwrite=True)
+        root = book.root_account
+        base = book.default_currency
+        currencies = {default: base}
+        assets = piecash.Account(
+            name="Assets", type="ASSET", parent=root,
+            commodity=base, placeholder=True,
+        )
+        equity = piecash.Account(
+            name="Opening", type="EQUITY", parent=root, commodity=base,
+        )
+        for code, balance, *cost in held:
+            if code not in currencies:
+                currencies[code] = factories.create_currency_from_ISO(code)
+                book.session.add(currencies[code])
+            acct = piecash.Account(
+                name=f"{code} Account", type="BANK", parent=assets,
+                commodity=currencies[code],
+            )
+            amt = Decimal(balance)
+            base_amt = Decimal(cost[0]) if cost else amt
+            book.session.add(piecash.Transaction(
+                currency=currencies[code], description="open",
+                post_date=date.today() - timedelta(days=10),
+                splits=[
+                    piecash.Split(account=acct, value=amt, quantity=amt),
+                    piecash.Split(account=equity, value=-amt,
+                                  quantity=-base_amt),
+                ],
+            ))
+        book.save()
+        return book, currencies
+
+    def test_inverse_only_rate_is_not_stale(self, tmp_path):
+        """EUR book holding USD, priced only as ``1 EUR = 1.08 USD``
+        (commodity EUR, currency USD) today: the USD account values
+        off the inverse, so no stale line — and no phantom "USD no
+        price on file"."""
+        book, cur = self._book(tmp_path / "eur.gnucash", "EUR", [("USD", "1080")])
+        book.session.add(piecash.Price(
+            commodity=cur["EUR"], currency=cur["USD"],
+            date=date.today(), value=Decimal("1.08"),
+        ))
+        book.save()
+        book.close()
+        result = GnuCashBook(str(tmp_path / "eur.gnucash")).get_book_summary()
+        assert self._stale_lines(result) == [], result
+        # ... and the account values through that inverse rate.
+        assert "USD Account: 1080.00 USD @ 0.925" in result and "(EUR 1000.00)" in result, result
+
+    def test_inverse_only_rate_goes_stale_by_its_own_date(self, tmp_path):
+        from tests.conftest import drop_transaction_prices
+
+        book, cur = self._book(tmp_path / "eur2.gnucash", "EUR", [("USD", "1080")])
+        book.session.add(piecash.Price(
+            commodity=cur["EUR"], currency=cur["USD"],
+            date=date.today() - timedelta(days=45), value=Decimal("1.08"),
+        ))
+        book.save()
+        book.close()
+        # The opening's fresh implied row would value USD (ruling
+        # 2026-09-29); the subject is the inverse QUOTE's age.
+        assert drop_transaction_prices(tmp_path / "eur2.gnucash") == 1
+        result = GnuCashBook(str(tmp_path / "eur2.gnucash")).get_book_summary()
+        assert self._stale_lines(result) == [
+            "⚠ Stale price: USD last updated 45 days ago"
+        ], result
+
+    def test_old_implied_rate_warns_and_names_its_source(self, tmp_path):
+        """Bookkeeper ruling (2026-09-29 evening): staleness keys on
+        the date of the rate valuation actually used, whatever its
+        source, one window for all. A 45-day-old transaction-implied
+        rate warns and says what it is; a quote of the same age
+        reads as before."""
+        from sqlalchemy import text
+
+        book, cur = self._book(
+            tmp_path / "old.gnucash", "USD", [("GBP", "500", "630")],
+        )
+        book.close()
+        old = date.today() - timedelta(days=45)
+        gc = GnuCashBook(str(tmp_path / "old.gnucash"))
+        with gc.open(readonly=False) as b:
+            b.session.execute(
+                text("UPDATE prices SET date = :d WHERE type = 'transaction'"),
+                {"d": old.strftime("%Y-%m-%d 10:59:00")},
+            )
+            b.save()
+        result = gc.get_book_summary()
+        assert self._stale_lines(result) == [
+            "⚠ Stale price: GBP valued at the rate of its last "
+            "transaction, 45 days ago"
+        ], result
+        assert "(USD 630.00)" in next(
+            ln for ln in result.splitlines() if "GBP Account" in ln
+        )
+        # A quote newer than the implied rate takes over, and is
+        # measured the same way.
+        gc.create_price("GBP", "CURRENCY", "1.30",
+                        price_date=date.today() - timedelta(days=40))
+        result = gc.get_book_summary()
+        assert self._stale_lines(result) == [
+            "⚠ Stale price: GBP last updated 40 days ago"
+        ], result
+
+    def test_chained_rate_is_as_old_as_its_oldest_leg(self, tmp_path):
+        """USD book holding GBP; GBP is priced only in EUR (today)
+        and EUR in USD (40 days ago). The valuation chains GBP→EUR→
+        USD, so GBP is stale at 40 days, named with its path.
+
+        The subject is the chain, so the opening's implied GBP/USD row
+        (a direct rate, which desktop and the server value by since
+        the 2026-09-29 ruling) is deleted: no direct pair on file."""
+        from tests.conftest import drop_transaction_prices
+
+        book, cur = self._book(tmp_path / "usd.gnucash", "USD", [("GBP", "500")])
+        eur = factories.create_currency_from_ISO("EUR")
+        book.session.add(eur)
+        book.session.add(piecash.Price(
+            commodity=cur["GBP"], currency=eur,
+            date=date.today(), value=Decimal("1.17"),
+        ))
+        book.session.add(piecash.Price(
+            commodity=eur, currency=cur["USD"],
+            date=date.today() - timedelta(days=40), value=Decimal("1.08"),
+        ))
+        book.save()
+        book.close()
+        assert drop_transaction_prices(tmp_path / "usd.gnucash") == 1
+        result = GnuCashBook(str(tmp_path / "usd.gnucash")).get_book_summary()
+        assert self._stale_lines(result) == [
+            "⚠ Stale price: GBP last updated 40 days ago (via EUR)"
+        ], result
+        assert "(via EUR)" in next(
+            ln for ln in result.splitlines() if "GBP Account" in ln
+        )
+
+    def test_currency_is_stale_only_when_it_matters_today(self, tmp_path):
+        """Spec B1: a zero-balance EUR account from a 2019 trip
+        triggered a stale warning forever. A currency is checked
+        only while an account holds it, or a transaction in the
+        last 90 days used it."""
+        path = tmp_path / "trip.gnucash"
+        book, cur = self._book(path, "USD", [("EUR", "300")])
+        eur_acct = next(a for a in book.accounts if a.name == "EUR Account")
+        equity = next(a for a in book.accounts if a.name == "Opening")
+        # Spend it all, years ago: balance zero, no recent activity.
+        with_dates = [date.today() - timedelta(days=9), date(2019, 6, 1)]
+        for s in eur_acct.splits:
+            s.transaction.post_date = with_dates[1]
+        book.session.add(piecash.Transaction(
+            currency=cur["EUR"], description="spent",
+            post_date=date(2019, 6, 2),
+            splits=[
+                piecash.Split(account=eur_acct, value=Decimal("-300"),
+                              quantity=Decimal("-300")),
+                piecash.Split(account=equity, value=Decimal("300"),
+                              quantity=Decimal("300")),
+            ],
+        ))
+        book.session.add(piecash.Price(
+            commodity=cur["EUR"], currency=cur["USD"],
+            date=date(2019, 6, 30), value=Decimal("1.12"),
+        ))
+        book.save()
+        book.close()
+        gc = GnuCashBook(str(path))
+        assert self._stale_lines(gc.get_book_summary()) == []
+        # A EUR transaction last week brings the check back ...
+        gc.create_transaction(
+            description="coffee", currency="EUR",
+            splits=[
+                {"account": "Assets:EUR Account", "amount": "-5"},
+                {"account": "Opening", "amount": "5", "quantity": "5.60"},
+            ],
+            trans_date=with_dates[0], check_duplicates=False,
+        )
+        # That transaction is itself cross-currency, so it leaves a
+        # fresh implied EUR rate — the cure the warning names — and
+        # nothing is stale.
+        assert self._stale_lines(gc.get_book_summary()) == []
+        # With that row gone (the state a same-currency EUR purchase
+        # leaves: activity, no new rate) the stale quote is back.
+        from tests.conftest import drop_transaction_prices
+        # Three implied rows: the 2019 opening and spend, and coffee.
+        assert drop_transaction_prices(path) == 3
+        lines = self._stale_lines(gc.get_book_summary())
+        assert len(lines) == 1 and lines[0].startswith("⚠ Stale price: EUR last updated")
+        # ... as does holding a balance, whatever the activity.
+
+    def test_no_price_on_file_means_cost_basis_fallback(self, tmp_path):
+        """Since the 2026-09-29 ruling the opening's implied rate
+        values GBP as desktop does, and a rate 10 days old warns of
+        nothing. Deleting that row — a book with no price of any
+        type is still real — brings 'no price on file' and the
+        cost-basis fallback."""
+        from tests.conftest import drop_transaction_prices
+
+        book, cur = self._book(
+            tmp_path / "np.gnucash", "USD", [("GBP", "500", "630")],
+        )
+        book.close()
+        result = GnuCashBook(str(tmp_path / "np.gnucash")).get_book_summary()
+        assert self._stale_lines(result) == [], result
+        assert "(USD 630.00)" in next(
+            ln for ln in result.splitlines() if "GBP Account" in ln
+        )
+
+        assert drop_transaction_prices(tmp_path / "np.gnucash") == 1
+        result = GnuCashBook(str(tmp_path / "np.gnucash")).get_book_summary()
+        assert self._stale_lines(result) == [
+            "⚠ Stale price: GBP no price on file"
+        ], result
+
+
+class TestDashboardOverdueAgreesWithOutstanding:
+    """Dashboard-accuracy spec A1: the Receivables line's overdue
+    count, the Past-due warnings, and get_outstanding_documents'
+    ``days_past_due > 0`` rows are one number, because all three
+    read ``_document_settlement``. The book holds the three shapes
+    that used to disagree: an overpaid invoice (rendered "Past due
+    … USD 50" through ``abs()``), a credit note, and a 0.75
+    residual (rendered "USD 0" through ``int()``)."""
+
+    def _post(self, gc, customer_id, price, due_days_ago):
+        inv = gc.create_invoice(
+            customer_id=customer_id,
+            date_opened=(date.today() - timedelta(days=60)).isoformat(),
+        )
+        gc.add_invoice_entry(
+            invoice_id=inv["id"], account="Income:Sales",
+            description="Service", quantity="1", price=price,
+        )
+        gc.post_invoice(
+            invoice_id=inv["id"],
+            post_account="Assets:Accounts Receivable",
+            post_date=(date.today() - timedelta(days=60)).isoformat(),
+            due_date=(date.today() - timedelta(days=due_days_ago)).isoformat(),
+        )
+        return inv["id"]
+
+    def test_three_shapes(self, business_book: Path):
+        from sqlalchemy import text
+        gc = GnuCashBook(str(business_book))
+        gc.create_customer(name="Residual Co", currency="USD")
+        gc.create_customer(name="Overpaid Co", currency="USD")
+        gc.create_customer(name="Credit Co", currency="USD")
+
+        # 1. A 0.75 residual, 20 days overdue.
+        residual = self._post(gc, "000001", "100.75", 20)
+        gc.pay_invoice(
+            invoice_id=residual, payment_account="Assets:Checking",
+            amount="100", payment_date=date.today().isoformat(),
+        )
+
+        # 2. An overpaid invoice, due date long past. pay_invoice
+        # refuses overpayment now, but warning-era books carry it:
+        # engineer the state the way those books hold it.
+        overpaid = self._post(gc, "000002", "100", 30)
+        gc.pay_invoice(
+            invoice_id=overpaid, payment_account="Assets:Checking",
+            amount="100", payment_date=date.today().isoformat(),
+        )
+        with gc.open(readonly=False) as book:
+            lot_guid, post_tx = book.session.execute(
+                text(
+                    "SELECT post_lot, post_txn FROM invoices "
+                    "WHERE id = :id"
+                ),
+                {"id": overpaid},
+            ).first()
+            pay_tx = book.session.execute(
+                text(
+                    "SELECT tx_guid FROM splits WHERE lot_guid = :lot "
+                    "AND tx_guid != :post"
+                ),
+                {"lot": lot_guid, "post": post_tx},
+            ).scalar()
+            # A/R leg -100 -> -150; bank leg +100 -> +150 (USD/100).
+            book.session.execute(
+                text(
+                    "UPDATE splits SET value_num = value_num - 5000, "
+                    "quantity_num = quantity_num - 5000 "
+                    "WHERE tx_guid = :tx AND lot_guid = :lot"
+                ),
+                {"tx": pay_tx, "lot": lot_guid},
+            )
+            book.session.execute(
+                text(
+                    "UPDATE splits SET value_num = value_num + 5000, "
+                    "quantity_num = quantity_num + 5000 "
+                    "WHERE tx_guid = :tx AND (lot_guid IS NULL OR lot_guid != :lot)"
+                ),
+                {"tx": pay_tx, "lot": lot_guid},
+            )
+            book.save()
+
+        # 3. An unapplied credit note.
+        cn = gc.create_credit_note(
+            owner_id="000003", owner_type="customer",
+            date_opened=(date.today() - timedelta(days=90)).isoformat(),
+        )
+        gc.add_credit_note_entry(
+            credit_note_id=cn["id"], account="Income:Sales",
+            description="Service credit", quantity="1", price="500",
+        )
+        gc.post_invoice(
+            invoice_id=cn["id"], post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+            post_date=(date.today() - timedelta(days=90)).isoformat(),
+        )
+
+        outstanding = gc.get_outstanding_invoices(compact=False)["invoices"]
+        assert len(outstanding) == 3
+        by_name = {r["owner_name"]: r for r in outstanding}
+        assert by_name["Overpaid Co"]["overpaid"] is True
+        assert by_name["Overpaid Co"]["days_past_due"] is None
+        overdue_rows = [
+            r for r in outstanding if (r["days_past_due"] or 0) > 0
+        ]
+        assert [r["owner_name"] for r in overdue_rows] == ["Residual Co"]
+
+        result = gc.get_book_summary()
+        receivables = next(
+            ln for ln in result.splitlines() if ln.startswith("Receivables:")
+        )
+        assert "(3 invoices, 1 overdue;" in receivables, receivables
+        past_due = [
+            ln.strip() for ln in result.splitlines() if "Past due" in ln
+        ]
+        assert past_due == [
+            "⚠ Past due invoice: Residual Co 20 days overdue, USD 0.75"
+        ], past_due
+        assert len(past_due) == len(overdue_rows)
+
+
+class TestClosedAccountsGoQuiet:
+    """Spec B3. "Never reconciled ⚠" fired forever on a zero-balance
+    card paid off years ago, and nothing on the dashboard read
+    GnuCash's ``hidden`` flag — desktop's way of closing an
+    account."""
+
+    @staticmethod
+    def _card(gc, name, when, amount, hidden=False):
+        gc.create_account(name=name, account_type="CREDIT", parent="Liabilities")
+        gc.create_transaction(
+            description=f"{name} charge",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": amount},
+                {"account": f"Liabilities:{name}", "amount": f"-{amount}"},
+            ],
+            trans_date=when, check_duplicates=False,
+        )
+        gc.create_transaction(
+            description=f"{name} payoff",
+            splits=[
+                {"account": f"Liabilities:{name}", "amount": amount},
+                {"account": "Assets:Checking", "amount": f"-{amount}"},
+            ],
+            trans_date=when + timedelta(days=1), check_duplicates=False,
+        )
+        if hidden:
+            with gc.open(readonly=False) as book:
+                gc._find_account(book, f"Liabilities:{name}").hidden = 1
+                book.save()
+
+    @staticmethod
+    def _recon(result):
+        return result.split("Reconciliation:")[1].split("\nNet worth")[0]
+
+    def test_paid_off_card_never_reconciled_is_dormant(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        self._card(gc, "Old Card", date.today() - timedelta(days=400), "120")
+        recon = self._recon(gc.get_book_summary())
+        assert "1 account dormant ($0, idle)" in recon, recon
+        status = gc.get_reconciliation_status()
+        assert "Liabilities:Old Card\tdormant\t" in status
+
+    def test_recently_active_zero_card_is_still_never_reconciled(
+        self, test_book: Path,
+    ):
+        gc = GnuCashBook(str(test_book))
+        self._card(gc, "Live Card", date.today() - timedelta(days=30), "120")
+        recon = self._recon(gc.get_book_summary())
+        assert "dormant" not in recon
+        assert "Liabilities:Live Card\tnever\t" in gc.get_reconciliation_status()
+
+    def test_hidden_zero_balance_account_is_excluded(self, tmp_path: Path):
+        """Hidden with nothing in it: out of reconciliation and out
+        of the stale-price check (a EUR card closed years ago no
+        longer keeps EUR in use)."""
+        path = tmp_path / "closed.gnucash"
+        book = piecash.create_book(str(path), currency="USD", overwrite=True)
+        root = book.root_account
+        usd = book.default_currency
+        eur = factories.create_currency_from_ISO("EUR")
+        book.session.add(eur)
+        liab = piecash.Account(
+            name="Liabilities", type="LIABILITY", parent=root,
+            commodity=usd, placeholder=True,
+        )
+        card = piecash.Account(
+            name="EUR Card", type="CREDIT", parent=liab, commodity=eur,
+            hidden=1,
+        )
+        equity = piecash.Account(
+            name="Opening", type="EQUITY", parent=root, commodity=eur,
+        )
+        long_ago = date.today() - timedelta(days=900)
+        for amt in ("-100", "100"):
+            book.session.add(piecash.Transaction(
+                currency=eur, description="x", post_date=long_ago,
+                splits=[
+                    piecash.Split(account=card, value=Decimal(amt),
+                                  quantity=Decimal(amt)),
+                    piecash.Split(account=equity, value=-Decimal(amt),
+                                  quantity=-Decimal(amt)),
+                ],
+            ))
+        book.session.add(piecash.Price(
+            commodity=eur, currency=usd, date=long_ago, value=Decimal("1.1"),
+        ))
+        book.save()
+        book.close()
+        result = GnuCashBook(str(path)).get_book_summary()
+        assert "Stale price" not in result, result
+        assert "never reconciled" not in result
+        status = GnuCashBook(str(path)).get_reconciliation_status()
+        assert "excluded (hidden, zero balance)" in status
+
+    def test_hidden_account_with_a_balance_stays_visible(self, test_book: Path):
+        """Money sitting in a closed account is itself a finding."""
+        gc = GnuCashBook(str(test_book))
+        gc.create_account(name="Hidden Card", account_type="CREDIT", parent="Liabilities")
+        gc.create_transaction(
+            description="charge",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "40"},
+                {"account": "Liabilities:Hidden Card", "amount": "-40"},
+            ],
+            trans_date=date.today() - timedelta(days=400), check_duplicates=False,
+        )
+        with gc.open(readonly=False) as book:
+            gc._find_account(book, "Liabilities:Hidden Card").hidden = 1
+            book.save()
+        recon = self._recon(gc.get_book_summary())
+        assert "never reconciled ⚠" in recon
+        assert "Liabilities:Hidden Card\tnever\t" in gc.get_reconciliation_status()
+
+
+class TestGetBookSummaryBalanceIntegrity:
+    """``N unbalanced transactions (oldest …) — get_transaction to
+    inspect`` — dashboard-accuracy spec A8. Integrity checks looked
+    only at Imbalance/Orphan balances, so a transaction whose split
+    values don't sum to zero (raw-SQL imports, other tools,
+    corruption) was never reported unless GnuCash had parked the
+    remainder itself."""
+
+    @staticmethod
+    def _integrity_lines(result: str) -> list[str]:
+        return [
+            ln.strip() for ln in result.splitlines()
+            if "unbalanced transaction" in ln
+        ]
+
+    def test_engineered_unbalanced_transaction_yields_one_line(
+        self, test_book: Path,
+    ):
+        gc = GnuCashBook(str(test_book))
+        assert self._integrity_lines(gc.get_book_summary()) == []
+        when = date.today() - timedelta(days=40)
+        created = gc.create_transaction(
+            description="Will be broken",
+            splits=[
+                {"account": "Assets:Checking", "amount": "100"},
+                {"account": "Income:Salary", "amount": "-100"},
+            ],
+            trans_date=when,
+        )
+        # Break it the way a foreign writer would: one split's value
+        # edited underneath the transaction.
+        from sqlalchemy import text
+        with gc.open(readonly=False) as book:
+            book.session.execute(
+                text(
+                    "UPDATE splits SET value_num = value_num + 500 "
+                    "WHERE tx_guid LIKE :g AND value_num > 0"
+                ),
+                {"g": created["guid"] + "%"},
+            )
+            book.save()
+        lines = self._integrity_lines(gc.get_book_summary())
+        assert lines == [
+            f"⚠ 1 unbalanced transaction (oldest {when.isoformat()}) "
+            f"— get_transaction to inspect"
+        ]
+
+    def test_value_quantity_disagreement_on_same_commodity_split(
+        self, test_book: Path,
+    ):
+        """A USD split in a USD transaction whose value and quantity
+        differ is the other shape of the same defect."""
+        gc = GnuCashBook(str(test_book))
+        created = gc.create_transaction(
+            description="Quantity drift",
+            splits=[
+                {"account": "Assets:Checking", "amount": "100"},
+                {"account": "Income:Salary", "amount": "-100"},
+            ],
+            trans_date=date.today() - timedelta(days=2),
+        )
+        from sqlalchemy import text
+        with gc.open(readonly=False) as book:
+            book.session.execute(
+                text(
+                    "UPDATE splits SET quantity_num = quantity_num + 1 "
+                    "WHERE tx_guid LIKE :g AND value_num > 0"
+                ),
+                {"g": created["guid"] + "%"},
+            )
+            book.save()
+        assert len(self._integrity_lines(gc.get_book_summary())) == 1
+
+    @pytest.mark.parametrize(
+        "sample",
+        ["alex-chen-morales.gnucash", "lin-wei.gnucash", "sabine-brenner.gnucash"],
+    )
+    def test_sample_books_are_balanced(self, sample, tmp_path):
+        src = Path(__file__).resolve().parent.parent / "samples" / sample
+        if not src.exists():
+            pytest.skip(f"{sample} not present")
+        import shutil
+        path = tmp_path / sample
+        shutil.copy(src, path)
+        assert self._integrity_lines(GnuCashBook(str(path)).get_book_summary()) == []
+
+
+class TestLowCashScheduledOutflow:
+    """Spec B6. Low-cash fired only when the balance fell under one
+    day of the account's average outflow, so checking at 400 with
+    a 2,100 mortgage scheduled in 3 days stayed silent."""
+
+    @staticmethod
+    def _set_checking(gc, target):
+        delta = Decimal(target) - gc.get_balance("Assets:Checking")
+        gc.create_transaction(
+            description="adjust",
+            splits=[
+                {"account": "Assets:Checking", "amount": str(delta)},
+                {"account": "Income:Salary", "amount": str(-delta)},
+            ],
+            trans_date=date.today() - timedelta(days=2),
+            check_duplicates=False,
+        )
+
+    @staticmethod
+    def _low_cash_lines(result):
+        return [
+            ln.strip() for ln in result.splitlines()
+            if "Low cash" in ln or "Critically low cash" in ln
+        ]
+
+    def test_scheduled_bill_exceeding_balance_warns(self, scheduled_book):
+        gc = GnuCashBook(str(scheduled_book))
+        self._set_checking(gc, "400")
+        due = date.today() + timedelta(days=3)
+        gc.create_scheduled_transaction(
+            name="Mortgage", description="Mortgage",
+            splits=[
+                {"account": "Expenses:Rent", "amount": "2100"},
+                {"account": "Assets:Checking", "amount": "-2100"},
+            ],
+            start_date=due.isoformat(), frequency="monthly",
+        )
+        assert self._low_cash_lines(gc.get_book_summary()) == [
+            f"⚠ Low cash: Checking at USD 400.00, USD 2,100.00 scheduled "
+            f"out by {due.isoformat()}"
+        ]
+
+    def test_balance_covering_the_week_does_not_warn(self, scheduled_book):
+        gc = GnuCashBook(str(scheduled_book))
+        self._set_checking(gc, "2500")
+        gc.create_scheduled_transaction(
+            name="Mortgage", description="Mortgage",
+            splits=[
+                {"account": "Expenses:Rent", "amount": "2100"},
+                {"account": "Assets:Checking", "amount": "-2100"},
+            ],
+            start_date=(date.today() + timedelta(days=3)).isoformat(),
+            frequency="monthly",
+        )
+        assert self._low_cash_lines(gc.get_book_summary()) == []
+
+    def test_bill_beyond_the_week_does_not_count(self, scheduled_book):
+        gc = GnuCashBook(str(scheduled_book))
+        self._set_checking(gc, "400")
+        gc.create_scheduled_transaction(
+            name="Mortgage", description="Mortgage",
+            splits=[
+                {"account": "Expenses:Rent", "amount": "2100"},
+                {"account": "Assets:Checking", "amount": "-2100"},
+            ],
+            start_date=(date.today() + timedelta(days=10)).isoformat(),
+            frequency="monthly",
+        )
+        assert self._low_cash_lines(gc.get_book_summary()) == []
+
+    def test_new_account_pace_divides_by_its_own_age(self, test_book):
+        """A five-day-old wallet that spent 90 of its 100 has a pace
+        of 18/day, not 0.5/day over the 180-day window — its 10
+        left is under one day of outflow."""
+        gc = GnuCashBook(str(test_book))
+        gc.create_account(name="Wallet", account_type="CASH", parent="Assets")
+        gc.create_transaction(
+            description="fund",
+            splits=[
+                {"account": "Assets:Wallet", "amount": "100"},
+                {"account": "Assets:Checking", "amount": "-100"},
+            ],
+            trans_date=date.today() - timedelta(days=5), check_duplicates=False,
+        )
+        gc.create_transaction(
+            description="spend",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "90"},
+                {"account": "Assets:Wallet", "amount": "-90"},
+            ],
+            trans_date=date.today() - timedelta(days=1), check_duplicates=False,
+        )
+        lines = self._low_cash_lines(gc.get_book_summary())
+        assert lines == [
+            "⚠ Critically low cash: Wallet at USD 10.00 "
+            "(under 1 day of its own outflow)"
+        ], lines
+
+
+class TestGetBookSummaryOverdraft:
+    """``Overdrawn: <leaf> at <CUR> -X`` — dashboard-accuracy spec
+    A4. Low-cash skips balances at or below zero and runway flags
+    only when the whole liquid pool is negative, so an individual
+    overdraft beside a healthy savings balance was flagged nowhere.
+    """
+
+    def _seed(self, gc: GnuCashBook, account: str, target: str) -> None:
+        """Drive ``account`` to an absolute balance of ``target`` as
+        of three days ago (the fixture's Checking already holds a
+        positive balance)."""
+        delta = Decimal(target) - gc.get_balance(account)
+        gc.create_transaction(
+            description=f"seed {account}",
+            splits=[
+                {"account": account, "amount": str(delta)},
+                {"account": "Income:Salary", "amount": str(-delta)},
+            ],
+            trans_date=date.today() - timedelta(days=3),
+            check_duplicates=False,
+        )
+
+    @staticmethod
+    def _warnings(result: str) -> str:
+        if "Warnings:" not in result:
+            return ""
+        return result.split("Warnings:")[1].split("Accounts:")[0]
+
+    def test_overdrawn_checking_beside_healthy_savings(
+        self, test_book: Path,
+    ):
+        gc = GnuCashBook(str(test_book))
+        gc.create_account(name="Savings", account_type="BANK", parent="Assets")
+        self._seed(gc, "Assets:Savings", "10000")
+        self._seed(gc, "Assets:Checking", "-300")
+        result = gc.get_book_summary()
+        block = self._warnings(result)
+        lines = [ln for ln in block.splitlines() if "Overdrawn" in ln]
+        assert lines == ["  ⚠ Overdrawn: Checking at USD -300.00"], block
+        # Runway still reads the pool as positive — the overdraft
+        # is not double-reported as "0 days".
+        assert "0 days ⚠" not in result
+
+    def test_overdrawn_sorts_most_negative_first_and_precedes_low_cash(
+        self, test_book: Path,
+    ):
+        gc = GnuCashBook(str(test_book))
+        gc.create_account(name="Savings", account_type="BANK", parent="Assets")
+        gc.create_account(name="Wallet", account_type="CASH", parent="Assets")
+        self._seed(gc, "Assets:Savings", "-50.25")
+        self._seed(gc, "Assets:Checking", "-1200")
+        # A thin wallet with its own outflow trips low-cash.
+        self._seed(gc, "Assets:Wallet", "1000")
+        gc.create_transaction(
+            description="wallet spend",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "999.50"},
+                {"account": "Assets:Wallet", "amount": "-999.50"},
+            ],
+            trans_date=date.today() - timedelta(days=1),
+            check_duplicates=False,
+        )
+        block = self._warnings(gc.get_book_summary())
+        flagged = [
+            ln.strip() for ln in block.splitlines()
+            if "Overdrawn" in ln or "Critically low cash" in ln
+        ]
+        assert flagged[:2] == [
+            "⚠ Overdrawn: Checking at USD -1,200.00",
+            "⚠ Overdrawn: Savings at USD -50.25",
+        ], block
+        # The low-cash amount renders at the currency's quantum too.
+        assert flagged[2].startswith("⚠ Critically low cash: Wallet at USD 0.50")
+
+    def test_future_dated_deposit_does_not_clear_an_overdraft(
+        self, test_book: Path,
+    ):
+        gc = GnuCashBook(str(test_book))
+        self._seed(gc, "Assets:Checking", "-300")
+        gc.create_transaction(
+            description="payday next week",
+            splits=[
+                {"account": "Assets:Checking", "amount": "5000"},
+                {"account": "Income:Salary", "amount": "-5000"},
+            ],
+            trans_date=date.today() + timedelta(days=7),
+            check_duplicates=False,
+        )
+        assert "Overdrawn: Checking at USD -300.00" in gc.get_book_summary()
+
+    def test_retirement_and_placeholder_accounts_are_not_watched(
+        self, test_book: Path,
+    ):
+        gc = GnuCashBook(str(test_book))
+        gc.create_account(
+            name="Retirement", account_type="BANK", parent="Assets",
+        )
+        gc.set_account_slot("Assets:Retirement", "is_retirement", "1")
+        self._seed(gc, "Assets:Retirement", "-300")
+        assert "Overdrawn" not in gc.get_book_summary()
 
 
 class TestGetBookSummaryLastEntry:
@@ -3076,8 +4231,9 @@ class TestGetBookSummaryLastEntry:
         transaction post_date is in the future (e.g. a scheduled-
         transaction instantiation that posts ahead of time), the
         line must not render as "(yesterday)" or "(N days
-        behind)". Future-dated transactions are normal — but a
-        date 31 days in the future shouldn't be called "yesterday."
+        behind)". A future entry never stands in for the last
+        entry: with nothing on or before today the line says so,
+        and the future entry is counted beside it.
         """
         # 31 days in the future = "next month" in the bookkeeper's
         # repro case.
@@ -3088,9 +4244,10 @@ class TestGetBookSummaryLastEntry:
             l for l in result.splitlines()
             if l.startswith("Last entry:")
         )
-        assert "future-dated" in last_line
-        assert "31 days ahead" in last_line
-        # Future-dated entries are not "behind" — no ⚠.
+        assert "none on or before today" in last_line
+        latest = (date.today() + timedelta(days=31)).isoformat()
+        assert f"(1 future-dated, latest {latest})" in last_line
+        # Nothing to be behind on — no ⚠.
         assert "⚠" not in last_line
         # And specifically NOT mislabeled as recent past.
         assert "yesterday" not in last_line
@@ -3100,7 +4257,7 @@ class TestGetBookSummaryLastEntry:
         self, tmp_path: Path,
     ):
         """Boundary: one day ahead is still future-dated, not
-        "today" — the cutoff is strictly ``days_behind >= 0``."""
+        "today" — ``_entry_dates`` caps ``last`` strictly at today."""
         path = self._book_with_last_entry_n_days_ago(tmp_path, -1)
         gc = GnuCashBook(str(path))
         result = gc.get_book_summary()
@@ -3108,8 +4265,58 @@ class TestGetBookSummaryLastEntry:
             l for l in result.splitlines()
             if l.startswith("Last entry:")
         )
-        assert "future-dated" in last_line
-        assert "1 days ahead" in last_line
+        assert "none on or before today" in last_line
+        assert "1 future-dated" in last_line
+        assert "today)" not in last_line
+
+    def test_future_dated_entry_does_not_hide_staleness(
+        self, tmp_path: Path,
+    ):
+        """Dashboard-accuracy spec A3: "Last entry" was
+        ``max(post_date)`` over every transaction, so one entry
+        dated ahead — a bill posted ahead, or a 2062 typo —
+        switched off the staleness ⚠ and the staleness note that
+        frames the time-based warnings. The last entry is the
+        latest on or before today; future entries are counted
+        beside it, and one more than a year ahead gets its own ⚠.
+        """
+        path = self._book_with_last_entry_n_days_ago(tmp_path, 30)
+        gc = GnuCashBook(str(path))
+        typo = date(2062, 3, 15)
+        gc.create_transaction(
+            description="Typo year",
+            splits=[
+                {"account": "Assets:Checking", "amount": "10"},
+                {"account": "Income:Salary", "amount": "-10"},
+            ],
+            trans_date=typo,
+        )
+        result = gc.get_book_summary()
+        lines = result.splitlines()
+        last_line = next(l for l in lines if l.startswith("Last entry:"))
+        thirty = (date.today() - timedelta(days=30)).isoformat()
+        assert last_line.startswith(f"Last entry: {thirty} (30 days behind) ⚠")
+        assert "(1 future-dated, latest 2062-03-15)" in last_line
+        # The true data range still spans the future entry.
+        range_line = next(l for l in lines if l.startswith("Data range:"))
+        assert range_line.endswith("to 2062-03-15")
+        # The typo-class entry earns its own warning.
+        assert (
+            "⚠ 1 transaction dated more than a year ahead "
+            "(latest 2062-03-15)"
+        ) in result
+        # ... and a bill posted ahead by a week does not.
+        gc.create_transaction(
+            description="Posted ahead",
+            splits=[
+                {"account": "Assets:Checking", "amount": "10"},
+                {"account": "Income:Salary", "amount": "-10"},
+            ],
+            trans_date=date.today() + timedelta(days=7),
+        )
+        result = gc.get_book_summary()
+        assert "(2 future-dated, latest 2062-03-15)" in result
+        assert "1 transaction dated more than a year ahead" in result
 
 
 class TestGetBookSummaryUpcomingScheduled:
@@ -3319,89 +4526,114 @@ class TestGetBookSummaryReconciliationSplitCount:
         assert "⚠" in recon_line
 
 
-class TestReconciliationLagFromOldestUnreconciled:
-    """The lag rendered for an account with pending reconciliation
-    work must reflect the OLDEST unreconciled split, not the
-    LATEST reconciled split. The bookkeeper plans against the
-    scope of work — "4 months behind" implies one sitting; "6
-    years behind" implies six years of statements. Misreporting
-    the lag costs a day of mismatched expectations.
+class TestReconciliationBehindVsOutstanding:
+    """Spec B2: "behind" is measured from the oldest unreconciled
+    split AFTER the last reconcile. Unreconciled splits dated
+    before it are outstanding items — a cheque that never cleared
+    — which get a note, no stronger, once the oldest is more than
+    90 days older than the last reconcile. Pre-B2 the lag anchored
+    to the oldest unreconciled split of any date, so one stale
+    cheque made a monthly-reconciled account read "6 years
+    behind ⚠".
     """
 
-    def test_lag_reflects_oldest_unreconciled_not_latest_y(
+    @staticmethod
+    def _add(gc, when, amount, description):
+        with gc.open(readonly=False) as book:
+            checking = gc._find_account(book, "Assets:Checking")
+            opening = gc._find_account(book, "Equity:Opening Balance")
+            book.session.add(piecash.Transaction(
+                currency=book.default_currency,
+                description=description, post_date=when,
+                splits=[
+                    piecash.Split(account=checking, value=Decimal(amount)),
+                    piecash.Split(account=opening, value=-Decimal(amount)),
+                ],
+            ))
+            book.save()
+
+    @staticmethod
+    def _reconcile_all_through(gc, through):
+        from datetime import datetime as _dt
+        with gc.open(readonly=False) as book:
+            checking = gc._find_account(book, "Assets:Checking")
+            for s in checking.splits:
+                if s.transaction.post_date <= through:
+                    s.reconcile_state = "y"
+                    s.reconcile_date = _dt.combine(through, _dt.min.time())
+            book.save()
+
+    def test_one_stale_cheque_is_a_note_not_years_behind(
         self, test_book: Path,
     ):
-        """Reconcile a RECENT split; leave an OLD split unreconciled.
-        The dashboard lag should describe the old gap, not the
-        recent reconciliation date.
-        """
-        from datetime import date as _date, timedelta, datetime as _dt
         gc = GnuCashBook(str(test_book))
-
-        # Add an OLD unreconciled split (5 years ago).
-        old_date = _date.today() - timedelta(days=5 * 365)
+        old_date = date.today() - timedelta(days=5 * 365)
+        recent = date.today() - timedelta(days=10)
+        self._add(gc, old_date, "100", "Cheque that never cleared")
+        self._add(gc, recent, "50", "Recent deposit")
+        self._reconcile_all_through(gc, recent)
+        # Un-reconcile just the old cheque.
         with gc.open(readonly=False) as book:
             checking = gc._find_account(book, "Assets:Checking")
-            opening = gc._find_account(book, "Equity:Opening Balance")
-            book.session.add(piecash.Transaction(
-                currency=book.default_currency,
-                description="Old skipped deposit",
-                post_date=old_date,
-                splits=[
-                    piecash.Split(account=checking, value=Decimal("100")),
-                    piecash.Split(account=opening, value=Decimal("-100")),
-                ],
-            ))
-            book.save()
-
-        # Reconcile a RECENT split (10 days ago) on Checking.
-        recent_date = _date.today() - timedelta(days=10)
-        with gc.open(readonly=False) as book:
-            checking = gc._find_account(book, "Assets:Checking")
-            opening = gc._find_account(book, "Equity:Opening Balance")
-            book.session.add(piecash.Transaction(
-                currency=book.default_currency,
-                description="Recent reconciled deposit",
-                post_date=recent_date,
-                splits=[
-                    piecash.Split(account=checking, value=Decimal("50")),
-                    piecash.Split(account=opening, value=Decimal("-50")),
-                ],
-            ))
-            book.save()
             for s in checking.splits:
-                if s.transaction.post_date == recent_date:
-                    s.reconcile_state = "y"
-                    s.reconcile_date = _dt.combine(
-                        recent_date, _dt.min.time(),
-                    )
+                if s.transaction.post_date == old_date:
+                    s.reconcile_state = "n"
             book.save()
 
         result = gc.get_book_summary()
-        recon_line = next(
-            l for l in result.splitlines()
-            if "Checking" in l and "oldest:" in l
-        )
-        # Lag must NOT be "10 days behind" / "1 week behind" — that
-        # would describe the gap to ``latest_y_date``, not the real
-        # scope of work.
-        assert "10 days behind" not in recon_line, (
-            f"lag computed from latest_y_date instead of oldest "
-            f"unreconciled: {recon_line!r}"
-        )
-        # It should land in the "years" branch — 5 years ago.
+        recon = result.split("Reconciliation:")[1].split("\nNet worth")[0]
+        # Current, not behind — no per-account ⚠ line.
+        assert "1 account current" in recon, recon
+        assert "behind" not in recon
+        assert "⚠" not in recon
+        # The cheque is an outstanding item, with its date and amount.
         assert (
-            "5 years behind" in recon_line
-            or "4 years behind" in recon_line
-        ), (
-            f"expected years-scale lag from oldest unreconciled; "
-            f"got: {recon_line!r}"
-        )
-        # And the oldest date itself appears in the line.
-        assert old_date.isoformat() in recon_line, (
-            f"oldest date {old_date} not surfaced in line: "
-            f"{recon_line!r}"
-        )
+            f"  Checking: 1 outstanding item older than last reconcile "
+            f"(oldest {old_date.isoformat()}, USD 100.00 net)"
+        ) in recon, recon
+
+        # The drill-down makes the same split.
+        status = gc.get_reconciliation_status()
+        line = next(ln for ln in status.splitlines() if "Assets:Checking" in ln)
+        assert "\tcurrent\t" in line
+        assert f"1 outstanding older than last reconcile (oldest: {old_date.isoformat()})" in line
+        assert "unreconciled" not in line
+
+    def test_recent_outstanding_item_gets_no_note(self, test_book: Path):
+        """An item less than 90 days older than the last reconcile
+        is ordinary float, not a signal."""
+        gc = GnuCashBook(str(test_book))
+        recent = date.today() - timedelta(days=10)
+        float_date = recent - timedelta(days=30)
+        self._add(gc, float_date, "100", "In transit")
+        self._add(gc, recent, "50", "Recent deposit")
+        self._reconcile_all_through(gc, recent)
+        with gc.open(readonly=False) as book:
+            checking = gc._find_account(book, "Assets:Checking")
+            for s in checking.splits:
+                if s.transaction.post_date == float_date:
+                    s.reconcile_state = "n"
+            book.save()
+        recon = gc.get_book_summary().split("Reconciliation:")[1].split("\nNet worth")[0]
+        assert "outstanding" not in recon
+        assert "1 account current" in recon
+
+    def test_backlog_after_last_reconcile_still_reads_behind(
+        self, test_book: Path,
+    ):
+        """Splits dated after the last reconcile are backlog and
+        anchor the lag as before."""
+        gc = GnuCashBook(str(test_book))
+        old = date.today() - timedelta(days=200)
+        self._add(gc, old, "100", "Reconciled long ago")
+        self._reconcile_all_through(gc, old)
+        backlog = date.today() - timedelta(days=120)
+        self._add(gc, backlog, "50", "Never reconciled since")
+        recon = gc.get_book_summary().split("Reconciliation:")[1].split("\nNet worth")[0]
+        line = next(ln for ln in recon.splitlines() if "Checking" in ln)
+        assert "4 months behind" in line and f"oldest: {backlog.isoformat()}" in line
+        assert "⚠" in line
+        assert "outstanding" not in recon
 
 
 class TestGetBookSummaryBusinessSignals:
@@ -6686,6 +7918,126 @@ class TestDeleteAccount:
             gc_book.delete_account("Expenses:Groceries")
 
 
+def _sold_out_lot(gc_book):
+    """A lot bought and sold to zero; returns (lot_guid, sell_guid)."""
+    lot_guid = gc_book.create_lot(
+        account="Assets:Investments:VTSAX", title="Sold out",
+    )["guid"]
+    guids = []
+    for amount, qty in (("1250.00", "10"), ("-1400.00", "-10")):
+        guid = gc_book.create_transaction(
+            description="Trade VTSAX",
+            splits=[
+                {
+                    "account": "Assets:Investments:VTSAX",
+                    "amount": amount, "quantity": qty,
+                },
+                {
+                    "account": "Assets:Checking",
+                    "amount": str(-Decimal(amount)),
+                },
+            ],
+        )["guid"]
+        split = next(
+            s for s in gc_book.get_transaction(guid)["splits"]
+            if s["account"] == "Assets:Investments:VTSAX"
+        )
+        gc_book.assign_split_to_lot(split["guid"], lot_guid)
+        guids.append(guid)
+    assert gc_book.get_lot(lot_guid)["is_closed"] is True
+    return lot_guid, guids[1]
+
+
+class TestLotFlagFollowsAmountChanges:
+    """GnuCash's ``mark_split`` resets a lot to LOT_CLOSED_UNKNOWN on
+    every amount or value change to one of its splits
+    (``xaccSplitSetAmount`` / ``xaccSplitSetValue``, which void and
+    unvoid both go through). A cached flag left behind describes the
+    old amounts: a sold-out lot whose sell is voided or shrunk holds
+    shares again and must stop reading closed."""
+
+    def test_void_reopens_lot(self, investment_book: Path):
+        gc_book = GnuCashBook(str(investment_book))
+        lot_guid, sell_guid = _sold_out_lot(gc_book)
+
+        gc_book.void_transaction(sell_guid, reason="entered twice")
+
+        assert gc_book.get_lot(lot_guid)["is_closed"] is False
+
+    def test_unvoid_closes_lot_again(self, investment_book: Path):
+        """Between void and unvoid the lot is open, and GnuCash caches
+        that answer (``gnc_lot_get_balance`` stores it). Unvoid has to
+        clear the cached 0, or the sold-out lot reads open."""
+        import sqlite3
+
+        gc_book = GnuCashBook(str(investment_book))
+        lot_guid, sell_guid = _sold_out_lot(gc_book)
+        gc_book.void_transaction(sell_guid, reason="entered twice")
+        assert gc_book.get_lot(lot_guid)["is_closed"] is False
+        with sqlite3.connect(investment_book) as conn:
+            cached = conn.execute(
+                "UPDATE lots SET is_closed = 0 WHERE guid LIKE ?",
+                (lot_guid + "%",),
+            )
+            assert cached.rowcount == 1
+
+        gc_book.unvoid_transaction(sell_guid)
+
+        assert gc_book.get_lot(lot_guid)["is_closed"] is True
+
+    HALF_SELL = [
+        {
+            "account": "Assets:Investments:VTSAX",
+            "amount": "-700.00", "quantity": "-5",
+        },
+        {"account": "Assets:Checking", "amount": "700.00"},
+    ]
+
+    def test_update_amount_needs_force(self, investment_book: Path):
+        """The gate replace_splits and delete apply: changing a
+        lot-held split's amount changes cost basis."""
+        gc_book = GnuCashBook(str(investment_book))
+        lot_guid, sell_guid = _sold_out_lot(gc_book)
+
+        with pytest.raises(ValueError, match="splits in lots"):
+            gc_book.update_transaction(sell_guid, splits=self.HALF_SELL)
+        assert gc_book.get_lot(lot_guid)["is_closed"] is True
+
+    def test_update_amount_reopens_lot(self, investment_book: Path):
+        gc_book = GnuCashBook(str(investment_book))
+        lot_guid, sell_guid = _sold_out_lot(gc_book)
+
+        result = gc_book.update_transaction(
+            sell_guid, splits=self.HALF_SELL, force=True,
+        )
+
+        assert result["lot_splits_affected"] == 1
+        assert gc_book.get_lot(lot_guid)["is_closed"] is False
+
+    def test_update_unchanged_lot_split_needs_no_force(
+        self, investment_book: Path,
+    ):
+        """Only an amount change is gated: a memo on the lot leg, with
+        its amount restated as-is, goes through."""
+        gc_book = GnuCashBook(str(investment_book))
+        lot_guid, sell_guid = _sold_out_lot(gc_book)
+
+        result = gc_book.update_transaction(
+            sell_guid,
+            splits=[
+                {
+                    "account": "Assets:Investments:VTSAX",
+                    "amount": "-1400.00", "quantity": "-10",
+                    "memo": "sold all",
+                },
+                {"account": "Assets:Checking", "amount": "1400.00"},
+            ],
+        )
+
+        assert "lot_splits_affected" not in result
+        assert gc_book.get_lot(lot_guid)["is_closed"] is True
+
+
 class TestDeleteTransaction:
     """Tests for delete_transaction method."""
 
@@ -6741,6 +8093,93 @@ class TestDeleteTransaction:
         assert result["status"] == "deleted"
         assert result["reconciled_splits_affected"] == 1
         assert gc_book.get_transaction(guid) is None
+
+    def test_delete_lot_split_rejected(self, investment_book: Path):
+        """A split in a lot is cost basis; deleting it needs force,
+        the same gate replace_splits applies."""
+        gc_book = GnuCashBook(str(investment_book))
+        lot_guid, sell_guid = _sold_out_lot(gc_book)
+
+        with pytest.raises(ValueError, match="splits in lots"):
+            gc_book.delete_transaction(sell_guid)
+        assert gc_book.get_transaction(sell_guid) is not None
+        assert gc_book.get_lot(lot_guid)["is_closed"] is True
+
+    def test_delete_lot_split_force_reopens_lot(self, investment_book: Path):
+        """Forced, the lot loses the split and its cached closed flag
+        goes back to UNKNOWN, as GnuCash does on removing a split —
+        a stale 1 would keep a lot with shares in it reading closed."""
+        gc_book = GnuCashBook(str(investment_book))
+        lot_guid, sell_guid = _sold_out_lot(gc_book)
+
+        result = gc_book.delete_transaction(sell_guid, force=True)
+
+        assert result["status"] == "deleted"
+        assert result["lot_splits_affected"] == 1
+        assert gc_book.get_transaction(sell_guid) is None
+        assert gc_book.get_lot(lot_guid)["is_closed"] is False
+
+    def test_batch_delete_lot_split_rejected(self, investment_book: Path):
+        gc_book = GnuCashBook(str(investment_book))
+        _, sell_guid = _sold_out_lot(gc_book)
+
+        with pytest.raises(ValueError, match="nothing deleted"):
+            gc_book.delete_transactions([sell_guid])
+        assert gc_book.get_transaction(sell_guid) is not None
+
+    def test_batch_delete_lot_split_force_reopens_lot(
+        self, investment_book: Path,
+    ):
+        gc_book = GnuCashBook(str(investment_book))
+        lot_guid, sell_guid = _sold_out_lot(gc_book)
+
+        result = gc_book.delete_transactions([sell_guid], force=True)
+
+        assert result["transactions"][0]["lot_splits_affected"] == 1
+        assert gc_book.get_lot(lot_guid)["is_closed"] is False
+
+    @staticmethod
+    def _reconcile_checking_leg(gc_book, txn_guid):
+        split = next(
+            s for s in gc_book.get_transaction(txn_guid)["splits"]
+            if s["account"] == "Assets:Checking"
+        )
+        gc_book.set_reconcile_state(split["guid"], "y")
+
+    def test_refusal_names_every_blocker(self, investment_book: Path):
+        """A paycheck with a 401(k) buy is reconciled on checking AND
+        lot-held (found on the maintainer's book). The refusal names
+        both, so force is never given for one and spent on the other."""
+        gc_book = GnuCashBook(str(investment_book))
+        _, sell_guid = _sold_out_lot(gc_book)
+        self._reconcile_checking_leg(gc_book, sell_guid)
+
+        for call in (
+            lambda: gc_book.delete_transaction(sell_guid),
+            lambda: gc_book.delete_transactions([sell_guid]),
+        ):
+            with pytest.raises(ValueError) as exc:
+                call()
+            message = str(exc.value)
+            assert "reconciled splits in: Assets:Checking" in message
+            assert "splits in lots: Sold out" in message
+
+    def test_replace_refusal_names_every_blocker(
+        self, investment_book: Path,
+    ):
+        gc_book = GnuCashBook(str(investment_book))
+        _, sell_guid = _sold_out_lot(gc_book)
+        self._reconcile_checking_leg(gc_book, sell_guid)
+
+        with pytest.raises(ValueError) as exc:
+            gc_book.replace_splits(guid=sell_guid, splits=[
+                {"account": "Assets:Checking", "amount": "1500.00"},
+                {"account": "Assets:Investments:VTSAX",
+                 "amount": "-1500.00", "quantity": "-10"},
+            ])
+        message = str(exc.value)
+        assert "reconciled splits in: Assets:Checking" in message
+        assert "splits in lots: Sold out" in message
 
 
 class TestDeleteTransactions:
@@ -7598,7 +9037,10 @@ class TestReplaceSplits:
         gc_book.assign_split_to_lot(inv_split["guid"], lot_guid)
 
         # Try to replace splits without force
-        with pytest.raises(ValueError, match="splits in lots"):
+        with pytest.raises(
+            ValueError,
+            match=r"splits in lots: Test Lot \(Assets:Investments:VTSAX\)",
+        ):
             gc_book.replace_splits(
                 guid=txn_guid,
                 splits=[
@@ -7661,6 +9103,23 @@ class TestReplaceSplits:
         assert result["status"] == "splits_replaced"
         assert "warnings" in result
         assert any("lot" in w.lower() for w in result["warnings"])
+
+    def test_lot_with_force_reopens_lot(self, investment_book: Path):
+        """The replaced sell leaves the lot, so its cached closed flag
+        goes back to UNKNOWN — the lot holds shares again."""
+        gc_book = GnuCashBook(str(investment_book))
+        lot_guid, sell_guid = _sold_out_lot(gc_book)
+
+        gc_book.replace_splits(
+            guid=sell_guid,
+            splits=[
+                {"account": "Assets:Checking", "amount": "1400.00"},
+                {"account": "Income:Capital Gains", "amount": "-1400.00"},
+            ],
+            force=True,
+        )
+
+        assert gc_book.get_lot(lot_guid)["is_closed"] is False
 
     def test_three_way_split(self, test_book: Path):
         """Should allow recategorizing to more splits than original."""
@@ -8378,10 +9837,14 @@ class TestReconcileAccount:
         remaining_guids = {s["guid"] for s in after["splits"]}
         assert excluded_guid in remaining_guids
 
-    def test_except_guids_unknown_prefix_ignored(self, test_book: Path):
-        """A prefix that doesn't resolve to any split is silently
-        dropped — the goal is \"exclude these if present\", and
-        a non-matching prefix has no effect on the set."""
+    def test_except_guids_that_name_no_split_are_refused(
+        self, test_book: Path,
+    ):
+        """An exception that matches nothing used to be dropped
+        silently, so the item it was meant to hold back (a
+        transaction GUID pasted where the split's belonged) was
+        reconciled with everything else (adversarial review
+        2026-09-30, IV-26). It is refused, and nothing reconciles."""
         gc_book = GnuCashBook(str(test_book))
         unreconciled = gc_book.get_unreconciled_splits(
             "Assets:Checking", compact=False,
@@ -8390,57 +9853,174 @@ class TestReconcileAccount:
             (Decimal(s["amount"]) for s in unreconciled["splits"]),
             Decimal("0"),
         )
-        # Bogus prefix — well-formed hex but doesn't exist.
-        result = gc_book.reconcile_account(
-            account_name="Assets:Checking",
-            statement_date=date(2024, 1, 31),
-            statement_balance=str(total),
-            reconcile_all=True,
-            except_guids=["deadbeef" * 4],
+        with pytest.raises(ValueError) as refusal:
+            gc_book.reconcile_account(
+                account_name="Assets:Checking",
+                statement_date=date(2024, 1, 31),
+                statement_balance=str(total),
+                reconcile_all=True,
+                except_guids=["deadbeef" * 4],
+            )
+        assert "names no split of Assets:Checking" in str(refusal.value)
+        assert "Nothing was reconciled" in str(refusal.value)
+        after = gc_book.get_unreconciled_splits(
+            "Assets:Checking", compact=False,
         )
-        # All splits reconciled despite the bogus exclusion.
-        assert result["splits_reconciled"] == len(unreconciled["splits"])
+        assert len(after["splits"]) == len(unreconciled["splits"])
 
 
 class TestVoidTransaction:
     """Tests for void_transaction method."""
 
-    def test_void_time_slot_is_timezone_aware(self, test_book: Path):
-        """The ``void-time`` slot must store a tz-aware ISO string
-        so a later reader can reconstruct the absolute void instant
-        across DST transitions and timezone changes. Pre-fix this
-        was naive ``datetime.now().isoformat()`` whose
-        interpretation depended on the host's current zone."""
-        from datetime import datetime as _dt
-        gc_book = GnuCashBook(str(test_book))
-        transactions = gc_book.list_transactions(compact=False)["transactions"]
-        guid = transactions[0]["guid"]
-
-        gc_book.void_transaction(guid=guid, reason="test")
-
-        # Read the raw value out of the slots table — the
-        # SlotString wrapper's repr contains the value but isn't
-        # itself directly parseable. Going through SQL gives us
-        # the stored ISO string verbatim.
+    @staticmethod
+    def _slot_rows(gc_book, guids):
         from sqlalchemy import text
         with gc_book.open(readonly=True) as book:
-            txn = next(
-                t for t in book.transactions if t.guid.startswith(guid[:8])
-            )
-            row = book.session.execute(
+            q = ",".join(f":g{i}" for i in range(len(guids)))
+            return book.session.execute(
                 text(
-                    "SELECT string_val FROM slots "
-                    "WHERE obj_guid = :guid AND name = :name"
+                    "SELECT obj_guid, name, slot_type, string_val, "
+                    "numeric_val_num, numeric_val_denom FROM slots "
+                    f"WHERE obj_guid IN ({q}) ORDER BY obj_guid, name"
                 ),
-                {"guid": txn.guid, "name": "void-time"},
-            ).first()
-        void_time_str = row[0]
-        parsed = _dt.fromisoformat(void_time_str)
-        # Pre-fix the slot stored a NAIVE ``datetime.now()`` whose
-        # absolute meaning depended on the host's current zone.
-        assert parsed.tzinfo is not None, (
-            f"void-time must be tz-aware, got naive: {void_time_str!r}"
+                {f"g{i}": g for i, g in enumerate(guids)},
+            ).fetchall()
+
+    def test_void_writes_gnucash_shape(self, test_book: Path):
+        """xaccTransVoid / xaccSplitVoid, key for key: void-reason
+        and void-time as strings, the time in GnuCash's own ISO
+        8601 (UTC, ``YYYY-MM-DD HH:MM:SS``, a space — Python's 'T'
+        form fails gnc-datetime's parser and desktop then does not
+        see the void at all), notes stashed in void-former-notes and
+        set to "Voided transaction", the transaction read-only, and
+        each split's originals as NUMERIC void-former-amount /
+        void-former-value. Pre-fix the server wrote STRING slots
+        under void-former-value and an invented void-former-quantity."""
+        import re
+        gc_book = GnuCashBook(str(test_book))
+        created = gc_book.create_transaction(
+            description="Will void", notes="keep me",
+            splits=[
+                {"account": "Assets:Checking", "amount": "-42.50"},
+                {"account": "Expenses:Groceries", "amount": "42.50"},
+            ],
+            trans_date=date.today() - timedelta(days=1),
         )
+        gc_book.void_transaction(guid=created["guid"], reason="test")
+        with gc_book.open(readonly=True) as book:
+            txn = gc_book._find_transaction(book, created["guid"])
+            txn_guid = txn.guid
+            split_guids = [s.guid for s in txn.splits]
+            assert txn.notes == "Voided transaction"
+        rows = self._slot_rows(gc_book, [txn_guid] + split_guids)
+        by = {(r[0], r[1]): r for r in rows}
+        assert by[(txn_guid, "void-reason")][2:4] == (4, "test")
+        assert by[(txn_guid, "void-former-notes")][2:4] == (4, "keep me")
+        assert by[(txn_guid, "trans-read-only")][2:4] == (4, "Transaction Voided")
+        void_time = by[(txn_guid, "void-time")][3]
+        assert re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", void_time), void_time
+        for sg in split_guids:
+            amount = by[(sg, "void-former-amount")]
+            value = by[(sg, "void-former-value")]
+            assert amount[2] == 3 and value[2] == 3  # KVP_TYPE_NUMERIC
+            assert abs(amount[4]) == 4250 and amount[5] == 100
+            assert abs(value[4]) == 4250 and value[5] == 100
+            assert (sg, "void-former-quantity") not in by
+
+    def test_unvoid_restores_from_gnucash_shape(self, test_book: Path):
+        """A void desktop made (numeric former amounts, no legacy
+        keys) unvoids here to the original amounts and notes, and
+        clears every void key including read-only."""
+        gc_book = GnuCashBook(str(test_book))
+        created = gc_book.create_transaction(
+            description="Desktop void", notes="original",
+            splits=[
+                {"account": "Assets:Checking", "amount": "-10"},
+                {"account": "Expenses:Groceries", "amount": "10"},
+            ],
+            trans_date=date.today() - timedelta(days=1),
+        )
+        # Engineer desktop's shape directly.
+        with gc_book.open(readonly=False) as book:
+            txn = gc_book._find_transaction(book, created["guid"])
+            txn["void-former-notes"] = "original"
+            txn.notes = "Voided transaction"
+            txn["void-reason"] = "desktop"
+            txn["void-time"] = "2026-09-29 17:00:00"
+            txn["trans-read-only"] = "Transaction Voided"
+            for s in txn.splits:
+                s["void-former-amount"] = Decimal(str(s.quantity))
+                s["void-former-value"] = Decimal(str(s.value))
+                s.value = Decimal("0")
+                s.quantity = Decimal("0")
+                s.reconcile_state = "v"
+            book.save()
+        gc_book.unvoid_transaction(created["guid"])
+        with gc_book.open(readonly=True) as book:
+            txn = gc_book._find_transaction(book, created["guid"])
+            assert txn.notes == "original"
+            assert sorted(abs(s.value) for s in txn.splits) == [Decimal("10")] * 2
+            assert all(s.reconcile_state == "n" for s in txn.splits)
+            guids = [txn.guid] + [s.guid for s in txn.splits]
+        names = {r[1] for r in self._slot_rows(gc_book, guids)}
+        assert not names & {
+            "void-reason", "void-time", "void-former-notes", "trans-read-only",
+            "void-former-amount", "void-former-value",
+        }
+
+    def test_legacy_void_converts_on_the_next_write(self, test_book: Path):
+        """A pre-fix void (STRING void-former-value, invented
+        void-former-quantity, 'T' void-time, no read-only) is
+        rewritten into GnuCash's shape by the next converting write,
+        keeping the amounts it held, and reported as voids_migrated."""
+        gc_book = GnuCashBook(str(test_book))
+        created = gc_book.create_transaction(
+            description="Old void",
+            splits=[
+                {"account": "Assets:Checking", "amount": "-7.25"},
+                {"account": "Expenses:Groceries", "amount": "7.25"},
+            ],
+            trans_date=date.today() - timedelta(days=1),
+        )
+        with gc_book.open(readonly=False) as book:
+            txn = gc_book._find_transaction(book, created["guid"])
+            txn["void-reason"] = "old"
+            txn["void-time"] = "2026-03-01T09:00:00-08:00"
+            for s in txn.splits:
+                s["void-former-value"] = str(s.value)
+                s["void-former-quantity"] = str(s.quantity)
+                s.value = Decimal("0")
+                s.quantity = Decimal("0")
+                s.reconcile_state = "v"
+            book.save()
+        # Any converting write: void a second transaction.
+        other = gc_book.create_transaction(
+            description="Another",
+            splits=[
+                {"account": "Assets:Checking", "amount": "-1"},
+                {"account": "Expenses:Groceries", "amount": "1"},
+            ],
+            trans_date=date.today() - timedelta(days=1),
+        )
+        result = gc_book.void_transaction(other["guid"], reason="x")
+        assert result["voids_migrated"] == 1
+        with gc_book.open(readonly=True) as book:
+            txn = gc_book._find_transaction(book, created["guid"])
+            guids = [txn.guid] + [s.guid for s in txn.splits]
+            txn_guid = txn.guid
+        by = {(r[0], r[1]): r for r in self._slot_rows(gc_book, guids)}
+        assert by[(txn_guid, "void-time")][3] == "2026-03-01 17:00:00"
+        assert (txn_guid, "trans-read-only") in by
+        for (obj, name), row in by.items():
+            if obj == txn_guid:
+                continue
+            assert name in ("void-former-amount", "void-former-value"), name
+            assert row[2] == 3 and abs(row[4]) == 725 and row[5] == 100
+        # ... and it unvoids to what it held.
+        gc_book.unvoid_transaction(created["guid"])
+        with gc_book.open(readonly=True) as book:
+            txn = gc_book._find_transaction(book, created["guid"])
+            assert sorted(abs(s.value) for s in txn.splits) == [Decimal("7.25")] * 2
 
     def test_void_transaction_success(self, test_book: Path):
         """Should void a transaction."""
@@ -8467,13 +10047,10 @@ class TestVoidTransaction:
         self, test_book: Path,
     ):
         """Voiding a transaction that contains reconciled splits
-        breaks the reconciled balance for the affected accounts —
-        the bank statement that originally reconciled is no longer
-        accurate. Unlike ``delete_transaction`` (which blocks on
-        reconciled splits), voiding is an audit operation that
-        should never be silently rejected; the result includes a
-        ``warning`` field naming the affected account(s) so the
-        caller knows what they just broke."""
+        breaks the reconciled balance for the affected accounts, so
+        it is refused without ``force`` (side-finding 11: the gate
+        delete and replace_splits already had). Forced, the result
+        includes a ``warning`` naming the affected account(s)."""
         gc_book = GnuCashBook(str(test_book))
 
         transactions = gc_book.list_transactions(compact=False)["transactions"]
@@ -8488,11 +10065,15 @@ class TestVoidTransaction:
             state="y",
         )
 
+        with pytest.raises(ValueError, match="force=true"):
+            gc_book.void_transaction(guid, reason="Wrong amount entered")
+        assert gc_book.get_transaction(guid)["splits"][0]["value"] != "0"
+
         result = gc_book.void_transaction(
-            guid, reason="Wrong amount entered",
+            guid, reason="Wrong amount entered", force=True,
         )
 
-        # Void still succeeded.
+        # The forced void succeeded.
         assert result["status"] == "voided"
         # And surfaced a warning naming the affected account.
         assert "warning" in result
@@ -8620,7 +10201,7 @@ class TestSpendingByCategory:
             end_date=date(2020, 1, 31),
         )
 
-        assert result["total"] == "0"
+        assert result["total"] == "0.00"
         assert result["categories"] == []
 
     def test_spending_by_category_nets_refunds(self, tmp_path: Path):
@@ -8935,6 +10516,125 @@ class TestModeAgreement:
         grouped_out = Decimal(out_row.split("\t")[-2])
         assert Decimal(single["outflows"]) == Decimal("325.00")
         assert Decimal(single["outflows"]) == grouped_out
+
+    # ── Dashboard monthly net (spec A6) ──────────────────────────
+
+    @staticmethod
+    def _dashboard_full_months(gc: GnuCashBook) -> dict[str, Decimal]:
+        """``{"Apr 2026": Decimal("+1247"), ...}`` from the rendered
+        Monthly net section, MTD row excluded (it is a partial
+        month; the reports have no same-day window)."""
+        result = gc.get_book_summary()
+        marker = "Monthly net (income - expenses, last 6 months):\n"
+        if marker not in result:
+            return {}
+        section = result.split(marker, 1)[1]
+        out: dict[str, Decimal] = {}
+        for line in section.splitlines():
+            if not line.startswith("  ") or "(MTD)" in line:
+                if line.startswith("  "):
+                    continue
+                break
+            label, value = line.strip().split(": ", 1)
+            out[label] = Decimal(value.replace(",", ""))
+        return out
+
+    def _assert_dashboard_agrees_with_flow_reports(self, gc: GnuCashBook):
+        months = self._dashboard_full_months(gc)
+        if not months:
+            pytest.skip("no full month with activity in the window")
+        for label, shown in months.items():
+            start = datetime.strptime(label, "%b %Y").date()
+            end = (
+                date(start.year + (start.month == 12),
+                     start.month % 12 + 1, 1) - timedelta(days=1)
+            )
+            income = Decimal(gc.income_by_source(
+                start_date=start, end_date=end, compact=False,
+            )["total"])
+            spending = Decimal(gc.spending_by_category(
+                start_date=start, end_date=end, compact=False,
+            )["total"])
+            expected = (income - spending).quantize(Decimal("1"))
+            assert shown == expected, (
+                f"{label}: dashboard {shown} != income {income} - "
+                f"spending {spending}"
+            )
+
+    def test_dashboard_monthly_net_agrees_with_flow_reports(self, tmp_path):
+        """Spec A6: the dashboard's monthly net converted every
+        month at TODAY's rate, contradicting the monthly-close
+        invariant — its March disagreed with cash_flow's March on
+        a multi-currency book. Now each full month equals
+        income_by_source minus spending_by_category for that
+        month. A EUR expense two months ago and a fresh, very
+        different rate today make the old policy visibly wrong."""
+        path = tmp_path / "fx_dash.gnucash"
+        book = piecash.create_book(str(path), currency="USD", overwrite=True)
+        root = book.root_account
+        usd = book.default_currency
+        eur = factories.create_currency_from_ISO("EUR")
+        book.session.add(eur)
+        expenses = piecash.Account(
+            name="Expenses", type="EXPENSE", parent=root,
+            commodity=usd, placeholder=True,
+        )
+        travel = piecash.Account(
+            name="EU Travel", type="EXPENSE", parent=expenses,
+            commodity=eur,
+        )
+        assets = piecash.Account(
+            name="Assets", type="ASSET", parent=root,
+            commodity=usd, placeholder=True,
+        )
+        eur_bank = piecash.Account(
+            name="EUR Account", type="BANK", parent=assets,
+            commodity=eur,
+        )
+        today = date.today()
+        two_ago = (today.replace(day=1) - timedelta(days=1)).replace(day=1)
+        two_ago = (two_ago - timedelta(days=1)).replace(day=15)
+        two_ago_end = (
+            date(two_ago.year + (two_ago.month == 12),
+                 two_ago.month % 12 + 1, 1) - timedelta(days=1)
+        )
+        book.session.add(piecash.Transaction(
+            currency=eur, description="trip", post_date=two_ago,
+            splits=[
+                piecash.Split(account=travel,
+                              value=Decimal("100"), quantity=Decimal("100")),
+                piecash.Split(account=eur_bank,
+                              value=Decimal("-100"), quantity=Decimal("-100")),
+            ],
+        ))
+        for d, rate in ((two_ago_end, "1.05"), (today, "2.00")):
+            book.session.add(piecash.Price(
+                commodity=eur, currency=usd, date=d, value=Decimal(rate),
+            ))
+        book.save()
+        book.close()
+        gc = GnuCashBook(str(path))
+        months = self._dashboard_full_months(gc)
+        # Month's close, not today's 2.00: -100 * 1.05.
+        assert months[two_ago.strftime("%b %Y")] == Decimal("-105")
+        self._assert_dashboard_agrees_with_flow_reports(gc)
+
+    @pytest.mark.parametrize(
+        "sample", ["lin-wei.gnucash", "sabine-brenner.gnucash"],
+    )
+    def test_dashboard_monthly_net_agrees_on_sample_books(
+        self, sample, tmp_path,
+    ):
+        """The same agreement on the multi-currency sample oracles
+        (Lin Wei, CNY; Sabine, EUR). Skips once the frozen books
+        age out of the dashboard's six-month window."""
+        src = Path(__file__).resolve().parent.parent / "samples" / sample
+        if not src.exists():
+            pytest.skip(f"{sample} not present")
+        import shutil
+        path = tmp_path / sample
+        shutil.copy(src, path)
+        self._assert_dashboard_agrees_with_flow_reports(GnuCashBook(str(path)))
 
 
 class TestGroupByBreakdown:
@@ -10478,7 +12178,14 @@ class TestMultiCurrencyBalances:
         ``usd_value`` alongside the human-readable triplet ``balance``.
         ``usd_value`` is dropped for currency rows where it would just
         repeat ``balance``.
+
+        The transfer's implied-rate price row values EUR since the
+        2026-09-29 ruling (desktop counts it); a book with no price
+        row of any type is still real, so drop it to reach that state.
         """
+        from tests.conftest import drop_transaction_prices
+
+        assert drop_transaction_prices(multi_currency_book) > 0
         gc_book = GnuCashBook(str(multi_currency_book))
         result = gc_book.balance_sheet(as_of_date=date(2024, 12, 31))
         accounts = {a["account"]: a for a in result["assets"]["accounts"]}
@@ -10572,7 +12279,7 @@ class TestMultiCurrencyBalances:
             end_date=date(2024, 12, 31),
             depth=2,
         )
-        assert result["total"] == "200"
+        assert result["total"] == "200.00"
         assert len(result["categories"]) == 1
         assert result["categories"][0]["account"] == "Expenses:Groceries"
 
@@ -10584,7 +12291,7 @@ class TestMultiCurrencyBalances:
             end_date=date(2024, 12, 31),
             depth=2,
         )
-        assert result["total"] == "3000"
+        assert result["total"] == "3000.00"
         assert len(result["sources"]) == 1
         assert result["sources"][0]["account"] == "Income:Salary"
 
@@ -10721,7 +12428,7 @@ class TestMultiCurrencyBalances:
 class TestMultiCurrencyDashboardHelpers:
     """v1.3.0 follow-up to the spending/income FX-conversion fix:
     three dashboard helpers (``_monthly_net_income``,
-    ``_daily_expense_burn``, ``_budget_headline``) and one report
+    ``_daily_cash_burn``, ``_budget_headline``) and one report
     (``vendor_spending_report``) were summing ``split.value`` /
     ``split.quantity`` raw across currencies. Same class of bug —
     silently wrong on any book with foreign-currency activity.
@@ -10821,7 +12528,7 @@ class TestMultiCurrencyDashboardHelpers:
             f"expected +1,200 in MTD line, got: {mtd_line!r}"
         )
 
-    def test_daily_expense_burn_converts_foreign_currency_expense(
+    def test_daily_cash_burn_converts_foreign_currency_expense(
         self, multi_currency_book: Path,
     ):
         """Runway's daily-burn divisor must reflect foreign-currency
@@ -10862,11 +12569,11 @@ class TestMultiCurrencyDashboardHelpers:
                 ],
             ))
             bk.save()
-            # _daily_expense_burn is an instance method requiring a
+            # _daily_cash_burn is an instance method requiring a
             # book session — call it within an open block.
             transactions = list(bk.transactions)
             from datetime import timedelta
-            burn = gc_book._daily_expense_burn(
+            burn = gc_book._daily_cash_burn(
                 bk, transactions, days=30,
             )
             # €200 × 1.50 = $300 of expense in default currency.
@@ -11298,18 +13005,18 @@ class TestPrices:
         assert Decimal(result["value"]) == Decimal("42.50")
         assert result["currency"] == "EUR"
 
-    def test_get_latest_price_skips_transaction_placeholder_prices(
+    def test_get_latest_price_counts_transaction_prices_like_desktop(
         self, test_book: Path,
     ):
-        """``get_latest_price`` must skip piecash's auto-created
-        ``type='transaction'`` placeholder rows so its answer agrees
-        with ``get_book_summary``, ``_find_exchange_rate``, and
-        every other valuation path.
+        """``get_latest_price`` answers with the most current row by
+        (stored time, smaller GUID), a ``type='transaction'`` row
+        included. GnuCash's lookups never filter on price type;
+        maintainer ruling 2026-09-29 overturned the issue #94 skip so
+        the server agrees with desktop on the current price.
 
-        On the bookkeeper's CNY book this surfaced as Moutai
-        returning a ``user:split-register`` rate of 33.333333 CNY
-        (the effective rate of a cross-currency transaction)
-        instead of the user's nav quote of 1810 CNY/share.
+        The shape is the bookkeeper's CNY-book one: a
+        ``user:split-register`` rate newer than the user's nav quote.
+        A quote dated after it wins back on timestamp.
         """
         import piecash
         gc_book = GnuCashBook(str(test_book))
@@ -11317,14 +13024,13 @@ class TestPrices:
             mnemonic="ZZZP", fullname="Test Stock",
             namespace="EXCHANGE",
         )
-        # User-quoted nav price (the "real" answer).
         gc_book.create_price(
             commodity="ZZZP", namespace="EXCHANGE",
             value="100.00", price_date=date(2026, 2, 1),
             price_type="nav",
         )
-        # Auto-created placeholder rows (newer date — would win on
-        # any "latest by date" sort if not filtered out).
+        # A cross-currency transaction's implied-rate row, newer than
+        # the nav quote — the current price, as desktop reads it.
         with gc_book.open(readonly=False) as book:
             usd = book.default_currency
             zzzp = next(
@@ -11341,10 +13047,19 @@ class TestPrices:
         result = gc_book.get_latest_price(
             commodity="ZZZP", namespace="EXCHANGE",
         )
-        # Must surface the user's nav quote, NOT the newer auto-
-        # created transaction artifact.
         assert result is not None
-        assert Decimal(result["value"]) == Decimal("100.00")
+        assert Decimal(result["value"]) == Decimal("33.333333")
+        assert result["type"] == "transaction"
+
+        gc_book.create_price(
+            commodity="ZZZP", namespace="EXCHANGE",
+            value="101.00", price_date=date(2026, 3, 20),
+            price_type="nav",
+        )
+        result = gc_book.get_latest_price(
+            commodity="ZZZP", namespace="EXCHANGE",
+        )
+        assert Decimal(result["value"]) == Decimal("101.00")
         assert result["type"] == "nav"
 
     def test_get_latest_price_no_prices(self, test_book: Path):
@@ -11542,11 +13257,8 @@ class TestDeletePrice:
             currency="USD", price_date=date(2026, 2, 7),
             source="user:price",
         )
-        gc_book.create_price(
-            commodity="VTSAX", namespace="FUND", value="127.99",
-            currency="USD", price_date=date(2026, 2, 7),
-            source="user:yfinance",
-        )
+        # A second same-day row, as older books hold them.
+        leak_same_day_price(test_book, "127.99", "Finance::Quote")
 
         with pytest.raises(ValueError) as exc_info:
             gc_book.delete_price(
@@ -11559,7 +13271,7 @@ class TestDeletePrice:
         # trailing zeros from stored values; check the integer
         # part to stay implementation-agnostic.
         assert "user:price" in msg
-        assert "user:yfinance" in msg
+        assert "Finance::Quote" in msg
         assert "127.5" in msg
         assert "127.99" in msg
         assert "source=" in msg
@@ -11574,15 +13286,12 @@ class TestDeletePrice:
             currency="USD", price_date=date(2026, 2, 7),
             source="user:price",
         )
-        gc_book.create_price(
-            commodity="VTSAX", namespace="FUND", value="127.99",
-            currency="USD", price_date=date(2026, 2, 7),
-            source="user:yfinance",
-        )
+        # A second same-day row, as older books hold them.
+        leak_same_day_price(test_book, "127.99", "Finance::Quote")
 
         result = gc_book.delete_price(
             commodity="VTSAX", namespace="FUND",
-            price_date=date(2026, 2, 7), source="user:yfinance",
+            price_date=date(2026, 2, 7), source="Finance::Quote",
         )
 
         assert Decimal(result["value"]) == Decimal("127.99")
@@ -11931,13 +13640,19 @@ class TestIssue94IntermediateCurrencyChain:
       B. foreign ccy → pivot → default          (GBP via USD)
       C. security → foreign ccy → pivot → default (fund priced GBP)
 
-    plus a direct-priced control and an unreachable control, and the
-    ``type='transaction'`` trap (the cross-currency GBP funding stamps
-    a non-market GBP/AED rate of 5.0 that the chain must ignore in
-    favour of the GBP→USD→AED market legs = 4.664075).
+    plus a direct-priced control and an unreachable control.
+
+    Every purchase here is AED-funded, so each leaves a direct
+    fund/AED (and GBP/AED) ``type='transaction'`` row, and since the
+    2026-09-29 ruling those value holdings as desktop does — direct
+    pair before any chain, as ``get_nearest_price`` orders it. The
+    chain-mechanics tests are about books with no direct row, so
+    ``_build`` deletes them unless asked to keep them (case B).
     """
 
-    def _build(self, tmp_path) -> GnuCashBook:
+    def _build(
+        self, tmp_path, keep_transaction_prices: bool = False,
+    ) -> GnuCashBook:
         from datetime import date as d
         path = tmp_path / "issue94.gnucash"
         book = piecash.create_book(
@@ -12062,6 +13777,11 @@ class TestIssue94IntermediateCurrencyChain:
         price(ofund, jpy, "1000")    # E unreachable
         book.save()
         book.close()
+        if not keep_transaction_prices:
+            from tests.conftest import drop_transaction_prices
+
+            # One row per cross-currency transaction: four buys + GBP.
+            assert drop_transaction_prices(path) == 5
         return GnuCashBook(str(path))
 
     def _holdings(self, gb: GnuCashBook) -> dict:
@@ -12078,9 +13798,23 @@ class TestIssue94IntermediateCurrencyChain:
         # Provenance: derived through USD, flagged for the reader.
         assert "via USD" in h["balance"]
 
-    def test_case_b_triangulation_ignores_transaction_price(self, tmp_path):
+    def test_case_b_transaction_price_beats_chain_like_desktop(
+        self, tmp_path,
+    ):
+        """The GBP funding's implied GBP/AED 5.0 is a direct rate, and
+        a direct rate answers before any chain, stale or not. GnuCash's
+        lookups never filter on price type; maintainer ruling
+        2026-09-29 overturned the issue #94 skip so the server agrees
+        with desktop on the current price. Without the row, the
+        GBP→USD→AED triangulation values the cash."""
+        h = self._holdings(
+            self._build(tmp_path, keep_transaction_prices=True)
+        )["GBP Cash"]
+        assert h["default_currency_value"] == "4000.00"  # 800 × 5.0
+        assert "via" not in h["balance"]
+
         h = self._holdings(self._build(tmp_path))["GBP Cash"]
-        # 800 × 1.27 × 3.6725 = 3731.26 — NOT 4000 (the 5.0 txn rate).
+        # 800 × 1.27 × 3.6725 = 3731.26.
         assert h["default_currency_value"] == "3731.26"
         assert "via USD" in h["balance"]
 
@@ -12414,13 +14148,13 @@ class TestBatchPrices:
         dry = {r["ref"]: r for r in _parse_results_tsv(env["results"])}
         assert dry["a"]["status"] == "would_create"
         assert dry["b"]["status"] == "rejected"
-        assert "duplicate price identity" in dry["b"]["reason"]
+        assert "same pair and date as ref 'a'" in dry["b"]["reason"]
 
         env = gc.create_prices(rows, on_error="skip")
         live = {r["ref"]: r for r in _parse_results_tsv(env["results"])}
         assert live["a"]["status"] == "created"
         assert live["b"]["status"] == "rejected"
-        assert "duplicate price identity" in live["b"]["reason"]
+        assert "same pair and date as ref 'a'" in live["b"]["reason"]
 
         # First row won; exactly one price landed.
         latest = gc.get_latest_price(commodity="VTSAX", namespace="FUND")
@@ -12439,14 +14173,19 @@ class TestBatchPrices:
         ])
         parsed = {r["ref"]: r for r in _parse_results_tsv(env["results"])}
         assert parsed["a"]["reason"] == "batch_aborted"
-        assert "duplicate price identity" in parsed["b"]["reason"]
+        assert "one price per pair per day" in parsed["b"]["reason"]
         assert gc.get_latest_price(
             commodity="VTSAX", namespace="FUND",
         ) is None
 
-    def test_distinct_source_is_not_a_duplicate(self, test_book: Path):
-        """Identity includes source — a feed quote and a manual
-        quote on the same date are both legitimate."""
+    def test_a_second_source_for_the_same_day_is_a_duplicate_too(
+        self, test_book: Path,
+    ):
+        """GnuCash keeps one price per pair per day, whatever its
+        source (``gnc_pricedb_add_price``; bookkeeper ruling
+        2026-09-30 on review item C24). Two rows of one batch for the
+        same day cannot both stand, so the second is refused and the
+        caller says which they mean."""
         gc = GnuCashBook(str(test_book))
         self._setup(gc)
         env = gc.create_prices([
@@ -12455,10 +14194,11 @@ class TestBatchPrices:
             {"ref": "b", "commodity": "VTSAX",
              "date": date(2026, 7, 21), "value": "101",
              "source": "user:market_data"},
-        ])
+        ], on_error="skip")
         parsed = {r["ref"]: r for r in _parse_results_tsv(env["results"])}
         assert parsed["a"]["status"] == "created"
-        assert parsed["b"]["status"] == "created"
+        assert parsed["b"]["status"] == "rejected"
+        assert "one price per pair per day" in parsed["b"]["reason"]
 
     def test_ambiguous_symbol_requires_ns(self, test_book: Path):
         gc = GnuCashBook(str(test_book))
@@ -12523,6 +14263,12 @@ class TestPricesTsvParser:
 
 class TestListCommoditiesStaleFilter:
     def test_work_list_filters_and_markers(self, multi_currency_book):
+        from tests.conftest import drop_transaction_prices
+
+        # The fixture's EUR transfer left an implied EUR/USD row that
+        # would price EUR (ruling 2026-09-29); the subject is the
+        # unquoted state.
+        assert drop_transaction_prices(multi_currency_book) >= 1
         from datetime import timedelta
 
         gc = GnuCashBook(str(multi_currency_book))
@@ -12564,6 +14310,50 @@ class TestListCommoditiesStaleFilter:
 class TestSplitAction:
     """Split ``action`` — native splits.action column, exposed on
     the create paths and preserved through replace_splits."""
+
+    def _wire(self, gc):
+        return gc.create_transaction(
+            description="Wire out",
+            splits=[
+                {"account": "Assets:Checking", "amount": "-90.00",
+                 "action": "Wire"},
+                {"account": "Expenses:Groceries", "amount": "90.00"},
+            ],
+        )["guid"]
+
+    def test_replaced_splits_keep_their_action_in_the_audit(
+        self, test_book: Path,
+    ):
+        """``previous_splits`` is the only record of legs replace_splits
+        deletes; an action dropped there is gone from the audit log."""
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+
+        gc = GnuCashBook(str(test_book))
+        guid = self._wire(gc)
+        result = gc.replace_splits(guid=guid, splits=[
+            {"account": "Assets:Checking", "amount": "-95.00"},
+            {"account": "Expenses:Groceries", "amount": "95.00"},
+        ])
+        old = next(
+            s for s in result["previous_splits"]
+            if s["account"] == "Assets:Checking"
+        )
+        assert old["action"] == "Wire"
+        rendered = _format_audit_entry_text({
+            "classification": "write", "entity_type": "transaction",
+            "operation": "replace_splits",
+            "timestamp": "2026-09-27T12:00:00",
+            "params": {"guid": guid}, "after_state": result,
+        })
+        assert "[Wire]" in rendered
+
+    def test_unvoid_reply_carries_the_action(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        guid = self._wire(gc)
+        gc.void_transaction(guid, reason="test")
+        restored = gc.unvoid_transaction(guid)["splits"]
+        chk = next(s for s in restored if s["account"] == "Assets:Checking")
+        assert chk["action"] == "Wire"
 
     def test_create_and_read_back(self, test_book: Path):
         gc = GnuCashBook(str(test_book))
@@ -12915,7 +14705,7 @@ class TestReconciliationDormancy:
         gc = GnuCashBook(str(test_book))
         self._card_with_history(gc, "Old Apple Card", pay_off=True)
         summary = gc.get_book_summary()
-        assert "1 account dormant ($0, fully reconciled)" in summary
+        assert "1 account dormant ($0, idle)" in summary
         assert "Old Apple Card" not in summary.split("Reconciliation:")[1]
 
     def test_carried_balance_stays_warned(self, test_book: Path):
@@ -13114,6 +14904,166 @@ class TestSplitGraphPreload:
                 f"{len(statements)} SQL statements — the preload's "
                 f"strong reference has been lost"
             )
+
+    def test_preloaded_notes_issue_no_sql(self, test_book):
+        """``txn.notes`` is slot-backed and piecash's Slot is
+        single-table polymorphic: a plain relationship load leaves
+        one SELECT per slot for its typed value. The preload loads
+        every subclass column, so a notes walk is free (#186)."""
+        from sqlalchemy import event
+
+        gc = GnuCashBook(str(test_book))
+        with gc.open(readonly=True) as book:
+            gc._preload_split_graph(book, account_splits=False)
+            transactions = list(book.transactions)
+
+            statements: list[str] = []
+            engine = book.session.get_bind()
+
+            def _record(conn, cursor, statement, parameters,
+                        context, executemany):
+                statements.append(statement)
+
+            event.listen(engine, "before_cursor_execute", _record)
+            try:
+                for txn in transactions:
+                    _ = txn.notes
+                    for s in txn.splits:
+                        _ = s.account
+            finally:
+                event.remove(engine, "before_cursor_execute", _record)
+
+            assert statements == [], (
+                f"notes/splits walk after preload issued "
+                f"{len(statements)} SQL statements: {statements[:2]}"
+            )
+
+    def test_upgrade_to_account_splits_in_same_open(self, test_book):
+        """A light preload followed by a full one in the same open
+        must add the account-side pass, not return early."""
+        from sqlalchemy import event
+
+        gc = GnuCashBook(str(test_book))
+        with gc.open(readonly=True) as book:
+            gc._preload_split_graph(book, account_splits=False)
+            gc._preload_split_graph(book)
+            accounts = list(book.accounts)
+
+            statements: list[str] = []
+            engine = book.session.get_bind()
+
+            def _record(conn, cursor, statement, parameters,
+                        context, executemany):
+                statements.append(statement)
+
+            event.listen(engine, "before_cursor_execute", _record)
+            try:
+                for acct in accounts:
+                    for s in acct.splits:
+                        _ = s.transaction
+            finally:
+                event.remove(engine, "before_cursor_execute", _record)
+            assert statements == []
+
+
+class TestReadToolQueryCounts:
+    """The whole-book read tools issue a fixed number of statements
+    regardless of how many transactions the book holds. Measured on
+    this branch: 9–10 per call at 30 and at 120 transactions, every
+    field mode of search_transactions included. Before the preload
+    covered slots, the notes search paid one SELECT per transaction
+    (129 at 120) and the unfiltered listing two per rendered row. The
+    budget sits well under the lazy version's cost on the 60-row
+    fixture below and well over the measured flat count."""
+
+    BUDGET = 20
+
+    @pytest.fixture
+    def noted_book(self, tmp_path):
+        path = tmp_path / "noted.gnucash"
+        book = piecash.create_book(str(path), currency="USD", overwrite=True)
+        usd = book.default_currency
+        assets = piecash.Account(
+            name="Assets", type="ASSET", commodity=usd,
+            parent=book.root_account, placeholder=True,
+        )
+        cash = piecash.Account(
+            name="Checking", type="BANK", commodity=usd, parent=assets,
+        )
+        exp = piecash.Account(
+            name="Expenses", type="EXPENSE", commodity=usd,
+            parent=book.root_account,
+        )
+        for i in range(60):
+            piecash.Transaction(
+                currency=usd, post_date=date(2025, 1 + i % 12, 1 + i % 27),
+                description=f"store {i}", notes=f"note {i}",
+                splits=[
+                    piecash.Split(account=exp, value=Decimal("10")),
+                    piecash.Split(account=cash, value=Decimal("-10")),
+                ],
+            )
+        book.save()
+        book.close()
+        return path
+
+    @staticmethod
+    def _count(gc, call):
+        from sqlalchemy import event
+
+        statements: list[str] = []
+        real_open = gc.open
+
+        class _Ctx:
+            def __init__(self, ctx):
+                self._ctx = ctx
+
+            def __enter__(self):
+                book = self._ctx.__enter__()
+                self._engine = book.session.get_bind()
+
+                def _record(conn, cursor, statement, parameters,
+                            context, executemany):
+                    statements.append(statement)
+
+                self._record = _record
+                event.listen(self._engine, "before_cursor_execute", _record)
+                return book
+
+            def __exit__(self, *exc):
+                event.remove(
+                    self._engine, "before_cursor_execute", self._record,
+                )
+                return self._ctx.__exit__(*exc)
+
+        gc.open = lambda **kw: _Ctx(real_open(**kw))
+        try:
+            call(gc)
+        finally:
+            gc.open = real_open
+        return len(statements)
+
+    @pytest.mark.parametrize("label, call", [
+        ("list unfiltered", lambda gc: gc.list_transactions(limit=10)),
+        ("list count-only", lambda gc: gc.list_transactions(limit=0)),
+        ("list by account", lambda gc: gc.list_transactions(
+            account="Assets:Checking", limit=10)),
+        ("search description", lambda gc: gc.search_transactions(
+            "store", field="description", limit=5)),
+        ("search memo", lambda gc: gc.search_transactions(
+            "x", field="memo", limit=5)),
+        ("search notes", lambda gc: gc.search_transactions(
+            "note", field="notes", limit=5)),
+        ("search amount", lambda gc: gc.search_transactions(
+            "10", field="amount", limit=5)),
+    ])
+    def test_flat_in_transaction_count(self, noted_book, label, call):
+        gc = GnuCashBook(str(noted_book))
+        n = self._count(gc, call)
+        assert n < self.BUDGET, (
+            f"{label}: {n} SQL statements on a 60-transaction book — "
+            f"a per-row lazy load is back"
+        )
 
 
 class TestDefaultedDateEcho:
@@ -13323,3 +15273,122 @@ class TestScheduledLineOverdueCopy:
         assert "overdue" not in sched_line
         assert "further" not in sched_line
         assert "1 due in next 7 days" in sched_line
+
+
+class TestDashboardHonestFailure:
+    """A dashboard check that fails says so — spec:
+    specs/v1.5/DASHBOARD_HONEST_FAILURE_SPEC.md.
+
+    Absence of a warning is the dashboard's "all clear", so a
+    collector that swallowed its own failure reported a clean book
+    (the Python 3.10 GDATE incident). Every handler now routes
+    through ``_check_failed``: one visible line, reason inline,
+    because the debug log is opt-in and most users have none.
+    """
+
+    def test_describe_check_failure_shape(self):
+        from gnucash_mcp.book.core import _describe_check_failure
+
+        class FakeStatementError(Exception):
+            pass
+
+        exc = FakeStatementError(
+            "(psycopg2.errors.InFailedSqlTransaction) current transaction "
+            "is aborted, commands ignored until end of transaction block\n"
+            "[SQL: SELECT count(*) FROM jobs]\n"
+            "[parameters: {}]\n"
+            "(Background on this error at: https://sqlalche.me/e/14/2j85)"
+        )
+        line = _describe_check_failure("Active-jobs", exc)
+        assert line.startswith(
+            "Active-jobs check failed: FakeStatementError: "
+            "(psycopg2.errors.InFailedSqlTransaction) current transaction"
+        )
+        # First line only — no statement, parameters, or docs link.
+        assert "[SQL:" not in line and "sqlalche.me" not in line
+
+    def test_describe_check_failure_masks_uris_and_truncates(self):
+        from gnucash_mcp.book.core import (
+            _CHECK_FAILURE_REASON_CHARS, _describe_check_failure,
+        )
+
+        exc = RuntimeError(
+            "could not connect to postgresql://gnucash:s3cret@db.local/gnucash"
+        )
+        line = _describe_check_failure("Low-cash", exc)
+        assert "s3cret" not in line
+        assert "gnucash:***@db.local" in line
+
+        long = RuntimeError("x" * 500)
+        line = _describe_check_failure("Low-cash", long)
+        reason = line.split("RuntimeError: ", 1)[1]
+        assert len(reason) == _CHECK_FAILURE_REASON_CHARS
+        assert reason.endswith("…")
+
+        assert _describe_check_failure("Low-cash", RuntimeError()) == (
+            "Low-cash check failed: RuntimeError"
+        )
+
+    def test_failed_section_is_one_visible_line(
+        self, test_book: Path, monkeypatch,
+    ):
+        """Force the backup-health collector to raise: the dashboard
+        names the check and the exception, and every other section
+        still renders."""
+        def boom(self, *args, **kwargs):
+            raise RuntimeError("backup state unreadable")
+
+        monkeypatch.setattr(GnuCashBook, "get_backup_health", boom)
+        result = GnuCashBook(str(test_book)).get_book_summary()
+        assert "Warnings:" in result
+        warnings_block = result.split("Warnings:")[1].split("Accounts:")[0]
+        assert (
+            "⚠ Backup-health check failed: RuntimeError: "
+            "backup state unreadable"
+        ) in warnings_block
+        assert warnings_block.count("check failed") == 1
+        assert "Accounts:" in result
+
+    def test_per_item_failures_are_one_line_with_a_count(
+        self, business_book: Path, monkeypatch,
+    ):
+        """Two posted, overdue invoices whose due-date resolution
+        raises: one line with the skipped count, and no 'Past due'
+        line pretending the check ran. One line, not two — the
+        counts and the warnings read one settlement pass (spec A1),
+        so a failed due-date lookup is one failed check."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Flaky Terms Co")
+        for _ in range(2):
+            inv = gb.create_invoice(customer_id="000001")
+            gb.add_invoice_entry(
+                invoice_id=inv["id"], account="Income:Sales",
+                description="Work", quantity="1", price="100",
+            )
+            gb.post_invoice(
+                invoice_id=inv["id"],
+                post_account="Assets:Accounts Receivable",
+                post_date=(date.today() - timedelta(days=90)).isoformat(),
+                due_date=(date.today() - timedelta(days=60)).isoformat(),
+                owner_type="customer",
+            )
+
+        def boom(self, book, inv):
+            raise RuntimeError("terms unreadable")
+
+        monkeypatch.setattr(GnuCashBook, "_resolve_invoice_due_date", boom)
+        result = gb.get_book_summary()
+        warnings_block = result.split("Warnings:")[1].split("Accounts:")[0]
+        assert (
+            "⚠ Overdue-document check failed: RuntimeError: "
+            "terms unreadable — 2 documents skipped"
+        ) in warnings_block
+        assert warnings_block.count("check failed") == 1
+        assert "Past due" not in warnings_block
+        # The documents still count as open — only overdue-ness was
+        # unknowable.
+        assert "(2 invoices, 0 overdue;" in result
+
+    def test_healthy_book_has_no_failure_lines(self, test_book: Path):
+        result = GnuCashBook(str(test_book)).get_book_summary()
+        assert "check failed" not in result

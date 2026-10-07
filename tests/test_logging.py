@@ -213,7 +213,10 @@ class TestTextFormat:
         content = txt_file.read_text()
 
         assert "GNUCASH MCP AUDIT LOG" in content
-        assert str(temp_book_path) in content
+        # The filename, never the directory: get_audit_log returns
+        # this header to the model (review C54).
+        assert f"Book: {temp_book_path.name}" in content
+        assert str(temp_book_path.parent) not in content
 
     def test_text_format_logs_write_operations(self, temp_book_path, temp_log_dir):
         """Verify text format logs write operations in human-readable form."""
@@ -627,6 +630,34 @@ class TestBudgetAndScheduledAuditHandlers:
         assert 'UPDATE SCHEDULED  "Monthly Rent"' in rendered
         assert "enabled: True → False" in rendered
 
+    def test_scheduled_update_start_date_move(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        entry = {
+            "classification": "write",
+            "entity_type": "scheduled_transaction",
+            "operation": "update",
+            "timestamp": "2026-09-29T09:00:00",
+            "params": {"guid": "abcdef01", "start_date": "2026-11-03"},
+            "before_state": {
+                "name": "Monthly Rent",
+                "enabled": True,
+                "start_date": "2026-11-15",
+                "end_date": None,
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert (
+            "start_date: 2026-11-15 → 2026-11-03 (recurrence rows moved with it)"
+        ) in rendered
+
+    def test_void_migration_line(self):
+        from gnucash_mcp.logging_config import _shape_upgrade_lines
+        lines = _shape_upgrade_lines({"voids_migrated": 2})
+        assert lines == [
+            " " * 10 + "2 voided transactions rewritten in GnuCash's void shape "
+            "(numeric originals, read-only; nothing posted)"
+        ]
+
     def test_scheduled_update_end_date_clear(self):
         from gnucash_mcp.logging_config import _format_audit_entry_text
         entry = {
@@ -826,6 +857,59 @@ class TestBudgetAndScheduledAuditHandlers:
         assert 'DELETE  guid:83862278  "Test Legacy Coffee" (2026-07-10)' in rendered
         assert 'DELETE  guid:d868498f  "Test Legacy Gas" (2026-07-11)' in rendered
         assert "Checking" in rendered
+        assert "Forced" not in rendered
+
+    def test_forced_delete_says_what_it_overrode(self):
+        """A forced delete of an invoice payment reads differently from
+        an ordinary one: the reviewer sees the overrides it took."""
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        entry = {
+            "classification": "write",
+            "entity_type": "transaction",
+            "operation": "delete",
+            "timestamp": "2026-09-26T11:44:22",
+            "params": {"guid": "125cb915", "force": True},
+            "before_state": {
+                "description": "BookkeepingCo", "date": "2026-03-20",
+                "splits": [],
+            },
+            "after_state": {
+                "guid": "125cb915", "description": "BookkeepingCo",
+                "status": "deleted",
+                "reconciled_splits_affected": 1,
+                "lot_splits_affected": 1,
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert (
+            "Forced: 1 reconciled split, 1 split in a lot (the lot "
+            "reopens)" in rendered
+        )
+
+    def test_forced_batch_delete_marks_each_row(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        entry = {
+            "classification": "write",
+            "entity_type": "transaction",
+            "operation": "delete",
+            "timestamp": "2026-09-26T11:44:22",
+            "params": {"guid": ["0860dd6f", "83862278"], "force": True},
+            "before_state": {"transactions": [
+                {"description": "Sell", "date": "2026-07-20", "splits": []},
+                {"description": "Coffee", "date": "2026-07-10", "splits": []},
+            ]},
+            "after_state": {
+                "status": "deleted", "count": 2,
+                "transactions": [
+                    {"guid": "0860dd6f", "description": "Sell",
+                     "lot_splits_affected": 2},
+                    {"guid": "83862278", "description": "Coffee"},
+                ],
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert rendered.count("Forced:") == 1
+        assert "Forced: 2 splits in lots (the lots reopen)" in rendered
 
     def test_entry_create_renders_notes_and_action(self):
         from gnucash_mcp.logging_config import _format_audit_entry_text
@@ -1140,6 +1224,122 @@ class TestPayDryRunAuditRendering:
         assert "PAY INVOICE  id:000013" in rendered
         assert "(dry run)" not in rendered
         assert "paid: 500.00" in rendered
+
+
+class TestPriceAuditLines:
+    """A price GnuCash's one-per-day rule turned away was not
+    written, and the audit line must not read as a write (review
+    item C24, bookkeeper ruling 2026-09-30)."""
+
+    def _entry(self, after):
+        return {
+            "classification": "write", "entity_type": "price",
+            "operation": "create", "timestamp": "2026-09-30T23:30:00",
+            "params": {"commodity": "EUR", "namespace": "CURRENCY"},
+            "after_state": {
+                "commodity": "EUR", "namespace": "CURRENCY",
+                "date": "2026-06-01", "value": "1.10", "currency": "USD",
+                **after,
+            },
+        }
+
+    def test_kept(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        rendered = _format_audit_entry_text(self._entry({
+            "status": "kept",
+            "existing": {"source": "Finance::Quote", "value": "1.11"},
+        }))
+        assert "PRICE NOT WRITTEN  CURRENCY:EUR" in rendered
+        assert "outranked by the day's Finance::Quote price (1.11)" in rendered
+        assert "CREATE PRICE" not in rendered
+
+    def test_replaced(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        rendered = _format_audit_entry_text(self._entry({
+            "status": "replaced", "replaced": {"source": "user:price"},
+        }))
+        assert "REPLACE PRICE  CURRENCY:EUR" in rendered
+        assert "replaced the day's user:price price" in rendered
+        assert "value: 1.10 USD" in rendered
+
+
+class TestPrepaymentAuditLines:
+    """A document settled from an earlier payment paid nothing new;
+    the audit line must not read as a payment from an account
+    (adversarial review 2026-09-30, C37 / C49 / C50)."""
+
+    def _entry(self, params, after, before=None, operation="pay"):
+        return {
+            "classification": "write", "entity_type": "invoice",
+            "operation": operation, "timestamp": "2026-09-30T21:00:00",
+            "params": {"id": "000002", **params},
+            "after_state": after, "before_state": before,
+        }
+
+    def test_settled_from_unapplied_payments(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        rendered = _format_audit_entry_text(self._entry(
+            {"from_prepayment": True},
+            {
+                "type": "invoice", "status": "partial",
+                "applied_from_prepayment": "20.00",
+                "remaining_balance": "30.00",
+                "from_payments": [{"guid": "abc12345", "amount": "20.00"}],
+            },
+        ))
+        assert "PAY INVOICE  id:000002" in rendered
+        assert "applied from unapplied payments: 20.00" in rendered
+        assert "remaining: 30.00" in rendered
+        assert "no new transaction" in rendered
+        assert "from payment txn:abc12345  20.00" in rendered
+        assert "paid: " not in rendered
+
+    def test_rehearsal_of_the_same(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        rendered = _format_audit_entry_text(self._entry(
+            {"from_prepayment": True, "dry_run": True},
+            {
+                "dry_run": True, "type": "invoice", "status": "would_apply",
+                "applied_from_prepayment": "20.00",
+                "remaining_balance_after": "30.00",
+                "from_payments": [{"since": "2026-01-20", "amount": "20.00"}],
+            },
+        ))
+        assert "PAY INVOICE (dry run)" in rendered
+        assert "would apply from unapplied payments: 20.00" in rendered
+        assert "nothing booked" in rendered
+
+    def test_an_overpayment_names_what_was_held(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        rendered = _format_audit_entry_text(self._entry(
+            {"payment_account": "Assets:Checking", "allow_prepayment": True},
+            {
+                "type": "invoice", "payment": "120.00", "total_paid": "100.00",
+                "remaining_balance": "0.00", "transaction_guid": "abc12345",
+                "prepayment": {"amount": "20.00", "currency": "USD"},
+            },
+        ))
+        assert "paid: 120.00" in rendered
+        assert "held as unapplied payment: USD 20.00" in rendered
+
+    def test_unpost_names_the_payments_it_kept(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        rendered = _format_audit_entry_text(self._entry(
+            {}, {
+                "type": "invoice", "status": "unposted",
+                "payments_kept": [{"guid": "abc12345", "amount": "100.00"}],
+                "links_removed": 1,
+            },
+            before={"date_posted": "2026-01-15",
+                    "post_account": "Assets:Accounts Receivable"},
+            operation="unpost",
+        ))
+        assert "UNPOST INVOICE" in rendered
+        assert (
+            "payments kept as the party's unapplied payment: "
+            "100.00 (txn:abc12345)"
+        ) in rendered
+        assert "lot links removed: 1" in rendered
 
 
 class TestConsolidatedParamNamesInFormatters:
@@ -2088,6 +2288,54 @@ class TestRedactPaths:
         assert "/Users" not in result
         assert "book.gnucash" in result
 
+    # ── adversarial review 2026-09-30, C56 ───────────────────────
+    @pytest.mark.parametrize("text, kept, gone", [
+        ("GnuCash book not found: /home/dana/Client Books/Acme Ltd.gnucash",
+         "Acme Ltd.gnucash", ["Client Books", "dana"]),
+        ("Lock on file '/home/dana/My Books/book one.gnucash' detected",
+         "'book one.gnucash'", ["My Books", "dana"]),
+        (r"Cannot open C:\Users\Alice Smith\Documents\book.gnucash",
+         "book.gnucash", ["Alice Smith", "Documents"]),
+        (r"Cannot open \\fileserver\Finance Share\books\ledger.gnucash now",
+         "ledger.gnucash now", ["fileserver", "Finance Share"]),
+        ("Backup dir /home/dana/Client Books/ledger.mcp/backups missing",
+         "ledger.mcp/backups missing", ["Client Books", "dana"]),
+    ])
+    def test_paths_with_spaces_and_network_paths(
+        self, monkeypatch, text, kept, gone,
+    ):
+        monkeypatch.setenv("GNUCASH_REDACT_PATHS", "1")
+        result = self._rp(text)
+        assert kept in result
+        for fragment in gone:
+            assert fragment not in result
+
+    def test_a_file_url_is_reduced_not_mangled(self, monkeypatch):
+        """``file:///…`` came out as ``filb.gnucash``: the ``e:`` of
+        ``file:`` was read as a drive letter."""
+        monkeypatch.setenv("GNUCASH_REDACT_PATHS", "1")
+        result = self._rp("opened file:///home/dana/books/b.gnucash ok")
+        assert result == "opened b.gnucash ok"
+
+    def test_the_books_own_folder_is_removed_even_with_spaces(
+        self, monkeypatch,
+    ):
+        """A directory with spaces and nothing after it cannot be
+        bounded by a pattern — but the server knows its own book's
+        folder."""
+        from gnucash_mcp import logging_config
+        monkeypatch.setenv("GNUCASH_REDACT_PATHS", "1")
+        monkeypatch.setattr(
+            logging_config, "_book_path_str",
+            "/home/dana/Client Books 2026/acme.gnucash",
+        )
+        result = self._rp(
+            "could not write to /home/dana/Client Books 2026 (disk full); "
+            "see /home/dana/Client Books 2026/acme.gnucash"
+        )
+        assert "Client Books" not in result and "dana" not in result
+        assert "acme.gnucash" in result
+
     def test_no_paths_no_change(self, monkeypatch):
         """Plain error messages with no paths pass through unchanged."""
         monkeypatch.setenv("GNUCASH_REDACT_PATHS", "1")
@@ -2649,3 +2897,171 @@ class TestAuditFileOpenedByPath:
         self._emit("AFTER DELETE")
         assert "AFTER DELETE" in live.read_text()
         assert stat.S_IMODE(live.stat().st_mode) == 0o600
+
+
+class TestAccountUpdateAuditListsOnlyWhatChanged:
+    """Review C41 / IV-15. ``after_state`` is the tool response,
+    which carries only the changed fields; the formatter read an
+    absent field as "" and logged a rename to nothing on every
+    description-only update. An audit trail that records edits that
+    did not happen is worse than one with gaps."""
+
+    BEFORE = {
+        "name": "Evil", "fullname": "Expenses:Evil",
+        "description": "keep me", "placeholder": False, "type": "EXPENSE",
+    }
+
+    def _lines(self, after):
+        from gnucash_mcp.logging_config import _fmt_account_update
+        return _fmt_account_update({
+            "timestamp": "2026-09-30T12:00:00+00:00",
+            "params": {"name": "Expenses:Evil"},
+            "before_state": dict(self.BEFORE),
+            "after_state": {"guid": "%abc1234", **after, "status": "updated"},
+        })
+
+    def test_description_only(self):
+        text = "\n".join(self._lines({"description": "x"}))
+        assert 'Description: "keep me" → "x"' in text
+        assert "Name:" not in text
+
+    def test_placeholder_only_logs_the_placeholder(self):
+        text = "\n".join(self._lines({"placeholder": True}))
+        assert "Placeholder: False → True" in text
+        assert "Name:" not in text and "Description:" not in text
+
+    def test_type_only(self):
+        text = "\n".join(self._lines({"type": "ASSET"}))
+        assert "Type: EXPENSE → ASSET" in text
+        assert "Name:" not in text and "Description:" not in text
+
+    def test_rename_only(self):
+        text = "\n".join(self._lines({"name": "Good"}))
+        assert 'Name: "Evil" → "Good"' in text
+        assert "Description:" not in text
+
+    def test_a_cleared_description_is_still_logged(self):
+        text = "\n".join(self._lines({"description": ""}))
+        assert 'Description: "keep me" → ""' in text
+
+    def test_through_the_real_tool(self, test_book, tmp_path, monkeypatch):
+        """End to end: the decorator, the staged before-state, the
+        response as after-state."""
+        from gnucash_mcp.book import GnuCashBook
+        from gnucash_mcp.logging_config import audit_log
+
+        monkeypatch.setenv("GNUCASH_LOG_DIR", str(tmp_path / "logs"))
+        gb = GnuCashBook(str(test_book))
+        setup_logging(str(test_book), audit=True, get_book=lambda: gb)
+
+        @audit_log(
+            classification="write", operation="update",
+            entity_type="account",
+        )
+        def update_account(**kwargs):
+            return json.dumps(gb.update_account(**kwargs))
+
+        update_account(name="Expenses:Groceries", description="weekly shop")
+        logged = "".join(
+            p.read_text() for p in (tmp_path / "logs").rglob("*.txt")
+        )
+        assert 'Description: "" → "weekly shop"' in logged
+        assert "Name:" not in logged
+
+
+class TestBookPathStaysOutOfModelFacingText:
+    """Review C54 / C55. The server names a book by its filename; the
+    directory (username, client folder names) is the private part.
+    Two surfaces carried the whole path to the model: the audit day
+    file's header, returned by every ``get_audit_log`` call, and the
+    dashboard's failed-check lines, which quote raw ``OSError`` text.
+    """
+
+    @pytest.fixture
+    def audit_tool_and_dir(self, tmp_path):
+        from gnucash_mcp.server import (
+            _apply_module_filter,
+            _reset_lazy_load_state,
+            mcp,
+        )
+
+        private = tmp_path / "Jane Doe Clients" / "Acme Holdings LLC"
+        private.mkdir(parents=True)
+        book_path = private / "ledger.gnucash"
+        book_path.touch()
+        setup_logging(book_path=str(book_path), debug=False)
+        log_dir = private / "ledger.gnucash.mcp" / "audit"
+
+        original = dict(mcp._tool_manager._tools)
+        try:
+            mcp._tool_manager._tools.clear()
+            _reset_lazy_load_state()
+            _apply_module_filter("audit")
+            yield mcp._tool_manager._tools["get_audit_log"], log_dir, book_path
+        finally:
+            mcp._tool_manager._tools.clear()
+            mcp._tool_manager._tools.update(original)
+            _reset_lazy_load_state()
+
+    def test_a_new_day_file_names_the_book_by_filename(
+        self, audit_tool_and_dir,
+    ):
+        tool, log_dir, book_path = audit_tool_and_dir
+        header = next(log_dir.glob("*.txt")).read_text()
+        assert "Book: ledger.gnucash" in header
+        assert "Acme Holdings LLC" not in header
+        assert "Jane Doe" not in header
+
+    def test_get_audit_log_never_returns_the_directory(
+        self, audit_tool_and_dir,
+    ):
+        tool, log_dir, book_path = audit_tool_and_dir
+        out = tool.fn()
+        assert "Acme Holdings LLC" not in out and "Jane Doe" not in out
+
+    def test_a_day_file_written_before_1_5_is_cleaned_on_read(
+        self, audit_tool_and_dir,
+    ):
+        """The path is baked into the file when it is created."""
+        tool, log_dir, book_path = audit_tool_and_dir
+        banner = "═" * 64
+        (log_dir / "2026-07-21.txt").write_text(
+            f"{banner}\nGNUCASH MCP AUDIT LOG — 2026-07-21\n"
+            f"Book: {book_path}\nTimezone: PDT\n{banner}\n\n"
+            '10:00:00  UPDATE TRANSACTION  guid:aaaaaaaa\n'
+            '          Notes: (none) → "first entry"\n'
+        )
+        for kwargs in ({"log_date": "2026-07-21"},
+                       {"log_date": "2026-07-21", "limit": 0}):
+            out = tool.fn(**kwargs)
+            assert "Book: ledger.gnucash" in out
+            assert "Acme Holdings LLC" not in out
+            assert "Jane Doe" not in out
+
+    def test_a_database_book_header_is_still_masked(
+        self, audit_tool_and_dir,
+    ):
+        tool, log_dir, _ = audit_tool_and_dir
+        banner = "═" * 64
+        (log_dir / "2026-07-22.txt").write_text(
+            f"{banner}\nGNUCASH MCP AUDIT LOG — 2026-07-22\n"
+            f"Book: postgresql://u:S3CRET@h/db?password=S3CRET\n{banner}\n\n"
+            '10:00:00  UPDATE TRANSACTION  guid:aaaaaaaa\n'
+        )
+        out = tool.fn(log_date="2026-07-22")
+        assert "S3CRET" not in out and "postgresql://u:***@h/db" in out
+
+    def test_failed_check_line_honors_path_redaction(self, monkeypatch):
+        from gnucash_mcp.book.core import _describe_check_failure
+
+        error = NotADirectoryError(
+            20, "Not a directory",
+            "/Users/jane/Finance/book.gnucash.mcp/backups",
+        )
+        monkeypatch.delenv("GNUCASH_REDACT_PATHS", raising=False)
+        assert "/Users/jane/Finance" in _describe_check_failure("Backup-health", error)
+        monkeypatch.setenv("GNUCASH_REDACT_PATHS", "1")
+        line = _describe_check_failure("Backup-health", error)
+        assert "/Users/jane" not in line
+        assert "Backup-health check failed: NotADirectoryError" in line
+        assert "backups" in line

@@ -5,8 +5,11 @@ gnucash_mcp/tools/.
 """
 
 import json
+import re
 import logging
 import traceback
+
+from sqlalchemy.exc import StatementError
 from datetime import date
 from functools import wraps
 from typing import Annotated, Callable, Literal
@@ -14,6 +17,9 @@ from typing import Annotated, Callable, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from gnucash_mcp.book import GnuCashLockError, StaleFXRateError
+
+
+_ISO_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 
 def _parse_iso_date(s: str | None) -> date | None:
@@ -32,7 +38,13 @@ def _parse_iso_date(s: str | None) -> date | None:
     """
     if not s:
         return None
-    return date.fromisoformat(s)
+    # ``date.fromisoformat`` accepts ``20260105`` and ``2026-W02-1`` on
+    # Python 3.11+ and rejects them on 3.10, a supported target; the
+    # contract is YYYY-MM-DD everywhere (scoped review 2026-10-06,
+    # IN-13).
+    if not _ISO_DATE_RE.fullmatch(s.strip()):
+        raise ValueError(f"date {s!r} is not a valid YYYY-MM-DD date")
+    return date.fromisoformat(s.strip())
 
 # Re-exports from the layer-neutral format module. Tool wrappers can
 # keep importing from ``tools._helpers`` (the historical home) without
@@ -45,7 +57,13 @@ from gnucash_mcp._format import (  # noqa: F401
     _paginate,
 )
 
+from gnucash_mcp.logging_config import CredentialScrubFilter  # noqa: E402
+
 logger = logging.getLogger(__name__)
+# Every error a tool raises is logged here with its exception text,
+# and this logger propagates to the host's stderr handler. Mask
+# connection-string credentials before the record leaves.
+logger.addFilter(CredentialScrubFilter())
 
 
 # ── Shared GUID parameter annotations ──────────────────────────────
@@ -431,7 +449,10 @@ def safe_tool(func: Callable) -> Callable:
                 {
                     "error": redact_paths(str(e)),
                     "error_type": "file_not_found",
-                    "suggestion": "Check that GNUCASH_BOOK_PATH is set correctly.",
+                    "suggestion": (
+                        "Check that GNUCASH_BOOK_PATH (or GNUCASH_BOOK_URI, "
+                        "for a database book) is set correctly."
+                    ),
                 }
             )
         except StaleFXRateError as e:
@@ -451,6 +472,29 @@ def safe_tool(func: Callable) -> Callable:
             return _json({
                 "error": redact_paths(str(e)),
                 "error_type": "validation_error",
+            })
+        except StatementError as e:
+            # A refusal raised while binding a value (a transaction
+            # date GnuCash cannot hold, in ``_date_bind``) reaches
+            # here wrapped by SQLAlchemy, with the statement and its
+            # parameters quoted. The inner ValueError is the message;
+            # anything else stays an unexpected error.
+            if isinstance(e.orig, ValueError):
+                logger.warning(
+                    f"Validation error in {func.__name__}: {e.orig}"
+                )
+                return _json({
+                    "error": redact_paths(str(e.orig)),
+                    "error_type": "validation_error",
+                })
+            logger.error(
+                f"Unexpected error in {func.__name__}: {e}\n{traceback.format_exc()}"
+            )
+            return _json({
+                "error": redact_paths(
+                    f"Unexpected error: {type(e).__name__}: {e}"
+                ),
+                "error_type": "unexpected_error",
             })
         except RuntimeError as e:
             # The _verify_* helpers raise RuntimeError for "the

@@ -4,8 +4,11 @@ Data loss is the one failure mode that can't be undone from within
 this server: a mangled book with no clean copy is game over. This
 mixin adds snapshot-based recovery: a ``create_backup()`` primitive
 built on SQLite's online backup API, plus a ``_maybe_auto_backup()``
-hook the audit decorator calls on the first write of a process to
-protect users who forget to back up manually.
+hook the audit decorator calls before a write to protect users who
+forget to back up manually. The hook does its work on the first
+write of a process and again whenever a stage has had time to come
+due — a server left running for days keeps snapshotting — and a
+failed attempt is retried on a later write.
 
 Auto-backups follow a grandfather-father-son retention policy — at
 most 7 session (12h spacing), 4 weekly (7d spacing), 6 monthly (30d
@@ -26,6 +29,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import re
 import shlex
 import sqlite3
@@ -36,7 +40,7 @@ from pathlib import Path
 
 import piecash
 
-from gnucash_mcp.logging_config import redact_paths
+from gnucash_mcp.logging_config import redact_paths, write_private_file
 
 debug_logger = logging.getLogger("gnucash_mcp.debug")
 
@@ -102,6 +106,12 @@ def _sanitize_label(label: str | None) -> str | None:
         return None
     safe = _LABEL_SAFE_RE.sub("-", label).strip("-")
     return safe or None
+
+
+def _monotonic() -> float:
+    """Seconds on a clock that never jumps; a seam for tests."""
+    import time
+    return time.monotonic()
 
 
 def _now_utc() -> datetime:
@@ -239,12 +249,41 @@ def _write_state(
     if book_sha256 is not None:
         payload["book_sha256"] = book_sha256
     path = _state_path(backups_dir, stem)
-    # Write via a temp + rename so a partial write never leaves a
-    # corrupted state file.
-    tmp = path.with_suffix(".json.tmp")
-    with tmp.open("w") as f:
-        json.dump(payload, f, indent=2, sort_keys=True)
-    tmp.replace(path)
+    # Temp + rename, so a partial write never leaves a corrupted
+    # state file; exclusive and link-safe (write_private_file).
+    write_private_file(
+        path, json.dumps(payload, indent=2, sort_keys=True),
+    )
+
+
+# ── Manual-backup anchor (separate file) ─────────────────────────────
+#
+# Which snapshot holds the book as it stands: the book file's sha256
+# when the last manual backup was taken, and that backup's filename.
+# Kept apart from the auto-backup state so neither rewrites the
+# other, and keyed on the stem like everything else in this folder.
+
+
+def _manual_anchor_path(backups_dir: Path, stem: str) -> Path:
+    return backups_dir / f".manual-{stem}.json"
+
+
+def _read_manual_anchor(backups_dir: Path, stem: str) -> dict:
+    try:
+        with _manual_anchor_path(backups_dir, stem).open() as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _write_manual_anchor(
+    backups_dir: Path, stem: str, book_sha256: str, filename: str,
+) -> None:
+    path = _manual_anchor_path(backups_dir, stem)
+    write_private_file(
+        path, json.dumps({"book_sha256": book_sha256, "file": filename}),
+    )
 
 
 # ── Auto-backup attempt status (separate file) ───────────────────────
@@ -314,10 +353,9 @@ def _write_attempt_status(
         "at": at.astimezone(timezone.utc).isoformat(),
     }
     path = _attempt_path_scoped(backups_dir, stem)
-    tmp = path.with_suffix(".json.tmp")
-    with tmp.open("w") as f:
-        json.dump(payload, f, indent=2, sort_keys=True)
-    tmp.replace(path)
+    write_private_file(
+        path, json.dumps(payload, indent=2, sort_keys=True),
+    )
 
 
 # ── Filename inspection ──────────────────────────────────────────────
@@ -356,10 +394,28 @@ class BackupMixin:
     SQLite connection for atomic, lock-safe page-level copying.
     """
 
-    # Flag toggled on first auto-backup attempt per process lifecycle.
-    # Prevents stat + JSON read on every subsequent write once we've
-    # decided this process is up-to-date.
+    # Set on the first auto-backup check of a process. Keeps the
+    # stat + JSON read off the hot path: once checked, the next
+    # check waits until ``_backup_next_check`` (monotonic seconds).
     _backup_checked_in_process: bool = False
+
+    # When the hook looks again. ``None`` with the flag above set
+    # means "never" — a test or caller that sets the flag by hand to
+    # switch the hook off keeps that meaning.
+    #
+    # The hook used to run ONCE per process. A server left running
+    # (every Claude Desktop session) took no further snapshots
+    # however many days passed, and one failed first attempt — the
+    # user had GnuCash open — left the rest of the process with no
+    # auto-backup at all, while the dashboard advised "close GnuCash
+    # and try again" (adversarial review 2026-09-30, C29).
+    _backup_next_check: float | None = None
+    # Healthy: look again after this long. The shortest stage
+    # interval is 12 hours, so a quarter of an hour is prompt, and
+    # the check itself is one small file read.
+    _BACKUP_RECHECK_SECONDS = 15 * 60
+    # After a failed attempt: soon, but not on every write.
+    _BACKUP_RETRY_SECONDS = 60
 
     # Serialize the read+write of ``_backup_checked_in_process`` across
     # threads. Without this, two simultaneous "first writes" of the
@@ -384,6 +440,14 @@ class BackupMixin:
         """
         from gnucash_mcp.logging_config import resolve_mcp_dir
         return resolve_mcp_dir(self.book_path) / "backups"
+
+    def _claim_backups_dir(self, backups_dir: Path) -> None:
+        """Before the first file lands under a shared
+        ``GNUCASH_LOG_DIR``: record which book the folder belongs to
+        (``claim_log_dir``), so a same-named book elsewhere gets its
+        own and never reads, counts, or prunes these snapshots."""
+        from gnucash_mcp.logging_config import claim_log_dir
+        claim_log_dir(backups_dir.parent, self.book_path)
 
     def _require_file_backed(self, action: str) -> None:
         """Refuse a file-shaped backup operation on a DB-backed book.
@@ -474,11 +538,135 @@ class BackupMixin:
 
     # ── Core primitive: create a backup ──────────────────────────
 
+    # ── The one-time snapshot before a book's shapes are converted ──
+
+    _PRE_UPGRADE_LABEL = "pre-1-5-upgrade"
+
+    # Per-instance once-flag (the marker file is the durable record).
+    # The test suite sets the class default True so 2,800 throwaway
+    # books don't each take a snapshot; the tests of this feature
+    # switch it back.
+    _pre_upgrade_checked: bool = False
+
+    def _pre_upgrade_marker(self) -> Path:
+        return self._backups_dir() / (
+            f".pre-1-5-upgrade-{self.book_path.stem.lower()}"
+        )
+
+    def _ensure_pre_upgrade_snapshot(self) -> dict:
+        """Before this server first converts a book's stored shapes:
+        make sure a snapshot of the book AS IT IS exists. Called by
+        ``_upgrade_book_shapes`` ahead of every converter; does its
+        work once per book and is a single flag check afterwards.
+
+        The 1.5 conversion rewrites thousands of rows in one commit —
+        schedule recipes, invoice links, reconcile dates, slot
+        fillers, price dates — and cannot be undone. The only way
+        back is a copy from before it. The routine auto-backup does
+        not promise one: it runs once per process and only when a
+        stage is due, so a server whose first write of the day
+        converted nothing, or one restarted within the session
+        window after the book changed, converted with no snapshot of
+        the state it converted from (adversarial review 2026-09-30,
+        C30).
+
+        - A ``manual``-stage snapshot labelled ``pre-1-5-upgrade`` is
+          written, always: manual snapshots are never pruned, and no
+          anchor is trusted to say an existing file holds this state.
+        - It cannot be written: the write is REFUSED. Every other
+          backup here is best-effort, because a routine write can be
+          redone; this one guards a change that cannot.
+        - A database book has no snapshot store: nothing is taken,
+          and the release notes say to dump the database first.
+
+        The copy is read from the file's last COMMITTED state through
+        a separate read-only connection, so whatever the calling
+        write has already staged is not in it. It runs BEFORE the
+        converters, not after they report work: a large conversion
+        can spill SQLite's page cache and take the exclusive lock
+        mid-transaction, after which nothing else can read the file.
+
+        Returns ``{"pre_upgrade_backup": <filename>}``, the copy
+        written here; the marker file names it.
+        """
+        if self._pre_upgrade_checked or not self.source.is_file:
+            return {}
+        try:
+            marker = self._pre_upgrade_marker()
+            if marker.exists():
+                self._pre_upgrade_checked = True
+                return {}
+            result: dict = {}
+            # Always a fresh copy of the committed state. The shortcut
+            # that reused the auto-backup's file when the book hash
+            # matched trusted a stale anchor: after a prune the newest
+            # file could hold an OLDER state of the book, and the
+            # irreversible conversion ran with no copy of what it
+            # converted (scoped review 2026-10-06, CS-2). One extra
+            # copy, once per book, is the price of knowing.
+            made = self.create_backup(
+                stage=_MANUAL_STAGE_NAME,
+                label=self._PRE_UPGRADE_LABEL,
+                _committed_state=True,
+            )
+            holds = Path(made["path"]).name
+            result["pre_upgrade_backup"] = holds
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            write_private_file(
+                marker, f"{_format_ts(_now_utc())}\nsnapshot: {holds}\n",
+            )
+        except Exception as e:
+            raise ValueError(
+                f"This write would convert the book's stored shapes to "
+                f"GnuCash's own, which cannot be undone, and the "
+                f"snapshot that guards it could not be written "
+                f"({type(e).__name__}: {e}). Nothing was changed. Make "
+                f"the backup folder writable (or point GNUCASH_LOG_DIR "
+                f"at a private folder) and retry."
+            ) from e
+        self._pre_upgrade_checked = True
+        return result
+
+    def _withdraw_pre_upgrade_snapshot(self, filename: str) -> None:
+        """Remove the pre-upgrade snapshot this call just took, because
+        the converters then found nothing to convert.
+
+        The snapshot has to be taken before the converters run (see
+        above), so it is taken on every book's first converting
+        write — including a book 1.5 or GnuCash desktop made, which
+        has no pre-1.5 shape in it. Kept, that was a never-pruned
+        file labelled "pre-1.5 upgrade" beside a book that was never
+        upgraded (GUI gate 2026-10-01, G-1). The marker stays, so the
+        question is not asked again. Best-effort: a file that cannot
+        be removed is only an extra copy. Manual-stage snapshots do
+        not move the auto-backup's hash anchor, so nothing else
+        refers to this one.
+        """
+        try:
+            (self._backups_dir() / filename).unlink()
+        except OSError as e:
+            debug_logger.warning(
+                f"Unneeded pre-upgrade snapshot not removed: {e}"
+            )
+            return
+        # The marker named that file (close-out flag 2); say instead
+        # that nothing needed a copy (scoped review, S-4 / M-6).
+        try:
+            marker = self._pre_upgrade_marker()
+            stamp = marker.read_text().splitlines()[0]
+            write_private_file(
+                marker, f"{stamp}\nsnapshot: none (nothing to convert)\n",
+            )
+        except (OSError, IndexError):
+            pass
+
     def create_backup(
         self,
         *,
         stage: str = _MANUAL_STAGE_NAME,
         label: str | None = None,
+        _committed_state: bool = False,
+        skip_unchanged: bool = False,
     ) -> dict:
         """Write a fresh snapshot via SQLite's online backup API and
         verify it with PRAGMA integrity_check.
@@ -489,6 +677,14 @@ class BackupMixin:
                 retention).
             label: Optional marker (sanitized to ``[A-Za-z0-9_-]``)
                 appended to the filename — "pre-big-reorg" style.
+            skip_unchanged: Manual stage only. When the book's bytes
+                are what they were at the last manual backup and that
+                file is still there, write nothing and answer with
+                the existing file (``status: unchanged``). This is
+                the cap on manual backups: nothing is ever deleted,
+                and a caller in a loop cannot fill the disk with
+                copies of one state (adversarial review 2026-09-30,
+                C60: 1,363 copies, 3.0 GB, in 20 seconds).
 
         Returns:
             ``{status, stage, path, size_bytes, integrity,
@@ -511,9 +707,35 @@ class BackupMixin:
         safe_label = _sanitize_label(label)
         ts = _now_utc()
         backups_dir = self._backups_dir()
+        self._claim_backups_dir(backups_dir)
         backups_dir.mkdir(parents=True, exist_ok=True)
 
         stem = self.book_path.stem
+        book_hash = None
+        if stage == _MANUAL_STAGE_NAME and not _committed_state:
+            book_hash = self._current_book_hash()
+        if skip_unchanged and book_hash is not None:
+            anchor = _read_manual_anchor(backups_dir, stem)
+            held = backups_dir / Path(str(anchor.get("file") or "-")).name
+            if anchor.get("book_sha256") == book_hash and held.is_file():
+                return {
+                    "status": "unchanged",
+                    "stage": stage,
+                    "path": redact_paths(str(held)),
+                    "size_bytes": held.stat().st_size,
+                    "note": (
+                        "The book has not changed since this backup "
+                        "was taken; no new copy was written"
+                        + (
+                            f", so the label {safe_label!r} was not applied"
+                            if safe_label else ""
+                        )
+                        + "."
+                    ),
+                    "restore_hint": redact_paths(
+                        self._restore_hint(held)
+                    ),
+                }
         ts_part = _format_ts(ts)
         filename = f"{stem}-{ts_part}-{stage}"
         if safe_label:
@@ -530,10 +752,7 @@ class BackupMixin:
                 f"collision; retry."
             )
 
-        # Source opened readonly (no write lock on the live book);
-        # SQLite's backup() copies pages without blocking readers.
-        with self.open(readonly=True) as book:
-            source_conn = book.session.connection().connection
+        def _copy(source_conn) -> None:
             dest_conn = sqlite3.connect(str(backup_path))
             try:
                 source_conn.backup(dest_conn)
@@ -551,6 +770,35 @@ class BackupMixin:
             finally:
                 # Idempotent — close() is a no-op on a closed conn.
                 dest_conn.close()
+            # The whole book, readable by its owner only — like the
+            # audit log beside it. It was created 0644, so a 0600
+            # book had world-readable copies (adversarial review
+            # 2026-09-30, DS-15 / SEC-15).
+            try:
+                os.chmod(backup_path, 0o600)
+            except OSError:
+                pass
+
+        if _committed_state:
+            # Called from INSIDE a write session
+            # (``_ensure_pre_upgrade_snapshot``): no second book open,
+            # and no piecash at all — a plain read-only connection
+            # sees the file's last committed state, which is the
+            # state the caller is about to change.
+            from urllib.parse import quote
+            source_conn = sqlite3.connect(
+                f"file:{quote(str(self.book_path))}?mode=ro", uri=True,
+            )
+            try:
+                _copy(source_conn)
+            finally:
+                source_conn.close()
+        else:
+            # Source opened readonly (no write lock on the live
+            # book); SQLite's backup() copies pages without blocking
+            # readers.
+            with self.open(readonly=True) as book:
+                _copy(book.session.connection().connection)
 
         # Verify before declaring success; a failed check deletes
         # the file so no broken snapshot masquerades as recovery.
@@ -577,13 +825,16 @@ class BackupMixin:
         # spaces/metachars break the command, and an unquoted
         # f-string is a latent injection if a future path component
         # is user-influenced.
-        restore_hint = (
-            "Restore by stopping the server, then: "
-            f"mv {shlex.quote(str(self.book_path))} "
-            f"{shlex.quote(str(self.book_path) + '.broken')} && "
-            f"cp {shlex.quote(str(backup_path))} "
-            f"{shlex.quote(str(self.book_path))}"
-        )
+        restore_hint = self._restore_hint(backup_path)
+        if book_hash is not None:
+            try:
+                _write_manual_anchor(
+                    backups_dir, stem, book_hash, backup_path.name,
+                )
+            except OSError as e:
+                # The backup itself is good; the next call just
+                # writes another.
+                debug_logger.warning(f"Manual backup anchor not saved: {e}")
         return {
             "status": "created",
             "stage": stage,
@@ -592,6 +843,15 @@ class BackupMixin:
             "integrity": integrity,
             "restore_hint": redact_paths(restore_hint),
         }
+
+    def _restore_hint(self, backup_path: Path) -> str:
+        return (
+            "Restore by stopping the server, then: "
+            f"mv {shlex.quote(str(self.book_path))} "
+            f"{shlex.quote(str(self.book_path) + '.broken')} && "
+            f"cp {shlex.quote(str(backup_path))} "
+            f"{shlex.quote(str(self.book_path))}"
+        )
 
     # ── Listing ──────────────────────────────────────────────────
 
@@ -807,15 +1067,16 @@ class BackupMixin:
     # ── Auto-backup driver (called from @audit_log) ───────────────
 
     def _maybe_auto_backup(self) -> None:
-        """Called once per process, before the first write, from the
-        audit decorator: backs up under the highest-priority due
-        stage (if any) and prunes each auto stage to its
-        ``keep_last_n``.
+        """Called before every write, from the audit decorator: backs
+        up under the highest-priority due stage (if any) and prunes
+        each auto stage to its ``keep_last_n``. Does its work on the
+        first call of a process and then again no sooner than
+        ``_BACKUP_RECHECK_SECONDS`` later (``_BACKUP_RETRY_SECONDS``
+        after a failure); in between it is a flag check.
 
         Silently returns on any failure — an auto-backup error must
-        never fail the user's write; the debug log records why.
-        Safe to call repeatedly (``_backup_checked_in_process``
-        gates it).
+        never fail the user's write; the debug log and the dashboard
+        record why.
         """
         # DB-backed books have no snapshot store. Return before the
         # process gate flips so the check stays cheap and idempotent
@@ -826,12 +1087,17 @@ class BackupMixin:
         # Lock so concurrent first-writes can't both pass the gate
         # and collide on the same backup filename.
         with self._backup_check_lock:
-            if self._backup_checked_in_process:
+            mono = _monotonic()
+            if self._backup_checked_in_process and (
+                self._backup_next_check is None
+                or mono < self._backup_next_check
+            ):
                 return
-            # Flag BEFORE running so a raise here won't cause the
-            # audit hook to retry on every subsequent write of the
-            # process.
+            # Set BEFORE running, so a raise below can't make the
+            # audit hook retry on every write: the failure path
+            # shortens the wait, it does not remove it.
             self._backup_checked_in_process = True
+            self._backup_next_check = mono + self._BACKUP_RECHECK_SECONDS
 
         backups_dir = self._backups_dir()
         stem = self.book_path.stem
@@ -905,6 +1171,12 @@ class BackupMixin:
             # We persist the failure so get_book_summary's Warnings
             # section can surface it on the next read.
             debug_logger.warning(f"Auto-backup skipped: {e}")
+            # Try again on a write soon after — the usual cause is
+            # GnuCash holding the book, and the user's next move is
+            # to close it and retry.
+            self._backup_next_check = (
+                _monotonic() + self._BACKUP_RETRY_SECONDS
+            )
             try:
                 _write_attempt_status(
                     backups_dir, stem, "failed", str(e), now,
@@ -927,6 +1199,19 @@ class BackupMixin:
                 "newest_backup_age_days": int | None,
             }``
         """
+        if not self.source.is_file:
+            # No chain to report on: this server does not back up a
+            # database book (create_backup refuses, _maybe_auto_backup
+            # is a no-op), so the dashboard's backup-health section has
+            # nothing to say. It must answer the empty shape rather
+            # than raise — this raised TypeError on ``book_path.stem``
+            # on every dashboard call, swallowed until the collectors
+            # started reporting failed checks.
+            return {
+                "last_attempt": None,
+                "newest_backup_at": None,
+                "newest_backup_age_days": None,
+            }
         backups_dir = self._backups_dir()
         attempt = _read_attempt_status(backups_dir, self.book_path.stem)
         try:

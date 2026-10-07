@@ -273,81 +273,34 @@ class TestSetBudgetAmount:
                 assert Decimal(acct["periods"][0]) == Decimal("700.00")
                 break
 
-    def test_subcent_amount_quantizes_consistently_on_insert_and_update(
+    def test_an_amount_finer_than_the_currency_unit_is_refused(
         self, budget_book: Path,
     ):
-        """Sub-cent input quantizes to commodity precision and produces
-        identical stored values via the insert and update paths.
-
-        Pre-fix, the insert path did ``int(amount * 100)`` which
-        truncated; the update path used piecash's hybrid setter which
-        did not. Same input produced different stored values depending
-        on whether a row already existed.
-        """
+        """12.345 was rounded to 12.34 and 0.001 to nothing, without a
+        word. Everywhere else money is entered, an amount finer than
+        the currency's unit is a typo and is refused (ruling
+        2026-09-27); budgets follow (adversarial review 2026-09-30,
+        C40). Both the insert and the update path refuse alike."""
         book = GnuCashBook(str(budget_book))
         book.create_budget(name="2026 Budget", year=2026, num_periods=12)
-
-        # Insert path (no existing row) — period 0
         book.set_budget_amount(
-            budget_name="2026 Budget",
-            account="Expenses:Groceries",
-            amount="499.995",
-            period=0,
+            budget_name="2026 Budget", account="Expenses:Groceries",
+            amount="500.00", period=1,
         )
-
-        # Update path — set period 0 again with same input
-        book.set_budget_amount(
-            budget_name="2026 Budget",
-            account="Expenses:Groceries",
-            amount="499.995",
-            period=0,
-        )
-
-        # And on a fresh period — also insert path
-        book.set_budget_amount(
-            budget_name="2026 Budget",
-            account="Expenses:Groceries",
-            amount="499.995",
-            period=1,
-        )
-
+        for period in (0, 1):  # no row yet; a row to update
+            for amount in ("499.995", "1234.567", "0.001"):
+                with pytest.raises(ValueError, match="Budget amount"):
+                    book.set_budget_amount(
+                        budget_name="2026 Budget",
+                        account="Expenses:Groceries",
+                        amount=amount, period=period,
+                    )
         budget = book.get_budget(compact=False, name="2026 Budget")
         groceries = next(
             a for a in budget["accounts"]
             if a["account"] == "Expenses:Groceries"
         )
-        # Banker's rounding: 499.995 → 500.00 (round half to even,
-        # 9 is odd → up to 10 → carry → 500.00).
-        expected = Decimal("500.00")
-        assert Decimal(groceries["periods"][0]) == expected
-        assert Decimal(groceries["periods"][1]) == expected
-        # Insert and update paths produce the same stored value.
-        assert groceries["periods"][0] == groceries["periods"][1]
-
-    def test_subcent_amount_truncation_does_not_silently_drop_digits(
-        self, budget_book: Path,
-    ):
-        """Larger sub-cent input rounds, doesn't truncate.
-
-        Pre-fix, ``int(Decimal('1234.567') * 100)`` truncated to
-        123456 → stored 1234.56 instead of rounding to 1234.57.
-        """
-        book = GnuCashBook(str(budget_book))
-        book.create_budget(name="2026 Budget", year=2026, num_periods=12)
-
-        book.set_budget_amount(
-            budget_name="2026 Budget",
-            account="Expenses:Groceries",
-            amount="1234.567",
-            period=0,
-        )
-
-        budget = book.get_budget(compact=False, name="2026 Budget")
-        groceries = next(
-            a for a in budget["accounts"]
-            if a["account"] == "Expenses:Groceries"
-        )
-        assert Decimal(groceries["periods"][0]) == Decimal("1234.57")
+        assert Decimal(groceries["periods"][1]) == Decimal("500.00")
 
     def test_set_nonexistent_budget_raises(self, budget_book: Path):
         """Setting amount on nonexistent budget raises ValueError."""
@@ -1613,3 +1566,55 @@ class TestBudgetHeadlineExpensesOnly:
         gb.set_budget_amount("H", "Income:Salary", "5000")
         with gb.open(readonly=True) as book:
             assert gb._budget_headline(book, list(book.transactions)) is None
+
+
+class TestBudgetAmountIsAMagnitude:
+    """Review C40 / IV-14. The ledger writes income as a negative, so
+    ``-5000`` is the natural slip on an income account — and it
+    stored a target in the wrong direction, which then cancelled a
+    correct one in the report."""
+
+    def _budget(self, budget_book):
+        book = GnuCashBook(str(budget_book))
+        book.create_budget(name="B", year=2026)
+        return book
+
+    @pytest.mark.parametrize("account", [
+        "Income:Salary", "Expenses:Groceries",
+    ])
+    def test_a_negative_amount_is_refused(self, budget_book, account):
+        book = self._budget(budget_book)
+        with pytest.raises(ValueError, match="positive numbers"):
+            book.set_budget_amount(
+                budget_name="B", account=account, amount="-5000",
+                period=0,
+            )
+        report = book.get_budget(name="B", compact=False)
+        assert account not in str(report.get("accounts", ""))
+
+    def test_income_target_does_not_cancel(self, budget_book):
+        book = self._budget(budget_book)
+        book.set_budget_amount(
+            budget_name="B", account="Income:Salary", amount="5000",
+            period=0,
+        )
+        with pytest.raises(ValueError):
+            book.set_budget_amount(
+                budget_name="B", account="Income:Salary",
+                amount="-5000", period=1,
+            )
+        book.set_budget_amount(
+            budget_name="B", account="Income:Salary", amount="5000",
+            period=1,
+        )
+        report = book.get_budget_report("B", period="all", compact=False)
+        row = next(
+            a for a in report["accounts"] if a["account"] == "Income:Salary"
+        )
+        assert Decimal(row["budgeted"]) == Decimal("10000")
+
+    def test_zero_still_clears_a_target(self, budget_book):
+        book = self._budget(budget_book)
+        assert book.set_budget_amount(
+            budget_name="B", account="Expenses:Groceries", amount="0",
+        )["status"] == "updated"

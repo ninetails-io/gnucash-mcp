@@ -26,6 +26,7 @@ import pytest
 from piecash import factories
 
 from gnucash_mcp.book import GnuCashBook
+from tests.conftest import drop_transaction_prices, leak_same_day_price
 
 
 # --------------------------------------------------------------------------
@@ -334,7 +335,11 @@ def test_budget_report_warns_on_unconvertible_foreign_target(tmp_path):
 def test_market_value_cost_basis_converts_foreign_purchase(tmp_path):
     """When a holding has no market price, the cost-basis fallback
     values each purchase at its posting-date rate (book default), not a
-    raw sum of foreign transaction-currency values."""
+    raw sum of foreign transaction-currency values.
+
+    The EUR buy leaves a NOPRICE/EUR implied-rate row that values the
+    fund since the 2026-09-29 ruling (desktop counts it); the subject
+    is the no-price fallback, so the row is deleted below."""
     path = tmp_path / "mv.gnucash"
     book = piecash.create_book(str(path), currency="USD", overwrite=True)
     usd = book.default_currency
@@ -371,6 +376,7 @@ def test_market_value_cost_basis_converts_foreign_purchase(tmp_path):
     )
     book.save()
     book.close()
+    assert drop_transaction_prices(path) == 1
 
     gb = GnuCashBook(str(path))
     with gb.open(readonly=True) as book:
@@ -387,83 +393,504 @@ def test_market_value_cost_basis_converts_foreign_purchase(tmp_path):
         assert value == Decimal("1200.00")
 
 
-class TestSameDatePriceTieBreak:
-    """Bookkeeper finding F3: two prices on the same
-    commodity/currency/date used to resolve by an accident of query
-    order — posting math and month-close valuation could flip between
-    runs. The rule is now deliberate: a manual quote (user:price /
-    user:price-editor) outranks feed sources; guid breaks residual
-    ties (arbitrary but stable)."""
+def test_balance_sheet_excludes_closed_unpriced_position(tmp_path):
+    """A fully-closed holding (net quantity zero) in a commodity that
+    was never independently priced must value at zero, not the
+    realized gain/loss baked into its unpriced sell leg.
 
-    def test_manual_quote_beats_feed_on_same_date(
-        self, multi_currency_book,
+    ``_split_in_default_currency``'s cost-basis fallback sums each
+    split's raw ``.value`` — correct while a position is open, since
+    that value approximates cost basis. But once every share is sold,
+    the true remaining value is zero regardless of what the unpriced
+    buy/sell legs recorded; summing them instead leaks the realized
+    gain (or loss) as a phantom balance. Reproduces a real book: a
+    small-cap altcoin bought for 1000 and fully sold for 1500 two
+    years later, with no market price ever recorded for it.
+    """
+    path = tmp_path / "closed.gnucash"
+    book = piecash.create_book(str(path), currency="USD", overwrite=True)
+    usd = book.default_currency
+    coin = piecash.Commodity(
+        namespace="CRYPTO", mnemonic="ALT",
+        fullname="Some Altcoin", fraction=100000000,
+    )
+    book.session.add(coin)
+    assets = piecash.Account(
+        name="Assets", type="ASSET", commodity=usd,
+        parent=book.root_account, placeholder=True,
+    )
+    cash = piecash.Account(
+        name="Checking", type="BANK", commodity=usd, parent=assets,
+    )
+    holding = piecash.Account(
+        name="Altcoin", type="STOCK", commodity=coin, parent=assets,
+    )
+    piecash.Transaction(
+        currency=usd, post_date=date(2021, 1, 1), description="Buy",
+        splits=[
+            piecash.Split(account=holding, value=Decimal("1000"),
+                          quantity=Decimal("10")),
+            piecash.Split(account=cash, value=Decimal("-1000"),
+                          quantity=Decimal("-1000")),
+        ],
+    )
+    piecash.Transaction(
+        currency=usd, post_date=date(2022, 6, 1), description="Sell",
+        splits=[
+            piecash.Split(account=holding, value=Decimal("-1500"),
+                          quantity=Decimal("-10")),
+            piecash.Split(account=cash, value=Decimal("1500"),
+                          quantity=Decimal("1500")),
+        ],
+    )
+    book.save()
+    book.close()
+
+    gb = GnuCashBook(str(path))
+    bs = gb.balance_sheet(as_of_date=date(2026, 1, 1))
+
+    rows = {a["account"]: a for a in bs["assets"]["accounts"]}
+    # The closed, unpriced position holds nothing and must not appear
+    # in the report at all — not a "$0.00" line, simply absent, same
+    # as any other zero-balance account.
+    assert "Assets:Altcoin" not in rows
+    # Total reflects only the cash account: -1000 (buy) + 1500 (sell) = 500.
+    assert Decimal(bs["assets"]["total"]) == Decimal("500.00")
+    # A = L + E still holds, and the unbooked 500 gain is what the
+    # balancing residual carries — not a dropped account.
+    assert (
+        Decimal(bs["assets"]["total"]) - Decimal(bs["liabilities"]["total"])
+        == Decimal(bs["equity"]["total"])
+    )
+    # net_worth reads the same book the same way (#185: it used to
+    # keep the phantom while balance_sheet dropped it).
+    nw = gb.net_worth(end_date=date(2026, 1, 1))
+    assert Decimal(nw["net_worth"]) == Decimal("500")
+
+
+def _unpriced_holding_book(path, legs, *, commodity_ns="CRYPTO"):
+    """USD book with one never-priced holding and one checking account.
+
+    ``legs`` is a list of ``(post_date, description, quantity, value)``
+    for the holding; the cash leg mirrors ``value``. Returns the
+    GnuCashBook.
+
+    Every leg leaves an implied-rate ``type='transaction'`` row, which
+    values the holding since the 2026-09-29 ruling (desktop counts
+    it). "Never priced" means no price row of any type — a real state
+    after desktop's Price Editor, or in older books — so they go.
+    """
+    book = piecash.create_book(str(path), currency="USD", overwrite=True)
+    usd = book.default_currency
+    coin = piecash.Commodity(
+        namespace=commodity_ns, mnemonic="ALT",
+        fullname="Some Altcoin", fraction=100000000,
+    )
+    book.session.add(coin)
+    assets = piecash.Account(
+        name="Assets", type="ASSET", commodity=usd,
+        parent=book.root_account, placeholder=True,
+    )
+    cash = piecash.Account(
+        name="Checking", type="BANK", commodity=usd, parent=assets,
+    )
+    holding = piecash.Account(
+        name="Altcoin", type="STOCK", commodity=coin, parent=assets,
+    )
+    for post_date, desc, qty, value in legs:
+        piecash.Transaction(
+            currency=usd, post_date=post_date, description=desc,
+            splits=[
+                piecash.Split(account=holding, value=Decimal(value),
+                              quantity=Decimal(qty)),
+                piecash.Split(account=cash, value=-Decimal(value),
+                              quantity=-Decimal(value)),
+            ],
+        )
+    book.save()
+    book.close()
+    assert drop_transaction_prices(path) == len(legs)
+    return GnuCashBook(str(path))
+
+
+def _three_surfaces(gb, as_of):
+    """(balance_sheet A - L, net_worth, dashboard net worth) as of a
+    date — the numbers that must agree on any book."""
+    bs = gb.balance_sheet(as_of_date=as_of)
+    sheet = (
+        Decimal(bs["assets"]["total"]) - Decimal(bs["liabilities"]["total"])
+    )
+    nw = Decimal(gb.net_worth(end_date=as_of)["net_worth"])
+    with gb.open(readonly=True) as book:
+        dash = gb._compute_net_worth_at(
+            book, as_of, book.default_currency, list(book.accounts),
+        )
+    # The sheet renders cents; the other two return the raw Decimal.
+    cent = Decimal("0.01")
+    return sheet, nw.quantize(cent), dash.quantize(cent)
+
+
+class TestUnpricedCostBasis:
+    """#185: an unpriced holding is worth its remaining cost basis.
+
+    The old fallback summed every leg's raw ``value``, which is cost
+    minus proceeds: a partly sold position carried its realized gain
+    (or loss) as part of the "basis", and a fully sold one showed the
+    gain as a phantom holding. The rule now lives in one place
+    (``_unpriced_cost_basis`` / ``_CostPool``) and every surface reads
+    it, so balance_sheet, net_worth and the dashboard agree by
+    construction.
+    """
+
+    AS_OF = date(2026, 1, 1)
+
+    def test_partial_sale_values_remaining_units_at_average_cost(
+        self, tmp_path,
     ):
-        from datetime import date
-        gc = GnuCashBook(str(multi_currency_book))
-        d = date(2026, 3, 31)
-        # Insert feed first, manual second AND manual first, feed
-        # second on a different date — order must not matter.
-        gc.create_price("EUR", "CURRENCY", "1.30", price_date=d,
-                        source="user:market-data")
-        gc.create_price("EUR", "CURRENCY", "1.10", price_date=d,
-                        source="user:price")
-        with gc.open(readonly=True) as book:
-            eur = book.commodities(mnemonic="EUR")
-            usd = book.default_currency
-            rate = gc._find_exchange_rate(book, eur, usd, d)
-            assert rate == Decimal("1.10"), (
-                f"manual quote must win the same-date tie, got {rate}"
+        gb = _unpriced_holding_book(tmp_path / "partial.gnucash", [
+            (date(2021, 1, 1), "Buy", "10", "1000"),
+            (date(2022, 6, 1), "Sell", "-9", "-1350"),
+        ])
+        bs = gb.balance_sheet(as_of_date=self.AS_OF)
+        rows = {a["account"]: a for a in bs["assets"]["accounts"]}
+        # One unit left, bought at 100 — not 1000 - 1350 = -350.
+        assert Decimal(
+            rows["Assets:Altcoin"]["default_currency_value"]
+        ) == Decimal("100.00")
+        assert "no price data" in rows["Assets:Altcoin"]["balance"]
+        # Cash: -1000 + 1350 = 350; plus the unit at cost = 450.
+        assert Decimal(bs["assets"]["total"]) == Decimal("450.00")
+        sheet, nw, dash = _three_surfaces(gb, self.AS_OF)
+        assert sheet == nw == dash == Decimal("450")
+
+    def test_repurchase_after_full_sale_starts_a_new_basis(
+        self, tmp_path,
+    ):
+        """Chronological: the pool relieves to zero on the sale and
+        the later buy opens a fresh basis — not the average of every
+        buy ever made."""
+        gb = _unpriced_holding_book(tmp_path / "rebuy.gnucash", [
+            (date(2021, 1, 1), "Buy", "10", "1000"),
+            (date(2021, 6, 1), "Sell", "-10", "-1500"),
+            (date(2022, 1, 1), "Buy again", "10", "2000"),
+        ])
+        bs = gb.balance_sheet(as_of_date=self.AS_OF)
+        rows = {a["account"]: a for a in bs["assets"]["accounts"]}
+        assert Decimal(
+            rows["Assets:Altcoin"]["default_currency_value"]
+        ) == Decimal("2000.00")
+        sheet, nw, dash = _three_surfaces(gb, self.AS_OF)
+        # Cash: -1000 + 1500 - 2000 = -1500; holding 2000 → 500.
+        assert sheet == nw == dash == Decimal("500")
+
+    def test_dust_remainder_is_not_a_knife_edge(self, tmp_path):
+        """One satoshi left behind used to keep the whole realized
+        gain on the sheet as a negative asset; now it is one satoshi
+        at cost."""
+        gb = _unpriced_holding_book(tmp_path / "dust.gnucash", [
+            (date(2021, 1, 1), "Buy", "10", "1000"),
+            (date(2022, 6, 1), "Sell", "-9.99999999", "-1499.99"),
+        ])
+        bs = gb.balance_sheet(as_of_date=self.AS_OF)
+        rows = {a["account"]: a for a in bs["assets"]["accounts"]}
+        remaining = Decimal(rows["Assets:Altcoin"]["default_currency_value"])
+        assert Decimal("0") <= remaining < Decimal("0.01")
+        sheet, nw, dash = _three_surfaces(gb, self.AS_OF)
+        assert sheet == nw == dash
+
+    def test_voided_sale_does_not_relieve_the_basis(self, tmp_path):
+        gb = _unpriced_holding_book(tmp_path / "void.gnucash", [
+            (date(2021, 1, 1), "Buy", "10", "1000"),
+            (date(2022, 6, 1), "Sell", "-10", "-1500"),
+        ])
+        with gb.open(readonly=False) as book:
+            sale = [t for t in book.transactions
+                    if t.description == "Sell"][0]
+            for s in sale.splits:
+                s.reconcile_state = "v"
+                s.value = Decimal("0")
+                s.quantity = Decimal("0")
+            book.save()
+        bs = gb.balance_sheet(as_of_date=self.AS_OF)
+        rows = {a["account"]: a for a in bs["assets"]["accounts"]}
+        assert Decimal(
+            rows["Assets:Altcoin"]["default_currency_value"]
+        ) == Decimal("1000.00")
+
+    def test_series_boundaries_match_point_in_time(self, tmp_path):
+        """The trajectory's incremental pool reads the same basis at
+        each boundary as the one-shot valuation."""
+        gb = _unpriced_holding_book(tmp_path / "series.gnucash", [
+            (date(2021, 3, 1), "Buy", "10", "1000"),
+            (date(2022, 6, 1), "Sell", "-4", "-600"),
+            (date(2023, 9, 1), "Buy", "2", "300"),
+            (date(2024, 2, 1), "Sell", "-8", "-1200"),
+        ])
+        series = gb.net_worth(
+            end_date=self.AS_OF, start_date=date(2021, 1, 1),
+            interval="year",
+        )["series"]
+        assert len(series) == 6
+        for point in series:
+            boundary = date.fromisoformat(point["date"])
+            one_shot = gb.net_worth(end_date=boundary)["net_worth"]
+            assert Decimal(point["net_worth"]) == Decimal(one_shot), (
+                point["date"]
             )
-            rates = gc._rates_as_of(book, d)
-            assert rates[eur.guid] == Decimal("1.10")
+        # After the last sale nothing remains: cash only.
+        assert Decimal(series[-1]["net_worth"]) == Decimal("500")
 
-    def test_unknown_user_source_ranks_between_manual_and_feed(
+    def test_foreign_liability_paid_off_leaves_the_sheet(self, tmp_path):
+        """Sign-agnostic: a EUR card with no EUR rate on file, charged
+        then paid in full, is a zero liability — and the FX difference
+        the user never booked is the residual, on every surface.
+        (Both legs leave EUR/USD implied-rate rows, which count as
+        rates since the 2026-09-29 ruling; they are deleted so the
+        card stays rate-less, as the subject needs.)"""
+        path = tmp_path / "card.gnucash"
+        book = piecash.create_book(str(path), currency="USD", overwrite=True)
+        usd = book.default_currency
+        eur = factories.create_currency_from_ISO("EUR")
+        assets = piecash.Account(
+            name="Assets", type="ASSET", commodity=usd,
+            parent=book.root_account, placeholder=True,
+        )
+        liab = piecash.Account(
+            name="Liabilities", type="LIABILITY", commodity=usd,
+            parent=book.root_account, placeholder=True,
+        )
+        cash = piecash.Account(
+            name="Checking", type="BANK", commodity=usd, parent=assets,
+        )
+        card = piecash.Account(
+            name="EuroCard", type="CREDIT", commodity=eur, parent=liab,
+        )
+        exp = piecash.Account(
+            name="Expenses", type="EXPENSE", commodity=usd,
+            parent=book.root_account,
+        )
+        piecash.Transaction(
+            currency=usd, post_date=date(2021, 1, 1), description="Charge",
+            splits=[
+                piecash.Split(account=card, value=Decimal("-1100"),
+                              quantity=Decimal("-1000")),
+                piecash.Split(account=exp, value=Decimal("1100"),
+                              quantity=Decimal("1100")),
+            ],
+        )
+        piecash.Transaction(
+            currency=usd, post_date=date(2021, 2, 1), description="Payoff",
+            splits=[
+                piecash.Split(account=card, value=Decimal("1050"),
+                              quantity=Decimal("1000")),
+                piecash.Split(account=cash, value=Decimal("-1050"),
+                              quantity=Decimal("-1050")),
+            ],
+        )
+        book.save()
+        book.close()
+        assert drop_transaction_prices(path) == 2
+        gb = GnuCashBook(str(path))
+        bs = gb.balance_sheet(as_of_date=self.AS_OF)
+        assert bs["liabilities"]["accounts"] == []
+        sheet, nw, dash = _three_surfaces(gb, self.AS_OF)
+        assert sheet == nw == dash == Decimal("-1050")
+
+
+class TestSameDatePriceTieBreak:
+    """Two prices on the same commodity/currency/day resolve the way
+    GnuCash's ``compare_prices_by_date`` resolves them: the later
+    stored time, then the smaller GUID. Bookkeeper finding F3 first
+    made the tie deliberate (a source rank); the price twin of
+    2026-09-29 showed desktop valuing a holding by a
+    wall-clock-stamped zero row the server ranked below the day's
+    neutral-time quote, and the maintainer ruled that parity means
+    agreeing on the price. Every surface — posting FX, as-of
+    valuation, the latest quote — reads one rule."""
+
+    @staticmethod
+    def _guids(gc, *, source_by_value):
+        from sqlalchemy import text
+        with gc.open(readonly=True) as book:
+            rows = book.session.execute(text(
+                "SELECT guid, value_num, value_denom FROM prices"
+            )).fetchall()
+        return {
+            Decimal(n) / Decimal(d): g for g, n, d in rows
+        }
+
+    def test_equal_times_go_to_the_smaller_guid(
         self, multi_currency_book,
     ):
-        """The bookkeeper's three-tier ruling: an unrecognized ``user:*``
-        source (an explicit operator act) outranks feeds but does
-        NOT silently override a deliberate manual quote."""
         from datetime import date
         gc = GnuCashBook(str(multi_currency_book))
         d = date(2026, 3, 31)
         gc.create_price("EUR", "CURRENCY", "1.30", price_date=d,
-                        source="user:market-data")
-        gc.create_price("EUR", "CURRENCY", "1.20", price_date=d,
-                        source="user:test-fx")
+                        source="Finance::Quote")
+        # A second row for the day, as desktop's SQL backend leaves
+        # one and older servers wrote one (see leak_same_day_price).
+        leak_same_day_price(multi_currency_book, "1.10", "user:price")
+        by_value = {
+            v: g for v, g in self._guids(gc, source_by_value=None).items()
+            if v in (Decimal("1.30"), Decimal("1.10"))
+        }
+        winner = min(by_value, key=lambda v: by_value[v])
         with gc.open(readonly=True) as book:
             eur = book.commodities(mnemonic="EUR")
             usd = book.default_currency
-            assert gc._find_exchange_rate(book, eur, usd, d) == \
-                Decimal("1.20")
-        # A known-manual quote still beats the custom user source.
-        gc.create_price("EUR", "CURRENCY", "1.10", price_date=d,
-                        source="user:price")
+            assert gc._find_exchange_rate(book, eur, usd, d) == winner
+            assert gc._rates_as_of(book, d)[eur.guid] == winner
+            assert Decimal(str(gc._find_prices(
+                book, commodity_guid=eur.guid, currency_guid=usd.guid,
+            )[0].value)) == winner
+
+    def test_later_stored_time_beats_the_smaller_guid(
+        self, multi_currency_book,
+    ):
+        """The twin's shape: desktop's editor left a row stamped at
+        wall-clock time, later than the day's neutral-time quote.
+        Desktop uses it; so does the server, whatever its GUID."""
+        from datetime import date
+        from sqlalchemy import text
+        gc = GnuCashBook(str(multi_currency_book))
+        d = date(2026, 3, 31)
+        gc.create_price("EUR", "CURRENCY", "1.30", price_date=d,
+                        source="Finance::Quote")
+        leak_same_day_price(multi_currency_book, "1.10", "user:price-editor")
+        with gc.open(readonly=False) as book:
+            book.session.execute(text(
+                "UPDATE prices SET date = '2026-03-31 20:44:14' "
+                "WHERE source = 'user:price-editor'"
+            ))
+            book.save()
         with gc.open(readonly=True) as book:
             eur = book.commodities(mnemonic="EUR")
             usd = book.default_currency
-            assert gc._find_exchange_rate(book, eur, usd, d) == \
-                Decimal("1.10")
+            assert gc._find_exchange_rate(book, eur, usd, d) == Decimal("1.10")
+            assert gc._rates_as_of(book, d)[eur.guid] == Decimal("1.10")
+
+    @staticmethod
+    def _day_rows(path, day="2026-03-31"):
+        import sqlite3
+        con = sqlite3.connect(str(path))
+        try:
+            return sorted(
+                (source, Decimal(n) / Decimal(d))
+                for source, n, d in con.execute(
+                    "select source, value_num, value_denom from prices "
+                    "where date like ?", (day + "%",),
+                )
+            )
+        finally:
+            con.close()
+
+    def test_one_price_per_pair_per_day_by_source_rank(
+        self, multi_currency_book,
+    ):
+        """``gnc_pricedb_add_price``: a price whose source ranks equal
+        or better takes the day; one that ranks worse is turned away.
+        The server wrote one row per source, and which won was the
+        GUID draw (adversarial review 2026-09-30, C24; bookkeeper
+        ruling the same night)."""
+        from datetime import date
+        gc = GnuCashBook(str(multi_currency_book))
+        d = date(2026, 3, 31)
+        first = gc.create_price(
+            "EUR", "CURRENCY", "1.10", price_date=d, source="user:price",
+        )
+        assert (first["status"], "note" in first) == ("created", False)
+
+        # A feed quote outranks a typed ``user:price``: it takes the day.
+        second = gc.create_price(
+            "EUR", "CURRENCY", "1.30", price_date=d, source="Finance::Quote",
+        )
+        assert second["status"] == "replaced"
+        assert second["replaced"]["source"] == "user:price"
+        assert self._day_rows(multi_currency_book) == [
+            ("Finance::Quote", Decimal("1.30")),
+        ]
+
+        # The typed price again: turned away, nothing written, and
+        # the caller is told why and how to override.
+        third = gc.create_price(
+            "EUR", "CURRENCY", "1.15", price_date=d, source="user:price",
+        )
+        assert third["status"] == "kept"
+        assert third["existing"]["source"] == "Finance::Quote"
+        assert "user:price-editor" in third["note"]
+        assert self._day_rows(multi_currency_book) == [
+            ("Finance::Quote", Decimal("1.30")),
+        ]
+
+        # The Price Editor's rank beats the feed.
+        fourth = gc.create_price(
+            "EUR", "CURRENCY", "1.15", price_date=d,
+            source="user:price-editor",
+        )
+        assert fourth["status"] == "replaced"
+        assert self._day_rows(multi_currency_book) == [
+            ("user:price-editor", Decimal("1.15")),
+        ]
+        # The same source again updates in place.
+        fifth = gc.create_price(
+            "EUR", "CURRENCY", "1.16", price_date=d,
+            source="user:price-editor",
+        )
+        assert fifth["status"] == "updated"
+        assert self._day_rows(multi_currency_book) == [
+            ("user:price-editor", Decimal("1.16")),
+        ]
+
+    def test_a_quote_the_other_way_round_replaces_the_days_price(
+        self, multi_currency_book,
+    ):
+        from datetime import date
+        gc = GnuCashBook(str(multi_currency_book))
+        d = date(2026, 3, 31)
+        gc.create_price("EUR", "CURRENCY", "1.25", price_date=d,
+                        source="user:price-editor")
+        result = gc.create_price(
+            "USD", "CURRENCY", "0.80", currency="EUR", price_date=d,
+            source="user:price-editor",
+        )
+        assert result["status"] == "replaced"
+        assert result["replaced"]["quoted"] == "opposite direction"
+        assert self._day_rows(multi_currency_book) == [
+            ("user:price-editor", Decimal("0.80")),
+        ]
 
     def test_create_price_notes_when_outranked(
         self, multi_currency_book,
     ):
-        """An operator who just wrote a price and can't see it
-        winning has been misled by silence — the losing write says
-        so; the winning write carries no note."""
+        """A book can still hold several rows for a day (desktop's
+        SQL backend leaves the ones its price database turned away).
+        When a written row is not the one desktop will use — the
+        later stored time, then the smaller GUID — the write says
+        so."""
         from datetime import date
+        from sqlalchemy import text
         gc = GnuCashBook(str(multi_currency_book))
         d = date(2026, 3, 31)
-        winner = gc.create_price(
-            "EUR", "CURRENCY", "1.10", price_date=d,
-            source="user:price",
+        gc.create_price(
+            "EUR", "CURRENCY", "1.10", price_date=d, source="user:price",
         )
-        assert "note" not in winner
-        loser = gc.create_price(
-            "EUR", "CURRENCY", "1.30", price_date=d,
-            source="user:market-data",
+        leaked = leak_same_day_price(
+            multi_currency_book, "1.30", "user:split-register",
         )
-        assert "outranks it as the effective rate" in loser["note"]
-        assert "user:price" in loser["note"]
+        # Stamp the leaked row later in the day, so it is the one
+        # desktop reads whatever the GUIDs are.
+        with gc.open(readonly=False) as book:
+            book.session.execute(
+                text("UPDATE prices SET date = '2026-03-31 20:44:14' "
+                     "WHERE guid = :g"), {"g": leaked},
+            )
+            book.save()
+        again = gc.create_price(
+            "EUR", "CURRENCY", "1.12", price_date=d, source="user:price",
+        )
+        if again["status"] != "kept":
+            assert "outranks it as the effective rate" in again["note"]
+            assert "user:split-register" in again["note"]
 
     def test_create_prices_batch_notes_outranked_in_reason(
         self, multi_currency_book,
@@ -473,15 +900,27 @@ class TestSameDatePriceTieBreak:
         from datetime import date
         gc = GnuCashBook(str(multi_currency_book))
         d = date(2026, 3, 31)
-        gc.create_price("EUR", "CURRENCY", "1.10", price_date=d,
-                        source="user:price")
-        out = gc.create_prices([{
+        gc.create_price("EUR", "CURRENCY", "1.30", price_date=d,
+                        source="Finance::Quote")
+        rows = [{
             "ref": "1", "commodity": "EUR", "date": d,
-            "value": "1.30", "source": "user:market-data",
-        }])["results"]
-        row = out.splitlines()[1]
-        assert "created" in row
-        assert "outranked by 'user:price'" in row
+            "value": "1.10", "source": "user:price",
+        }]
+        dry = gc.create_prices(rows, dry_run=True)["results"].splitlines()[1]
+        assert "would_keep" in dry and "outranks 'user:price'" in dry
+        live = gc.create_prices(rows)["results"].splitlines()[1]
+        assert "\tkept\t" in live and "outranks 'user:price'" in live
+        assert self._day_rows(multi_currency_book) == [
+            ("Finance::Quote", Decimal("1.30")),
+        ]
+        better = [{
+            "ref": "2", "commodity": "EUR", "date": d,
+            "value": "1.20", "source": "user:price-editor",
+        }]
+        assert "would_replace" in gc.create_prices(
+            better, dry_run=True,
+        )["results"]
+        assert "\treplaced\t" in gc.create_prices(better)["results"]
 
 
 class TestPriceLookupMemo:
@@ -499,9 +938,8 @@ class TestPriceLookupMemo:
         gc = GnuCashBook(str(multi_currency_book))
         d = date(2026, 3, 31)
         gc.create_price("EUR", "CURRENCY", "1.30", price_date=d,
-                        source="user:market-data")
-        gc.create_price("EUR", "CURRENCY", "1.10", price_date=d,
-                        source="user:price")
+                        source="Finance::Quote")
+        leak_same_day_price(multi_currency_book, "1.10", "user:price")
 
         with gc.open(readonly=True) as book:
             eur = book.commodities(mnemonic="EUR")
@@ -519,9 +957,16 @@ class TestPriceLookupMemo:
                 "memoized lookups must return the same prices "
                 "in the same order as the first query"
             )
-            # The manual quote wins the same-date tie on both.
-            assert first[0].value == Decimal("1.10")
-            assert repeat[0].value == Decimal("1.10")
+            # The smaller GUID wins the same-time tie on both. (The
+            # fixture's 2024 transfer row rides along, older — a
+            # price since the 2026-09-29 ruling — so the tie is the
+            # two quotes on ``d``.)
+            from gnucash_mcp.book._currency import _to_date
+
+            tied = [p for p in first if _to_date(p.date) == d]
+            assert len(tied) == 2 and len(first) == 3
+            assert first[0].guid == min(p.guid for p in tied)
+            assert repeat[0].guid == first[0].guid
 
     def test_price_written_mid_call_is_visible_after_invalidation(
         self, multi_currency_book,
@@ -595,3 +1040,72 @@ class TestPriceLookupMemo:
                         price_date=date(2026, 5, 2),
                         source="user:price")
         assert calls, "delete_price must invalidate after its save"
+
+
+# --------------------------------------------------------------------------
+# MM-12 — a budget report is a flow report: monthly-close valuation
+# --------------------------------------------------------------------------
+
+def test_budget_report_actuals_agree_with_spending_by_category(tmp_path):
+    """Actuals convert at each split's month close, as the spending
+    report does; one period-end rate made the two disagree on the same
+    data (the review's 260.0 against 240.0)."""
+    path = tmp_path / "budget_fx.gnucash"
+    book = piecash.create_book(str(path), currency="USD", overwrite=True)
+    usd = book.default_currency
+    eur = factories.create_currency_from_ISO("EUR")
+    assets = piecash.Account(
+        name="Assets", type="ASSET", commodity=usd,
+        parent=book.root_account, placeholder=True,
+    )
+    cash = piecash.Account(
+        name="EUR Cash", type="CASH", commodity=eur, parent=assets,
+    )
+    expenses = piecash.Account(
+        name="Expenses", type="EXPENSE", commodity=usd,
+        parent=book.root_account, placeholder=True,
+    )
+    travel = piecash.Account(
+        name="EU Travel", type="EXPENSE", commodity=eur, parent=expenses,
+    )
+    for d in (date(2026, 1, 10), date(2026, 2, 10)):
+        piecash.Transaction(
+            currency=eur, description="Trip", post_date=d,
+            splits=[
+                piecash.Split(account=travel, value=Decimal("100")),
+                piecash.Split(account=cash, value=Decimal("-100")),
+            ],
+        )
+    book.save()
+    book.close()
+
+    gb = GnuCashBook(str(path))
+    for d, rate in (
+        (date(2026, 1, 15), "1.0"),
+        (date(2026, 2, 15), "1.4"),
+        (date(2026, 3, 15), "2.0"),
+    ):
+        gb.create_price(
+            commodity="EUR", namespace="CURRENCY", value=rate,
+            currency="USD", price_date=d,
+        )
+    gb.create_budget(
+        name="2026", num_periods=12, period_type="monthly",
+        start_date="2026-01-01",
+    )
+    gb.set_budget_amount(
+        budget_name="2026", account="Expenses:EU Travel",
+        amount="100", period="all",
+    )
+
+    res = gb.get_budget_report(budget_name="2026", period="all", compact=False)
+    spend = gb.spending_by_category(
+        start_date=date(2026, 1, 1), end_date=date(2026, 12, 31),
+        depth=2, compact=False,
+    )
+    row = next(a for a in res["accounts"] if a["account"] == "Expenses:EU Travel")
+    assert Decimal(row["actual"]) == Decimal("240")
+    assert Decimal(row["actual"]) == Decimal(spend["total"])
+    # Targets: each month's 100 EUR at that month's close (Mar's 2.0
+    # carries through December).
+    assert Decimal(row["budgeted"]) == Decimal("2240")

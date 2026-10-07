@@ -493,7 +493,7 @@ def add_prices(out_path: Path) -> int:
         for when in sorted(usd_dates):
             piecash.Price(commodity=usd, currency=eur, date=when,
                           value=eur_per_usd(when), type="last",
-                          source="user:market-data")
+                          source="Finance::Quote")
             n += 1
         for when in sorted(etf_dates):
             piecash.Price(commodity=etf, currency=eur, date=when,
@@ -2618,7 +2618,7 @@ def _add_price_rows(out_path: Path, pairs: list[tuple[str, date]]) -> int:
                      else etf_price(when))
             piecash.Price(
                 commodity=comm_by[sym], currency=eur, date=when,
-                value=value, type="last", source="user:market-data",
+                value=value, type="last", source="Finance::Quote",
             )
             n += 1
         book.save()

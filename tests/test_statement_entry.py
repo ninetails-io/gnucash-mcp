@@ -171,6 +171,31 @@ def _commit(gc, statement_book, **kw):
     )
 
 
+class TestFutureStatementDate:
+    """A statement dated after today is a typo; it goes through and
+    the warnings table says so in both modes, with the sentence
+    reconcile_account uses (ruled 2026-09-29)."""
+
+    def test_dry_run_warns(self, statement_book):
+        from datetime import timedelta
+        gc = GnuCashBook(str(statement_book))
+        tomorrow = date.today() + timedelta(days=1)
+        res = gc.enter_statement(
+            "Assets:Checking", tomorrow, _OPEN, _CLOSE,
+            _checking_lines(), dry_run=True,
+        )
+        assert (
+            f"*\tstatement_date {tomorrow.isoformat()} is after today "
+            f"({date.today().isoformat()}) — a statement is not dated in "
+            f"the future; check the transcription"
+        ) in res["warnings"]
+
+    def test_past_statement_has_no_such_row(self, statement_book):
+        gc = GnuCashBook(str(statement_book))
+        res = _dry(gc)
+        assert "is after today" not in res["warnings"]
+
+
 # ── Grammar ────────────────────────────────────────────────────────
 
 
@@ -748,6 +773,9 @@ class TestStatementReviewFindings:
         )
         assert "REJECTED" in res["summary"]
         assert "wrong split" in res["results"]
+        # The hint names the tool that can change an amount (C36).
+        assert "replace_splits" in res["results"]
+        assert "update_transactions" not in res["results"]
 
     def test_sub_quantum_amount_rejects(self, statement_book):
         gc = GnuCashBook(str(statement_book))
@@ -1764,3 +1792,57 @@ class TestCandidateUniverseQueryBudget:
             f"on a 45-transaction account — the candidate universe "
             f"is lazy-loading transactions per split again"
         )
+
+
+class TestLineDatedAwayFromItsStatement:
+    """Review C34. A statement cannot list a line dated after it
+    closed, and one from more than a year before is a slipped year
+    far more often than a real entry. Both were entered AND
+    reconciled with no word in either mode."""
+
+    def _lines(self):
+        rows = _checking_lines()
+        rows[1]["date"] = date(2062, 7, 3)     # 2062 for 2026
+        rows[2]["date"] = date(26, 7, 10)      # 0026
+        return rows
+
+    def test_dry_run_names_each_line(self, statement_book):
+        gc = GnuCashBook(str(statement_book))
+        res = _dry(gc, self._lines())
+        warned = {
+            row.split("\t")[0]: row
+            for row in res["warnings"].splitlines()[1:]
+        }
+        assert "after the statement date (2026-07-31)" in warned["2"]
+        assert "2062-07-03" in warned["2"]
+        assert "more than a year before" in warned["3"]
+        assert "0026-07-10" in warned["3"]
+        assert "1" not in warned and "4" not in warned
+
+    def test_commit_says_it_too(self, statement_book):
+        """The commit is what makes the date permanent."""
+        gc = GnuCashBook(str(statement_book))
+        cands = _cands(_dry(gc))
+        rows = _checking_lines(
+            cands["1"][0]["candidate_guid"], cands["3"][0]["candidate_guid"],
+        )
+        rows[3]["date"] = date(2062, 7, 15)    # the explicit-splits line
+        res = gc.enter_statement(
+            "Assets:Checking", date(2026, 7, 31), _OPEN, _CLOSE,
+            rows, dry_run=False,
+        )
+        assert "created" in res["results"]
+        assert "4\tdated 2062-07-15, after the statement date" in res["warnings"]
+
+    def test_an_ordinary_statement_carries_no_date_warning(
+        self, statement_book,
+    ):
+        gc = GnuCashBook(str(statement_book))
+        assert "check the year" not in _dry(gc)["warnings"]
+        assert "warnings" not in _commit(gc, statement_book)
+
+    def test_a_line_on_the_statement_date_is_fine(self, statement_book):
+        gc = GnuCashBook(str(statement_book))
+        rows = _checking_lines()
+        rows[3]["date"] = date(2026, 7, 31)
+        assert "check the year" not in _dry(gc, rows)["warnings"]

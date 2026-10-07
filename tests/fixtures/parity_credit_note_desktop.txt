@@ -1,0 +1,25 @@
+INVOICE id='Parity01' date_opened='2026-09-29 10:59:00' date_posted='2026-09-29 10:59:00' notes='' active=1 currency='ccy:USD' owner_type=2 owner_guid='cust:Emerald Analytics' terms=None billing_id='' post_txn='txn:I' post_lot='lot:Credit Note Parity01' post_acc='acct:Accounts Receivable' billto_type=None billto_guid=None charge_amt_num=0 charge_amt_denom=1
+ENTRY date='2026-09-29 19:00:00' description='Retainer adjustment' action='' notes='' quantity_num=-1 quantity_denom=1 i_acct='acct:LLC Revenue' i_price_num=500 i_price_denom=1 i_discount_num=0 i_discount_denom=1 invoice='inv:Parity01' i_disc_type='PERCENT' i_disc_how='PRETAX' i_taxable=0 i_taxincluded=0 i_taxtable=None b_acct=None b_price_num=0 b_price_denom=1 bill=None b_taxable=1 b_taxincluded=0 b_taxtable=None b_paytype=1 billable=0 billto_type=None billto_guid=None order_guid=None
+TXN txn:I num='Parity01' post_date='2026-09-29 10:59:00' desc='Emerald Analytics' ccy=ccy:USD
+  SPLIT acct=acct:Accounts Receivable memo='' action='Credit Note' rec=n rec_date=1970-01-01 00:00:00 value=-50000/100 qty=-50000/100 lot=lot:Credit Note Parity01
+  SPLIT acct=acct:LLC Revenue memo='' action='Credit Note' rec=n rec_date=1970-01-01 00:00:00 value=50000/100 qty=50000/100 lot=None
+TXN txn:L num='' post_date='2026-09-29 10:59:00' desc='Emerald Analytics' ccy=ccy:USD
+  SPLIT acct=acct:Accounts Receivable memo='Offset between documents: Credit Note Parity01 - Invoice 000018' action='Lot Link' rec=n rec_date=1970-01-01 00:00:00 value=-50000/100 qty=-50000/100 lot=lot:Invoice 000018
+  SPLIT acct=acct:Accounts Receivable memo='Offset between documents: Credit Note Parity01 - Invoice 000018' action='Lot Link' rec=n rec_date=1970-01-01 00:00:00 value=50000/100 qty=50000/100 lot=lot:Credit Note Parity01
+TXN txn:P num='' post_date='2026-09-29 10:59:00' desc='Emerald Analytics' ccy=ccy:USD
+  SPLIT acct=acct:Accounts Receivable memo='Apply credit note' action='Payment' rec=n rec_date=1970-01-01 00:00:00 value=-300000/100 qty=-300000/100 lot=lot:Invoice 000018
+  SPLIT acct=acct:Checking Account memo='Apply credit note' action='Payment' rec=n rec_date=1970-01-01 00:00:00 value=300000/100 qty=300000/100 lot=None
+LOT lot:Credit Note Parity01 is_closed=-1 acct=acct:Accounts Receivable
+LOT lot:Invoice 000018 is_closed=-1 acct=acct:Accounts Receivable
+SLOT inv:Parity01 credit-note type=1 1 fill[s=None d=None t=1970-01-01 00:00:00 n=0/1 gd=None]
+SLOT lot:Credit Note Parity01 gncInvoice type=9 frame fill[i=0 s=None d=None t=1970-01-01 00:00:00 n=0/1 gd=None]
+SLOT lot:Credit Note Parity01 gncInvoice/invoice-guid type=5 inv:Parity01 fill[i=0 s=None d=None t=1970-01-01 00:00:00 n=0/1 gd=None]
+SLOT lot:Credit Note Parity01 title type=4 'Credit Note Parity01' fill[i=0 d=None t=1970-01-01 00:00:00 n=0/1 gd=None]
+SLOT txn:I date-posted type=10 20260929 fill[i=0 s=None d=None t=1970-01-01 00:00:00 n=0/1]
+SLOT txn:I gncInvoice type=9 frame fill[i=0 s=None d=None t=1970-01-01 00:00:00 n=0/1 gd=None]
+SLOT txn:I gncInvoice/invoice-guid type=5 inv:Parity01 fill[i=0 s=None d=None t=1970-01-01 00:00:00 n=0/1 gd=None]
+SLOT txn:I trans-date-due type=6 2026-09-29 10:59:00 fill[i=0 s=None d=None n=0/1 gd=None]
+SLOT txn:I trans-read-only type=4 'Generated from an invoice. Try unposting the invoice.' fill[i=0 d=None t=1970-01-01 00:00:00 n=0/1 gd=None]
+SLOT txn:I trans-txn-type type=4 'I' fill[i=0 d=None t=1970-01-01 00:00:00 n=0/1 gd=None]
+SLOT txn:L trans-txn-type type=4 'L' fill[i=0 d=None t=1970-01-01 00:00:00 n=0/1 gd=None]
+SLOT txn:P trans-txn-type type=4 'P' fill[i=0 d=None t=1970-01-01 00:00:00 n=0/1 gd=None]

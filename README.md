@@ -47,9 +47,9 @@ sample books — a complete financial dashboard in a single call:
 Book: samples/alex-chen-morales.gnucash
 Currency: USD
 Data range: 2025-01-01 to 2026-05-31
-Last entry: 2026-05-31 (future-dated, 31 days ahead)
+Last entry: 2026-04-30 (today) (1 future-dated, latest 2026-05-31)
 Warnings:
-  ⚠ Past due invoice: Berlin Digital GmbH 58 days past 30-day default, EUR 4,200 (no term set)
+  ⚠ Past due invoice: Berlin Digital GmbH 58 days overdue, EUR 4,200.00
   ⚠ Stale price: GBP last updated 150 days ago
 Accounts: 108 total
 Assets: 12 accounts, USD 602680.49
@@ -84,7 +84,7 @@ Monthly net (last 6 months):
   Dec 2025: +4,853
   Nov 2025: -1,494
 Runway: 121 days (USD 84,579 liquid / USD 694/day burn)
-Budget (2026 Annual Budget): 41% used / 33% elapsed (+8% over pace)
+Budget (2026 Annual Budget): USD 24,600 spent / USD 22,800 expected by today (+8%)
 Transactions: 2473
 Scheduled: 13 recurring, none due in next 7 days
 Business: 4 customers, 2 vendors, 1 employee
@@ -307,6 +307,14 @@ sudo apt update && sudo apt install libdbd-sqlite3
 You only do this once. From then on, GnuCash and the MCP server
 both work against the same SQLite file.
 
+**GnuCash 3.8 or newer.** Once the server has written to a book, the
+book carries a feature marker ("Use natural signs in budget
+amounts") that GnuCash 3.8 introduced, and GnuCash 3.0–3.7 refuses
+to open a book marked with a feature it does not know. GnuCash 3.8
+and later mark any book with a budget the same way when they open
+it, so this only matters if you still run an older 3.x. The server
+is tested against GnuCash 5.12.
+
 ### Set the path
 
 Update `GNUCASH_BOOK_PATH` in your Claude Desktop config to
@@ -371,7 +379,17 @@ Worth knowing before you switch:
   schedule before you move a real book over — see
   [`docs/RESTORE_FROM_BACKUP.md`](docs/RESTORE_FROM_BACKUP.md).
 - Your password is masked wherever the server names the book — in
-  tool results, in the dashboard header, and in the audit log.
+  tool results, in the dashboard header, and in the audit log — and
+  in every error message, log line, and startup error, including
+  the ones a database driver writes. A password given as a query
+  parameter (`?password=…`, `sslpassword=…`) is masked the same
+  way.
+- **Put the connection string in the `env` block, not on the
+  command line.** `--book-uri` works, but a password in a command
+  line is visible to every user of the machine in the process
+  list. On PostgreSQL you can also leave the password out of the
+  string entirely and let the driver read `PGPASSWORD` or
+  `~/.pgpass`.
 
 Both dialects are exercised by the test suite and CI: PostgreSQL
 16 and MariaDB 11, each against a real server.
@@ -554,6 +572,10 @@ tie.
 > 1× Consulting at \$1,500.00 = \$1,500.00. Open. Tell me when
 > you're ready to post it.
 
+If you open a server-posted invoice in GnuCash's Process Payment
+dialog, set its "Post To" account to the invoice's receivable first:
+the dialog lists only the documents posted to the selected account.
+
 ### Foreign-currency invoicing
 
 > "Invoice Berlin Digital €4,200 for Q1 retainer, due in 30 days."
@@ -602,8 +624,9 @@ exactly what changed and when. Sample entry:
     account: Assets:Accounts Receivable  txn:a1b2c3d4
 ```
 
-**Automatic backups.** Before the very first write of each
-session, the server snapshots your book to
+**Automatic backups.** Before the first write of each session
+(and again as a long-running session crosses into a new backup
+period), the server snapshots your book to
 `<your-book>.gnucash.mcp/backups/` — so if something goes
 wrong, you can roll back to a known-good state without
 relying on Time Machine or your own habit. Backups are
@@ -823,8 +846,21 @@ A condensed changelog of major releases lives in
 
 - Confirm your book is in **SQLite** format, not XML.
 - Make sure GnuCash isn't open with the same book — file lock.
+  The server honors GnuCash's lock but deliberately takes none of
+  its own (it holds the book for one call at a time), so GnuCash
+  will open a book the server is using without a warning. Don't
+  edit in both at once.
 - Try opening the book in GnuCash itself to verify it isn't
   corrupted.
+
+### Docker: "both GNUCASH_BOOK_PATH and GNUCASH_BOOK_URI are set"
+
+The image ships with `GNUCASH_BOOK_PATH` pointing at its bundled
+demo books. To serve a database book from it, clear that default
+on the command line (`-e GNUCASH_BOOK_PATH=`) beside your
+`GNUCASH_BOOK_URI`; to serve a mounted file, set
+`GNUCASH_BOOK_PATH` to the mounted path and run the container as
+the user who owns the file (`--user "$(id -u):$(id -g)"`).
 
 ### "Account not found"
 

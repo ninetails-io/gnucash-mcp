@@ -15,7 +15,9 @@ performed with the server stopped — see
 ``docs/RESTORE_FROM_BACKUP.md``.
 """
 
-from gnucash_mcp.logging_config import audit_log
+import os
+
+from gnucash_mcp.logging_config import audit_log, audit_note
 from gnucash_mcp.tools._helpers import _json, safe_tool
 
 
@@ -45,7 +47,10 @@ def register(mcp, get_book) -> None:
         backup and raises.
 
         Manual backups are kept indefinitely — automatic retention
-        (session / weekly / monthly stages) does not touch them. To
+        (session / weekly / monthly stages) does not touch them. A
+        call made while the book is unchanged since the last manual
+        backup writes nothing and answers ``status: unchanged`` with
+        that backup's path. To
         review or remove backups, the user works with the files
         directly in the backup directory; no tool can list or delete
         them.
@@ -62,5 +67,14 @@ def register(mcp, get_book) -> None:
                 ``"pre-tax-filing"``.
         """
         book = get_book()
-        result = book.create_backup(stage="manual", label=label)
+        result = book.create_backup(
+            stage="manual", label=label, skip_unchanged=True,
+        )
+        # Read-classified (the book did not change), which also meant
+        # unrecorded: a session could write a thousand copies and
+        # get_audit_log showed nothing (adversarial review
+        # 2026-09-30, C60). The trail names each one.
+        name = os.path.basename(str(result.get("path") or ""))
+        if result.get("status") != "unchanged":
+            audit_note("CREATE BACKUP", name or "(manual)")
         return _json(result)

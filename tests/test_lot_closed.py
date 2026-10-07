@@ -165,7 +165,7 @@ class TestDesktopTouchedLots:
     def test_close_lot_refuses_a_balance(self, desktop_touched_book):
         gb = GnuCashBook(str(desktop_touched_book))
         lots = gb.list_lots(account="Assets:STK", compact=False)["lots"]
-        with pytest.raises(ValueError, match="still holds 10.0000 STK"):
+        with pytest.raises(ValueError, match="still holds 10 STK"):
             gb.close_lot(lots[0]["guid"])
 
     def test_close_lot_caches_one_on_a_zero_balance(self, desktop_touched_book):
@@ -213,7 +213,9 @@ class TestChokepointLock:
     def test_every_split_assignment_caches_the_flag_first(self):
         """piecash's guard reads the raw column for truth, so each
         ``x.lot = lot`` must be preceded by ``_lot_cache_flag(lot)``
-        within a few lines."""
+        within a few lines — or, in the ports of GnuCash's payment-lot
+        arithmetic, by ``_lot_hold_open(lot)`` (see its docstring for
+        why the computed flag is wrong mid-move)."""
         offenders = []
         for path in sorted(self.BOOK_DIR.glob("*.py")):
             lines = path.read_text().splitlines()
@@ -222,13 +224,43 @@ class TestChokepointLock:
                 if not m:
                     continue
                 window = "\n".join(lines[max(0, i - 6):i])
-                if f"_lot_cache_flag({m.group(1)})" not in window:
+                if (
+                    f"_lot_cache_flag({m.group(1)})" not in window
+                    and f"_lot_hold_open({m.group(1)})" not in window
+                ):
                     offenders.append(f"{path.name}:{i + 1}: {line.strip()}")
         assert not offenders, "\n".join(offenders)
 
     def test_the_assignment_scanner_is_not_vacuous(self):
         text = (self.BOOK_DIR / "investments.py").read_text()
         assert re.search(r"^\s*split\.lot = lot\s*$", text, re.M)
+
+    # A split's amounts written directly: ``split.value = …`` or the
+    # tuple form ``split.value, split.quantity = …``.
+    AMOUNT_WRITE = re.compile(
+        r"^\s*(\w*split\w*|s)\.(quantity|value)\s*(=[^=]|,\s*\w+\.)"
+    )
+
+    def test_every_amount_write_forgets_the_flag(self):
+        """GnuCash's ``mark_split`` resets the lot on every
+        ``xaccSplitSetAmount`` / ``SetValue``. Here the only writer of
+        a split's amounts is ``_set_split_amounts``, and it resets the
+        flag; any other direct write skips the reset."""
+        offenders = []
+        for path in sorted(self.BOOK_DIR.glob("*.py")):
+            for lineno, line in enumerate(path.read_text().splitlines(), 1):
+                if self.AMOUNT_WRITE.search(line):
+                    offenders.append(f"{path.name}:{lineno}: {line.strip()}")
+        base = (self.BOOK_DIR / "_base.py").read_text()
+        helper = base[base.index("def _set_split_amounts"):]
+        helper = helper[:helper.index("\ndef ")]
+        assert [o for o in offenders if not o.startswith("_base.py")] == []
+        assert "_lot_forget_flag(split.lot)" in helper
+
+    def test_the_amount_scanner_is_not_vacuous(self):
+        """The helper's own write is the one the scanner must see."""
+        lines = (self.BOOK_DIR / "_base.py").read_text().splitlines()
+        assert sum(1 for l in lines if self.AMOUNT_WRITE.search(l)) == 1
 
     def test_no_literal_writes(self):
         offenders = []

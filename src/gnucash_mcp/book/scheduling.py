@@ -14,9 +14,9 @@ Depends on shared helpers from BaseGnuCashBook:
   - _verify_write, _verify_composite_write, _verify_delete
 """
 
-from calendar import monthrange
 from datetime import date, datetime, timedelta
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from fractions import Fraction
 import uuid
 
 import piecash
@@ -27,11 +27,19 @@ from piecash.kvp import KVP_Type, Slot
 from sqlalchemy import text
 from sqlalchemy.orm import object_session
 
-from gnucash_mcp.book._base import (
+from gnucash_mcp.book._base import (  # noqa: F401 — re-exported ports
     _HEX_GUID_RE,
+    _PT_MONTHISH,
+    _PT_WEEKEND_ADJUSTED,
+    _add_months,
+    _adjust_for_weekend,
+    _is_last_of_month,
+    _nth_weekday_compare,
+    _recurrence_next,
     _commodity_quantum,
     _gnc_bool,
     _guid_prefix_map,
+    _new_split,
     _sx_to_compact_line,
     _to_decimal,
     _unique_prefix,
@@ -39,126 +47,13 @@ from gnucash_mcp.book._base import (
     _verify_composite_write,
     _verify_delete,
     _verify_write,
+    _check_text,
+    _TEXT_WIDTH,
+    _SLOT_TEXT_WIDTH,
+    _check_one_line,
+    _check_ledger_date,
 )
 from gnucash_mcp._format import _paginate
-
-
-# ── GnuCash's recurrence engine, ported from Recurrence.cpp ──────
-# The occurrence anchor is the RECURRENCE row (period type, mult,
-# period start, weekend adjust), never the schedule's start_date and
-# never a frequency label: desktop lets "start 9 Sep, monthly on the
-# 15th" exist, and a schedule may carry several rows (monthly on the
-# 5th AND the 20th). recurrenceNextInstance is ported line for line,
-# including the weekend-adjust Friday special case; string tables
-# verbatim from period_type_strings / weekend_adj_strings.
-_PT_MONTHISH = frozenset(
-    {"year", "month", "end of month", "nth weekday", "last weekday"}
-)
-_PT_WEEKEND_ADJUSTED = frozenset({"year", "month", "end of month"})
-
-
-def _add_months(d: date, n: int) -> date:
-    """g_date_add_months: day clamped to the target month's length."""
-    total = d.month - 1 + n
-    y, m = d.year + total // 12, total % 12 + 1
-    return date(y, m, min(d.day, monthrange(y, m)[1]))
-
-
-def _is_last_of_month(d: date) -> bool:
-    return d.day == monthrange(d.year, d.month)[1]
-
-
-def _nth_weekday_compare(start: date, nxt: date, pt: str) -> int:
-    nd, sd = nxt.day, start.day
-    week = 3 if sd // 7 > 3 else sd // 7
-    if week > 0 and sd % 7 == 0 and sd != 28:
-        week -= 1
-    matchday = 7 * week + (
-        nd - nxt.isoweekday() + start.isoweekday() + 7
-    ) % 7
-    dim = monthrange(nxt.year, nxt.month)[1]
-    if (dim - matchday) >= 7 and pt == "last weekday":
-        matchday += 7
-    if pt == "nth weekday" and matchday % 7 == 0:
-        matchday += 7
-    return matchday - nd
-
-
-def _adjust_for_weekend(pt: str, wadj: str, d: date) -> date:
-    if pt in _PT_WEEKEND_ADJUSTED and d.isoweekday() in (6, 7):
-        sat = d.isoweekday() == 6
-        if wadj == "back":
-            return d - timedelta(days=1 if sat else 2)
-        if wadj == "forward":
-            return d + timedelta(days=2 if sat else 1)
-    return d
-
-
-def _recurrence_next(
-    pt: str, mult: int, start: date, wadj: str, ref: date,
-) -> date | None:
-    """First occurrence strictly after ``ref``; None when the
-    recurrence yields nothing (``once`` already past, unknown type)."""
-    mult = max(int(mult or 1), 1)
-    adjusted_start = _adjust_for_weekend(pt, wadj, start)
-    if ref < adjusted_start:
-        return adjusted_start
-    nxt = ref
-    if pt == "once":
-        return None
-    if pt in _PT_MONTHISH:
-        m = mult * 12 if pt == "year" else mult
-        # Step 1: forward one period, passing exactly one occurrence.
-        if (wadj == "back" and pt in _PT_WEEKEND_ADJUSTED
-                and nxt.isoweekday() in (6, 7)):
-            nxt -= timedelta(days=1 if nxt.isoweekday() == 6 else 2)
-        if (wadj == "back" and pt in _PT_WEEKEND_ADJUSTED
-                and nxt.isoweekday() == 5):
-            tmp_sat, tmp_sun = nxt + timedelta(days=1), nxt + timedelta(days=2)
-            if pt == "end of month":
-                if (_is_last_of_month(nxt) or _is_last_of_month(tmp_sat)
-                        or _is_last_of_month(tmp_sun)):
-                    nxt = _add_months(nxt, m)
-                else:
-                    nxt = _add_months(nxt, m - 1)
-            else:
-                if tmp_sat.day == start.day:
-                    nxt = _add_months(tmp_sat, m)
-                elif tmp_sun.day == start.day:
-                    nxt = _add_months(tmp_sun, m)
-                elif nxt.day >= start.day:
-                    nxt = _add_months(nxt, m)
-                elif _is_last_of_month(nxt):
-                    nxt = _add_months(nxt, m)
-                elif _is_last_of_month(tmp_sat):
-                    nxt = _add_months(tmp_sat, m)
-                elif _is_last_of_month(tmp_sun):
-                    nxt = _add_months(tmp_sun, m)
-                else:
-                    nxt = _add_months(nxt, m - 1)
-        elif (_is_last_of_month(nxt)
-              or (pt in ("month", "year") and nxt.day >= start.day)
-              or (pt in ("nth weekday", "last weekday")
-                  and _nth_weekday_compare(start, nxt, pt) <= 0)):
-            nxt = _add_months(nxt, m)
-        else:
-            nxt = _add_months(nxt, m - 1)
-        # Step 2: back up to the base phase, then align the day.
-        n_months = 12 * (nxt.year - start.year) + (nxt.month - start.month)
-        nxt = _add_months(nxt, -(n_months % m))
-        dim = monthrange(nxt.year, nxt.month)[1]
-        if pt in ("nth weekday", "last weekday"):
-            nxt += timedelta(days=_nth_weekday_compare(start, nxt, pt))
-        elif pt == "end of month" or start.day >= dim:
-            nxt = nxt.replace(day=dim)
-        else:
-            nxt = nxt.replace(day=start.day)
-        return _adjust_for_weekend(pt, wadj, nxt)
-    if pt in ("week", "day"):
-        step = mult * 7 if pt == "week" else mult
-        nxt = nxt + timedelta(days=step)
-        return nxt - timedelta(days=(nxt - start).days % step)
-    return None
 
 
 def _gdate(v) -> date | None:
@@ -328,7 +223,9 @@ class SchedulingMixin:
             return None
         if sx.num_occur > 0 and sx.rem_occur <= 0:
             return None
-        ref = last if last is not None else start - timedelta(days=1)
+        ref = last if last is not None else (
+            start - timedelta(days=1) if start > date.min else start
+        )
         candidates = [
             _recurrence_next(pt, mult, anchor, wadj, ref)
             for pt, mult, anchor, wadj in rows
@@ -465,9 +362,8 @@ class SchedulingMixin:
             notes=notes or None,
             post_date=start,
             splits=[
-                piecash.Split(
-                    account=template_acct,
-                    value=Decimal("0"), quantity=Decimal("0"),
+                _new_split(
+                    template_acct, Decimal("0"), Decimal("0"), currency,
                     memo=leg.get("memo") or "",
                     action=leg.get("action") or "",
                 )
@@ -475,7 +371,6 @@ class SchedulingMixin:
             ],
         )
         book.session.flush()
-        denom = currency.fraction
         for split, leg in zip(txn.splits, legs):
             label = f"template split for {leg['account'].fullname}"
             frame_guid = uuid.uuid4().hex
@@ -497,11 +392,15 @@ class SchedulingMixin:
                     KVP_Type.KVP_TYPE_STRING, label,
                     string_val=format(val, "f") if val else "",
                 )
+                # The SX editor stores what gnc_exp_parser returns,
+                # a reduced fraction (gnc_numeric_reduce): 4200.00 is
+                # 4200/1, 42.50 is 85/2, and the unused side is 0/1.
+                reduced = Fraction(val)
                 self._slot_insert(
                     book, frame_guid, f"{self._SX_FRAME}/{side}-numeric",
                     KVP_Type.KVP_TYPE_NUMERIC, label,
-                    numeric_val_num=int(val * denom),
-                    numeric_val_denom=denom,
+                    numeric_val_num=reduced.numerator,
+                    numeric_val_denom=reduced.denominator,
                 )
             if leg.get("quantity") is not None:
                 q = leg["quantity"]
@@ -514,7 +413,14 @@ class SchedulingMixin:
                 self._slot_insert(
                     book, mcp_frame, self._MCP_QUANTITY,
                     KVP_Type.KVP_TYPE_NUMERIC, label,
-                    numeric_val_num=int(q * q_denom),
+                    # Rounded, as a split's quantity is at storage
+                    # (it was truncated: 1.23456 kept as 1.2345 where
+                    # create_transaction stores 1.2346 — MM-15).
+                    numeric_val_num=int(
+                        (Decimal(str(q)) * q_denom).quantize(
+                            Decimal(1), rounding=ROUND_HALF_UP,
+                        )
+                    ),
                     numeric_val_denom=q_denom,
                 )
         return txn
@@ -544,17 +450,56 @@ class SchedulingMixin:
         return {r[0]: tuple(r[1:]) for r in rows}
 
     @staticmethod
-    def _slot_amount(children, numeric_key, formula_key):
+    def _rational_amount(num: int, denom: int, fraction: int) -> Decimal:
+        """A stored ``num/denom`` as a Decimal.
+
+        A decimal denominator keeps its precision as typed (4250/100
+        is 42.50, not 42.5), exactly, at any magnitude. Any OTHER
+        denominator is a formula desktop evaluated and stored as the
+        exact rational — "100/3" is 100 over 3, "1234/12" is 617 over
+        6 (gnc-exp-parser divides with GNC_HOW_DENOM_EXACT and
+        reduces) — and has no finite decimal form: it is rounded
+        half-up to ``fraction``, the template currency's, which is
+        what GnuCash's split setters do when Since-Last-Run turns
+        the template into a transaction. Quantizing to ``1/denom``
+        instead raised ``decimal.InvalidOperation`` (a third needs
+        more digits than the context has) and took ``get_book_
+        summary`` down with it, on any book holding such a schedule,
+        enabled or not (adversarial review 2026-09-30, C19).
+        """
+        from gnucash_mcp.book import _entry_math
+
+        places = len(str(denom)) - 1
+        if denom == 10 ** places:
+            # Never fewer places than the currency has: the editor
+            # stores 4200.00 reduced, as 4200/1. Never more either:
+            # desktop stores "1.001" typed into a USD schedule as
+            # 1001/1000 and Since-Last-Run rounds it half-up to the
+            # currency; the server refused the instance (scoped
+            # review 2026-10-05, M-4).
+            unit = len(str(fraction)) - 1
+            if fraction == 10 ** unit and places < unit:
+                return Decimal(num).scaleb(-places).quantize(
+                    Decimal(1).scaleb(-unit)
+                )
+            if fraction == 10 ** unit and places > unit:
+                return _entry_math.round_half_up(Fraction(num, denom), fraction)
+            return Decimal(num).scaleb(-places)
+        return _entry_math.round_half_up(Fraction(num, denom), fraction)
+
+    @staticmethod
+    def _slot_amount(children, numeric_key, formula_key, fraction=100):
         """Debit or credit side of a template split: the numeric when
         present and non-zero (what Since-Last-Run prefers), else the
         formula parsed as a plain number, else None (a formula with
-        variables — GnuCash prompts; we refuse)."""
+        variables — GnuCash prompts; we refuse). ``fraction`` is the
+        template currency's, for a numeric with no decimal form
+        (``_rational_amount``)."""
         num = children.get(numeric_key)
         if num and num[3] is not None and num[4] and num[3] != 0:
-            value = Decimal(num[3]) / Decimal(num[4])
-            # 4250/100 is 42.50, not 42.5 — keep the fraction's
-            # precision so amounts round-trip as typed.
-            return value.quantize(Decimal(1) / Decimal(num[4]))
+            return SchedulingMixin._rational_amount(
+                int(num[3]), int(num[4]), fraction,
+            )
         formula = children.get(formula_key)
         text_val = (formula[1] or "").strip() if formula else ""
         if not text_val:
@@ -626,9 +571,11 @@ class SchedulingMixin:
                     continue
                 debit = self._slot_amount(
                     ch, self._SX_DEBIT_NUMERIC, self._SX_DEBIT_FORMULA,
+                    txn.currency.fraction,
                 )
                 credit = self._slot_amount(
                     ch, self._SX_CREDIT_NUMERIC, self._SX_CREDIT_FORMULA,
+                    txn.currency.fraction,
                 )
                 if debit is None or credit is None:
                     bad = (ch.get(self._SX_DEBIT_FORMULA) or ch.get(
@@ -649,11 +596,9 @@ class SchedulingMixin:
                     book, split_guid, self._MCP_FRAME,
                 ).get(self._MCP_QUANTITY)
                 if q and q[4]:
-                    leg["quantity"] = str(
-                        (Decimal(q[3]) / Decimal(q[4])).quantize(
-                            Decimal(1) / Decimal(q[4])
-                        )
-                    )
+                    leg["quantity"] = str(self._rational_amount(
+                        int(q[3]), int(q[4]), int(q[4]),
+                    ))
                 recipe["splits"].append(leg)
             # The splits table has no sequence column, so the
             # caller's order is not recoverable; ledger order
@@ -885,16 +830,38 @@ class SchedulingMixin:
             ValueError: If invalid frequency, accounts not found,
                        or splits don't balance.
         """
+        # Every free-text argument through the one text gate (scoped
+        # review 2026-10-05, I-4): no control characters, GnuCash's
+        # column width.
+        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic", "memo", "action"):
+            _check_text(
+                locals().get(_field),
+                _SLOT_TEXT_WIDTH if _field == "notes" else _TEXT_WIDTH, _field,
+            )
+            if _field in ("name", "title", "reference", "fullname", "mnemonic", "action"):
+                _check_one_line(locals().get(_field), _field)
         if frequency not in self.VALID_FREQUENCIES:
             raise ValueError(
                 f"Invalid frequency: {frequency}. "
                 f"Valid: {', '.join(sorted(self.VALID_FREQUENCIES))}"
             )
 
+        for leg in splits or []:
+            if isinstance(leg, dict):
+                _check_text(leg.get("memo"), _TEXT_WIDTH, "memo")
         parsed_start = date.fromisoformat(start_date)
         parsed_end = (
             date.fromisoformat(end_date) if end_date else None
         )
+        _check_ledger_date(parsed_start, "start_date")
+        _check_ledger_date(parsed_end, "end_date")
+        # A schedule that ends before it starts has no occurrence and
+        # was accepted with ``next_occurrence: None`` (C42).
+        if parsed_end is not None and parsed_end < parsed_start:
+            raise ValueError(
+                f"end_date {parsed_end.isoformat()} is before "
+                f"start_date {parsed_start.isoformat()}"
+            )
 
         # _to_decimal rescues stray floats from direct callers so
         # the balance check doesn't fail on IEEE-754 noise.
@@ -1154,25 +1121,26 @@ class SchedulingMixin:
                     "scheduled_transactions": page,
                 }
 
-    def _upcoming_within_days(
-        self, book, days: int = 7,
-    ) -> dict:
-        """Summary stats for scheduled transactions due within
-        ``days`` days: ``{"count": int, "total": Decimal,
-        "unrated": int}``.
+    def _upcoming_cash_legs(self, book, days: int = 7) -> dict:
+        """One pass over the schedules due within ``days`` days —
+        the shared source for the Scheduled line
+        (``_upcoming_within_days``) and the low-cash scheduled-
+        outflow trigger (``_scheduled_cash_out_by_account``), so the
+        two can't drift (spec B6)::
 
-        Total = sum of positive split amounts per occurrence (same
-        convention as ``get_upcoming_transactions``), in the BOOK
-        DEFAULT currency: foreign-currency templates convert at the
-        latest market rate; templates whose currency has no rate on
-        file are counted but excluded from the total (``unrated``
-        reports how many, so the summary line can say so instead of
-        silently understating). Feeds the get_book_summary Scheduled
-        line; lives here so a book class built without scheduling
-        lacks the method and the summary skips the line via
-        ``hasattr``.
+            {"count": int, "unrated": int, "legacy": int,
+             "occurrences": [{"due": date,
+                              "legs": [(account_guid, amount)]}]}
+
+        ``legs`` are each occurrence's CASH legs — splits into
+        BANK/CASH accounts outside a retirement subtree, the same
+        accounts the low-cash check reads — in the BOOK DEFAULT
+        currency: foreign-currency templates convert at the latest
+        market rate; templates whose currency has no rate on file
+        are counted but carry no legs (``unrated`` reports how
+        many). An overdue occurrence belongs to the dashboard's
+        overdue bucket (same ``_sx_next_due``), not here.
         """
-
         today = date.today()
         window_end = today + timedelta(days=days)
 
@@ -1180,9 +1148,9 @@ class SchedulingMixin:
         rates = self._rates_as_of(book, today, default_currency)
 
         count = 0
-        total = Decimal("0")
         unrated = 0
         legacy = 0
+        occurrences: list[dict] = []
         for sx in book.session.query(ScheduledTransaction).all():
             # Recipes still in the pre-native shape are invisible
             # to desktop until their first write migrates them.
@@ -1191,9 +1159,6 @@ class SchedulingMixin:
             if not sx.enabled:
                 continue
 
-            # An overdue occurrence belongs to the dashboard's
-            # overdue bucket (same _sx_next_due), not to "due in
-            # next N days" — counting it here too would double it.
             next_occ = self._sx_next_due(sx)
             if not next_occ or next_occ < today or next_occ > window_end:
                 continue
@@ -1201,9 +1166,7 @@ class SchedulingMixin:
             count += 1
             # splits-json amounts are denominated in the template's
             # currency (the ``currency`` slot; absent = book
-            # default). Foreign templates convert at the latest
-            # market rate; no rate on file → counted, excluded from
-            # the total, reported via ``unrated``.
+            # default).
             rate = Decimal("1")
             recipe = self._sx_recipe(book, sx)
             sx_cur = recipe["currency"]
@@ -1215,14 +1178,105 @@ class SchedulingMixin:
                 if rate is None:
                     unrated += 1
                     continue
+            legs = []
             for s in recipe["splits"]:
-                amt = _to_decimal(s["amount"])
-                if amt > 0:
-                    total += amt * rate
+                acct = self._sx_split_cash_account(
+                    book, s.get("account", ""),
+                )
+                if acct is not None:
+                    legs.append((acct.guid, _to_decimal(s["amount"]) * rate))
+            occurrences.append({"due": next_occ, "legs": legs})
         return {
-            "count": count, "total": total, "unrated": unrated,
-            "legacy": legacy,
+            "count": count, "unrated": unrated, "legacy": legacy,
+            "occurrences": occurrences,
         }
+
+    def _upcoming_within_days(
+        self, book, days: int = 7,
+    ) -> dict:
+        """Summary stats for scheduled transactions due within
+        ``days`` days: ``{"count": int, "cash_out": Decimal,
+        "cash_in": Decimal, "unrated": int, "legacy": int}``.
+
+        Money is measured on each occurrence's cash legs
+        (``_upcoming_cash_legs``), netted per occurrence: negative
+        lands in ``cash_out``, positive in ``cash_in``. A signless
+        sum of positive splits (the old ``total``) added a
+        paycheck's gross to the week's bills — USD 6,777 "due" on
+        a live book whose real outflow was USD 1,931. Netting per
+        occurrence also keeps a checking→savings sweep out of both
+        columns, and a paycheck counts only what reaches checking,
+        not the 401k/FSA/tax legs. A schedule with no cash leg (a
+        charge to a card) still counts toward ``count`` but moves
+        no cash this week. Feeds the get_book_summary Scheduled
+        line; lives here so a book class built without scheduling
+        lacks the method and the summary skips the line via
+        ``hasattr``.
+        """
+        legs = self._upcoming_cash_legs(book, days)
+        cash_out = Decimal("0")
+        cash_in = Decimal("0")
+        for occ in legs["occurrences"]:
+            net = sum((amt for _g, amt in occ["legs"]), Decimal("0"))
+            if net < 0:
+                cash_out += -net
+            else:
+                cash_in += net
+        return {
+            "count": legs["count"], "cash_out": cash_out, "cash_in": cash_in,
+            "unrated": legs["unrated"], "legacy": legs["legacy"],
+        }
+
+    def _scheduled_cash_out_by_account(
+        self, book, days: int = 7,
+    ) -> dict[str, tuple[Decimal, date]]:
+        """``{account_guid: (cash_out, latest_due)}`` — each cash
+        account's scheduled net outflow over the next ``days`` days,
+        in the book default, and the last date it lands. Per
+        occurrence an account's legs net (a sweep in and out of the
+        same account is nothing); a negative net is outflow. The
+        low-cash check's second trigger (spec B6): a balance below
+        the week's scheduled bills is low, however healthy the
+        account's average pace looks.
+        """
+        out: dict[str, tuple[Decimal, date]] = {}
+        for occ in self._upcoming_cash_legs(book, days)["occurrences"]:
+            net: dict[str, Decimal] = {}
+            for guid, amt in occ["legs"]:
+                net[guid] = net.get(guid, Decimal("0")) + amt
+            for guid, amt in net.items():
+                if amt >= 0:
+                    continue
+                prev = out.get(guid)
+                out[guid] = (
+                    (prev[0] if prev else Decimal("0")) - amt,
+                    max(prev[1], occ["due"]) if prev else occ["due"],
+                )
+        return out
+
+    def _sx_split_cash_account(self, book, ref: str):
+        """The recipe split's account when it is spendable cash:
+        BANK/CASH, outside a retirement subtree — the low-cash
+        check's notion of cash; else ``None``. ``ref`` is a stored
+        recipe account: a full GUID, or a path on pre-GUID
+        templates. A vanished account is not cash.
+        """
+        if len(ref) == 32 and _HEX_GUID_RE.fullmatch(ref):
+            acct = book.session.query(
+                piecash.Account
+            ).filter_by(guid=ref).first()
+        else:
+            acct = self._find_account(book, ref)
+        if acct is None or acct.type not in ("BANK", "CASH"):
+            return None
+        if self._is_in_retirement_subtree(acct):
+            return None
+        return acct
+
+    def _sx_split_is_cash(self, book, ref: str) -> bool:
+        """True when a recipe split's account is spendable cash —
+        see ``_sx_split_cash_account``."""
+        return self._sx_split_cash_account(book, ref) is not None
 
     def get_upcoming_transactions(
         self,
@@ -1250,6 +1304,12 @@ class SchedulingMixin:
         """
 
         today = date.today()
+        # ``days=3285000`` raised OverflowError out of the date
+        # arithmetic (IV-18). Ten years ahead is already a forecast.
+        if not 0 <= days <= 3660:
+            raise ValueError(
+                f"days must be between 0 and 3660, got {days}"
+            )
         window_end = today + timedelta(days=days)
 
         with self.open(readonly=True) as book:
@@ -1397,6 +1457,27 @@ class SchedulingMixin:
 
             if transaction_date:
                 txn_date = date.fromisoformat(transaction_date)
+                # The schedule's own stops bind a date the caller
+                # names as much as one the server picks: an explicit
+                # date used to post an instance after the schedule
+                # had ended (adversarial review 2026-09-30,
+                # side-finding 3).
+                if sx.num_occur > 0 and sx.rem_occur <= 0:
+                    raise ValueError(
+                        f"'{sx.name}' has entered all {sx.num_occur} "
+                        f"occurrences. delete_scheduled_transaction "
+                        f"if it's finished, or enter this one with "
+                        f"create_transactions."
+                    )
+                if end and txn_date > end:
+                    raise ValueError(
+                        f"Transaction date {txn_date.isoformat()} is "
+                        f"after '{sx.name}' ended "
+                        f"({end.isoformat()}). Clear the end date with "
+                        f"update_scheduled_transaction(end_date=\"\") "
+                        f"to resume it, or enter this one with "
+                        f"create_transactions."
+                    )
             else:
                 # Oldest un-entered occurrence — the date the
                 # dashboard calls overdue, if one is. Never "the next
@@ -1461,28 +1542,66 @@ class SchedulingMixin:
             # quantity (GnuCash asks for the rate at Since-Last-Run).
             # Answer the one variable we can: the rate on file at
             # the instance date. No rate → refuse, naming the leg.
-            rates = None
+            #
+            # The rate goes into a stored quantity, so it is chosen
+            # the way a POSTING chooses one, not the way a report
+            # values a holding: from quotes somebody entered or
+            # fetched (never a transaction's own implied rate — an
+            # instance priced off the last instance's echo refreshes
+            # that echo forever and the stale-price warning goes
+            # quiet), and within the staleness window. This read used
+            # ``_rates_as_of``, which has no age limit and counts
+            # implied and forecast rows: a schedule booked 100 EUR at
+            # a 984-day-old rate without a word while post_document
+            # on the same book refused (adversarial review
+            # 2026-09-30, C18).
+            from gnucash_mcp.book._currency import (
+                _fx_guard_days,
+                _fx_staleness_days,
+            )
+
+            rate_notes: list[str] = []
             for s in splits:
                 if s.get("quantity") is not None:
                     continue
                 acct = self._resolve_account(book, s["account"])
                 if acct is None or acct.commodity == txn_currency:
                     continue
-                if rates is None:
-                    rates = self._rates_as_of(book, txn_date, txn_currency)
-                rate = rates.get(acct.commodity.guid)
-                if not rate:
+                pair = (
+                    f"{acct.commodity.mnemonic}/{txn_currency.mnemonic}"
+                )
+                with self._market_prices_only(book):
+                    aged = self._find_exchange_rate_aged(
+                        book, acct.commodity, txn_currency, txn_date,
+                    )
+                if aged is None:
+                    cap = _fx_staleness_days()
+                    window = f" within {cap} days of" if cap > 0 else " for"
                     raise ValueError(
                         f"Cannot instantiate '{sx.name}': the leg on "
                         f"{acct.fullname} is in {acct.commodity.mnemonic} "
-                        f"and no {acct.commodity.mnemonic}/"
-                        f"{txn_currency.mnemonic} rate is on file for "
-                        f"{txn_date.isoformat()}. create_price, or run "
-                        f"it from GnuCash desktop."
+                        f"and no {pair} quote is on file{window} "
+                        f"{txn_date.isoformat()}. Add one with "
+                        f"create_price(commodity="
+                        f"'{acct.commodity.mnemonic}', "
+                        f"namespace='{acct.commodity.namespace}', "
+                        f"currency='{txn_currency.mnemonic}', "
+                        f"value='...', date='{txn_date.isoformat()}'), "
+                        f"or run it from GnuCash desktop, which asks "
+                        f"for the rate."
+                    )
+                rate, age_days, price_date = aged
+                guard = _fx_guard_days()
+                if guard > 0 and age_days > guard:
+                    rate_notes.append(
+                        f"{acct.fullname}: converted at the {pair} "
+                        f"quote of {price_date.isoformat()}, "
+                        f"{age_days} days from the transaction date"
                     )
                 s["quantity"] = str(
                     (_to_decimal(s["amount"]) / rate).quantize(
-                        _commodity_quantum(acct.commodity)
+                        _commodity_quantum(acct.commodity),
+                        rounding=ROUND_HALF_UP,
                     )
                 )
 
@@ -1503,52 +1622,106 @@ class SchedulingMixin:
         # Re-find by guid — the phase-1 ORM object detached when
         # its session closed.
         shapes: dict = {}
-        with self.open(readonly=False) as book:
-            sx = self._find_scheduled_transaction(book, guid)
-            if not sx:
-                # SX deleted concurrently between phases — the
-                # transaction exists; respond cleanly rather than
-                # crash. Practically unreachable single-threaded.
-                instance_count = None
-                remaining = None
-            else:
-                # Desktop stamps every instance with its schedule;
-                # so do we, by raw SQL — an ORM SlotGUID in the
-                # session arms the delete cascade.
-                if txn_result.get("guid"):
-                    created = self._find_transaction(
-                        book, txn_result["guid"],
-                    )
-                    if created is not None:
-                        self._slot_insert(
-                            book, created.guid, self._SX_FROM,
-                            KVP_Type.KVP_TYPE_GUID,
-                            f"from-sched-xaction on {created.guid[:8]}",
-                            guid_val=sx.guid,
+        closed = None
+        try:
+            with self.open(readonly=False) as book:
+                closed = self._read_only_period_note(
+                    book, [txn_date], "",
+                    dialog="Since Last Run assistant",
+                )
+                sx = self._find_scheduled_transaction(book, guid)
+                if not sx:
+                    # SX deleted concurrently between phases — the
+                    # transaction exists; respond cleanly rather than
+                    # crash. Practically unreachable single-threaded.
+                    instance_count = None
+                    remaining = None
+                else:
+                    # Desktop stamps every instance with its schedule;
+                    # so do we, by raw SQL — an ORM SlotGUID in the
+                    # session arms the delete cascade.
+                    if txn_result.get("guid"):
+                        created = self._find_transaction(
+                            book, txn_result["guid"],
                         )
-                # Every pre-1.5 shape in the book converts on this
-                # write; the other schedules are converted without
-                # being posted.
-                shapes = self._upgrade_book_shapes(book)
-                current_last = sx.last_occur
-                if isinstance(current_last, datetime):
-                    current_last = current_last.date()
-                # Advance + increment only when txn_date is beyond
-                # the current marker — a concurrent writer may have
-                # registered the period already, and a second
-                # increment would break "instance_count = distinct
-                # periods produced". Never rewind.
-                if current_last is None or txn_date > current_last:
-                    sx.last_occur = txn_date
-                    sx.instance_count += 1
-                    # Finite schedules count down, as GnuCash's
-                    # own creation does; at zero _sx_next_due
-                    # answers None and the schedule is finished.
-                    if sx.num_occur > 0 and sx.rem_occur > 0:
-                        sx.rem_occur -= 1
-                book.save()
-                instance_count = sx.instance_count
-                remaining = sx.rem_occur if sx.num_occur > 0 else None
+                        if created is not None:
+                            self._slot_insert(
+                                book, created.guid, self._SX_FROM,
+                                KVP_Type.KVP_TYPE_GUID,
+                                f"from-sched-xaction on {created.guid[:8]}",
+                                guid_val=sx.guid,
+                            )
+                    # Every pre-1.5 shape in the book converts on this
+                    # write; the other schedules are converted without
+                    # being posted.
+                    shapes = self._upgrade_book_shapes(book)
+                    current_last = sx.last_occur
+                    if isinstance(current_last, datetime):
+                        current_last = current_last.date()
+                    # Advance + increment only when txn_date is beyond
+                    # the current marker — a concurrent writer may have
+                    # registered the period already, and a second
+                    # increment would break "instance_count = distinct
+                    # periods produced". Never rewind.
+                    if current_last is None or txn_date > current_last:
+                        sx.last_occur = txn_date
+                        sx.instance_count += 1
+                        # Finite schedules count down, as GnuCash's
+                        # own creation does; at zero _sx_next_due
+                        # answers None and the schedule is finished.
+                        if sx.num_occur > 0 and sx.rem_occur > 0:
+                            sx.rem_occur -= 1
+                    book.save()
+                    instance_count = sx.instance_count
+                    remaining = sx.rem_occur if sx.num_occur > 0 else None
+        except Exception as exc:
+            # The instance is committed and the schedule is not. Left
+            # like that, the transaction carries no schedule stamp,
+            # the schedule still calls the period due, and a retry is
+            # refused as a duplicate (adversarial review 2026-09-30,
+            # C27). Take the instance back out, so a failure here
+            # changes nothing and the retry is clean.
+            created_guid = txn_result.get("guid")
+            if not created_guid or txn_result.get("status") == "rejected":
+                raise
+            # If the advance DID commit and the failure came after it,
+            # the instance must stay: deleting it would skip the
+            # occurrence for good (scoped review 2026-10-06, CS-6).
+            try:
+                with self.open(readonly=True) as check:
+                    sx_now = self._find_scheduled_transaction(check, guid)
+                    advanced = (
+                        sx_now is not None and sx_now.last_occur == txn_date
+                    )
+            except Exception:
+                advanced = False
+            if advanced:
+                raise RuntimeError(
+                    f"'{sx_name}' was entered as transaction "
+                    f"{created_guid} and the schedule advanced to it, "
+                    f"but the reply could not be built "
+                    f"({type(exc).__name__}: {exc}). Nothing needs "
+                    f"redoing; list_scheduled_transactions shows the "
+                    f"new state."
+                ) from exc
+            try:
+                self.delete_transaction(created_guid, force=True)
+            except Exception:
+                raise RuntimeError(
+                    f"'{sx_name}' was entered as transaction "
+                    f"{created_guid}, but the schedule could not be "
+                    f"advanced ({type(exc).__name__}: {exc}) and the "
+                    f"transaction could not be removed again. It "
+                    f"carries no schedule stamp and the schedule "
+                    f"still shows this occurrence as due: delete "
+                    f"transaction {created_guid}, then retry."
+                ) from exc
+            raise RuntimeError(
+                f"'{sx_name}' could not be advanced "
+                f"({type(exc).__name__}: {exc}). The transaction that "
+                f"had just been entered for it was removed again, so "
+                f"nothing changed. Retry."
+            ) from exc
 
         # ── Build response. ─────────────────────────────────────
         response = {
@@ -1561,7 +1734,11 @@ class SchedulingMixin:
         }
         if remaining is not None:
             response["remaining_occurrences"] = remaining
+        if rate_notes:
+            response["warnings"] = rate_notes
         response.update(shapes)
+        if closed and response["status"] != "rejected":
+            response["read_only_period"] = closed
         if txn_result.get("status") == "rejected":
             # Evidence that the rejection is the CORRECT outcome —
             # without it, the natural retry instinct re-triggers the
@@ -1577,12 +1754,22 @@ class SchedulingMixin:
         enabled: bool | None = None,
         end_date: str | None = None,
         notes: str | None = None,
+        start_date: str | None = None,
     ) -> dict:
         """Update a scheduled transaction.
 
         Args:
             guid: Scheduled transaction GUID.
             enabled: Enable or disable.
+            start_date: ``"YYYY-MM-DD"`` to move the schedule's start.
+                What desktop's editor does on OK: the recurrence rows
+                take the new date as their period start
+                (``gnc_sx_set_schedule``) and the schedule's own
+                ``start_date`` follows (``xaccSchedXactionSetStartDate``);
+                ``last_occur`` is untouched. The start is the
+                PHASE anchor — monthly from the 15th becomes monthly
+                from the 3rd for every future occurrence — which is
+                the point: it is a mover, not a relabel.
             end_date: ``"YYYY-MM-DD"`` to set, ``""`` to clear,
                 ``None`` (default) to leave unchanged. The
                 empty-string sentinel exists because ``None``
@@ -1596,6 +1783,16 @@ class SchedulingMixin:
         Raises:
             ValueError: If not found.
         """
+        # Every free-text argument through the one text gate (scoped
+        # review 2026-10-05, I-4): no control characters, GnuCash's
+        # column width.
+        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic", "memo", "action"):
+            _check_text(
+                locals().get(_field),
+                _SLOT_TEXT_WIDTH if _field == "notes" else _TEXT_WIDTH, _field,
+            )
+            if _field in ("name", "title", "reference", "fullname", "mnemonic", "action"):
+                _check_one_line(locals().get(_field), _field)
         with self.open(readonly=False) as book:
             sx = self._find_scheduled_transaction(book, guid)
             if not sx:
@@ -1609,6 +1806,9 @@ class SchedulingMixin:
             self._stage_audit_before({
                 "name": sx.name,
                 "enabled": bool(sx.enabled),
+                "start_date": (
+                    sx.start_date.isoformat() if sx.start_date else None
+                ),
                 "end_date": (
                     sx.end_date.isoformat() if sx.end_date else None
                 ),
@@ -1638,7 +1838,41 @@ class SchedulingMixin:
                 if end_date == "":
                     sx.end_date = None
                 else:
-                    sx.end_date = date.fromisoformat(end_date)
+                    new_end = date.fromisoformat(end_date)
+                    current_start = sx.start_date
+                    if isinstance(current_start, datetime):
+                        current_start = current_start.date()
+                    if (
+                        start_date is None and current_start is not None
+                        and new_end < current_start
+                    ):
+                        raise ValueError(
+                            f"end_date {new_end.isoformat()} is before "
+                            f"the schedule's start date "
+                            f"{current_start.isoformat()}"
+                        )
+                    sx.end_date = new_end
+
+            if start_date is not None:
+                new_start = date.fromisoformat(start_date)
+                if sx.end_date and new_start > sx.end_date:
+                    raise ValueError(
+                        f"start_date {new_start.isoformat()} is after the "
+                        f"schedule's end date {sx.end_date.isoformat()}"
+                    )
+                # Every recurrence row moves with the start, as the
+                # editor rebuilds them from one start date.
+                book.session.execute(
+                    Recurrence.__table__.update()
+                    .where(Recurrence.__table__.c.obj_guid == sx.guid)
+                    .values(recurrence_period_start=new_start)
+                )
+                _verify_composite_write(
+                    book.session, Recurrence.__table__,
+                    {"obj_guid": sx.guid, "recurrence_period_start": new_start},
+                    f"recurrence start for scheduled transaction '{sx.name}'",
+                )
+                sx.start_date = new_start
 
             if notes is not None:
                 # Upsert as delete-then-insert: the slot table has

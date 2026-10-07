@@ -96,6 +96,106 @@ def clean_server():
                 os.environ[k] = v
 
 
+# ── Credentials: end to end ───────────────────────────────────────
+
+
+class TestCredentialsNeverLeave:
+    """A URI-mode server whose database cannot be opened, with a
+    password planted in the connection string, called the way a
+    client calls it. The password must appear in nothing that leaves:
+    the tool result, the audit and debug files, or the log records
+    that propagate to the host's stderr handler. (Review C16a, C16b,
+    C59; the unit table is ``tests/test_credential_scrub.py``.)
+    """
+
+    SECRET = "S3CRET-pw-do-not-leak"
+
+    def _call_a_tool(self, srv, tmp_path, monkeypatch, caplog, uri):
+        import json
+        import logging
+
+        from gnucash_mcp.logging_config import audit_log
+        from gnucash_mcp.tools._helpers import safe_tool
+
+        monkeypatch.setenv("GNUCASH_LOG_DIR", str(tmp_path / "logs"))
+        srv._logging_audit = True
+        srv._logging_debug = True
+        srv._install_book_uri(uri, activate=True)
+
+        @safe_tool
+        @audit_log(
+            classification="write", operation="create",
+            entity_type="account",
+        )
+        def create_account(name: str) -> str:
+            return json.dumps(
+                srv.get_book().create_account(name, "EXPENSE")
+            )
+
+        with caplog.at_level(logging.DEBUG):
+            result = create_account(name="Dining")
+        files = {
+            str(p.relative_to(tmp_path)): p.read_text()
+            for p in (tmp_path / "logs").rglob("*") if p.is_file()
+        }
+        return result, files, caplog.text
+
+    def _assert_clean(self, result, files, logged):
+        assert self.SECRET not in result
+        for name, text in files.items():
+            assert self.SECRET not in text, name
+        assert self.SECRET not in logged
+        # It did fail, and said so on every surface.
+        assert '"error"' in result
+        assert any("ERROR" in text for text in files.values())
+        assert "create_account" in logged
+
+    def test_missing_database_named_by_piecash(
+        self, clean_server, tmp_path, monkeypatch, caplog,
+    ):
+        """piecash: ``Database '<the whole uri>' does not exist``."""
+        uri = (
+            f"sqlite:///{tmp_path}/missing.gnucash"
+            f"?password={self.SECRET}"
+        )
+        result, files, logged = self._call_a_tool(
+            clean_server, tmp_path, monkeypatch, caplog, uri,
+        )
+        self._assert_clean(result, files, logged)
+        # The message survives, masked: the user can still see which
+        # database is missing.
+        assert "does not exist" in result
+        assert "password=***" in result
+
+    def test_userinfo_password_quoted_by_sqlalchemy(
+        self, clean_server, tmp_path, monkeypatch, caplog,
+    ):
+        """SQLAlchemy: ``Invalid SQLite URL: sqlite://u:<pw>@``."""
+        uri = f"sqlite://dbuser:{self.SECRET}@/{tmp_path}/missing.gnucash"
+        result, files, logged = self._call_a_tool(
+            clean_server, tmp_path, monkeypatch, caplog, uri,
+        )
+        self._assert_clean(result, files, logged)
+        assert "dbuser:***@" in result
+
+    def test_the_book_is_named_without_the_password_everywhere(
+        self, clean_server, tmp_path, monkeypatch, caplog,
+    ):
+        """The header and the startup notice masked the userinfo
+        password already; a query-string one passed straight
+        through (C16b)."""
+        uri = (
+            f"sqlite:///{tmp_path}/missing.gnucash"
+            f"?sslpassword={self.SECRET}"
+        )
+        result, files, logged = self._call_a_tool(
+            clean_server, tmp_path, monkeypatch, caplog, uri,
+        )
+        self._assert_clean(result, files, logged)
+        assert self.SECRET not in BookSource.from_uri(uri).display_name
+        assert self.SECRET not in clean_server.get_server_config()
+
+
 # ── BookSource ────────────────────────────────────────────────────
 
 
@@ -179,9 +279,46 @@ class TestRedaction:
 # ── Reads and writes over a URI ───────────────────────────────────
 
 
+def _read_only_period_is_named(gb: GnuCashBook) -> None:
+    """The read-only-period warning's one query (a slot read by name)
+    on whatever backend ``gb`` is: the option stored as GnuCash
+    stores it, a double under options/Accounts, then one write on
+    each side of the date (review C69)."""
+    from datetime import timedelta
+
+    with gb.open(readonly=False) as book:
+        book["options"] = {"Accounts": {
+            "Day Threshold for Read-Only Transactions (red line)": 30.0,
+        }}
+        book.save()
+
+    def spend(days_ago: int) -> dict:
+        return gb.create_transaction(
+            description=f"Read-only probe {days_ago}",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "3.21"},
+                {"account": "Assets:Checking", "amount": "-3.21"},
+            ],
+            trans_date=date.today() - timedelta(days=days_ago),
+            check_duplicates=False,
+        )
+
+    def kinds(result: dict) -> list:
+        return [
+            w.get("type") for w in result.get("warnings", [])
+            if isinstance(w, dict)
+        ]
+
+    assert "read_only_period" in kinds(spend(40))
+    assert "read_only_period" not in kinds(spend(5))
+
+
 class TestUriBookOperations:
     def test_accounts_read_back(self, uri_book):
         assert "Assets:Checking" in uri_book.list_accounts()
+
+    def test_read_only_period_is_named(self, uri_book):
+        _read_only_period_is_named(uri_book)
 
     def test_write_round_trips(self, uri_book):
         result = uri_book.create_transaction(
@@ -271,6 +408,22 @@ class TestBackupDegradation:
         must not raise — a refusal here would block the write itself."""
         uri_book._maybe_auto_backup()
         assert uri_book._backup_checked_in_process is False
+
+    def test_backup_health_is_empty_not_an_error(self, uri_book):
+        """No chain, no report — and no exception. This raised
+        TypeError on ``book_path.stem`` for every database book's
+        dashboard call; the collectors swallowed it until they started
+        reporting failed checks (the honest-failure branch's first
+        catch)."""
+        assert uri_book.get_backup_health() == {
+            "last_attempt": None,
+            "newest_backup_at": None,
+            "newest_backup_age_days": None,
+        }
+
+    def test_dashboard_has_no_failed_check_on_a_uri_book(self, uri_book):
+        result = uri_book.get_book_summary()
+        assert "check failed" not in result
 
     def test_file_books_still_back_up(self, test_book: Path):
         book = GnuCashBook(str(test_book))
@@ -699,6 +852,18 @@ def _worker_db_uri(env_var: str) -> str | None:
     return str(url.set(database=f"{url.database or 'gnucash'}_{worker}"))
 
 
+def _ensure_account(book, *args, **kwargs) -> None:
+    """Create an account another test in the class may already have
+    made. The class shares one database book per xdist worker, and
+    which tests land on a worker varies by run: two tests that each
+    created ``Income`` passed or failed by scheduling."""
+    try:
+        book.create_account(*args, **kwargs)
+    except ValueError as e:
+        if "already exists" not in str(e):
+            raise
+
+
 _PG_URI = _worker_db_uri("GNUCASH_TEST_PG_URI")
 _MYSQL_URI = _worker_db_uri("GNUCASH_TEST_MYSQL_URI")
 
@@ -721,6 +886,9 @@ class _RealDatabaseTests:
     DUMP_TOOL: str = ""
     # Count of this database's live server connections.
     LIVE_CONNECTIONS_SQL: str = ""
+    # Whether one failed statement poisons the rest of the transaction
+    # (PostgreSQL's InFailedSqlTransaction). MySQL and SQLite carry on.
+    ABORTS_ON_ERROR: bool = False
 
     @pytest.fixture(scope="class")
     def db_book(self, request):
@@ -767,6 +935,46 @@ class _RealDatabaseTests:
         listing = db_book.list_accounts()
         assert "Assets:Checking" in listing
         assert "Expenses:Groceries" in listing
+
+    def test_read_only_period_is_named(self, db_book):
+        _read_only_period_is_named(db_book)
+
+    def test_an_emoji_on_desktop_shaped_mysql_tables_is_refused_by_name(
+        self, db_book,
+    ):
+        """Side-finding 12. GnuCash desktop creates utf8mb3 tables;
+        piecash (this fixture) creates utf8mb4. Make ``transactions``
+        desktop's shape, and a four-byte character is refused before
+        the database is asked to store it."""
+        if db_book.source.backend != "mysql":
+            pytest.skip("utf8mb3 is MySQL's")
+        from sqlalchemy import text
+
+        def emoji_write():
+            return db_book.create_transaction(
+                description="Lunch \U0001F35C",
+                splits=[
+                    {"account": "Expenses:Groceries", "amount": "9.00"},
+                    {"account": "Assets:Checking", "amount": "-9.00"},
+                ],
+                trans_date=date(2026, 2, 2), check_duplicates=False,
+            )
+
+        def convert(charset):
+            with db_book.open(readonly=False) as book:
+                book.session.execute(text(
+                    f"ALTER TABLE transactions CONVERT TO CHARACTER SET {charset}"
+                ))
+            db_book._mysql_three_byte = None
+
+        convert("utf8mb3")
+        try:
+            with pytest.raises(ValueError, match="utf8mb3"):
+                emoji_write()
+            assert "Lunch" not in db_book.search_transactions("Lunch")
+        finally:
+            convert("utf8mb4")
+        assert emoji_write()["status"] == "created"
 
     def test_write_round_trips(self, db_book):
         result = db_book.create_transaction(
@@ -834,6 +1042,380 @@ class _RealDatabaseTests:
                 assert opened.default_currency is not None
         assert live() == before
 
+    def test_document_lifecycle(self, db_book):
+        """Regression: every invoice lookup on a PostgreSQL book failed
+        with InFailedSqlTransaction — ``_find_invoice``'s SQLite-only
+        ``date_posted=''`` heal aborted the transaction ahead of the
+        SELECT, so get/post/pay/entry and explicit-id creation were
+        all dead while auto-id creation (no lookup) kept working.
+        Found and fixed by @JamesRao98 on the 10xtechnology fork. The
+        whole document lifecycle runs here so the business module's
+        raw SQL is proven on each dialect, not just on SQLite.
+        """
+        db_book.create_account(
+            name="Accounts Receivable", account_type="RECEIVABLE",
+            parent="Assets",
+        )
+        _ensure_account(
+            db_book, name="Income", account_type="INCOME", placeholder=True,
+        )
+        _ensure_account(
+            db_book, name="Sales", account_type="INCOME", parent="Income",
+        )
+        customer = db_book.create_customer(name="Dialect Co")
+        inv = db_book.create_invoice(customer_id=customer["id"])
+
+        found = db_book.get_invoice(inv["id"], owner_type="customer")
+        assert found["id"] == inv["id"]
+
+        db_book.add_invoice_entry(
+            invoice_id=inv["id"], account="Income:Sales",
+            description="Consulting", quantity="2", price="50.00",
+        )
+        posted = db_book.post_invoice(
+            invoice_id=inv["id"],
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        assert posted
+        paid = db_book.pay_invoice(
+            invoice_id=inv["id"], payment_account="Assets:Checking",
+            amount="100.00", owner_type="customer",
+        )
+        assert paid
+        assert db_book.get_invoice(
+            inv["id"], owner_type="customer"
+        )["status"] == "paid"
+
+        explicit = db_book.create_invoice(
+            customer_id=customer["id"], invoice_id="INV-EXPLICIT",
+        )
+        assert explicit["id"] == "INV-EXPLICIT"
+        assert db_book.get_invoice(
+            "INV-EXPLICIT", owner_type="customer"
+        )["id"] == "INV-EXPLICIT"
+
+    def test_prepayment_lifecycle(self, db_book):
+        """The payment-lot paths are raw SQL over the slots table
+        (owner frames joined to their children, the document-link
+        test, the party-delete guard): overpay, settle another
+        document from the excess, unpost a paid one, and read it all
+        back, on each dialect (adversarial review 2026-09-30, C37 /
+        C49 / C50)."""
+        _ensure_account(
+            db_book, name="Accounts Receivable", account_type="RECEIVABLE",
+            parent="Assets",
+        )
+        _ensure_account(
+            db_book, name="Income", account_type="INCOME", placeholder=True,
+        )
+        _ensure_account(
+            db_book, name="Sales", account_type="INCOME", parent="Income",
+        )
+        customer = db_book.create_customer(name="Prepay Co")
+        ids = []
+        for price in ("100.00", "50.00"):
+            inv = db_book.create_invoice(customer_id=customer["id"])
+            db_book.add_invoice_entry(
+                invoice_id=inv["id"], account="Income:Sales",
+                description="Work", quantity="1", price=price,
+            )
+            db_book.post_invoice(
+                invoice_id=inv["id"],
+                post_account="Assets:Accounts Receivable",
+                post_date="2026-01-15", owner_type="customer",
+            )
+            ids.append(inv["id"])
+
+        def unapplied():
+            return db_book.get_outstanding_invoices(
+                compact=False, customer_id=customer["id"],
+            ).get("unapplied_payments", [])
+
+        paid = db_book.pay_invoice(
+            invoice_id=ids[0], payment_account="Assets:Checking",
+            amount="120.00", payment_date="2026-01-20",
+            owner_type="customer", allow_prepayment=True,
+        )
+        assert paid["prepayment"]["amount"] == "20.00"
+        assert [u["amount"] for u in unapplied()] == ["20.00"]
+        assert db_book.get_invoice(
+            ids[1], owner_type="customer",
+        )["unapplied_payments_available"] == "20.00"
+
+        settled = db_book.pay_invoice(
+            invoice_id=ids[1], owner_type="customer", from_prepayment=True,
+        )
+        assert settled["remaining_balance"] == "30.00"
+        assert unapplied() == []
+
+        unposted = db_book.unpost_invoice(
+            invoice_id=ids[0], owner_type="customer",
+        )
+        assert [p["amount"] for p in unposted["payments_kept"]] == ["100.00"]
+        assert [u["amount"] for u in unapplied()] == ["100.00"]
+        assert "Book:" in db_book.get_book_summary()
+        with pytest.raises(ValueError, match="unapplied payment"):
+            db_book.delete_customer(customer["id"])
+
+    def test_tax_bearing_draft_can_be_deleted(self, db_book):
+        """Regression: deleting an unposted document with a taxed
+        entry ran ``SET refcount = MAX(0, refcount - :n)`` — SQLite's
+        scalar two-argument MAX, which PostgreSQL and MySQL reject
+        outright (MAX is an aggregate there; GREATEST is the scalar).
+        Every tax-bearing draft was undeletable on a database book.
+        The clamp is now a CASE expression every backend accepts.
+        """
+        # Self-contained: xdist gives each worker its own class
+        # fixture, so nothing here may lean on accounts another test
+        # created.
+        db_book.create_account(
+            name="Tax Liabilities", account_type="LIABILITY",
+            placeholder=True,
+        )
+        db_book.create_account(
+            name="Sales Tax", account_type="LIABILITY",
+            parent="Tax Liabilities",
+        )
+        db_book.create_account(
+            name="Taxed Income", account_type="INCOME",
+        )
+        db_book.create_taxtable(
+            name="VAT", entries=[{
+                "type": "percentage", "amount": "10",
+                "account": "Tax Liabilities:Sales Tax",
+            }],
+        )
+        customer = db_book.create_customer(name="Taxed Co")
+        inv = db_book.create_invoice(customer_id=customer["id"])
+        db_book.add_invoice_entry(
+            invoice_id=inv["id"], account="Taxed Income",
+            description="Taxed work", quantity="1", price="100.00",
+            taxtable="VAT",
+        )
+        result = db_book.delete_invoice(inv["id"])
+        assert result["status"] == "deleted"
+        assert db_book.get_taxtable("VAT")["refcount"] == 0
+
+    def test_dashboard_recovers_from_an_aborted_transaction(
+        self, db_book, monkeypatch,
+    ):
+        """Poison the transaction just ahead of one collector. On
+        PostgreSQL that collector's first query fails with
+        InFailedSqlTransaction; ``_check_failed`` reports it once and
+        clears the abort, so every collector after it runs and the
+        dashboard returns. MySQL has no aborted state: nothing fails,
+        nothing is reported. Spec:
+        specs/v1.5/DASHBOARD_HONEST_FAILURE_SPEC.md.
+        """
+        from sqlalchemy import text
+
+        original = GnuCashBook._overdue_scheduled_warnings
+
+        def poisoned(self, book, today, failures=None):
+            try:
+                book.session.execute(text("SELECT no_such_column_anywhere"))
+            except Exception:
+                pass  # deliberately NOT cleared — that is the point
+            return original(self, book, today, failures=failures)
+
+        monkeypatch.setattr(
+            GnuCashBook, "_overdue_scheduled_warnings", poisoned,
+        )
+        result = db_book.get_book_summary()
+        assert "Accounts:" in result
+        if self.ABORTS_ON_ERROR:
+            assert "Overdue-schedule check failed" in result
+            assert "InFailedSqlTransaction" in result
+            assert result.count("check failed") == 1, result
+        else:
+            assert "check failed" not in result
+
+    def test_price_row_lands_in_editor_shape(self, db_book):
+        """The price twin's shape on a real driver: ``_stamp_price_row``
+        binds the neutral-time date as a string and the reduced
+        numerator/denominator by raw SQL, and the converter's date
+        rule reads the driver's datetime back. SQLite stores the
+        string verbatim; here the column is a real timestamp."""
+        from datetime import date
+
+        from sqlalchemy import text
+
+        db_book.create_commodity(
+            mnemonic="AAPL", fullname="Apple", namespace="NASDAQ",
+        )
+        db_book.create_price(
+            commodity="AAPL", namespace="NASDAQ", value="178.70",
+            price_date=date(2026, 9, 28),
+        )
+        with db_book.open(readonly=True) as book:
+            row = book.session.execute(text(
+                "SELECT date, value_num, value_denom, source FROM prices"
+            )).one()
+        assert (row[1], row[2], row[3]) == (1787, 10, "user:price")
+        assert str(row[0])[:19] == "2026-09-28 10:59:00"
+        # A second write on the same day updates in place — the
+        # converter runs first and must leave the row alone.
+        result = db_book.create_price(
+            commodity="AAPL", namespace="NASDAQ", value="180",
+            price_date=date(2026, 9, 28),
+        )
+        assert result["status"] == "updated"
+        assert "price_dates_normalized" not in result
+        assert "price_values_reduced" not in result
+
+    def test_cross_currency_transfer_writes_desktops_rows(self, db_book):
+        """The cross-currency twin on a real driver: the implied
+        price is a raw INSERT with a string timestamp and exact
+        numerator/denominator, the slot fillers come from a column
+        default bound as a datetime, and both converters run their
+        UPDATEs with the same binds. SQLite accepts anything here;
+        a typed timestamp column does not."""
+        from datetime import date
+
+        from sqlalchemy import text
+
+        db_book.create_commodity(
+            mnemonic="EUR", fullname="Euro", namespace="CURRENCY",
+        )
+        db_book.create_account(
+            "EUR Savings", "BANK", parent="Assets", commodity="EUR",
+        )
+        db_book.create_transaction(
+            "transfer",
+            splits=[
+                {"account": "Assets:Checking", "amount": "-100"},
+                {"account": "Assets:EUR Savings", "amount": "100",
+                 "quantity": "90"},
+            ],
+            trans_date=date(2026, 9, 29), check_duplicates=False,
+            notes="a note",
+        )
+        stale = (
+            "SELECT COUNT(*) FROM slots WHERE "
+            "(double_val = 0 AND slot_type <> 2) OR "
+            "(timespec_val IS NULL AND slot_type <> 6)"
+        )
+        with db_book.open(readonly=True) as book:
+            row = book.session.execute(text(
+                "SELECT c.mnemonic, u.mnemonic, p.date, p.source, p.type, "
+                "p.value_num, p.value_denom FROM prices p "
+                "JOIN commodities c ON c.guid = p.commodity_guid "
+                "JOIN commodities u ON u.guid = p.currency_guid "
+                "WHERE p.type = 'transaction' AND c.mnemonic = 'EUR'"
+            )).one()
+            assert (row[0], row[1], row[3], row[4], row[5], row[6]) == (
+                "EUR", "USD", "user:xfer-dialog", "transaction", 10, 9,
+            )
+            assert str(row[2])[:19] == "2026-09-29 10:59:00"
+            assert book.session.execute(text(stale)).scalar() == 0
+            # This account's frame, not the book's: the fixture is
+            # class-scoped and another test may have created accounts
+            # first (the count was 2 on one CI run, 1 on the re-run).
+            assert book.session.execute(text(
+                "SELECT COUNT(*) FROM slots s JOIN accounts a "
+                "ON a.guid = s.obj_guid WHERE s.name = 'balance-limit' "
+                "AND a.name = 'EUR Savings'"
+            )).scalar() == 1
+        # piecash's old fillers, then the converter's two UPDATEs.
+        with db_book.open(readonly=False) as book:
+            book.session.execute(text(
+                "UPDATE slots SET double_val = 0, timespec_val = NULL"
+            ))
+            book.save()
+        with db_book.open(readonly=False) as book:
+            out = db_book._upgrade_book_shapes(book)
+            book.save()
+        assert out["slot_fillers_normalized"] >= 2
+        with db_book.open(readonly=True) as book:
+            assert book.session.execute(text(stale)).scalar() == 0
+
+    def test_cross_currency_payment_on_a_real_driver(self, db_book):
+        """The payment twin's shape where the columns are typed: a
+        EUR invoice paid from USD is a USD transaction, the day's
+        price is a raw INSERT, and the lot's balance reads the
+        document's currency through a raw SELECT on ``invoices``."""
+        from datetime import date
+
+        from sqlalchemy import text
+
+        try:
+            db_book.create_commodity(
+                mnemonic="EUR", fullname="Euro", namespace="CURRENCY",
+            )
+        except ValueError:
+            pass  # an earlier test in this class created it
+        _ensure_account(db_book, "Income", "INCOME")
+        _ensure_account(db_book, "Sales", "INCOME", parent="Income")
+        db_book.create_account(
+            "AR EUR", "RECEIVABLE", parent="Assets", commodity="EUR",
+        )
+        db_book.create_price(
+            "EUR", "CURRENCY", "1.111111", price_date=date(2026, 8, 1),
+        )
+        db_book.create_price(
+            "EUR", "CURRENCY", "1.20", price_date=date(2026, 8, 9),
+        )
+        cust = db_book.create_customer(name="Berlin GmbH", currency="EUR")
+        inv = db_book.create_invoice(
+            customer_id=cust["id"], date_opened="2026-08-02",
+        )
+        db_book.add_invoice_entry(
+            invoice_id=inv["id"], account="Income:Sales",
+            description="work", quantity="1", price="900",
+        )
+        db_book.post_invoice(
+            invoice_id=inv["id"], post_account="Assets:AR EUR",
+            post_date="2026-08-02",
+        )
+        result = db_book.pay_invoice(
+            invoice_id=inv["id"], payment_account="Assets:Checking",
+            amount="900", payment_date="2026-08-10",
+        )
+        assert result["status"] == "paid"
+        assert result["fx_realized"]["amount"] == "80.00"
+        doc = db_book.get_invoice(inv["id"])
+        assert (doc["amount_paid"], doc["amount_due"]) == ("900.00", "0.00")
+        with db_book.open(readonly=True) as book:
+            rows = book.session.execute(text(
+                "SELECT c.mnemonic, a.name, s.value_num, s.quantity_num "
+                "FROM splits s JOIN accounts a ON a.guid = s.account_guid "
+                "JOIN transactions t ON t.guid = s.tx_guid "
+                "JOIN commodities c ON c.guid = t.currency_guid "
+                # This payment only: the class shares one book, and
+                # another test's payment is in it when both land on
+                # the same xdist worker.
+                "WHERE s.action = 'Payment' AND t.guid LIKE :txn "
+                "ORDER BY a.name"
+            ), {"txn": result["transaction_guid"] + "%"}).fetchall()
+            assert [tuple(r) for r in rows] == [
+                ("USD", "AR EUR", -100000, -90000),
+                ("USD", "Checking", 108000, 108000),
+                ("USD", "Foreign Exchange Gain/Loss", -8000, -8000),
+            ]
+            price = book.session.execute(text(
+                "SELECT p.source, p.value_num, p.value_denom FROM prices p "
+                "WHERE p.type = 'transaction' AND p.value_num = 6"
+            )).one()
+            assert tuple(price) == ("user:xfer-dialog", 6, 5)
+
+    def test_rollback_if_aborted(self, db_book):
+        """The real-driver half of ``TestRollbackIfAborted``: after a
+        swallowed bad statement, the helper clears PostgreSQL's
+        aborted state (and reports it), leaves a MySQL session alone,
+        and either way the next statement runs."""
+        from sqlalchemy import text
+
+        from gnucash_mcp.book._base import _rollback_if_aborted
+
+        with db_book.open(readonly=True) as book:
+            try:
+                book.session.execute(text("SELECT no_such_column_anywhere"))
+            except Exception:
+                pass
+            assert _rollback_if_aborted(book.session) is self.ABORTS_ON_ERROR
+            assert book.session.execute(text("SELECT 1")).scalar() == 1
+
 
 @pytest.mark.skipif(
     not _PG_URI, reason="set GNUCASH_TEST_PG_URI to run PostgreSQL tests"
@@ -841,6 +1423,7 @@ class _RealDatabaseTests:
 class TestPostgresBackend(_RealDatabaseTests):
     URI = _PG_URI
     DUMP_TOOL = "pg_dump"
+    ABORTS_ON_ERROR = True
     LIVE_CONNECTIONS_SQL = (
         "SELECT count(*) FROM pg_stat_activity "
         "WHERE datname = current_database()"

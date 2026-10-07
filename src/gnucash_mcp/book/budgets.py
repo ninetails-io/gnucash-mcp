@@ -9,32 +9,43 @@ piecash blocks the Budget / Recurrence / BudgetAmount constructors
 SQLAlchemy Core API paired with _verify_* round-trip checks.
 """
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from decimal import ROUND_HALF_EVEN, Decimal
 
 import piecash
-from dateutil.relativedelta import relativedelta
 from piecash._common import Recurrence
 from piecash.budget import Budget, BudgetAmount
 from piecash.kvp import Slot
 
 from gnucash_mcp.book._base import (
     _BUDGET_SCRUB_FLIP,
+    _budget_period_bounds,
     _BUDGET_UNREVERSED_BOGUS_KEY,
-    _BUDGET_UNREVERSED_FEATURE,
     _BUDGET_UNREVERSED_DESCRIPTION,
     _BUDGET_UNREVERSED_KEY,
     _budget_scrub_policy,
     _budget_stored_sign,
     _budget_targets,
+    _money_precision_error,
     _budget_unreversed,
     _verify_delete,
     _to_decimal,
     _unique_prefix,
     _verify_composite_write,
     _verify_write,
+    _check_text,
+    _TEXT_WIDTH,
+    _SLOT_TEXT_WIDTH,
+    _check_one_line,
+    _check_ledger_date,
 )
-from gnucash_mcp._format import _paginate
+from gnucash_mcp._format import (
+    _format_exact,
+    _paginate,
+    _period_label,
+    _round_converted,
+    _one_line,
+)
 
 
 def _collapse_period_runs(
@@ -116,7 +127,7 @@ def _format_budget_report_compact(report: dict) -> str:
     budget_name = report.get("budget", "?")
     period_info = report.get("period", "")
 
-    header_line = f"{budget_name} — {period_info}"
+    header_line = f"{_one_line(budget_name)} — {period_info}"
     if not accounts:
         return f"{header_line}\n(no budgeted accounts)"
 
@@ -150,7 +161,7 @@ def _format_budget_report_compact(report: dict) -> str:
         # Whole-dollar values render simpler.
         if d == d.to_integral_value():
             return f"{int(d):,}"
-        return f"{d:,.2f}"
+        return _format_exact(d)
 
     budget_strs = [_fmt(r["budgeted"]) for r in accounts]
     actual_strs = [_fmt(r["actual"]) for r in accounts]
@@ -243,7 +254,7 @@ def _format_get_budget_compact(
     period_type = info.get("period_type", "")
     start = info.get("start_date", "?")
     header = (
-        f"{name}  {num_periods} periods"
+        f"{_one_line(name)}  {num_periods} periods"
         + (f" ({period_type})" if period_type else "")
         + f"  starts:{start}"
     )
@@ -321,25 +332,15 @@ class BudgetsMixin:
                 f"(0-{budget.num_periods - 1})"
             )
 
-        rec = budget.recurrence
-        anchor = rec.recurrence_period_start
-        if isinstance(anchor, datetime):
-            anchor = anchor.date()
-
-        period_type = rec.recurrence_period_type
-        mult = rec.recurrence_mult
-
-        if period_type == "month":
-            delta = relativedelta(months=mult)
-        elif period_type == "week":
-            delta = relativedelta(weeks=mult)
-        else:
-            raise ValueError(f"Unsupported period type: {period_type}")
-
-        start = anchor + delta * period_num
-        end = anchor + delta * (period_num + 1) - timedelta(days=1)
-
-        return start, end
+        # One rule for period boundaries, shared with the dashboard
+        # headline: the Recurrence.cpp port (spec B5).
+        bounds = _budget_period_bounds(budget)
+        if bounds is None:
+            raise ValueError(
+                f"Unsupported period type: "
+                f"{budget.recurrence.recurrence_period_type}"
+            )
+        return bounds[period_num]
 
     def _current_period(self, budget) -> int | None:
         """Get the current period number based on today's date.
@@ -469,7 +470,7 @@ class BudgetsMixin:
                 start = d.get("start_date", "?")
                 ptype_str = f" ({ptype})" if ptype else ""
                 lines.append(
-                    f"{d['name']:<{name_width}}  "
+                    f"{_one_line(d['name']):<{name_width}}  "
                     f"{periods} periods{ptype_str}  starts:{start}"
                 )
             return "\n".join(lines)
@@ -589,6 +590,16 @@ class BudgetsMixin:
             ValueError: duplicate name, invalid period_type /
                 num_periods / start_date.
         """
+        # Every free-text argument through the one text gate (scoped
+        # review 2026-10-05, I-4): no control characters, GnuCash's
+        # column width.
+        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic", "memo", "action"):
+            _check_text(
+                locals().get(_field),
+                _SLOT_TEXT_WIDTH if _field == "notes" else _TEXT_WIDTH, _field,
+            )
+            if _field in ("name", "title", "reference", "fullname", "mnemonic", "action"):
+                _check_one_line(locals().get(_field), _field)
         import uuid
 
 
@@ -599,10 +610,20 @@ class BudgetsMixin:
             )
         if num_periods < 1:
             raise ValueError("num_periods must be at least 1")
+        # 100,000 periods were accepted, and set_budget_amount without
+        # a period then wrote 100,000 rows (IV-25). A century of
+        # monthly periods is 1,200.
+        if num_periods > 1200:
+            raise ValueError(
+                f"num_periods must be at most 1200, got {num_periods}"
+            )
+        if not name or not name.strip():
+            raise ValueError("Budget name cannot be empty")
 
         if start_date is not None:
             try:
                 period_start = date.fromisoformat(start_date)
+                _check_ledger_date(period_start, "start_date")
             except ValueError as e:
                 raise ValueError(
                     f"Invalid start_date {start_date!r}: must be "
@@ -611,6 +632,8 @@ class BudgetsMixin:
         else:
             if year is None:
                 year = date.today().year
+            if not 1400 <= year <= 9999:
+                raise ValueError(f"year {year} is outside 1400..9999")
             period_start = date(year, 1, 1)
 
         recurrence_map = {
@@ -703,6 +726,21 @@ class BudgetsMixin:
         """
 
         amount_decimal = _to_decimal(amount)
+        # A budget amount on this surface is a MAGNITUDE: 5000 is a
+        # 5,000 income target on an income account and a 5,000
+        # spending limit on an expense account; the account's type
+        # supplies the direction (``_budget_stored_sign``). The
+        # ledger's own convention writes income as a negative, so
+        # "-5000" is the natural slip, and it stored a target in the
+        # WRONG direction that cancelled a correct one in the report.
+        if amount_decimal < 0:
+            raise ValueError(
+                f"Budget amounts are entered as positive numbers "
+                f"(got {amount}): {abs(amount_decimal)} is the target "
+                f"for an income account and the limit for an expense "
+                f"account alike. The account's type supplies the "
+                f"direction."
+            )
 
         with self.open(readonly=False) as book:
             budget = self._find_budget(book, budget_name)
@@ -745,6 +783,16 @@ class BudgetsMixin:
             # different values for the same input.
             amount_denom = acct.commodity.fraction
             quantum = Decimal(1) / Decimal(amount_denom)
+            # An amount finer than the currency's unit is a typo, as
+            # everywhere else money is entered (ruling 2026-09-27);
+            # this path still rounded 12.345 to 12.34 and 0.001 to
+            # nothing (adversarial review 2026-09-30, C40).
+            if acct.commodity.namespace == "CURRENCY":
+                error = _money_precision_error(
+                    amount_decimal, acct.commodity, "Budget amount",
+                )
+                if error:
+                    raise error
             quantized = amount_decimal.quantize(
                 quantum, rounding=ROUND_HALF_EVEN,
             )
@@ -874,11 +922,24 @@ class BudgetsMixin:
             else:
                 target_accounts = None
 
-            # One factors map, period-end-anchored, used for BOTH
-            # targets and actuals — converting only the actuals
-            # leaves targets in raw account commodities and makes
-            # used_pct meaningless on multi-currency budgets.
-            factors = self._account_conversion_factors(book, last_end)
+            # A budget report is a FLOW report (MM-12 ruling,
+            # 2026-10-02): every actual converts at its own month's
+            # close, as spending_by_category / income_by_source do,
+            # so the two agree on the same data. Targets convert too
+            # — converting only the actuals leaves targets in raw
+            # account commodities and makes used_pct meaningless on
+            # multi-currency budgets — each at the close of the month
+            # its period ends in.
+            monthly_factors = self._monthly_conversion_factors(
+                book, first_start, last_end,
+            )
+            period_end_month = {
+                p: _period_label(
+                    min(self._period_to_date_range(budget, p)[1], last_end),
+                    "month",
+                )
+                for p in report_periods
+            }
             default_currency = self._require_default_currency(book)
             # Currencies of budgeted accounts folded in raw for lack of
             # an FX rate — surfaced as a warning so the converted totals
@@ -900,7 +961,9 @@ class BudgetsMixin:
                 # _split_in_default_currency. Record the currency so a
                 # foreign fold isn't silent (it stays in the totals —
                 # a caveated budget line beats a dropped one).
-                factor = factors.get(ba.account.guid)
+                factor = monthly_factors.get(
+                    period_end_month[ba.period_num], {}
+                ).get(ba.account.guid)
                 ba_amount = magnitude
                 if factor is not None:
                     target_in_default = ba_amount * factor
@@ -950,7 +1013,7 @@ class BudgetsMixin:
                     continue
                 amount = self._split_in_default_currency(
                     split, account,
-                    factors.get(account.guid),
+                    self._monthly_factor(monthly_factors, _txn, account),
                 )
                 # SIGNED accumulation so contra splits net — same
                 # convention as spending_by_category /
@@ -965,6 +1028,19 @@ class BudgetsMixin:
                     actuals[rollup_target] = actuals.get(
                         rollup_target, Decimal("0")
                     ) + (-amount)
+
+            # Each account's figures are values in the book currency:
+            # rounded as GnuCash rounds a conversion (review C20), so
+            # the rows, the side sums, and the TOTAL are exact sums of
+            # what is shown.
+            budgeted = {
+                k: _round_converted(v, default_currency)
+                for k, v in budgeted.items()
+            }
+            actuals = {
+                k: _round_converted(v, default_currency)
+                for k, v in actuals.items()
+            }
 
             accounts_result = []
             # Income and expense targets are tallied on their own

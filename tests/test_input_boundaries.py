@@ -294,10 +294,11 @@ class TestInputLengthCaps:
         """A value exactly at the byte cap is accepted — the cap is
         the inclusive boundary."""
         from gnucash_mcp.book import GnuCashBook
-        from gnucash_mcp.book.admin import _SLOT_VALUE_MAX_BYTES
+        from gnucash_mcp.book._base import _SLOT_TEXT_WIDTH
         gb = GnuCashBook(str(test_book))
-        # Exactly at cap (ASCII payload — bytes == chars).
-        payload = "x" * _SLOT_VALUE_MAX_BYTES
+        # Exactly at GnuCash's column width (scoped review 2026-10-06,
+        # IN-11: the slot columns are VARCHAR(4096)).
+        payload = "x" * _SLOT_TEXT_WIDTH
         result = gb.set_account_slot(
             account_name="Assets:Checking",
             key="big_blob",
@@ -308,10 +309,10 @@ class TestInputLengthCaps:
     def test_set_account_slot_rejects_oversize_value(self, test_book):
         """One byte past the cap rejects with a clear error."""
         from gnucash_mcp.book import GnuCashBook
-        from gnucash_mcp.book.admin import _SLOT_VALUE_MAX_BYTES
+        from gnucash_mcp.book._base import _SLOT_TEXT_WIDTH
         gb = GnuCashBook(str(test_book))
-        payload = "x" * (_SLOT_VALUE_MAX_BYTES + 1)
-        with pytest.raises(ValueError, match="too long"):
+        payload = "x" * (_SLOT_TEXT_WIDTH + 1)
+        with pytest.raises(ValueError, match="at most 4096"):
             gb.set_account_slot(
                 account_name="Assets:Checking",
                 key="too_big",
@@ -336,7 +337,7 @@ class TestInputLengthCaps:
         assert len(payload.encode("utf-8")) > _SLOT_VALUE_MAX_BYTES, (
             "fixture math wrong: byte count should be above cap"
         )
-        with pytest.raises(ValueError, match="too long"):
+        with pytest.raises(ValueError, match="at most 4096|too long"):
             gb.set_account_slot(
                 account_name="Assets:Checking",
                 key="unicode_blob",

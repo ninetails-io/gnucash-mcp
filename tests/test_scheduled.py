@@ -2,13 +2,12 @@
 
 from datetime import date, timedelta
 from decimal import Decimal
-from dateutil.relativedelta import relativedelta
 from unittest.mock import patch
 
 import pytest
+from dateutil.relativedelta import relativedelta
 
 from gnucash_mcp.book import GnuCashBook
-
 
 # ── Create ──────────────────────────────────────────────────
 
@@ -547,6 +546,59 @@ class TestUpdateScheduled:
         )
         assert result["end_date"] == "2026-12-31"
 
+    def test_move_start_date_moves_the_phase(self, scheduled_book):
+        """Desktop parity: the editor's OK rewrites the recurrence
+        rows from the new start (gnc_sx_set_schedule) and sets the
+        schedule's start_date (xaccSchedXactionSetStartDate),
+        leaving last_occur alone. Monthly from the 15th moved to
+        the 3rd is due on the 3rd from then on."""
+        from datetime import timedelta
+
+        from sqlalchemy import text
+        gb = GnuCashBook(str(scheduled_book))
+        old_start = (date.today() + timedelta(days=40)).replace(day=15)
+        sx = gb.create_scheduled_transaction(
+            name="Rent", description="Rent",
+            splits=[
+                {"account": "Expenses:Rent", "amount": "1850.00"},
+                {"account": "Assets:Checking", "amount": "-1850.00"},
+            ],
+            start_date=old_start.isoformat(), frequency="monthly",
+        )
+        new_start = old_start.replace(day=3)
+        result = gb.update_scheduled_transaction(
+            sx["guid"], start_date=new_start.isoformat(),
+        )
+        assert result["start_date"] == new_start.isoformat()
+        with gb.open(readonly=True) as book:
+            row = gb._find_scheduled_transaction(book, sx["guid"])
+            starts = book.session.execute(
+                text(
+                    "SELECT recurrence_period_start FROM recurrences "
+                    "WHERE obj_guid = :g"
+                ),
+                {"g": row.guid},
+            ).fetchall()
+            assert len(starts) == 1
+            assert str(starts[0][0]).replace("-", "")[:8] == new_start.strftime("%Y%m%d")
+            assert row.start_date == new_start
+            assert row.last_occur is None
+            assert gb._sx_next_due(row) == new_start
+
+    def test_move_start_past_end_is_refused(self, scheduled_book):
+        gb = GnuCashBook(str(scheduled_book))
+        sx = gb.create_scheduled_transaction(
+            name="Rent", description="Rent",
+            splits=[
+                {"account": "Expenses:Rent", "amount": "1850.00"},
+                {"account": "Assets:Checking", "amount": "-1850.00"},
+            ],
+            start_date="2026-01-01", frequency="monthly",
+            end_date="2026-06-30",
+        )
+        with pytest.raises(ValueError, match="after the schedule's end date"):
+            gb.update_scheduled_transaction(sx["guid"], start_date="2026-07-15")
+
     def test_not_found_error(self, scheduled_book):
         gb = GnuCashBook(str(scheduled_book))
         with pytest.raises(ValueError, match="not found"):
@@ -1037,7 +1089,8 @@ class TestScheduledCurrency:
         """A foreign template's bill-list amount carries its
         currency code — '25.00' from an EUR schedule must not read
         as a book-default amount."""
-        from datetime import date as _date, timedelta as _td
+        from datetime import date as _date
+        from datetime import timedelta as _td
 
         gc = GnuCashBook(str(multi_currency_book))
         self._eur_accounts(gc)
@@ -1062,27 +1115,35 @@ class TestScheduledCurrency:
         """Dashboard 7-day total: foreign templates convert at the
         latest market rate; with no rate on file they're counted
         but flagged unrated instead of silently mixed in."""
-        from datetime import date as _date, timedelta as _td
+        from datetime import date as _date
+        from datetime import timedelta as _td
 
         gc = GnuCashBook(str(multi_currency_book))
         self._eur_accounts(gc)
+        gc.create_account(
+            name="Euro Fees", account_type="EXPENSE",
+            parent="Expenses", commodity="EUR",
+        )
         gc.create_scheduled_transaction(
-            name="EUR Sweep", description="x",
+            name="EUR Bill", description="x",
             splits=[
                 {"account": "Assets:EUR Checking", "amount": "-25.00"},
-                {"account": "Assets:Euro Savings", "amount": "25.00"},
+                {"account": "Expenses:Euro Fees", "amount": "25.00"},
             ],
             start_date=(_date.today() + _td(days=2)).isoformat(),
             frequency="monthly", currency="EUR",
         )
-        # The fixture's only EUR price is piecash's auto
-        # type='transaction' placeholder, which the market-rate
-        # chokepoint skips → unrated.
+        # The fixture's only EUR price is its transfer's implied-rate
+        # row, which rates EUR since the 2026-09-29 ruling (desktop
+        # counts it); delete it to reach "no rate on file" → unrated.
+        from tests.conftest import drop_transaction_prices
+
+        assert drop_transaction_prices(multi_currency_book) == 1
         with gc.open(readonly=True) as book:
             stats = gc._upcoming_within_days(book, days=7)
         assert stats["count"] == 1
         assert stats["unrated"] == 1
-        assert stats["total"] == 0
+        assert stats["cash_out"] == 0
 
         # A real market rate converts the total.
         gc.create_price(
@@ -1092,7 +1153,8 @@ class TestScheduledCurrency:
         with gc.open(readonly=True) as book:
             stats = gc._upcoming_within_days(book, days=7)
         assert stats["unrated"] == 0
-        assert stats["total"] == Decimal("25.00") * Decimal("1.08")
+        assert stats["cash_out"] == Decimal("25.00") * Decimal("1.08")
+        assert stats["cash_in"] == 0
 
 
 class TestScheduledSplitAction:
@@ -1134,6 +1196,7 @@ def _make_legacy(book_path, sx_name, *, refs="guid", description=True,
     write — so the guards that read it need tests that can still
     construct it."""
     import json
+
     from sqlalchemy import text
     gb = GnuCashBook(str(book_path))
     with gb.open(readonly=False) as book:
@@ -1196,6 +1259,101 @@ def _rent(gb, start, name="Rent", **kw):
         frequency="monthly",
         **kw,
     )
+
+
+def _sched_line(gb):
+    return next(
+        line for line in gb.get_book_summary().splitlines()
+        if line.startswith("Scheduled:")
+    )
+
+
+class TestSummaryCashDirection:
+    """The dashboard's 7-day money reads cash legs by direction. A
+    signless positive-split sum put a paycheck's gross into the
+    week's bills (live book, 2026-09-24: USD 6,777 "due", USD 1,931
+    actually leaving checking)."""
+
+    def _paycheck(self, gb, splits=None):
+        gb.create_scheduled_transaction(
+            name="Paycheck", description="Paycheck",
+            splits=splits or [
+                {"account": "Assets:Checking", "amount": "3000.00"},
+                {"account": "Income:Salary", "amount": "-3000.00"},
+            ],
+            start_date=(date.today() + timedelta(days=1)).isoformat(),
+            frequency="monthly",
+        )
+
+    def test_income_and_bills_split_by_direction(self, scheduled_book):
+        gb = GnuCashBook(str(scheduled_book))
+        _rent(gb, date.today() + timedelta(days=3))
+        self._paycheck(gb)
+        with gb.open(readonly=True) as book:
+            week = gb._upcoming_within_days(book, days=7)
+        assert week["count"] == 2
+        assert week["cash_out"] == Decimal("1850.00")
+        assert week["cash_in"] == Decimal("3000.00")
+        assert (
+            "2 due in next 7 days (USD 1,850 out, USD 3,000 in)"
+            in _sched_line(gb)
+        )
+
+    def test_only_the_cash_leg_of_a_paycheck_counts(self, scheduled_book):
+        """Retirement and non-cash legs of a paycheck aren't cash
+        arriving — only what reaches checking is."""
+        gb = GnuCashBook(str(scheduled_book))
+        gb.create_account(
+            name="Retirement Cash", account_type="BANK", parent="Assets",
+        )
+        gb.create_account(
+            name="Federal", account_type="EXPENSE", parent="Expenses",
+        )
+        self._paycheck(gb, splits=[
+            {"account": "Assets:Checking", "amount": "2200.00"},
+            {"account": "Assets:Retirement Cash", "amount": "500.00"},
+            {"account": "Expenses:Federal", "amount": "300.00"},
+            {"account": "Income:Salary", "amount": "-3000.00"},
+        ])
+        with gb.open(readonly=True) as book:
+            week = gb._upcoming_within_days(book, days=7)
+        assert week["cash_in"] == Decimal("2200.00")
+        assert week["cash_out"] == 0
+        assert "(USD 2,200 in)" in _sched_line(gb)
+
+    def test_transfers_and_card_charges_move_no_cash(self, scheduled_book):
+        gb = GnuCashBook(str(scheduled_book))
+        gb.create_account(
+            name="Savings", account_type="BANK", parent="Assets",
+        )
+        gb.create_account(
+            name="Liabilities", account_type="LIABILITY", placeholder=True,
+        )
+        gb.create_account(
+            name="Card", account_type="CREDIT", parent="Liabilities",
+        )
+        soon = (date.today() + timedelta(days=2)).isoformat()
+        gb.create_scheduled_transaction(
+            name="Sweep", description="Sweep",
+            splits=[
+                {"account": "Assets:Checking", "amount": "-200.00"},
+                {"account": "Assets:Savings", "amount": "200.00"},
+            ],
+            start_date=soon, frequency="monthly",
+        )
+        gb.create_scheduled_transaction(
+            name="Streaming", description="Streaming",
+            splits=[
+                {"account": "Expenses:Utilities", "amount": "22.10"},
+                {"account": "Liabilities:Card", "amount": "-22.10"},
+            ],
+            start_date=soon, frequency="monthly",
+        )
+        with gb.open(readonly=True) as book:
+            week = gb._upcoming_within_days(book, days=7)
+        assert week["count"] == 2
+        assert week["cash_out"] == 0 and week["cash_in"] == 0
+        assert "2 due in next 7 days (no cash moves)" in _sched_line(gb)
 
 
 class TestOccurrenceAgreement:
@@ -1375,8 +1533,8 @@ class TestTornWriteLate:
         delete-template-then-save, which commits the partial rows;
         it only looked clean because piecash's
         Account.scheduled_transaction cascade swept them out."""
-        from sqlalchemy import text
         from piecash.kvp import Slot
+        from sqlalchemy import text
         gb = GnuCashBook(str(scheduled_book))
         real_insert = Slot.__table__.insert
         calls = {"n": 0}
@@ -1551,9 +1709,10 @@ class TestNativeTemplates:
             rent = seen[rent_guid]
             assert rent["sched-xaction/account"][0] == 5
             assert rent["sched-xaction/debit-formula"][1] == "1850.00"
-            assert rent["sched-xaction/debit-numeric"][3:] == (185000, 100)
+            # Reduced, as gnc_exp_parser hands them to the editor (C26).
+            assert rent["sched-xaction/debit-numeric"][3:] == (1850, 1)
             assert rent["sched-xaction/credit-formula"][1] == ""
-            assert rent["sched-xaction/credit-numeric"][3:] == (0, 100)
+            assert rent["sched-xaction/credit-numeric"][3:] == (0, 1)
             # Nothing legacy on the SX row.
             assert _slots_for(book, sx[0]) == {}
 
@@ -1760,7 +1919,7 @@ class TestNativeTemplatesFX:
                 "DELETE FROM slots WHERE name IN ('gnc-mcp', 'gnc-mcp/quantity')"
             ))
             book.save()
-        with pytest.raises(ValueError, match="Euro Savings.*EUR/USD rate"):
+        with pytest.raises(ValueError, match="Euro Savings.*EUR/USD quote"):
             gb.create_transaction_from_scheduled(guid=sx["guid"])
         gb.create_price(commodity="EUR", namespace="CURRENCY", value="1.10", currency="USD",
                         price_date=date.today())
@@ -1768,6 +1927,78 @@ class TestNativeTemplatesFX:
         txn = gb.get_transaction(r["transaction_guid"])
         eur = next(s for s in txn["splits"] if s["account"] == "Assets:Euro Savings")
         assert Decimal(eur["quantity"]) == Decimal("-100.00")
+        assert "warnings" not in r
+
+    def _desktop_shaped(self, gb):
+        """A schedule whose EUR leg carries no stored quantity, as
+        desktop writes one."""
+        from sqlalchemy import text
+        sx = self._eur_schedule(gb)
+        with gb.open(readonly=False) as book:
+            book.session.execute(text(
+                "DELETE FROM slots WHERE name IN ('gnc-mcp', 'gnc-mcp/quantity')"
+            ))
+            book.save()
+        return sx
+
+    def test_a_transactions_own_implied_rate_is_not_a_quote(
+        self, multi_currency_book,
+    ):
+        """Review C18. The fixture's only EUR/USD row is the implied
+        rate of a 2024 transaction. The instance used to book 100 EUR
+        at it, years stale, without a word — while post_document on
+        the same book refused — and then left a fresh implied row
+        dated today that silenced the stale-price warning."""
+        from sqlalchemy import text
+        gb = GnuCashBook(str(multi_currency_book))
+        sx = self._desktop_shaped(gb)
+        with gb.open(readonly=True) as book:
+            kinds = {r[0] for r in book.session.execute(
+                text("SELECT type FROM prices")
+            )}
+        assert kinds == {"transaction"}
+
+        with pytest.raises(ValueError, match="no EUR/USD quote is on file"):
+            gb.create_transaction_from_scheduled(guid=sx["guid"])
+
+    def test_an_old_quote_is_used_and_named(self, multi_currency_book):
+        gb = GnuCashBook(str(multi_currency_book))
+        sx = self._desktop_shaped(gb)
+        quoted = date.today() - timedelta(days=20)
+        gb.create_price(commodity="EUR", namespace="CURRENCY", value="1.10",
+                        currency="USD", price_date=quoted)
+        r = gb.create_transaction_from_scheduled(guid=sx["guid"])
+        assert r["status"] == "created"
+        note = " ".join(r["warnings"])
+        assert quoted.isoformat() in note and "20 days" in note
+
+    def test_a_quote_past_the_staleness_window_is_refused(
+        self, multi_currency_book,
+    ):
+        gb = GnuCashBook(str(multi_currency_book))
+        sx = self._desktop_shaped(gb)
+        gb.create_price(commodity="EUR", namespace="CURRENCY", value="1.10",
+                        currency="USD",
+                        price_date=date.today() - timedelta(days=200))
+        with pytest.raises(ValueError, match="within 90 days"):
+            gb.create_transaction_from_scheduled(guid=sx["guid"])
+
+    def test_the_refusal_names_a_call_that_fixes_it(self, multi_currency_book):
+        import re
+        gb = GnuCashBook(str(multi_currency_book))
+        sx = self._desktop_shaped(gb)
+        with pytest.raises(ValueError) as refusal:
+            gb.create_transaction_from_scheduled(guid=sx["guid"])
+        call = re.search(r"create_price\((.*?)\)", str(refusal.value)).group(1)
+        args = dict(re.findall(r"(\w+)='([^']*)'", call))
+        gb.create_price(
+            commodity=args["commodity"], namespace=args["namespace"],
+            currency=args["currency"], value="1.10",
+            price_date=date.fromisoformat(args["date"]),
+        )
+        assert gb.create_transaction_from_scheduled(
+            guid=sx["guid"],
+        )["status"] == "created"
 
 
 
@@ -2023,3 +2254,84 @@ class TestLegacyRecipeWarning:
         assert "crashes" in line and "update_scheduled_transaction" in line
         gb.update_scheduled_transaction(a["guid"])
         assert "on the 1.4 recipe" not in gb.get_book_summary()
+
+
+class TestDesktopFormulaAmounts:
+    """Review C19. GnuCash's formula parser stores "100/3" as the
+    exact rational 100 over 3, and "1234/12" reduced to 617 over 6.
+    The reader quantized to 1/denominator, which has no decimal form:
+    ``decimal.InvalidOperation``, raised all the way through
+    ``get_book_summary`` — the first call an assistant makes."""
+
+    def _thirds(self, scheduled_book, num, denom, enabled=True):
+        import sqlite3
+        gb = GnuCashBook(str(scheduled_book))
+        made = gb.create_scheduled_transaction(
+            name="Shared rent", description="Rent share",
+            splits=[
+                {"account": "Expenses:Rent", "amount": "33.33"},
+                {"account": "Assets:Checking", "amount": "-33.33"},
+            ],
+            start_date=date.today().isoformat(), frequency="monthly",
+        )
+        if not enabled:
+            gb.update_scheduled_transaction(made["guid"], enabled=False)
+        con = sqlite3.connect(str(scheduled_book))
+        changed = con.execute(
+            "UPDATE slots SET numeric_val_num = ?, numeric_val_denom = ? "
+            "WHERE name LIKE 'sched-xaction/%-numeric' "
+            "AND numeric_val_num = 3333",
+            (num, denom),
+        ).rowcount
+        con.commit()
+        con.close()
+        assert changed == 2
+        return gb, made["guid"]
+
+    @pytest.mark.parametrize("num,denom,expected", [
+        (100, 3, "33.33"), (617, 6, "102.83"), (200, 3, "66.67"),
+    ])
+    def test_every_reader_survives(self, scheduled_book, num, denom, expected):
+        gb, guid = self._thirds(scheduled_book, num, denom)
+
+        summary = gb.get_book_summary()
+        assert "check failed" not in summary
+        assert expected in str(gb.get_upcoming_transactions(days=40))
+        assert expected in str(gb.list_scheduled_transactions(compact=False))
+        # Both legs round the same way, so the instance balances.
+        made = gb.create_transaction_from_scheduled(guid=guid)
+        assert made["status"] == "created"
+
+    def test_a_disabled_schedule_does_not_take_the_dashboard_down(
+        self, scheduled_book,
+    ):
+        """The dashboard reads every recipe before checking
+        ``enabled``."""
+        gb, _ = self._thirds(scheduled_book, 100, 3, enabled=False)
+        assert "check failed" not in gb.get_book_summary()
+
+    def test_decimal_denominators_keep_their_precision(self):
+        from gnucash_mcp.book.scheduling import SchedulingMixin
+        amount = SchedulingMixin._rational_amount
+        assert str(amount(4250, 100, 100)) == "42.50"
+        # A whole amount the editor reduced still reads at the
+        # currency's places (C26).
+        assert str(amount(25, 1, 100)) == "25.00"
+        assert str(amount(25, 1, 1)) == "25"
+        assert str(amount(-185000, 100, 100)) == "-1850.00"
+        assert str(amount(1, 3, 1)) == "0"          # a zero-decimal currency
+        assert str(amount(-100, 3, 100)) == "-33.33"
+
+    def test_a_reader_failure_costs_one_line_not_the_summary(
+        self, scheduled_book, monkeypatch,
+    ):
+        gb, _ = self._thirds(scheduled_book, 4250, 100)
+
+        def boom(self, book, days):
+            raise RuntimeError("recipe unreadable")
+
+        monkeypatch.setattr(type(gb), "_upcoming_within_days", boom)
+        summary = gb.get_book_summary()
+        assert "Upcoming-schedule check failed" in summary
+        assert "recipe unreadable" in summary
+        assert "Scheduled:" in summary

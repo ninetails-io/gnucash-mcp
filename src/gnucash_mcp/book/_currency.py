@@ -9,17 +9,24 @@ split valuation (``_split_in_default_currency``), account valuation
 with cost-basis fallback (``_market_value``), and pairwise exchange
 rates (``_find_exchange_rate``).
 
-All helpers skip piecash's auto-created ``type='transaction'`` price
-placeholders via :func:`_is_market_price` (re-exported through
-``book._base``) — those would shadow real user-supplied quotes.
+Every price row counts, ``type='transaction'`` included — GnuCash's
+own lookups never filter on type (maintainer ruling, 2026-09-29,
+overturning the issue #94 skip).
 """
 
 import os
+from contextlib import contextmanager
 from datetime import date, datetime
 from decimal import Decimal
 
 import piecash
 
+from gnucash_mcp._format import (
+    _enumerate_periods,
+    _format_rate,
+    _period_label,
+    _round_converted,
+)
 
 # ── FX staleness cap ───────────────────────────────────────────────
 #
@@ -130,58 +137,161 @@ def _to_date(dt: date | datetime) -> date:
     return dt
 
 
-# The two sources a deliberate manual quote arrives under:
-# ``user:price`` from create_price, ``user:price-editor`` from
-# GnuCash's editor. An EXPLICIT allowlist — ``user:market-data`` is
-# deliberately feed-ranked despite the prefix, so it needs its own
-# explicit demotion below the generic ``user:*`` tier.
-_MANUAL_PRICE_SOURCES = frozenset({"user:price", "user:price-editor"})
-_FEED_PRICE_SOURCES = frozenset({"user:market-data"})
+class _SmallerWins:
+    """Ordering wrapper: in a "higher tuple wins" key, the SMALLER
+    wrapped value ranks higher. GnuCash breaks a price-time tie by
+    ``guid_compare`` ascending (``compare_prices_by_date``,
+    gnc-pricedb.cpp), so the lower GUID is the current price."""
+
+    __slots__ = ("v",)
+
+    def __init__(self, v):
+        self.v = v
+
+    def __lt__(self, other):
+        return self.v > other.v
+
+    def __gt__(self, other):
+        return self.v < other.v
+
+    def __eq__(self, other):
+        return self.v == other.v
+
+    def __le__(self, other):
+        return self.v >= other.v
+
+    def __ge__(self, other):
+        return self.v <= other.v
+
+    def __repr__(self):
+        return f"_SmallerWins({self.v!r})"
 
 
-def _price_source_rank(source: str | None) -> int:
-    """Three-tier source rank for same-date ties: 2 = known manual
-    quote, 1 = other ``user:*`` (an explicit operator act, but one
-    that shouldn't silently override a deliberate manual edit),
-    0 = feeds and everything else — including ``user:market-data``,
-    which is feed-ranked by name despite the prefix."""
-    source = source or ""
-    if source in _MANUAL_PRICE_SOURCES:
-        return 2
-    if source in _FEED_PRICE_SOURCES:
-        return 0
-    if source.startswith("user:"):
-        return 1
-    return 0
+_STORED_TIME_ATTR = "_gnc_mcp_stored_time"
+
+
+def _price_row_utc(raw) -> "datetime | None":
+    """UTC-aware datetime of a raw ``prices.date`` value: the
+    ``YYYY-MM-DD HH:MM:SS`` string SQLite stores, or the naive/aware
+    datetime a database driver returns."""
+    from datetime import timezone
+
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        digits = "".join(ch for ch in raw if ch.isdigit()).ljust(14, "0")
+        raw = datetime(
+            int(digits[0:4]), int(digits[4:6]), int(digits[6:8]),
+            int(digits[8:10]), int(digits[10:12]), int(digits[12:14]),
+        )
+    if isinstance(raw, datetime):
+        return raw.astimezone(timezone.utc) if raw.tzinfo else raw.replace(tzinfo=timezone.utc)
+    return None
 
 
 def _price_tie_rank(price) -> tuple:
-    """Deterministic tie-break key for prices sharing a date
-    (bookkeeper finding F3 — the winner used to be an accident of
-    query/iteration order, so posting math and month-close valuation
-    could flip between runs on books carrying same-date duplicates).
+    """Which of two prices on a pair is the more current — GnuCash's
+    ``compare_prices_by_date`` (gnc-pricedb.cpp): the later stored
+    time first, and for equal times the smaller GUID. Higher tuple
+    wins.
 
-    Higher tuple wins. Rank via ``_price_source_rank`` (manual
-    quote > other user:* > feed); the guid breaks residual ties —
-    arbitrary but STABLE, which is the property that matters.
-    ``create_price``/``create_prices`` report when a written row
-    loses this tie, so any rank order stays visible to the operator.
+    The stored time is the full timestamp, not the calendar day:
+    piecash's ``Price.date`` strips the time, so ``_find_prices``
+    attaches the raw column value to each row it returns. Every
+    same-day tie the server resolves — month-close valuation,
+    posting FX, the latest quote — therefore lands on the row
+    desktop's Accounts tab and reports use. Until 2026-09-29 the
+    tie went to a source rank (bookkeeper finding F3: manual quote
+    over other user sources over feeds); the price twin showed
+    desktop valuing a holding by a wall-clock-stamped row the
+    server ranked below the day's neutral-time quote, and the
+    maintainer ruled that parity means agreeing on the price.
     """
-    source = getattr(price, "source", None) or ""
-    return (_price_source_rank(source), price.guid or "")
+    stored = getattr(price, _STORED_TIME_ATTR, None)
+    if stored is None:
+        # A row that did not come through _find_prices: piecash
+        # reads the day back at local midnight; rank it at the
+        # neutral time the server and desktop both store.
+        from gnucash_mcp.book._base import _neutral_time
+
+        stored = _neutral_time(_to_date(price.date))
+    return (stored, _SmallerWins(price.guid or ""))
 
 
 def _is_market_price(price) -> bool:
-    """True iff ``price`` is a real market quote, not a piecash
-    auto-placeholder.
+    """True iff ``price`` is a quote somebody entered or fetched, not
+    the ``type='transaction'`` row a cross-currency transaction
+    leaves behind. Valuation counts BOTH, as desktop does (ruling
+    2026-09-29), and so does every staleness measure — one window
+    for all sources (bookkeeper ruling, same evening). This
+    predicate serves :meth:`CurrencyMixin._market_prices_only`,
+    which has two users: the dashboard's stale-price warning
+    re-derives the rate over quotes alone to NAME a stale rate's
+    provenance, and the business module picks the rate for a NEW
+    cross-currency posting or payment from quotes alone, so a
+    posting never prices itself off the last posting's echo.
 
-    piecash auto-creates a ``type='transaction'`` Price row on every
-    cross-currency transaction — a bookkeeping artifact, not a user
-    quote. Every helper that walks ``book.prices`` must skip these
-    or they shadow real quotes. Centralized so all call sites answer
-    the same way; a future placeholder type needs one change.
-    """
+    A ``temporary`` row is not a quote either: desktop leaks one on
+    every cross-currency invoice post (``gnc_price_invert`` builds a
+    reversed copy with ``PRICE_SOURCE_TEMP`` and the SQL backend
+    saves it), typed ``last``. Counted as a quote, the echo of a
+    posting would satisfy the staleness guard for the next one."""
+    if getattr(price, "source", None) == "temporary":
+        return False
     return getattr(price, "type", None) != "transaction"
+
+
+class _CostPool:
+    """Running average-cost basis of one unpriced holding.
+
+    The one arithmetic behind every "what is this holding worth when
+    no market rate is on file" answer. Legs are applied in posting
+    order:
+
+    - a leg that opens or grows the position (same sign as the
+      running quantity, or the first leg) adds its cost to the pool;
+    - a leg that shrinks it relieves the pool at the running average,
+      so the realized gain or loss on the sold units never stays in
+      the basis — a fully sold position is worth exactly zero;
+    - a leg that crosses zero relieves everything and opens the new
+      position at the crossing leg's proportional cost;
+    - a zero-quantity leg (return of capital, a fee booked to the
+      holding) adjusts the pool directly.
+
+    Sign-agnostic, so a foreign-currency liability with no rate on
+    file (charges negative, payments positive) values the same way.
+    """
+
+    __slots__ = ("quantity", "basis")
+
+    def __init__(self) -> None:
+        self.quantity = Decimal("0")
+        self.basis = Decimal("0")
+
+    def apply(self, quantity: Decimal, value: Decimal) -> None:
+        q, v = quantity, value
+        if q == 0:
+            self.basis += v
+            return
+        if self.quantity == 0 or (q > 0) == (self.quantity > 0):
+            self.quantity += q
+            self.basis += v
+            return
+        held = abs(self.quantity)
+        moved = abs(q)
+        if moved < held:
+            self.basis -= self.basis * moved / held
+            self.quantity += q
+            return
+        if moved == held:
+            self.quantity = Decimal("0")
+            self.basis = Decimal("0")
+            return
+        # Crosses zero: the excess opens a position the other way at
+        # the leg's proportional cost.
+        excess = moved - held
+        self.quantity += q
+        self.basis = v * excess / moved
 
 
 class CurrencyMixin:
@@ -201,16 +311,39 @@ class CurrencyMixin:
     # paths that mutate prices mid-call.
     _PRICE_LOOKUPS_ATTR = "_gnucash_mcp_price_lookups"
     _PRICE_COMMODITIES_ATTR = "_gnucash_mcp_price_commodities"
+    _MARKET_ONLY_ATTR = "_gnucash_mcp_market_prices_only"
+
+    @staticmethod
+    @contextmanager
+    def _market_prices_only(book: piecash.Book):
+        """Within the block, ``_find_prices`` returns only quotes
+        somebody entered or fetched (``_is_market_price``), so every
+        rate derived inside — direct, inverse, chained — answers
+        "when did the operator last quote this?" rather than "what
+        is it worth?". Two users: the dashboard's stale-price
+        warning (to name a stale rate's provenance) and the
+        business module's posting-rate lookup (the rate the server
+        chooses for a write); valuation never runs inside it. The
+        memo is untouched — the
+        filter is applied per call, so nothing cached inside leaks
+        out."""
+        setattr(book, CurrencyMixin._MARKET_ONLY_ATTR, True)
+        try:
+            yield
+        finally:
+            setattr(book, CurrencyMixin._MARKET_ONLY_ATTR, False)
 
     @staticmethod
     def _invalidate_price_caches(book: piecash.Book) -> None:
         """Drop the memoized price lookups. Every path that adds or
         removes a Price row must call this after its save so a later
         lookup in the same call sees the change — today that is
-        create_price, create_prices, and delete_price. (piecash's
-        auto-created ``type='transaction'`` placeholders on
-        cross-currency saves skip this deliberately: every consumer
-        filters them out via ``market_only``.)"""
+        create_price, create_prices, and delete_price. piecash's
+        auto-created ``type='transaction'`` row on a cross-currency
+        save counts as a price too (since 2026-09-29) but is not
+        invalidated for: a lookup later in the same call would miss
+        a rate equal to the transaction it just wrote, and the next
+        call reads it."""
         for attr in (
             CurrencyMixin._PRICE_LOOKUPS_ATTR,
             CurrencyMixin._PRICE_COMMODITIES_ATTR,
@@ -224,20 +357,22 @@ class CurrencyMixin:
         *,
         commodity_guid: str | None = None,
         currency_guid: str | None = None,
-        market_only: bool = True,
     ) -> list:
-        """Indexed lookup over ``book.prices``, newest first.
+        """Indexed lookup over ``book.prices``, most current first.
 
         Replaces the linear ``for p in book.prices`` walks.
         ``commodity_guid`` filters the held instrument,
-        ``currency_guid`` the quote side; ``market_only`` (default)
-        skips ``type='transaction'`` auto-placeholders.
+        ``currency_guid`` the quote side. Every row counts,
+        ``type='transaction'`` included: GnuCash's own lookups
+        (``gnc_pricedb_lookup_latest``, ``lookup_nearest_in_time``)
+        never filter on type, so a cross-currency transaction's
+        implied rate IS a price desktop values by. The server
+        skipped them from issue #94 until 2026-09-29, when the
+        maintainer overturned that for parity with desktop.
 
         Memoized per ``(commodity_guid, currency_guid)`` on the open
         book: the first request for a pair runs one indexed query,
-        and every repeat is served from memory (``market_only``
-        re-filters the memoized list per call — cheap, since a
-        pair's list is small). The pivot search requests the
+        and every repeat is served from memory. The pivot search requests the
         same handful of pairs once per candidate leg per commodity,
         so without the memo a whole-book report re-runs identical
         queries thousands of times; with it the query count is
@@ -255,31 +390,45 @@ class CurrencyMixin:
         key = (commodity_guid, currency_guid)
         prices = lookups.get(key)
         if prices is None:
-            from piecash.core.commodity import Price
-
-            q = book.session.query(Price)
-            if commodity_guid is not None:
-                q = q.filter(Price.commodity_guid == commodity_guid)
-            if currency_guid is not None:
-                q = q.filter(Price.currency_guid == currency_guid)
-            prices = list(q)
-            # Newest first, with same-date ties resolved by
-            # _price_tie_rank rather than row order (see its
-            # docstring for the rule), and full-key ties by guid so
-            # the ordering never falls through to arbitrary DB row
-            # order. Sorted once, at memoization time, so every
-            # consumer sees the same ordering.
-            prices.sort(
-                key=lambda p: (
-                    _to_date(p.date), _price_tie_rank(p), p.guid,
-                ),
-                reverse=True,
+            prices = CurrencyMixin._query_prices_with_time(
+                book, commodity_guid, currency_guid,
             )
+            # Most current first — the full stored time, then the
+            # smaller GUID (_price_tie_rank: GnuCash's own order) —
+            # never DB row order. Sorted once, at memoization time,
+            # so every consumer sees the same ordering.
+            prices.sort(key=_price_tie_rank, reverse=True)
             lookups[key] = prices
 
-        if market_only:
+        if getattr(book, CurrencyMixin._MARKET_ONLY_ATTR, False):
             return [p for p in prices if _is_market_price(p)]
         return list(prices)
+
+    @staticmethod
+    def _query_prices_with_time(
+        book: piecash.Book, commodity_guid: str | None,
+        currency_guid: str | None,
+    ) -> list:
+        """One indexed query for a pair's Price rows, each carrying
+        its raw stored ``date`` (UTC-aware) on ``_STORED_TIME_ATTR``.
+        piecash's column type reads the timestamp back as a bare
+        day, and desktop orders prices by the full time, so the raw
+        column rides along in the same SELECT. The only reader of
+        that column; ``_find_prices`` memoizes the result and the
+        outranker check reads it fresh."""
+        from piecash.core.commodity import Price
+        from sqlalchemy import literal_column
+
+        q = book.session.query(Price, literal_column("prices.date"))
+        if commodity_guid is not None:
+            q = q.filter(Price.commodity_guid == commodity_guid)
+        if currency_guid is not None:
+            q = q.filter(Price.currency_guid == currency_guid)
+        prices = []
+        for p, raw in q:
+            setattr(p, _STORED_TIME_ATTR, _price_row_utc(raw))
+            prices.append(p)
+        return prices
 
     @staticmethod
     def _anchor_for_as_of(as_of: date) -> date:
@@ -310,13 +459,45 @@ class CurrencyMixin:
         default_currency: piecash.Commodity | None = None,
     ) -> dict[str, Decimal]:
         """Latest user-supplied rate per non-default-currency
-        commodity, as of a specific date.
-
-        Returns ``{commodity_guid: Decimal rate}`` — the most recent
-        market price of each commodity quoted in the default
-        currency, date-filtered per :meth:`_anchor_for_as_of`.
-        Commodities with no qualifying price are absent; callers
+        commodity, as of a specific date — the rate-only projection
+        of :meth:`_rates_as_of_dated`, which is where the lookup
+        lives. Returns ``{commodity_guid: Decimal rate}``;
+        commodities with no qualifying price are absent and callers
         fall back to cost basis.
+        """
+        return {
+            guid: rate
+            for guid, (rate, _d, _via) in self._rates_as_of_dated(
+                book, as_of, default_currency,
+            ).items()
+        }
+
+    def _rates_as_of_dated(
+        self,
+        book: piecash.Book,
+        as_of: date,
+        default_currency: piecash.Commodity | None = None,
+    ) -> dict[str, tuple[Decimal, date, str | None]]:
+        """Latest user-supplied rate per non-default-currency
+        commodity, as of a specific date, with the rate's date and
+        provenance.
+
+        Returns ``{commodity_guid: (rate, rate_date, via)}`` — the
+        most recent market price of each commodity quoted in the
+        default currency, date-filtered per :meth:`_anchor_for_as_of`.
+        ``rate_date`` is the date of that price; for a rate chained
+        through a pivot it is the OLDEST leg's date, and ``via`` is
+        the ``_format_via`` note (``None`` for a direct or inverse
+        price). Commodities with no qualifying price are absent;
+        callers fall back to cost basis.
+
+        This is the one answer to "which rate, from when" — the
+        dashboard's asset lines and runway take the rate, and its
+        stale-price warning takes the date, so the warning describes
+        the rate actually used. Keying staleness on a commodity's
+        own price rows instead flagged a EUR book's USD accounts
+        as "no price on file" forever while they valued correctly
+        off the inverse ``1 EUR = 1.08 USD`` row (spec A5).
 
         Commodities with no *direct* default-currency price chain
         through intermediates via
@@ -332,23 +513,36 @@ class CurrencyMixin:
         anchor = self._anchor_for_as_of(as_of)
         if default_currency is None:
             default_currency = self._require_default_currency(book)
-        latest: dict[str, tuple[date, Decimal]] = {}
-        for p in book.prices:
-            if p.currency != default_currency:
-                continue
-            if not _is_market_price(p):
-                continue
+        latest: dict[str, tuple[date, tuple, Decimal]] = {}
+
+        def _offer(key: str, p, rate: Decimal) -> None:
             p_date = _to_date(p.date)
             if p_date > anchor:
-                continue
-            key = p.commodity.guid
+                return
             existing = latest.get(key)
             cand = (p_date, _price_tie_rank(p))
             if existing is None or cand > (existing[0], existing[1]):
-                latest[key] = (p_date, _price_tie_rank(p),
-                               Decimal(str(p.value)))
-        result = {
-            guid: rate for guid, (_d, _rank, rate) in latest.items()
+                latest[key] = (p_date, cand[1], rate)
+
+        # A pair's prices are ONE list whichever way each row is
+        # stored: GnuCash merges the forward and reverse lists
+        # (``pricedb_get_prices_internal``) and takes the most
+        # current. Desktop stores a rate against the default
+        # currency but older rows, other tools and the pre-1.5
+        # server stored either way, so both directions compete.
+        for p in self._find_prices(
+            book, currency_guid=default_currency.guid,
+        ):
+            _offer(p.commodity.guid, p, Decimal(str(p.value)))
+        for p in self._find_prices(
+            book, commodity_guid=default_currency.guid,
+        ):
+            inverse = Decimal(str(p.value))
+            if inverse > 0:
+                _offer(p.currency.guid, p, Decimal("1") / inverse)
+        result: dict[str, tuple[Decimal, date, str | None]] = {
+            guid: (rate, p_date, None)
+            for guid, (p_date, _rank, rate) in latest.items()
         }
 
         # Chain pass for commodities the direct pass couldn't rate
@@ -366,20 +560,23 @@ class CurrencyMixin:
             # chain on the same forecast convention as the direct
             # pass; the legs run cap-free, so date.max selects the
             # latest rate rather than excluding everything as stale.
-            chained = self._market_rate_to_default(
+            chained = self._market_rate_to_default_with_path(
                 book, commodity, default_currency, anchor,
                 allow_after=allow_after,
             )
             if chained is not None:
-                result[commodity.guid] = chained
+                rate, intermediates, rate_date = chained
+                result[commodity.guid] = (
+                    rate, rate_date, self._format_via(intermediates),
+                )
         return result
 
     @staticmethod
     def _commodities_with_market_prices(
         book: piecash.Book,
     ) -> list[piecash.Commodity]:
-        """Distinct commodities that appear on either side of a market
-        price (``type='transaction'`` rows excluded).
+        """Distinct commodities that appear on either side of a price
+        (inside ``_market_prices_only``, of a quote).
 
         Both sides matter: a held currency may appear only as the
         *quote* side of a pair (``USD/GBP`` rather than ``GBP/USD``),
@@ -390,10 +587,18 @@ class CurrencyMixin:
         if cached is not None:
             return cached
 
+        # Enumerated over EVERY row whatever the market-only flag
+        # says: the set is memoized once per book, and a superset
+        # only costs the market-only pass a chain attempt that finds
+        # no quote.
+        flag = getattr(book, CurrencyMixin._MARKET_ONLY_ATTR, False)
+        setattr(book, CurrencyMixin._MARKET_ONLY_ATTR, False)
+        try:
+            rows = CurrencyMixin._find_prices(book)
+        finally:
+            setattr(book, CurrencyMixin._MARKET_ONLY_ATTR, flag)
         seen: dict[str, piecash.Commodity] = {}
-        for p in book.prices:
-            if not _is_market_price(p):
-                continue
+        for p in rows:
             for c in (p.commodity, p.currency):
                 seen.setdefault(c.guid, c)
         result = sorted(
@@ -428,14 +633,17 @@ class CurrencyMixin:
         to_commodity: piecash.Commodity,
         as_of: date,
         allow_after: bool = True,
-    ) -> tuple[Decimal, list[str]] | None:
+    ) -> tuple[Decimal, list[str], date] | None:
         """Rate from ``from_commodity`` to ``to_commodity`` with the
         intermediate path: direct, inverse, or single-pivot.
 
         ``1 unit of from_commodity == rate units of to_commodity``.
-        Returns ``(rate, intermediates)`` — ``[]`` for direct/inverse,
-        ``[P.mnemonic]`` for a pivot — feeding the ``(via …)``
-        provenance note.
+        Returns ``(rate, intermediates, rate_date)`` — intermediates
+        ``[]`` for direct/inverse, ``[P.mnemonic]`` for a pivot —
+        feeding the ``(via …)`` provenance note. ``rate_date`` is
+        the date of the price used, or the OLDEST leg's date for a
+        pivot: a chain is only as fresh as its stalest leg, and
+        the stale-price warning reads this date (spec A5).
 
         Candidate pivots are scored by **freshest worst leg** (ties
         by mnemonic) so the choice is deterministic. Single pivot
@@ -448,7 +656,7 @@ class CurrencyMixin:
         cross.
         """
         if from_commodity == to_commodity:
-            return (Decimal("1"), [])
+            return (Decimal("1"), [], as_of)
         # Valuation chain: legs ignore the FX staleness cap so a
         # holding values at its latest available rate (matching the
         # cap-free direct path), regardless of age.
@@ -461,9 +669,9 @@ class CurrencyMixin:
             allow_after=allow_after,
         )
         if direct is not None:
-            return (direct[0], [])
+            return (direct[0], [], _to_date(direct[2]))
         best_key: tuple[int, str] | None = None
-        best: tuple[Decimal, list[str]] | None = None
+        best: tuple[Decimal, list[str], date] | None = None
         for pivot in self._pivot_currencies(book):
             if pivot == from_commodity or pivot == to_commodity:
                 continue
@@ -486,7 +694,11 @@ class CurrencyMixin:
             key = (max(leg1[1], leg2[1]), pivot.mnemonic or "")
             if best_key is None or key < best_key:
                 best_key = key
-                best = (leg1[0] * leg2[0], [pivot.mnemonic or ""])
+                best = (
+                    leg1[0] * leg2[0],
+                    [pivot.mnemonic or ""],
+                    min(_to_date(leg1[2]), _to_date(leg2[2])),
+                )
         return best
 
     def _cross_rate(
@@ -511,10 +723,12 @@ class CurrencyMixin:
         default_currency: piecash.Commodity,
         as_of: date,
         allow_after: bool = True,
-    ) -> tuple[Decimal, list[str]] | None:
+    ) -> tuple[Decimal, list[str], date] | None:
         """Market rate converting one unit of ``commodity`` to the
-        book default, with the intermediate path, chaining when
-        there is no direct price.
+        book default, with the intermediate path and the rate's
+        date (oldest leg for a chain — see
+        :meth:`_cross_rate_with_path`), chaining when there is no
+        direct price.
 
         Resolution: (1) :meth:`_cross_rate_with_path` ``commodity →
         default`` (direct/inverse, pivot triangulation, security
@@ -523,11 +737,12 @@ class CurrencyMixin:
         ``X`` × rate(X → default), the 3-hop case (fund priced in
         GBP, GBP only reachable via USD).
 
-        Returns ``(rate, intermediates)`` or ``None`` (caller keeps
-        cost basis); ``[]`` only for a direct default-currency price.
+        Returns ``(rate, intermediates, rate_date)`` or ``None``
+        (caller keeps cost basis); ``[]`` only for a direct
+        default-currency price.
         """
         if commodity == default_currency:
-            return (Decimal("1"), [])
+            return (Decimal("1"), [], as_of)
         res = self._cross_rate_with_path(
             book, commodity, default_currency, as_of,
             allow_after=allow_after,
@@ -535,7 +750,7 @@ class CurrencyMixin:
         if res is not None:
             return res
         for p in self._find_prices(
-            book, commodity_guid=commodity.guid, market_only=True,
+            book, commodity_guid=commodity.guid,
         ):
             # Newest-first list with no date bound; the outer hop
             # honors the same anchor convention as the legs —
@@ -553,6 +768,7 @@ class CurrencyMixin:
                 return (
                     Decimal(str(p.value)) * leg[0],
                     [quote.mnemonic or ""] + leg[1],
+                    min(_to_date(p.date), leg[2]),
                 )
         return None
 
@@ -653,6 +869,57 @@ class CurrencyMixin:
                 factors[acct.guid] = rates.get(acct.commodity.guid)
         return factors
 
+    def _monthly_conversion_factors(
+        self,
+        book: piecash.Book,
+        start_date: date,
+        end_date: date,
+    ) -> dict[str, dict[str, Decimal | None]]:
+        """``{YYYY-MM: {account_guid: factor}}`` covering the range —
+        the FLOW-report valuation quantum (GB-1 ruling, 2026-07-07).
+
+        Flow reports (spending / income / cash_flow) value every
+        split at its own MONTH's closing rate, in single-period and
+        group_by modes alike. Month is the quantum because it makes
+        totals granularity-invariant (quarter/year/single are sums of
+        month-valued splits), matches the ``group_by="month"``
+        numbers users had already seen before unification, and is a
+        recognizable accounting convention (monthly close). Anchors
+        clamp to ``end_date`` via ``_enumerate_periods``, so a
+        partial final month values at the range end and the
+        forecast-price convention (``_anchor_for_as_of``) applies
+        through ``_account_conversion_factors`` as everywhere else.
+
+        STOCK reports (balance_sheet, net_worth) are deliberately
+        different: they value holdings as of their report date, not
+        per flow month.
+        """
+        # Lives on the always-composed CurrencyMixin (not the
+        # optional ReportingMixin) because the dashboard's monthly
+        # net uses it too (spec A6): one quantum for every flow.
+        return {
+            pl: self._account_conversion_factors(book, anchor)
+            for pl, anchor in _enumerate_periods(
+                start_date, end_date, "month",
+            )
+        }
+
+    @staticmethod
+    def _monthly_factor(
+        monthly_factors: dict[str, dict[str, Decimal | None]],
+        txn,
+        account,
+    ) -> Decimal | None:
+        """The conversion factor for one split under the monthly
+        quantum: its transaction's month, its account. ``None`` (no
+        rate on file that month, or a month outside the built range)
+        falls back to ``split.value`` in
+        ``_split_in_default_currency`` — the same degradation as
+        every other missing-rate path.
+        """
+        month = _period_label(txn.post_date, "month")
+        return monthly_factors.get(month, {}).get(account.guid)
+
     @staticmethod
     def _split_in_default_currency(
         split,
@@ -662,9 +929,12 @@ class CurrencyMixin:
         """Value a single split in the book's default currency.
 
         Uses ``factor * quantity`` when a factor is available. Falls
-        back to ``split.value`` otherwise — correct for STOCK/MUTUAL
-        splits whose transaction currency is the book default, and a
-        reasonable cost-basis approximation for other cases.
+        back to ``split.value`` otherwise — the raw transaction-
+        currency amount, which is right for a flow report reading one
+        leg. It is NOT a valuation of the account: summed over a
+        holding it is cost minus proceeds, so any sold units leave
+        their realized gain behind. Account-level consumers value an
+        unpriced holding through :meth:`_unpriced_cost_basis` instead.
         """
         if factor is not None:
             return Decimal(str(split.quantity)) * factor
@@ -692,6 +962,9 @@ class CurrencyMixin:
         :meth:`_validate_transaction_splits` (``account``, ``value``,
         ``quantity``). ``as_of`` is the transaction date.
         """
+        # _base imports this module; resolve at call time.
+        from gnucash_mcp.book._base import _commodity_quantum
+
         as_of = as_of or date.today()
         ratio_cap = _fx_sanity_ratio()
         out: list[dict] = []
@@ -699,6 +972,23 @@ class CurrencyMixin:
             account = v["account"]
             if account.commodity == trans_currency:
                 continue
+            entered = v.get("quantity_as_entered")
+            if entered is not None:
+                # Not a rate problem, but the same kind of heads-up:
+                # what was stored is not what was typed.
+                out.append({
+                    "type": "quantity_rounded",
+                    "message": (
+                        f"Split for '{account.fullname}': quantity "
+                        f"{entered} stored as {v['quantity']} — "
+                        f"{account.commodity.mnemonic} is counted in "
+                        f"units of "
+                        f"{_commodity_quantum(account.commodity)}. "
+                        f"No price was recorded from this split: "
+                        f"the stored amounts imply a rate the "
+                        f"entry did not state."
+                    ),
+                })
             value = abs(Decimal(str(v["value"])))
             quantity = abs(Decimal(str(v["quantity"])))
             if value == 0 or quantity == 0:
@@ -780,40 +1070,109 @@ class CurrencyMixin:
         Returns:
             ``(value_in_default_currency, display_note)``;
             ``display_note`` is None for default-currency accounts.
+
+        A converted value is rounded to the default currency's unit
+        HERE, once per account, as GnuCash rounds a conversion
+        (``gnc_pricedb_convert_balance``): totals built from these
+        are sums of what each line shows, so a statement's lines add
+        up to its total and every surface reaches the same total.
+        ``balance_sheet`` and ``net_worth`` round per account the
+        same way; summing unrounded values and rounding the total
+        could differ from the lines by a unit per commodity.
         """
         if account.commodity == default_currency:
             return quantity, None
+        from gnucash_mcp.book._base import _format_account_amount
+
         sym = account.commodity.mnemonic
+        shown = _format_account_amount(quantity, account)
         rate = rates.get(account.commodity.guid)
         if rate is not None:
-            note = f"{quantity} {sym} @ {rate}"
+            note = f"{shown} {sym} @ {_format_rate(rate)}"
             via = (provenance or {}).get(account.commodity.guid)
             if via:
                 note += f" ({via})"
-            return quantity * rate, note
+            return _round_converted(quantity * rate, default_currency), note
         if not with_cost_fallback:
-            return Decimal("0"), f"{quantity} {sym} — no price data"
-        # No market price for the holding: fall back to cost basis in
-        # the book default. ``split.value`` is in each purchase's
-        # transaction currency; convert each at its posting-date rate
-        # (mirroring calculate_lot_gain / _lot_decimals) so a holding
-        # bought across foreign currencies isn't summed as raw mixed
-        # units. Missing per-leg rate degrades to the raw value.
-        cost_basis = Decimal("0")
-        for s in account.splits:
-            if today is not None and s.transaction.post_date > today:
+            return Decimal("0"), f"{shown} {sym} — no price data"
+        # No market price for the holding: its remaining cost basis
+        # in the book default (see ``_unpriced_cost_basis``).
+        cost_basis = self._unpriced_cost_basis(
+            book, account.splits,
+            default_currency=default_currency, as_of=today,
+        )
+        return (
+            _round_converted(cost_basis, default_currency),
+            f"{shown} {sym} — no price data",
+        )
+
+    def _leg_value_in_default(
+        self,
+        book: piecash.Book,
+        split,
+        default_currency: piecash.Commodity,
+    ) -> Decimal:
+        """One split's ``value`` in the book default: converted at
+        its posting-date rate when the transaction currency differs
+        (mirroring calculate_lot_gain / _lot_decimals), so a holding
+        bought across foreign currencies is never summed as raw mixed
+        units. A missing per-leg rate degrades to the raw value."""
+        value = Decimal(str(split.value))
+        txn_ccy = split.transaction.currency
+        if txn_ccy != default_currency:
+            leg_rate = self._cross_rate(
+                book, txn_ccy, default_currency,
+                as_of=split.transaction.post_date,
+            )
+            if leg_rate is not None:
+                value = value * leg_rate
+        return value
+
+    def _unpriced_cost_basis(
+        self,
+        book: piecash.Book,
+        splits,
+        *,
+        default_currency: piecash.Commodity,
+        as_of: date | None = None,
+    ) -> Decimal:
+        """Remaining cost basis, in the book default, of a holding
+        with no market rate on file — the one valuation every surface
+        (dashboard, ``balance_sheet``, ``net_worth``, runway) uses for
+        such an account, so they agree by construction.
+
+        Folds the account's legs through a :class:`_CostPool` in
+        posting order (``_txn_sort_key``, so same-day legs resolve the
+        same way on every backend). Voided and undated splits are
+        skipped by the same rule as ``_own_splits_balance``; ``as_of``
+        (inclusive) caps to legs posted by then, ``None`` applies no
+        bound.
+
+        Not the old raw sum of ``split.value``: that kept the realized
+        gain of every sold unit in the "basis" and showed a fully sold
+        altcoin as a phantom holding (issue #185, PR #184).
+        """
+        from gnucash_mcp.book._base import _is_voided, _txn_sort_key
+
+        legs = []
+        for s in splits:
+            if _is_voided(s):
                 continue
-            value = Decimal(str(s.value))
-            txn_ccy = s.transaction.currency
-            if txn_ccy != default_currency:
-                leg_rate = self._cross_rate(
-                    book, txn_ccy, default_currency,
-                    as_of=s.transaction.post_date,
-                )
-                if leg_rate is not None:
-                    value = value * leg_rate
-            cost_basis += value
-        return cost_basis, f"{quantity} {sym} — no price data"
+            txn = s.transaction
+            post_date = txn.post_date
+            if post_date is None:
+                continue
+            if as_of is not None and post_date > as_of:
+                continue
+            legs.append((_txn_sort_key(txn), s))
+        legs.sort(key=lambda item: item[0])
+        pool = _CostPool()
+        for _key, s in legs:
+            pool.apply(
+                Decimal(str(s.quantity)),
+                self._leg_value_in_default(book, s, default_currency),
+            )
+        return pool.basis
 
     @staticmethod
     def _find_exchange_rate(
@@ -918,7 +1277,6 @@ class CurrencyMixin:
             book,
             commodity_guid=from_commodity.guid,
             currency_guid=to_commodity.guid,
-            market_only=True,  # load-bearing: skips FX placeholders
         ):
             p_date = _to_date(p.date)
             days = (as_of - p_date).days
@@ -941,7 +1299,6 @@ class CurrencyMixin:
             book,
             commodity_guid=to_commodity.guid,
             currency_guid=from_commodity.guid,
-            market_only=True,  # load-bearing: skips FX placeholders
         ):
             p_date = _to_date(p.date)
             days = (as_of - p_date).days
@@ -960,12 +1317,19 @@ class CurrencyMixin:
                 if _better(-days, rank, best_after_inverse):
                     best_after_inverse = (-days, rank, rate, p_date)
 
-        for candidate in (
-            best_before_direct,
-            best_before_inverse,
-            best_after_direct,
-            best_after_inverse,
+        # Direct and inverse rows are one list to GnuCash
+        # (``pricedb_get_prices_internal`` merges them); the nearer,
+        # then the more current, wins whichever way it is stored.
+        # Before-anchor candidates still precede after-anchor ones.
+        for direct, inverse in (
+            (best_before_direct, best_before_inverse),
+            (best_after_direct, best_after_inverse),
         ):
+            candidate = direct
+            if inverse is not None and _better(
+                inverse[0], inverse[1], direct,
+            ):
+                candidate = inverse
             if candidate is not None:
                 age_days, _rank, rate, p_date = candidate
                 return (rate, age_days, p_date)
