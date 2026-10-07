@@ -4357,9 +4357,13 @@ def _verify_stability(book: GnuCashBook, through: date) -> None:
         worst_paid = worst_open = 0
         n_open = 0
         for doc in docs:
+            # Quantity, not value: every lot split sits in the
+            # document's A/R account, in the document's currency, while
+            # a cross-currency payment's value is in the paying
+            # account's currency (as GnuCash books it).
             rows = con.execute(
                 "SELECT date(t.post_date) AS d, "
-                "s.value_num * 1.0 / s.value_denom AS v "
+                "s.quantity_num * 1.0 / s.quantity_denom AS v "
                 "FROM splits s JOIN transactions t ON t.guid = s.tx_guid "
                 "WHERE s.lot_guid = ? ORDER BY t.post_date",
                 (doc["post_lot"],)).fetchall()
