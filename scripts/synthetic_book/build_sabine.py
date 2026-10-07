@@ -94,6 +94,7 @@ from dateutil.easter import easter
 
 from gnucash_mcp.book import GnuCashBook
 from market_data import MarketData
+from base_book import record_prices
 
 SEED = 20250101
 YEAR = 2025
@@ -480,30 +481,25 @@ def create_book_file(out_path: Path) -> None:
 
 
 def add_prices(out_path: Path) -> int:
-    book = piecash.open_book(str(out_path), readonly=False, do_backup=False)
-    n = 0
+    book = piecash.open_book(str(out_path), readonly=True, do_backup=False)
+    rows: list = []
     try:
-        eur = book.default_currency
-        usd = next(c for c in book.commodities if c.mnemonic == "USD")
-        etf = next(c for c in book.commodities if c.mnemonic == ETF_MNEMONIC)
+        eur = book.default_currency.mnemonic
+        etf_ns = next(c.namespace for c in book.commodities
+                      if c.mnemonic == ETF_MNEMONIC)
         # Closing point AT the horizon (bookkeeper review §5): a fresh
         # build opens without a stale-price warning.
         usd_dates = set(price_months()) | {US_POST, US_PAY, THROUGH}
         etf_dates = set(price_months()) | {date(YEAR, 1, 1), THROUGH}
         for when in sorted(usd_dates):
-            piecash.Price(commodity=usd, currency=eur, date=when,
-                          value=eur_per_usd(when), type="last",
-                          source="Finance::Quote")
-            n += 1
+            rows.append(("USD", "CURRENCY", eur, when, eur_per_usd(when),
+                         "Finance::Quote"))
         for when in sorted(etf_dates):
-            piecash.Price(commodity=etf, currency=eur, date=when,
-                          value=etf_price(when), type="last",
-                          source="user:synthetic")
-            n += 1
-        book.save()
+            rows.append((ETF_MNEMONIC, etf_ns, eur, when, etf_price(when),
+                         "Finance::Quote"))
     finally:
         book.close()
-    return n
+    return record_prices(out_path, rows)
 
 
 # ── Phase 2: chart ─────────────────────────────────────────────────
@@ -2600,10 +2596,10 @@ def continuation_txns(through: date) -> list[dict]:
 def _add_price_rows(out_path: Path, pairs: list[tuple[str, date]]) -> int:
     """EUR-base quotes for (symbol, date) pairs, skipping any the book
     already has (the prefix's price table is never touched)."""
-    book = piecash.open_book(str(out_path), readonly=False, do_backup=False)
-    n = 0
+    book = piecash.open_book(str(out_path), readonly=True, do_backup=False)
+    rows: list = []
     try:
-        eur = book.default_currency
+        eur = book.default_currency.mnemonic
         comm_by = {c.mnemonic: c for c in book.commodities}
         seen: set[tuple[str, str]] = set()
         for p in book.prices:
@@ -2616,15 +2612,11 @@ def _add_price_rows(out_path: Path, pairs: list[tuple[str, date]]) -> int:
             seen.add(key)
             value = (eur_per_usd(when) if sym == "USD"
                      else etf_price(when))
-            piecash.Price(
-                commodity=comm_by[sym], currency=eur, date=when,
-                value=value, type="last", source="Finance::Quote",
-            )
-            n += 1
-        book.save()
+            rows.append((sym, comm_by[sym].namespace, eur, when, value,
+                         "Finance::Quote"))
     finally:
         book.close()
-    return n
+    return record_prices(out_path, rows)
 
 
 def extend_prices(out_path: Path, since: date, through: date) -> int:

@@ -89,11 +89,13 @@ from gnucash_mcp.book import GnuCashBook
 # module or as a path because uv adds the script dir to sys.path.
 try:
     from market_data import MarketData
+    from base_book import record_prices
     from continuation import business_day, federal_holidays, is_business_day
 except ImportError:  # pragma: no cover - fallback for package-style import
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from market_data import MarketData
+    from base_book import record_prices
     from continuation import business_day, federal_holidays, is_business_day
 
 
@@ -366,48 +368,43 @@ def add_prices(out_path: Path) -> int:
     reflects the most recent real close instead of forward-filling the
     1st-of-month value to the end of the horizon.
     """
-    book = piecash.open_book(str(out_path), readonly=False, do_backup=False)
-    count = 0
+    book = piecash.open_book(str(out_path), readonly=True, do_backup=False)
     try:
-        usd = book.default_currency
-        comm_by_mnemonic = {c.mnemonic: c for c in book.commodities}
-        seen: set[tuple[str, str]] = set()
-
-        def _add(mnemonic: str, pdate: date, value: Decimal) -> None:
-            nonlocal count
-            key = (mnemonic, pdate.isoformat())
-            if key in seen:  # piecash rejects duplicate commodity+date+currency
-                return
-            seen.add(key)
-            piecash.Price(
-                commodity=comm_by_mnemonic[mnemonic], currency=usd,
-                date=pdate, value=value, type="last", source="Finance::Quote",
-            )
-            count += 1
-
-        # Layer 1: 1st-of-month snapshots, real closes, forward-filled.
-        for yr, mo in PRICE_MONTHS:
-            pdate = date(yr, mo, 1)
-            for sym, _full, _ns, _frac in SECURITIES:
-                _add(sym, pdate, MD.security(sym, pdate).quantize(_security_quant(sym)))
-            for foreign in FOREIGN_CURRENCIES:
-                _add(foreign, pdate, MD.fx(foreign, "USD", pdate).quantize(D("0.0001")))
-
-        # Layer 2: closing point at the last available real quote per
-        # commodity (never past THROUGH). This is the price reports walk to
-        # at the present edge of the book — the actual most-recent close,
-        # not the 1st-of-month value carried over.
-        for sym, _full, _ns, _frac in SECURITIES:
-            asof = THROUGH  # §5: closing point AT the horizon (value forward-fills)
-            _add(sym, asof, MD.security(sym, asof).quantize(_security_quant(sym)))
-        for foreign in FOREIGN_CURRENCIES:
-            asof = THROUGH
-            _add(foreign, asof, MD.fx(foreign, "USD", asof).quantize(D("0.0001")))
-
-        book.save()
+        usd = book.default_currency.mnemonic
+        ns_by_mnemonic = {c.mnemonic: c.namespace for c in book.commodities}
     finally:
         book.close()
-    return count
+    rows: list = []
+    seen: set[tuple[str, str]] = set()
+
+    def _add(mnemonic: str, pdate: date, value: Decimal) -> None:
+        key = (mnemonic, pdate.isoformat())
+        if key in seen:  # one price per pair per day
+            return
+        seen.add(key)
+        rows.append((mnemonic, ns_by_mnemonic[mnemonic], usd, pdate,
+                     value, "Finance::Quote"))
+
+    # Layer 1: 1st-of-month snapshots, real closes, forward-filled.
+    for yr, mo in PRICE_MONTHS:
+        pdate = date(yr, mo, 1)
+        for sym, _full, _ns, _frac in SECURITIES:
+            _add(sym, pdate, MD.security(sym, pdate).quantize(_security_quant(sym)))
+        for foreign in FOREIGN_CURRENCIES:
+            _add(foreign, pdate, MD.fx(foreign, "USD", pdate).quantize(D("0.0001")))
+
+    # Layer 2: closing point at the last available real quote per
+    # commodity (never past THROUGH). This is the price reports walk to
+    # at the present edge of the book — the actual most-recent close,
+    # not the 1st-of-month value carried over.
+    for sym, _full, _ns, _frac in SECURITIES:
+        asof = THROUGH  # §5: closing point AT the horizon (value forward-fills)
+        _add(sym, asof, MD.security(sym, asof).quantize(_security_quant(sym)))
+    for foreign in FOREIGN_CURRENCIES:
+        asof = THROUGH
+        _add(foreign, asof, MD.fx(foreign, "USD", asof).quantize(D("0.0001")))
+
+    return record_prices(out_path, rows)
 
 
 def add_event_prices(out_path: Path, events: list[tuple[str, date]]) -> int:
@@ -417,10 +414,10 @@ def add_event_prices(out_path: Path, events: list[tuple[str, date]]) -> int:
     date so cross-currency posts/pays find a fresh rate and lot-gain
     calculations have an on-date market price.
     """
-    book = piecash.open_book(str(out_path), readonly=False, do_backup=False)
-    count = 0
+    book = piecash.open_book(str(out_path), readonly=True, do_backup=False)
+    rows: list = []
     try:
-        usd = book.default_currency
+        usd = book.default_currency.mnemonic
         comm_by_mnemonic = {c.mnemonic: c for c in book.commodities}
         sec_syms = {s[0] for s in SECURITIES}
         # Skip (commodity, date) pairs that already have a price on file —
@@ -440,15 +437,11 @@ def add_event_prices(out_path: Path, events: list[tuple[str, date]]) -> int:
                 value = MD.security(sym, when).quantize(_security_quant(sym))
             else:
                 value = MD.fx(sym, "USD", when).quantize(D("0.0001"))
-            piecash.Price(
-                commodity=comm, currency=usd, date=when,
-                value=value, type="last", source="Finance::Quote",
-            )
-            count += 1
-        book.save()
+            rows.append((sym, comm.namespace, usd, when, value,
+                          "Finance::Quote"))
     finally:
         book.close()
-    return count
+    return record_prices(out_path, rows)
 
 
 # ── Phase 2: Chart of accounts ──────────────────────────────────

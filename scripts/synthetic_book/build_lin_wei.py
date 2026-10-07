@@ -73,6 +73,7 @@ from gnucash_mcp.book import GnuCashBook
 # whether this script is launched as a module or by path.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from market_data import MarketData  # noqa: E402
+from base_book import record_prices  # noqa: E402
 
 
 # ── Configuration ───────────────────────────────────────────────
@@ -723,10 +724,10 @@ def add_prices(out_path: Path) -> int:
        reflects the most recent real close rather than forward-filling
        the 1st-of-month value to the end of the horizon.
     """
-    book = piecash.open_book(str(out_path), readonly=False, do_backup=False)
-    count = 0
+    book = piecash.open_book(str(out_path), readonly=True, do_backup=False)
+    rows: list = []
     try:
-        cny = book.default_currency
+        cny = book.default_currency.mnemonic
         comm_by_mnemonic = {c.mnemonic: c for c in book.commodities}
 
         # Collect (symbol -> set of dates) needing a price. Start with the
@@ -750,19 +751,11 @@ def add_prices(out_path: Path) -> int:
         for sym, dates in wanted.items():
             comm = comm_by_mnemonic[sym]
             for pdate in sorted(dates):
-                piecash.Price(
-                    commodity=comm,
-                    currency=cny,
-                    date=pdate,
-                    value=real_price(sym, pdate),
-                    type="last",
-                    source="Finance::Quote",
-                )
-                count += 1
-        book.save()
+                rows.append((sym, comm.namespace, cny, pdate,
+                             real_price(sym, pdate), "Finance::Quote"))
     finally:
         book.close()
-    return count
+    return record_prices(out_path, rows)
 
 
 def dca_dates() -> list[date]:
@@ -4563,10 +4556,10 @@ def continuation_txns(through: date) -> list[dict]:
 def _add_price_rows(out_path: Path, pairs: list[tuple[str, date]]) -> int:
     """Real CNY-base quotes for (symbol, date) pairs, skipping any the
     book already has (the prefix's price table is never touched)."""
-    book = piecash.open_book(str(out_path), readonly=False, do_backup=False)
-    count = 0
+    book = piecash.open_book(str(out_path), readonly=True, do_backup=False)
+    rows: list = []
     try:
-        cny = book.default_currency
+        cny = book.default_currency.mnemonic
         comm_by = {c.mnemonic: c for c in book.commodities}
         seen: set[tuple[str, str]] = set()
         for p in book.prices:
@@ -4577,16 +4570,11 @@ def _add_price_rows(out_path: Path, pairs: list[tuple[str, date]]) -> int:
             if key in seen:
                 continue
             seen.add(key)
-            piecash.Price(
-                commodity=comm_by[sym], currency=cny, date=when,
-                value=real_price(sym, when), type="last",
-                source="Finance::Quote",
-            )
-            count += 1
-        book.save()
+            rows.append((sym, comm_by[sym].namespace, cny, when,
+                         real_price(sym, when), "Finance::Quote"))
     finally:
         book.close()
-    return count
+    return record_prices(out_path, rows)
 
 
 def extend_prices(out_path: Path, since: date, through: date) -> int:
