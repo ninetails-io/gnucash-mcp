@@ -11,6 +11,7 @@ Books can live in PostgreSQL or MySQL/MariaDB as well as a SQLite file, and ever
 - Before converting, the server copies the book to its backups folder (labelled `pre-1-5-upgrade`, never pruned) and refuses the write if the copy cannot be made. For a database book, run `pg_dump` or `mysqldump` first.
 - Make that first write before opening the book in GnuCash desktop again. Until it is converted, a schedule created by an earlier version crashes GnuCash 5.12's Scheduled Transaction Editor.
 - Don't point a 1.4.x server and a 1.5 server at the same book. A 1.4.x write to a converted book is detected and reported.
+- Step by step, with how to check and how to go back: [docs/UPGRADING.md](docs/UPGRADING.md).
 
 ### Added
 - **PostgreSQL and MySQL/MariaDB books** through `GNUCASH_BOOK_URI` (#175, #181). Install the `postgres` or `mysql` extra. CI tests both against real database servers. A database book is single-book, needs `GNUCASH_LOG_DIR`, and is backed up with the database's own dump tool, not by the server.
