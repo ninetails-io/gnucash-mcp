@@ -1112,6 +1112,10 @@ def advance_sx(book_path: Path, through: date) -> dict:
         "yearly": relativedelta(years=1),
     }
     info = {"enabled": 0, "upcoming": 0}
+    latest_instance = {
+        sx_guid: rows[-1][1]
+        for sx_guid, rows in sx_instances(book_path, through).items() if rows
+    }
 
     book = piecash.open_book(str(book_path), readonly=False, do_backup=False)
     try:
@@ -1140,13 +1144,15 @@ def advance_sx(book_path: Path, through: date) -> dict:
                 cur = cur + period[freq]
             rows.append((sx, occs))
 
-        # Every cursor at its last occurrence on or before ``through``:
-        # the books are current to the close, nothing overdue.
+        # Every cursor at its last occurrence on or before ``through``,
+        # or at its latest posted instance when that is later (a bill
+        # paid ahead of its date): current to the close, nothing
+        # overdue, never behind the ledger.
         for sx, occs in rows:
-            if not occs:
-                last = None
-            else:
-                last = occs[-1]
+            dates = [d for d in (occs[-1] if occs else None,
+                                 latest_instance.get(sx.guid)) if d]
+            last = max(dates) if dates else None
+            if last is not None:
                 info["upcoming"] += 1
             sx.enabled = 1
             sx.last_occur = last

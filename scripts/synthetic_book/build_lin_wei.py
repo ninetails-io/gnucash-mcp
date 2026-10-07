@@ -301,6 +301,18 @@ def next_business_day(d: date) -> date:
     return d
 
 
+def paid_by_due(planned: date, opened: date, terms_days: int = 30) -> date:
+    """A client's payment run, never after the invoice's due date: the
+    planned day capped at ``opened + terms_days``, rolled BACK off a
+    weekend or holiday. Rolling forward left an invoice past due over
+    every weekend and 国庆, so the books did not read current at the
+    close."""
+    d = min(planned, opened + timedelta(days=terms_days))
+    while not is_business_day(d):
+        d -= timedelta(days=1)
+    return d
+
+
 def next_trading_day(d: date) -> date:
     """The exchange calendar is the public-holiday calendar plus
     weekends — an ETF 定投 cannot fill on 2025-05-01 (audit L9)."""
@@ -550,7 +562,7 @@ def foreign_invoice_plans() -> list[dict]:
             plans.append({
                 "customer": "pacific", "currency": "USD", "amount": amt,
                 "open": open_d,
-                "pay": next_business_day(date(pay_y, pay_m, 5)),
+                "pay": paid_by_due(date(pay_y, pay_m, 5), open_d),
                 "desc": f"{open_d.strftime('%B %Y')} cross-border app "
                         f"engagement",
                 "job": m == 9,
@@ -560,7 +572,7 @@ def foreign_invoice_plans() -> list[dict]:
             plans.append({
                 "customer": "munich", "currency": "EUR", "amount": amt,
                 "open": open_d,
-                "pay": next_business_day(date(yy, m + 1, 8)),
+                "pay": paid_by_due(date(yy, m + 1, 8), open_d),
                 "desc": f"{open_d.strftime('%B %Y')} Softwareentwicklung",
                 "job": m == 11,
             })
@@ -574,13 +586,14 @@ def foreign_invoice_plans() -> list[dict]:
 # of those post dates for the 7-day FX freshness guard.
 
 # Open receivables, as days before THROUGH the document posts. With Net 30
-# terms that leaves three invoices overdue by 1, 12 and 33 days and two
-# posted-but-current — staggered ages, the way a living A/R ledger reads
-# (G10: a single anchor made every overdue invoice the same age).
+# terms the books read current at the close: one invoice past due (the
+# München Phase 2, 12 days — the one follow-up a demo shows) and four
+# posted-but-current at staggered ages (G10: a single anchor made every
+# open invoice the same age).
 OPEN_DOC_AGE = {
-    "sz_milestone": 31,     # 深圳跨境电商 平台改版里程碑 — 1 day overdue
+    "sz_milestone": 24,     # 深圳跨境电商 平台改版里程碑 — due in 6 days
     "sz_maint": 10,         # 深圳跨境电商 运维支持 — due in 20 days
-    "pacific": 63,          # Pacific Trade retainer (USD) — 33 days overdue
+    "pacific": 21,          # Pacific Trade retainer (USD) — due in 9 days
     "munich_p2": 42,        # München ERP Phase 2 (EUR) — 12 days overdue
     "munich_wartung": 3,    # München Wartung (EUR) — due in 27 days
 }
@@ -2656,8 +2669,8 @@ def run_business(book: GnuCashBook, since: date | None = None) -> dict:
                     extra=(f"{yy} 年度合同续签，月费 ¥{fee}"
                            if m == 1 and yy > YEAR else "")),
             )
-    # Shenzhen OUTSTANDING (CNY A/R demo surface): a milestone just past
-    # due and a maintenance invoice not yet due, both unpaid.
+    # Shenzhen OUTSTANDING (CNY A/R demo surface): a milestone and a
+    # maintenance invoice, both open and not yet due.
     if "深圳跨境电商有限公司" not in open_owner_names:
         sz_ms = open_document_date("sz_milestone")
         run_invoice(
@@ -3816,30 +3829,13 @@ def stamp_entry_dates(out_path: Path) -> int:
 # ── Scheduled-transaction state (kept ENABLED) ──────────────────
 
 def set_schedule_state(out_path: Path) -> dict:
-    """``last_occur`` = the latest POSTED instance of each schedule, and
-    every instance stamped with GnuCash's ``from-sched-xaction`` slot
-    (audit A3: 经营所得 季度预缴 sat at 2026-06-14 with its September
-    instance in the ledger, so the dashboard called it overdue). A
-    schedule with no instance yet keeps ``last_occur`` empty. Instances
-    are found, and stamped, by continuation's shared matcher."""
-    from continuation import stamp_sx_instances, sx_instances
-
-    info = {"schedules": 0, "instances": 0, "unposted": []}
-    instances = sx_instances(out_path, THROUGH)
-    gc = piecash.open_book(str(out_path), readonly=False, do_backup=False)
-    try:
-        for sx in gc.session.query(piecash.ScheduledTransaction).all():
-            rows = instances.get(sx.guid, [])
-            sx.enabled = 1
-            sx.last_occur = rows[-1][1] if rows else None
-            if not rows:
-                info["unposted"].append(sx.name)
-            info["schedules"] += 1
-        gc.save()
-    finally:
-        gc.close()
-    info["instances"] = stamp_sx_instances(out_path, THROUGH)
-    return info
+    """Every schedule's cursor through the shared engine rule
+    (``continuation.advance_sx``): current to the close and never behind
+    its latest posted instance (audit A3: 经营所得 季度预缴 sat at
+    2026-06-14 with its September instance in the ledger, so the
+    dashboard called it overdue), and every instance stamped."""
+    from continuation import advance_sx
+    return advance_sx(out_path, THROUGH)
 
 
 def _parse_money(s) -> Decimal:
@@ -4227,7 +4223,8 @@ def _verify_invariants(out_path: Path, tax_summary: dict) -> None:
             raise SystemExit(f"INVARIANT: {yy} tax booked {got} vs implied "
                              f"{implied} ({dev:.1f}%)")
 
-    # A3: every schedule's cursor is its latest posted instance.
+    # A3: no cursor behind its latest posted instance, and none overdue
+    # at the close.
     from continuation import sx_instances
     instances = sx_instances(out_path, THROUGH)
     gc = piecash.open_book(str(out_path), readonly=True, open_if_lock=True)
@@ -4235,19 +4232,26 @@ def _verify_invariants(out_path: Path, tax_summary: dict) -> None:
         bad = []
         for sx in gc.session.query(piecash.ScheduledTransaction).all():
             inst = instances.get(sx.guid, [])
-            want = inst[-1][1] if inst else None
+            latest = inst[-1][1] if inst else None
             have = sx.last_occur
             if hasattr(have, "date") and have is not None:
                 have = have.date()
-            if want != have:
-                bad.append((sx.name, have, want))
+            if latest is not None and (have is None or have < latest):
+                bad.append((sx.name, have, latest))
         n_sx = gc.session.query(piecash.ScheduledTransaction).count()
     finally:
         gc.close()
-    print(f"  schedules: {n_sx} cursors == latest posted instance"
-          f"{' OK' if not bad else ' MISMATCH ' + str(bad)}")
+    due = [s for s in GnuCashBook(str(out_path)).list_scheduled_transactions(
+               enabled_only=True, compact=False)
+           if s.get("next_occurrence") and s["next_occurrence"] <= THROUGH.isoformat()]
+    print(f"  schedules: {n_sx} cursors at or past the latest posted "
+          f"instance{' OK' if not bad else ' BEHIND ' + str(bad)}; "
+          f"{len(due)} overdue at the close")
     if bad:
-        raise SystemExit("INVARIANT: last_occur != latest posted instance")
+        raise SystemExit("INVARIANT: last_occur behind its latest posted instance")
+    if due:
+        raise SystemExit(f"INVARIANT: schedules overdue at the close: "
+                         f"{[s['name'] for s in due]}")
 
 
 def verify(out_path: Path, business: dict, tax_summary: dict | None = None) -> None:
