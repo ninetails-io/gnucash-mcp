@@ -27,10 +27,11 @@ years of activity, mixed currencies, customers, invoices,
 budgets, the works. Walk through one in five minutes; if it
 clicks, point the server at your own book and you're done.
 
-What the repo commits is each persona's chart-only base — the
-accounts, nothing dated, about 230 KB. One command
+The repo commits no book files, only the builders that make them.
+One command
 (`uv run python scripts/synthetic_book/rebuild_all.py --skip-refresh`)
-builds all three into full books through today, deterministically:
+builds all three into full books through today in about four
+minutes, offline and deterministically:
 statement payments from real balances, invoices settled, accounts
 reconciled, every row in the shapes GnuCash desktop reads. The
 bundle ships them built as of its build day, so a bundle user never
@@ -215,8 +216,8 @@ exception: if an update changes *dependencies*, run
 
 ### 2. Make a working copy of a sample book
 
-The committed sample is a chart-only base; build the full book
-first (about a minute, offline). The server then writes audit logs
+The repo holds no book files, only their builders, so build the
+book first (about a minute and a half, offline). The server then writes audit logs
 and auto-backups alongside the book file, and you don't want either
 committed back to the repo, so copy the built book somewhere outside
 it:

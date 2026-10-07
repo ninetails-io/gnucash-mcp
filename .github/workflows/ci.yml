@@ -129,11 +129,10 @@ jobs:
         with:
           node-version: "24"
       - name: Generate the demo books (offline, committed cache)
-        # samples/ holds chart-only BASES (commodities, accounts,
-        # slots; nothing dated). The builders regenerate every
-        # transaction from them deterministically through the build
-        # date, priced from the committed rates cache — no network —
-        # then verify and promote in the workspace, where the bundle
+        # The builders create each book from nothing, deterministically,
+        # through the build date, priced from the committed rates
+        # cache — no network — then verify and promote in the
+        # workspace, where the bundle
         # whitelist (.mcpbignore) picks the books up. Every bundle
         # build is thereby a full regression run of the generators.
         run: uv run --locked --extra dev python scripts/synthetic_book/rebuild_all.py --skip-refresh
