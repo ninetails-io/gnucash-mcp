@@ -4241,9 +4241,11 @@ def _verify_invariants(out_path: Path, tax_summary: dict) -> None:
         n_sx = gc.session.query(piecash.ScheduledTransaction).count()
     finally:
         gc.close()
-    due = [s for s in GnuCashBook(str(out_path)).list_scheduled_transactions(
-               enabled_only=True, compact=False)
-           if s.get("next_occurrence") and s["next_occurrence"] <= THROUGH.isoformat()]
+    listing = GnuCashBook(str(out_path)).list_scheduled_transactions(
+        enabled_only=True, compact=False, limit=250)
+    due = [s for s in listing["scheduled_transactions"]
+           if s.get("next_occurrence")
+           and s["next_occurrence"] <= THROUGH.isoformat()]
     print(f"  schedules: {n_sx} cursors at or past the latest posted "
           f"instance{' OK' if not bad else ' BEHIND ' + str(bad)}; "
           f"{len(due)} overdue at the close")
