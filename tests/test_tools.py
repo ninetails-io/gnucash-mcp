@@ -64,7 +64,7 @@ class TestGetBookSummaryTool:
         assert isinstance(result, str)
         assert "Book:" in result
         assert "Currency: USD" in result
-        assert "Accounts:" in result
+        assert "Chart of accounts:" in result
         # The bottom-line "Net worth:" line was retired in favor of
         # the trajectory section's "now" anchor — single source of
         # truth for the net-worth number.

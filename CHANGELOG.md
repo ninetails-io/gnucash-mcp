@@ -28,6 +28,7 @@ Books can live in PostgreSQL or MySQL/MariaDB as well as a SQLite file, and ever
 - **Cross-currency payments** are booked in the paying account's currency, as GnuCash books them.
 - **Prices.** One price per currency pair per day. Same-day ties, and the rates implied by cross-currency transactions, are resolved the way GnuCash resolves them. Read tools issue a fixed number of queries whatever the book's size (#182, #186).
 - Report totals equal the sum of their lines on multi-currency books, and amounts print with each commodity's own decimal places.
+- Dashboard: the account counts are one chart-of-accounts map, two levels deep, with a `list_accounts(root=…)` call to drill into any branch. Every count ties to `list_accounts`; hidden accounts are shown as `+N hidden`. Account parameters say they take a `%short` guid as well as a name.
 - Dashboard: overdue invoices use GnuCash's billing-term due dates, reconciliation lag follows desktop's statement cycle, budget pace follows the budget's own periods, and stale-price warnings name the rate actually used.
 - A write dated inside the book's read-only period carries a warning.
 - In a book that uses trading accounts, transactions across currencies or commodities are refused (see Known limitations).
@@ -38,6 +39,7 @@ Books can live in PostgreSQL or MySQL/MariaDB as well as a SQLite file, and ever
 - An invoice's posting transaction can no longer be voided, rewritten, or re-dated; unpost the invoice instead.
 - Deleting a transaction, account, or document no longer removes metadata belonging to other records.
 - A database password is masked in every error message and log.
+- The audit log names the account for every `acct` cell of `create_transactions` and `enter_statement`, whether the call used a name or a `%short` guid.
 - Invoice lookups and deleting a taxed draft on PostgreSQL (#189).
 - A sold-out holding with no price is valued at zero (#184, #185).
 - Report date boundaries, automatic backups in long-running sessions, and two books with the same filename under one `GNUCASH_LOG_DIR`.

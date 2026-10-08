@@ -1811,6 +1811,96 @@ class TestAuditLogResolvesAccountRefs:
         assert "Assets:Checking" in rendered
         assert full_guid not in rendered
 
+    @staticmethod
+    def _logging_on(test_book):
+        from gnucash_mcp.book import GnuCashBook
+        from gnucash_mcp.logging_config import setup_logging
+
+        book = GnuCashBook(str(test_book))
+        setup_logging(
+            book_path=str(test_book), debug=False, get_book=lambda: book,
+        )
+        with book.open(readonly=True) as b:
+            account = book._find_account(b, "Assets:Checking")
+            short = book._account_short_guid(b, account)
+        return book, short
+
+    def test_batch_create_acct_cells_render_identically(self, test_book):
+        """Acceptance 3 of PLAN_BOOK_SUMMARY_MAP: a transaction
+        entered with a %guid ``acct`` cell audits byte-identically
+        to the by-name entry. The TSV is re-parsed by its handler,
+        so the dispatcher's top-level normalizer never saw those
+        cells; ``_resolve_tsv_split_refs`` covers them."""
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+
+        _, short = self._logging_on(test_book)
+
+        def entry(acct):
+            return {
+                "classification": "write",
+                "entity_type": "transaction",
+                "operation": "create_batch",
+                "timestamp": "2026-10-07T18:00:00",
+                "params": {"transactions": (
+                    "ref\tdate\tdescription\tamt1\tacct1\tamt2\tacct2\n"
+                    f"1\t2026-10-07\tGas\t-54.19\t{acct}"
+                    "\t54.19\tExpenses:Groceries"
+                )},
+                "after_state": {"results": (
+                    "ref\tstatus\ttxn_guid\tdup_count\treason\n"
+                    "1\tcreated\tabcd1234\t\t"
+                )},
+            }
+
+        by_guid = _format_audit_entry_text(entry(short))
+        by_name = _format_audit_entry_text(entry("Assets:Checking"))
+        assert by_guid == by_name, f"{by_guid!r}\n!=\n{by_name!r}"
+        assert "Checking" in by_guid
+        assert short not in by_guid
+
+    def test_statement_counter_acct_cells_render_identically(
+        self, test_book,
+    ):
+        """Same contract for ``enter_statement``: a created row's
+        counter splits render, by canonical name, whichever form
+        the ``acct`` cell used."""
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+
+        _, short = self._logging_on(test_book)
+
+        def entry(acct):
+            return {
+                "classification": "write",
+                "entity_type": "statement",
+                "operation": "enter",
+                "timestamp": "2026-10-07T18:00:00",
+                "params": {
+                    "account": "Expenses:Groceries",
+                    "statement_date": "2026-10-07",
+                    "opening_balance": "0.00",
+                    "closing_balance": "54.19",
+                    "dry_run": False,
+                    "lines": (
+                        "ref\tdate\tdescription\tamount\tamt\tacct\n"
+                        f"1\t2026-10-07\tGas\t54.19\t-54.19\t{acct}"
+                    ),
+                },
+                "after_state": {
+                    "summary": "1 created",
+                    "tie": "tie holds",
+                    "results": (
+                        "ref\tstatus\tguid\tnote\n"
+                        "1\tcreated\tabcd1234\t"
+                    ),
+                },
+            }
+
+        by_guid = _format_audit_entry_text(entry(short))
+        by_name = _format_audit_entry_text(entry("Assets:Checking"))
+        assert by_guid == by_name, f"{by_guid!r}\n!=\n{by_name!r}"
+        assert "Checking" in by_guid
+        assert short not in by_guid
+
     def test_path_input_unchanged(self, test_book):
         from gnucash_mcp.book import GnuCashBook
         from gnucash_mcp.logging_config import (

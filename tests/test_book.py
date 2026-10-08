@@ -1,5 +1,6 @@
 """Tests for GnuCashBook wrapper."""
 
+import re
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -137,11 +138,11 @@ class TestGetBookSummary:
 
         assert "Book:" in result
         assert "Currency:" in result
-        assert "Accounts:" in result
+        assert "Chart of accounts:" in result
         assert "Assets:" in result
         assert "Liabilities:" in result
-        assert "Income:" in result
-        assert "Expenses:" in result
+        assert "  Income (" in result
+        assert "  Expenses (" in result
         assert "Transactions:" in result
         assert "Commodities:" in result
         # The bottom-line "Net worth:" line was removed in favor of
@@ -332,6 +333,170 @@ class TestGetBookSummary:
         assert "Warnings" in result
         assert "Auto-backup failing" in result
         assert "disk quota exceeded" in result
+
+
+class TestGetBookSummaryChartMap:
+    """The chart-of-accounts map (spec
+    ``specs/v1.5.1/PLAN_BOOK_SUMMARY_MAP.md``): one tree, depth two,
+    replacing the scattered per-type count lines. Every count ties
+    to ``list_accounts`` under the same filters; the drill-down
+    hint names a call that validates. The header adds how many are
+    active (carry a split).
+    """
+
+    _ROOT_RE = re.compile(r'list_accounts\(root="(.*)"\)')
+
+    @staticmethod
+    def _map_lines(summary: str) -> list[str]:
+        lines = summary.splitlines()
+        i = next(k for k, line in enumerate(lines) if line.startswith("Chart of accounts:"))
+        out = [lines[i]]
+        for line in lines[i + 1:]:
+            if not line.startswith("  "):
+                break
+            out.append(line)
+        return out
+
+    @staticmethod
+    def _label_total(label: str) -> int:
+        # "64 total", "14", "14, 2 hidden", "2 hidden": the first
+        # number is always the branch's total.
+        return int(re.match(r"(\d+)", label).group(1))
+
+    @staticmethod
+    def _list_total(gc, root=None) -> int:
+        text = gc.list_accounts(root=root, limit=0)
+        return int(re.search(r"of (\d+) accounts", text).group(1))
+
+    def _assert_ties(self, gc):
+        head, *branches = self._map_lines(gc.get_book_summary())
+        m = re.search(r"^Chart of accounts: (\d+) total \((\d+) active", head)
+        assert m, head
+        assert int(m.group(1)) == self._list_total(gc)
+        seen = 0
+        for line in branches:
+            top, _, rest = line[2:].partition(": ")
+            tm = re.match(r"(.*) \(([^()]*)\)$", top)
+            assert tm, line
+            name, label = tm.group(1), tm.group(2)
+            assert self._label_total(label) == self._list_total(gc, name), line
+            seen += 1
+            for part in [x for x in rest.split(", ") if x and x != "…"]:
+                cm = re.match(r"(.*) \(([^()]*)\)$", part)
+                assert cm, part
+                child = f"{name}:{cm.group(1)}"
+                assert self._label_total(cm.group(2)) == self._list_total(gc, child), part
+        assert seen >= 4
+        return head, branches
+
+    def test_every_count_ties_to_list_accounts(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        gc.create_account(name="Auto", account_type="EXPENSE", parent="Expenses", placeholder=True)
+        gc.create_account(name="Fuel", account_type="EXPENSE", parent="Expenses:Auto")
+        gc.create_account(name="Repairs", account_type="EXPENSE", parent="Expenses:Auto")
+        gc.create_account(name="Savings", account_type="BANK", parent="Assets")
+        head, branches = self._assert_ties(gc)
+        assert any(ln.startswith("  Expenses (") and "Auto (3)" in ln for ln in branches), branches
+
+    def test_hidden_parent_counts_its_children_as_hidden(self, test_book: Path):
+        """``_is_hidden`` inherits: a hidden parent's visible-flagged
+        child is hidden too, and the branch says so."""
+        gc = GnuCashBook(str(test_book))
+        gc.create_account(name="Old Banks", account_type="ASSET", parent="Assets", placeholder=True)
+        gc.create_account(name="Closed", account_type="BANK", parent="Assets:Old Banks")
+        with gc.open(readonly=False) as book:
+            gc._find_account(book, "Assets:Old Banks").hidden = 1
+            book.save()
+        head, branches = self._assert_ties(gc)
+        assert ", 2 hidden)" in head, head
+        assets = next(ln for ln in branches if ln.startswith("  Assets ("))
+        assert "total, 2 hidden)" in assets and "Old Banks (2 hidden)" in assets, assets
+
+    def test_active_counts_accounts_with_splits(self, test_book: Path):
+        """The header's active figure is the accounts that carry a
+        split, or hold one that does; a new, empty account adds to
+        the total only."""
+        gc = GnuCashBook(str(test_book))
+
+        def counts():
+            head = self._map_lines(gc.get_book_summary())[0]
+            m = re.search(r"^Chart of accounts: (\d+) total \((\d+) active", head)
+            return int(m.group(1)), int(m.group(2))
+
+        total, active = counts()
+        gc.create_account(name="Unused", account_type="EXPENSE", parent="Expenses")
+        assert counts() == (total + 1, active)
+        # A parent that only holds used accounts is in use.
+        gc.create_account(name="Auto", account_type="EXPENSE",
+                          parent="Expenses", placeholder=True)
+        gc.create_account(name="Fuel", account_type="EXPENSE", parent="Expenses:Auto")
+        assert counts() == (total + 3, active)
+        gc.create_transaction(
+            description="Gas",
+            splits=[
+                {"account": "Expenses:Auto:Fuel", "amount": "40.00"},
+                {"account": "Assets:Checking", "amount": "-40.00"},
+            ],
+            trans_date=date(2026, 1, 5),
+            check_duplicates=False,
+        )
+        assert counts() == (total + 3, active + 2)
+
+    def test_template_accounts_are_not_counted(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        before = self._map_lines(gc.get_book_summary())
+        gc.create_scheduled_transaction(
+            name="Rent", description="Rent", start_date="2026-01-01",
+            frequency="monthly",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "10.00"},
+                {"account": "Assets:Checking", "amount": "-10.00"},
+            ],
+        )
+        after = self._map_lines(gc.get_book_summary())
+        assert before == after
+        self._assert_ties(gc)
+
+    def test_drill_down_hint_validates(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        gc.create_account(name="Auto", account_type="EXPENSE", parent="Expenses", placeholder=True)
+        gc.create_account(name="Fuel", account_type="EXPENSE", parent="Expenses:Auto")
+        head = self._map_lines(gc.get_book_summary())[0]
+        root = self._ROOT_RE.search(head).group(1)
+        assert root == "Expenses:Auto"
+        listing = gc.list_accounts(root=root, limit=250).splitlines()
+        assert "of 2 accounts" in listing[0]
+        for line in listing[1:]:
+            path = line.split("\t", 1)[1].split(" [")[0]
+            assert path == root or path.startswith(root + ":"), line
+
+    def test_wide_trees_cap_at_eight_branches(self, test_book: Path):
+        """Rule d: income/expense second levels show the eight largest
+        branches and elide the rest; assets show every branch."""
+        gc = GnuCashBook(str(test_book))
+        for i in range(10):
+            gc.create_account(name=f"E{i:02d}", account_type="EXPENSE", parent="Expenses", placeholder=True)
+            gc.create_account(name="leaf", account_type="EXPENSE", parent=f"Expenses:E{i:02d}")
+            gc.create_account(name=f"A{i:02d}", account_type="ASSET", parent="Assets", placeholder=True)
+            gc.create_account(name="leaf", account_type="BANK", parent=f"Assets:A{i:02d}")
+        head, branches = self._assert_ties(gc)
+        expenses = next(ln for ln in branches if ln.startswith("  Expenses ("))
+        assert expenses.endswith(", …"), expenses
+        assert expenses.count(" (2)") == 8, expenses
+        assets = next(ln for ln in branches if ln.startswith("  Assets ("))
+        assert "…" not in assets and assets.count(" (2)") == 10, assets
+
+    def test_fold_removed_the_scattered_count_lines(self, test_book: Path):
+        summary = GnuCashBook(str(test_book)).get_book_summary()
+        assert "Accounts: " not in summary
+        assert " active (" not in summary
+        assert not re.search(r"^(Assets|Liabilities): \d+ accounts?,", summary, re.M)
+        assert re.search(r"^Assets: USD ", summary, re.M)
+        assert (
+            "Frequently used accounts (last 180 days — any account "
+            "parameter accepts the %guid or the full name; a %guid is "
+            "fewer tokens and faster to write):"
+        ) in summary or "Frequently used accounts" not in summary
 
 
 class TestGetBookSummaryReconciliation:
@@ -2580,7 +2745,7 @@ class TestGetBookSummaryWarnings:
         # specifically is not in any warning line.
         if "Warnings:" in result:
             warnings_block = result.split("Warnings:")[1].split(
-                "Accounts:"
+                "Chart of accounts:"
             )[0]
             assert "Imbalance-USD" not in warnings_block
 
@@ -2601,7 +2766,7 @@ class TestGetBookSummaryWarnings:
         result = gc.get_book_summary()
         assert "Warnings:" in result
         warnings_block = result.split("Warnings:")[1].split(
-            "Accounts:"
+            "Chart of accounts:"
         )[0]
         assert "VTSAX" in warnings_block
         assert "Stale price" in warnings_block
@@ -2666,7 +2831,7 @@ class TestGetBookSummaryWarnings:
         result = gc.get_book_summary()
         assert "Warnings:" in result
         warnings_block = result.split("Warnings:")[1].split(
-            "Accounts:"
+            "Chart of accounts:"
         )[0]
         assert "Stale price: WILD no price on file" in warnings_block
 
@@ -2750,7 +2915,7 @@ class TestGetBookSummaryWarnings:
         result = gc.get_book_summary()
         assert "Warnings:" in result
         warnings_block = result.split("Warnings:")[1].split(
-            "Accounts:"
+            "Chart of accounts:"
         )[0]
         assert "EUR" in warnings_block
         assert "Stale price" in warnings_block
@@ -2773,7 +2938,7 @@ class TestGetBookSummaryWarnings:
         result = gc.get_book_summary()
         if "Warnings:" in result:
             warnings_block = result.split("Warnings:")[1].split(
-                "Accounts:"
+                "Chart of accounts:"
             )[0]
             assert "UNUSED" not in warnings_block
 
@@ -2786,7 +2951,7 @@ class TestGetBookSummaryWarnings:
         result = gc.get_book_summary()
         if "Warnings:" in result:
             warnings_block = result.split("Warnings:")[1].split(
-                "Accounts:"
+                "Chart of accounts:"
             )[0]
             # USD is the fixture's default currency.
             assert "USD" not in warnings_block.replace(
@@ -2813,7 +2978,7 @@ class TestGetBookSummaryWarnings:
         result = gc.get_book_summary()
         assert "Warnings:" in result
         warnings_block = result.split("Warnings:")[1].split(
-            "Accounts:"
+            "Chart of accounts:"
         )[0]
         assert "Overdue scheduled" in warnings_block
         assert "Overdue Rent" in warnings_block
@@ -2838,7 +3003,7 @@ class TestGetBookSummaryWarnings:
         result = gc.get_book_summary()
         if "Warnings:" in result:
             warnings_block = result.split("Warnings:")[1].split(
-                "Accounts:"
+                "Chart of accounts:"
             )[0]
             assert "Disabled Schedule" not in warnings_block
 
@@ -2881,7 +3046,7 @@ class TestGetBookSummaryWarnings:
         )
         result = gc.get_book_summary()
         warnings_block = result.split("Warnings:")[1].split(
-            "Accounts:"
+            "Chart of accounts:"
         )[0]
         assert "Critically low cash: Savings" in warnings_block
         assert "under 1 day of its own outflow" in warnings_block
@@ -2946,7 +3111,7 @@ class TestGetBookSummaryWarnings:
         result = gc.get_book_summary()
         if "Warnings:" in result:
             warnings_block = result.split("Warnings:")[1].split(
-                "Accounts:"
+                "Chart of accounts:"
             )[0]
             assert "Critically low cash" not in warnings_block
 
@@ -2974,7 +3139,7 @@ class TestGetBookSummaryWarnings:
         result = gc.get_book_summary()
         if "Warnings:" in result:
             warnings_block = result.split("Warnings:")[1].split(
-                "Accounts:"
+                "Chart of accounts:"
             )[0]
             assert "Empty Savings" not in warnings_block
 
@@ -3020,7 +3185,7 @@ class TestGetBookSummaryWarnings:
         result = gc.get_book_summary()
         if "Warnings:" in result:
             warnings_block = result.split("Warnings:")[1].split(
-                "Accounts:"
+                "Chart of accounts:"
             )[0]
             assert "Roth IRA" not in warnings_block
 
@@ -3061,7 +3226,7 @@ class TestGetBookSummaryWarnings:
         result = gc.get_book_summary()
         if "Warnings:" in result:
             warnings_block = result.split("Warnings:")[1].split(
-                "Accounts:"
+                "Chart of accounts:"
             )[0]
             # Not a cash-flow alarm...
             assert "Critically low cash: Imbalance-USD" not in warnings_block
@@ -3095,7 +3260,7 @@ class TestGetBookSummaryWarnings:
         result = gc.get_book_summary()
         if "Warnings:" in result:
             warnings_block = result.split("Warnings:")[1].split(
-                "Accounts:"
+                "Chart of accounts:"
             )[0]
             assert "Critically low cash" not in warnings_block
 
@@ -3124,7 +3289,7 @@ class TestGetBookSummaryWarnings:
         result = gc.get_book_summary()
         assert "Warnings:" in result
         warnings_block = result.split("Warnings:")[1].split(
-            "Accounts:"
+            "Chart of accounts:"
         )[0]
         assert "Past due invoice" in warnings_block
         assert "Acme Corp" in warnings_block
@@ -3156,7 +3321,7 @@ class TestGetBookSummaryWarnings:
         )
         result = gc.get_book_summary()
         warnings_block = result.split("Warnings:")[1].split(
-            "Accounts:"
+            "Chart of accounts:"
         )[0]
         assert "Past due bill" in warnings_block
         assert "Office Depot" in warnings_block
@@ -3192,7 +3357,7 @@ class TestGetBookSummaryWarnings:
         )
         result = gc.get_book_summary()
         warnings_block = result.split("Warnings:")[1].split(
-            "Accounts:"
+            "Chart of accounts:"
         )[0]
         assert "Past due invoice" in warnings_block
         assert "No Terms Co" in warnings_block
@@ -3273,7 +3438,7 @@ class TestGetBookSummaryWarnings:
         )
         result = gc.get_book_summary()
         warnings_block = result.split("Warnings:")[1].split(
-            "Accounts:"
+            "Chart of accounts:"
         )[0]
         # Net 30 + 85 days posted = 55 days overdue.
         assert "Berlin Digital" in warnings_block
@@ -3312,7 +3477,7 @@ class TestGetBookSummaryWarnings:
         result = gc.get_book_summary()
         if "Warnings:" in result:
             warnings_block = result.split("Warnings:")[1].split(
-                "Accounts:"
+                "Chart of accounts:"
             )[0]
             assert "Prompt Payer" not in warnings_block
 
@@ -3331,7 +3496,7 @@ class TestGetBookSummaryWarnings:
         result = gc.get_book_summary()
         if "Warnings:" in result:
             warnings_block = result.split("Warnings:")[1].split(
-                "Accounts:"
+                "Chart of accounts:"
             )[0]
             assert "Draft Co" not in warnings_block
 
@@ -3351,7 +3516,7 @@ class TestGetBookSummaryWarnings:
         result = gc.get_book_summary()
         assert "Warnings:" in result
         warnings_idx = result.index("Warnings:")
-        accounts_idx = result.index("Accounts:")
+        accounts_idx = result.index("Chart of accounts:")
         assert warnings_idx < accounts_idx
 
 
@@ -4040,7 +4205,7 @@ class TestGetBookSummaryOverdraft:
     def _warnings(result: str) -> str:
         if "Warnings:" not in result:
             return ""
-        return result.split("Warnings:")[1].split("Accounts:")[0]
+        return result.split("Warnings:")[1].split("Chart of accounts:")[0]
 
     def test_overdrawn_checking_beside_healthy_savings(
         self, test_book: Path,
@@ -14628,7 +14793,11 @@ class TestFrequentAccounts:
                 ],
             )
         summary = gc.get_book_summary()
-        assert "Frequently used accounts (last 180 days):" in summary
+        assert (
+            "Frequently used accounts (last 180 days — any account "
+            "parameter accepts the %guid or the full name; a %guid is "
+            "fewer tokens and faster to write):"
+        ) in summary
         section = summary.split("Frequently used accounts")[1]
         lines = [
             ln.strip() for ln in section.split("\n")[1:]
@@ -15341,13 +15510,13 @@ class TestDashboardHonestFailure:
         monkeypatch.setattr(GnuCashBook, "get_backup_health", boom)
         result = GnuCashBook(str(test_book)).get_book_summary()
         assert "Warnings:" in result
-        warnings_block = result.split("Warnings:")[1].split("Accounts:")[0]
+        warnings_block = result.split("Warnings:")[1].split("Chart of accounts:")[0]
         assert (
             "⚠ Backup-health check failed: RuntimeError: "
             "backup state unreadable"
         ) in warnings_block
         assert warnings_block.count("check failed") == 1
-        assert "Accounts:" in result
+        assert "Chart of accounts:" in result
 
     def test_per_item_failures_are_one_line_with_a_count(
         self, business_book: Path, monkeypatch,
@@ -15378,7 +15547,7 @@ class TestDashboardHonestFailure:
 
         monkeypatch.setattr(GnuCashBook, "_resolve_invoice_due_date", boom)
         result = gb.get_book_summary()
-        warnings_block = result.split("Warnings:")[1].split("Accounts:")[0]
+        warnings_block = result.split("Warnings:")[1].split("Chart of accounts:")[0]
         assert (
             "⚠ Overdue-document check failed: RuntimeError: "
             "terms unreadable — 2 documents skipped"

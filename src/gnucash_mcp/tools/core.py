@@ -161,7 +161,9 @@ def register(mcp, get_book) -> None:
         transactions by text or amount, use ``search_transactions``.
 
         Args:
-            root: Filter to a subtree (e.g., "Expenses" for expense accounts only).
+            root: Subtree to list. Account name ("Assets:Checking") or %short guid ("%d53d547").
+                Prefix-matched on the path, so a second-level
+                branch ("Expenses:Auto") works too.
             verbose: If false (default), compact text output — optimized
                 for reading and token efficiency. If true, structured
                 JSON, for when you need machine-readable fields rather
@@ -194,7 +196,7 @@ def register(mcp, get_book) -> None:
         (APR, credit_limit, ...).
 
         Args:
-            name: Account ref: full path (e.g. 'Assets:Bank:Checking'), %short GUID, or full 32-char GUID
+            name: Account name ("Assets:Checking") or %short guid ("%d53d547").
         """
         book = get_book()
         result = book.get_account(name)
@@ -214,7 +216,7 @@ def register(mcp, get_book) -> None:
         an explicit ``as_of_date`` past today.
 
         Args:
-            account_name: Account ref: full path (e.g. 'Assets:Bank:Checking'), %short GUID, or full 32-char GUID
+            account_name: Account name ("Assets:Checking") or %short guid ("%d53d547").
             as_of_date: Date in ISO format (YYYY-MM-DD). Defaults to today.
         """
         book = get_book()
@@ -274,7 +276,8 @@ def register(mcp, get_book) -> None:
         full breakdown.
 
         Args:
-            account: Filter by account name (switches output to register form)
+            account: Account name ("Assets:Checking") or %short guid ("%d53d547").
+                Filtering switches output to register form.
             start_date: Start date in ISO format (YYYY-MM-DD)
             end_date: End date in ISO format (YYYY-MM-DD)
             limit: Page size (default 50, max 250). 0 = count only.
@@ -342,6 +345,12 @@ def register(mcp, get_book) -> None:
 
             ref<TAB>date<TAB>description<TAB>amt1<TAB>acct1<TAB>amt2<TAB>acct2...
             1<TAB>2026-05-21<TAB>Gas<TAB>-54.19<TAB>Assets:Checking<TAB>54.19<TAB>Expenses:Auto:Fuel
+
+        An ``acct`` cell is an account name ("Assets:Checking") or a
+        %short guid ("%d53d547") as list_accounts prints them.
+        In wide batches, %guids in ``acct`` cells shrink the payload;
+        nothing is lost — the audit log records the resolved account
+        names regardless of which form the call used.
 
         Two opt-in extensions, each activated by naming it in the
         header (legacy headers parse exactly as before):
@@ -572,8 +581,12 @@ def register(mcp, get_book) -> None:
         ``raw``, ``match``, ``num``, ``link``, ``amount``
         (required), then optional
         ``amt, acct, memo, qty`` counter-split groups (batch
-        grammar). The statement account's own leg is SYNTHESIZED —
-        never a column. Dry-run typically needs only::
+        grammar; an ``acct`` cell is an account name or %short guid).
+        The statement account's own leg is SYNTHESIZED — never a
+        column. In wide batches, %guids in ``acct`` cells shrink the
+        payload; nothing is lost — the audit log records the resolved
+        account names regardless of which form the call used. Dry-run
+        typically needs only::
 
             ref<TAB>date<TAB>raw<TAB>amount
             1<TAB>2026-07-03<TAB>POS DEBIT WHOLEFDS #123<TAB>-87.12
@@ -646,7 +659,7 @@ def register(mcp, get_book) -> None:
         returns just ``summary`` + ``results``).
 
         Args:
-            account: Statement account ref (path, %short, or GUID).
+            account: Statement account. Account name ("Assets:Checking") or %short guid ("%d53d547").
                 BANK/CASH/ASSET/CREDIT/LIABILITY only.
             statement_date: The statement's closing date
                 (YYYY-MM-DD); every touched split reconciles at it.
@@ -752,8 +765,8 @@ def register(mcp, get_book) -> None:
             account_type: One of ASSET, BANK, CASH, CREDIT, EQUITY,
                 EXPENSE, INCOME, LIABILITY, MUTUAL, STOCK, RECEIVABLE,
                 PAYABLE.
-            parent: Parent account ref (full path, %short GUID, or full
-                32-char GUID). Omit for top-level.
+            parent: Parent account. Account name ("Assets:Checking") or %short guid ("%d53d547").
+                Omit for top-level.
             description: Optional description.
             placeholder: Container-only account. Default False.
             commodity: ISO currency code ("USD") or stock/fund symbol
@@ -792,7 +805,7 @@ def register(mcp, get_book) -> None:
         """Update an existing account's properties.
 
         Args:
-            name: Account ref to update (full path e.g. "Expenses:Groceries", %short GUID, or full 32-char GUID)
+            name: Account to update. Account name ("Assets:Checking") or %short guid ("%d53d547").
             new_name: New name for the account (just the leaf name, not full path)
             description: New description
             placeholder: New placeholder status (true = container only)
@@ -835,8 +848,8 @@ def register(mcp, get_book) -> None:
         rename in place instead of moving.
 
         Args:
-            name: Account ref to move (full path e.g. "Expenses:Old:Account", %short GUID, or full 32-char GUID)
-            new_parent: New parent account ref (full path, %short GUID, or full 32-char GUID)
+            name: Account to move. Account name ("Assets:Checking") or %short guid ("%d53d547").
+            new_parent: New parent. Account name ("Assets:Checking") or %short guid ("%d53d547").
         """
         book = get_book()
         result = book.move_account(name=name, new_parent=new_parent)
@@ -851,7 +864,7 @@ def register(mcp, get_book) -> None:
         Safeguards prevent deletion if the account has children or transactions.
 
         Args:
-            name: Account ref to delete (full path, %short GUID, or full 32-char GUID)
+            name: Account to delete. Account name ("Assets:Checking") or %short guid ("%d53d547").
         """
         book = get_book()
         result = book.delete_account(name=name)

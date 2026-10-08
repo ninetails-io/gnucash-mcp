@@ -55,15 +55,20 @@ Last entry: 2026-04-30 (today) (1 future-dated, latest 2026-05-31)
 Warnings:
   ⚠ Past due invoice: Berlin Digital GmbH 58 days overdue, EUR 4,200.00
   ⚠ Stale price: GBP last updated 150 days ago
-Accounts: 108 total
-Assets: 12 accounts, USD 602680.49
+Chart of accounts (108 active) — drill into any branch with list_accounts(root="Assets:Investments"):
+  Assets (20): Investments (8), Current Assets (4), Fixed Assets (3), Receivables (3)
+  Liabilities (8): Credit Card (3), Loans (3)
+  Equity (2)
+  Income (10): Investment Income (4)
+  Expenses (56): Taxes (8), Business (7), Utilities (6), Housing (5), Auto (4), Insurance (4), Interest (4), Pet (3)
+Assets: USD 602680.49
   Condo: USD 473250.00
   VTSAX: 230.7620 VTSAX @ 170.99 (USD 39457.99)
   Vehicle: USD 27845.00
   401k: USD 13404.62
   Checking Account: USD 12393.11
   ...
-Liabilities: 4 accounts, USD 418457.79
+Liabilities: USD 418457.79
   Credit cards (2): USD 38044.26
   Loans (2): USD 380413.53
   Top 3: Mortgage USD 372199.55, Chase Sapphire USD 22383.23, Business Amex USD 15661.03

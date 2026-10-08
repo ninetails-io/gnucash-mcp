@@ -42,7 +42,8 @@ def register(mcp, get_book) -> None:
         notes: BusinessNotes = "",
         address: BusinessAddressInput | None = None,
     ) -> str:
-        """Create a customer, vendor, or employee.
+        """Create a customer (client), vendor (supplier, contractor,
+        payee), or employee record.
 
         Additive: each call creates a fresh party — names are NOT
         checked for duplicates, so list_parties first when unsure.
@@ -52,8 +53,10 @@ def register(mcp, get_book) -> None:
         party_type is required everywhere.
 
         Args:
-            party_type: "customer" (pays you), "vendor" (you pay),
-                or "employee" (expense-voucher workflows).
+            party_type: "customer" (a client who pays you — accounts
+                receivable), "vendor" (a supplier, contractor, or
+                payee you pay — accounts payable), or "employee"
+                (expense-voucher workflows).
             name: Party name (e.g., "Acme Corp", "Jane Smith").
             currency: ISO currency code (e.g., "USD", "EUR").
                 Defaults to book's default currency.
@@ -331,7 +334,7 @@ def register(mcp, get_book) -> None:
                 ``type``: "value" or "percentage".
                 ``amount``: positive decimal as string. Percentages
                 are the rate ("5.00" = 5%, not "0.05").
-                ``account``: account path, %short-guid, or full GUID.
+                ``account``: Account name ("Assets:Checking") or %short guid ("%d53d547").
                 Must be ASSET or LIABILITY type. All entries on a
                 single taxtable must reference accounts in the same
                 commodity.
@@ -460,8 +463,9 @@ def register(mcp, get_book) -> None:
         applies_to_id: str | None = None,
         force: bool = False,
     ) -> str:
-        """Create a customer invoice, vendor bill, employee expense
-        voucher, or credit note.
+        """Create a customer invoice (accounts receivable), vendor
+        bill (accounts payable), employee expense voucher, or credit
+        note (credit memo).
 
         The owner side derives from the document type — invoice →
         customer, bill → vendor, voucher → employee. Credit notes
@@ -478,7 +482,8 @@ def register(mcp, get_book) -> None:
                 vouchers). ID counters are per type.
             party_type: Required for credit notes only ("customer"
                 or "vendor" — which side the credit belongs to).
-                Derived from document_type otherwise.
+                Omit for invoices, bills, and vouchers; it is
+                derived from document_type.
             date_opened: ISO date. Defaults to today (echoed in the
                 response).
             notes: Optional notes (max 4096 characters).
@@ -594,8 +599,8 @@ def register(mcp, get_book) -> None:
                 "credit_note".
             id: Document ID (e.g., "000001").
             account: Income account for invoices / credit notes;
-                expense account for bills and vouchers. Full path,
-                %short GUID, or full GUID.
+                expense account for bills and vouchers.
+                Account name ("Assets:Checking") or %short guid ("%d53d547").
             description: Line item description.
             quantity: Quantity as a decimal string (e.g., "3").
             price: Unit price as a decimal string (e.g., "125.00").
@@ -841,8 +846,11 @@ def register(mcp, get_book) -> None:
             id: Document ID (e.g., "000001"). This is the
                 human-readable ID, not the internal GUID.
             document_type: "invoice", "bill", "voucher", or
-                "credit_note" — disambiguates when IDs collide
-                across per-type counters.
+                "credit_note". ID counters are PER TYPE, so invoice
+                "000001" and bill "000001" can both exist; an ID
+                that matches more than one document is refused
+                with the candidates listed unless this (plus
+                party_type for a credit note) is given.
             party_type: Owner side ("customer"/"vendor") — needed
                 only for credit notes, which exist on both sides.
         """
@@ -882,12 +890,16 @@ def register(mcp, get_book) -> None:
 
         Args:
             id: Document ID (e.g., "000001").
-            post_account: A/R or A/P account path (e.g., "Assets:Accounts Receivable").
+            post_account: The A/R or A/P account. Account name ("Assets:Checking") or %short guid ("%d53d547").
             post_date: Date in ISO format (YYYY-MM-DD). Defaults to today.
             due_date: Payment due date (YYYY-MM-DD). Optional.
             description: Description for the posting transaction. Optional.
             document_type: "invoice", "bill", "voucher", or
-                "credit_note" — disambiguates when IDs collide.
+                "credit_note". ID counters are PER TYPE, so invoice
+                "000001" and bill "000001" can both exist; an ID
+                that matches more than one document is refused
+                with the candidates listed unless this (plus
+                party_type for a credit note) is given.
             party_type: Owner side, credit notes only.
             force: Override the stale-FX-rate guard and post with a
                 7–90 day stale rate. Default False.
@@ -933,7 +945,11 @@ def register(mcp, get_book) -> None:
         Args:
             id: Document ID (e.g., "000001").
             document_type: "invoice", "bill", "voucher", or
-                "credit_note" — disambiguates when IDs collide.
+                "credit_note". ID counters are PER TYPE, so invoice
+                "000001" and bill "000001" can both exist; an ID
+                that matches more than one document is refused
+                with the candidates listed unless this (plus
+                party_type for a credit note) is given.
             party_type: Owner side, credit notes only.
         """
         owner_type = _document_owner_type(document_type, party_type)
@@ -965,8 +981,11 @@ def register(mcp, get_book) -> None:
         from_prepayment: bool = False,
         payment_account_amount: str | None = None,
     ) -> str:
-        """Record a payment against a posted customer invoice,
-        vendor bill, employee voucher, or credit note.
+        """Record a payment against a posted customer invoice
+        (receive a customer payment), vendor bill (pay a supplier),
+        employee voucher (reimburse an employee), or credit note
+        (refund). Handles partial payments, early-payment discounts,
+        cross-currency FX gain/loss, and prepayments.
 
         Creates a payment transaction from the specified bank/cash account
         to the document's A/R or A/P account. Partial payments are supported:
@@ -1037,20 +1056,24 @@ def register(mcp, get_book) -> None:
 
         Args:
             id: Document ID (e.g., "000001").
-            payment_account: Bank or cash account for payment (e.g.,
-                "Assets:Checking"). Required unless
-                ``from_prepayment``.
+            payment_account: Bank or cash account the payment moves
+                through. Account name ("Assets:Checking") or %short guid ("%d53d547").
+                Required unless ``from_prepayment``.
             amount: Payment amount as decimal string (e.g., "500.00"),
                 in the document's currency. Required unless
                 ``from_prepayment``.
             payment_date: Payment date (YYYY-MM-DD). Defaults to today.
             description: Description for the payment transaction. Optional.
             document_type: "invoice", "bill", "voucher", or
-                "credit_note" — disambiguates when IDs collide.
+                "credit_note". ID counters are PER TYPE, so invoice
+                "000001" and bill "000001" can both exist; an ID
+                that matches more than one document is refused
+                with the candidates listed unless this (plus
+                party_type for a credit note) is given.
             party_type: Owner side, credit notes only.
             fx_account: Optional INCOME or EXPENSE account to receive
                 realized FX gain/loss (cross-currency payments only).
-                Accepts a full path, %short GUID, or full 32-char GUID.
+                Account name ("Assets:Checking") or %short guid ("%d53d547").
             apply_discount: When True, treat this payment as the
                 final settlement and absorb the early-payment
                 discount from the invoice's billterm. Default False
@@ -1058,8 +1081,7 @@ def register(mcp, get_book) -> None:
                 (refunds don't take discounts).
             discount_account: Optional INCOME or EXPENSE account to
                 receive the discount split. Auto-resolves when
-                omitted. Accepts full path, %short GUID, or full
-                32-char GUID.
+                omitted. Account name ("Assets:Checking") or %short guid ("%d53d547").
             force: Override the stale-FX-rate guard. A cross-currency
                 payment etches the rate at pay time; if the latest
                 price is 7–90 days from the payment date the payment
