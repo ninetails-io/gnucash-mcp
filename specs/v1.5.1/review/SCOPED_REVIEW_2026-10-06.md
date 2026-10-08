@@ -64,9 +64,9 @@ reproduction script re-run against the fixed code.
 | IN-2 document ID skips the text gate | SERIOUS | Fixed, `3748c6a`. |
 | IN-3 business free text skips the gate | SERIOUS | Fixed, `3748c6a`: `_check_text` on every business writer, `pay_document` included. |
 | IN-4 a schedule starting 0001-01-01 breaks every listing | SERIOUS | Fixed, `3748c6a`: `_check_ledger_date`. |
-| IN-5 calendar guard and far-date warning only in the batch tool | MINOR | Range half fixed, `3748c6a`: every stored date passes `_check_ledger_date` where it binds. The far-date WARNING stays batch-only; listed. |
+| IN-5 calendar guard and far-date warning only in the batch tool | MINOR | Range half fixed, `3748c6a`: every stored date passes `_check_ledger_date` where it binds. The far-date warning half fixed on `fix/1.5.0-input-gaps`: `_far_date_warning` on update, post, pay and instantiate. |
 | IN-6 `create_prices` drops cells past the header | SERIOUS | Fixed, `3748c6a`: refused, naming the row. |
-| IN-7 representability bound checks magnitude and scale separately | MINOR | Open. Known limitations. |
+| IN-7 representability bound checks magnitude and scale separately | MINOR | Fixed on `fix/1.5.0-input-gaps`: the count of the commodity's smallest unit is checked per row (`_unit_count_error`), and a price's digits in `_check_price`. |
 | IN-8 BOM stripped by one of four parsers | MINOR | Fixed, `3748c6a`: `_tsv_lines`. |
 | IN-9 bill-term day counts unbounded | MINOR | Fixed, `de67dc1`: 36,500 at most. |
 | IN-10 account names accept C1 controls and line separators | MINOR | Fixed, `3748c6a`: `_validate_account_name` runs the control-character and one-line rules. |
@@ -79,8 +79,8 @@ reproduction script re-run against the fixed code.
 | IN-17 refusals name parameters the tool lacks | NIT | Fixed, `de67dc1`: `party_type`. |
 | IN-18 doubled backslash in three path cells | NIT | Fixed, `de67dc1`. |
 | IN-19 empty draft lists with `?` | NIT | Fixed, `de67dc1`: `0.00`. |
-| IN-20 small boundary inconsistencies | NIT | In part, `de67dc1`: a negative `offset` is refused. A report whose start is after its end still answers an empty total; listed. |
-| IN-21 URI-mode errors give the wrong cure | NIT | In part, `3748c6a`: the not-found cure names `GNUCASH_BOOK_URI`. piecash's `create_book` advice on a missing database still surfaces; listed. |
+| IN-20 small boundary inconsistencies | NIT | In part, `de67dc1`: a negative `offset` is refused. The rest fixed on `fix/1.5.0-input-gaps`: `_check_report_range` on every report, named statement balances, the "plain digits" cure on every `_to_decimal` refusal. |
+| IN-21 URI-mode errors give the wrong cure | NIT | In part, `3748c6a`: the not-found cure names `GNUCASH_BOOK_URI`. The rest fixed on `fix/1.5.0-input-gaps`: a missing database is `file_not_found` with the cure, not piecash's `create_book` advice. |
 | SR2-B1 `create_billterm` takes a multi-line name (bookkeeper's live pass) | SERIOUS | Fixed, `TestBookkeeperSecondLoop`: bill-term and tax-table names pass `_check_one_line`. |
 | SR2-B2 a 300-character document ID is accepted (bookkeeper's live pass) | — | Not a defect: GnuCash's `MAX_ID_LEN` is 2048 on every backend, and the gate is that width; the test plan misstated PostgreSQL's column. |
 | Q1 / Q2 (bookkeeper's queries) | — | Plan errors, corrected in the plan; Q2 also added the audit header as adoption evidence. Answers in `testing/BOOKKEEPER_REPORT_SECOND_REVIEW.md`. |

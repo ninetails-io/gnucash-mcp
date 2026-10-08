@@ -1249,7 +1249,19 @@ def _book_format_error(path: Path) -> str | None:
     one last saved by GnuCash 2.6, used to pass startup and fail
     every tool call with piecash's bare "Unsupported table versions"
     (adversarial review 2026-09-30, FC-14).
+
+    A path with a ``?`` in it is refused by name first: piecash
+    builds an unescaped ``sqlite:///`` URI from it, reads the rest as
+    a query string, and every tool call then failed with "Database …
+    does not exist" (scoped review 2026-10-05, S-9).
     """
+    if "?" in str(path):
+        return (
+            f"The path to {path.name} contains a '?', which the "
+            "database library this server uses cannot open. Rename "
+            "the file, or the folder it is in, without the '?', then "
+            "point the server at the new path."
+        )
     try:
         with open(path, "rb") as fh:
             head = fh.read(len(_SQLITE_MAGIC))

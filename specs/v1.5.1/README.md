@@ -48,7 +48,9 @@ branch). Find code by name, not by the review's line numbers.
 
 Three readers over the merged diff: `review/SCOPED_REVIEW_2026-10-05.md`
 holds the resolution table. All fixed on `fix/1.5.0-scoped-review`
-except S-9 (a `?` in the book path; pre-existing, listed).
+except S-9 (a `?` in the book path; pre-existing), now refused at
+startup by name on `fix/1.5.0-input-gaps`; opening such a path
+through a quoted URI is the remaining fix.
 
 ### The second scoped review of 2026-10-06
 
@@ -71,18 +73,29 @@ each listed under Known limitations in the CHANGELOG:
 - **BS-9** — the once-per-book marker leaves a 1.4.x server's later
   rows converted without a fresh snapshot (FC-20 names them).
   Re-arm the snapshot when a marked book shows a fingerprint.
-- **IN-7** — the representability bound should check the numerator
-  over the commodity's denominator, in the per-row validators.
-- **IN-5** (the warning half), **IN-20** (start after end;
-  `opening_balance` and statement-line amount errors could name
-  their field and cure), **IN-21** (piecash's `create_book` advice
-  on a missing database).
+- **IN-7** — closed on `fix/1.5.0-input-gaps`: `_unit_count_error`
+  checks the count of the commodity's smallest unit against int64 in
+  `_money_precision_error` and the share-quantity branch, and
+  `_check_price` checks a price's digits.
+- **IN-5** (the warning half) — closed on `fix/1.5.0-input-gaps`:
+  `_far_date_warning` speaks on update (single and batch), post,
+  pay and schedule instantiation, as the batch tool did.
+- **IN-20** — closed on `fix/1.5.0-input-gaps`: `_check_report_range`
+  refuses a report whose start is after its end; the statement
+  balances name their field; every `_to_decimal` refusal carries the
+  "plain digits" cure, and a statement line keeps it.
+- **IN-21** — closed on `fix/1.5.0-input-gaps`: `open()` reports a
+  missing database as `FileNotFoundError` with the cure, not
+  piecash's `create_book` advice.
 
 ### Not the server's code
 
 - **FC-18 — the bundled demo books are old piecash-format files.**
-  Belongs to the sample-book regeneration (`feat/demo-books-legal-
-  pass` and the round branches).
+  Closed by #202: no book is committed, and the builders make all
+  three from nothing through the server's own write paths (prices
+  through `create_prices`, splits through `_new_split`, schedule
+  stamps through one shared writer). A converting write on a fresh
+  build reports nothing to convert.
 
 ### Closed by ruling; do not pick up without a new one
 

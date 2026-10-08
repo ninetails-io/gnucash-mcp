@@ -2273,6 +2273,24 @@ class TestBookFormatSniff:
         book = _make_min_book(tmp_path / "ok.gnucash")
         assert _book_format_error(book) is None
 
+    def test_a_question_mark_in_the_path_is_refused_by_name(self, tmp_path):
+        """piecash reads a '?' in a sqlite path as a URI query string,
+        so the book passed startup and failed every call (S-9)."""
+        from gnucash_mcp.server import _book_format_error
+        in_name = _make_min_book(tmp_path / "q?x.gnucash")
+        msg = _book_format_error(in_name)
+        assert msg is not None and "contains a '?'" in msg
+        assert "q?x.gnucash" in msg and "Rename" in msg
+        folder = tmp_path / "Books?2026"
+        folder.mkdir()
+        in_folder = _make_min_book(folder / "ledger.gnucash")
+        assert "contains a '?'" in _book_format_error(in_folder)
+
+    def test_other_punctuation_in_the_path_still_passes(self, tmp_path):
+        from gnucash_mcp.server import _book_format_error
+        for name in ("sp ace.gnucash", "hash#1.gnucash", "pct%41.gnucash"):
+            assert _book_format_error(_make_min_book(tmp_path / name)) is None, name
+
     def test_xml_book_gets_save_as_message(self, tmp_path):
         from gnucash_mcp.server import _book_format_error
         p = tmp_path / "old.gnucash"

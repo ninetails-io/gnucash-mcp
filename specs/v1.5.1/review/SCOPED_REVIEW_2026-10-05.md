@@ -29,7 +29,7 @@ Totals: 6 SERIOUS, 21 MINOR, 5 NIT; no BLOCKER. Fixed on
 | S-6 shared intent file, fixed temp name | MINOR | Fixed, `767e3c9`: one intent per pid; `mkstemp`. |
 | S-7 / I-8 void and unvoid refused in a trading book | MINOR | Fixed with S-2. |
 | S-8 dispose skipped if close raises | NIT | Fixed, `767e3c9`. |
-| S-9 a `?` in the book path | NIT | Open; pre-existing. Listed under Known limitations. |
+| S-9 a `?` in the book path | NIT | Refused at startup by name on `fix/1.5.0-input-gaps` (`_book_format_error`), the review's second option. Opening it through a quoted URI remains; listed under Known limitations. |
 | S-10 startup check waits on a lock | NIT | Fixed, `767e3c9`: a one-second timeout. |
 | M-1 dashboard budget line at one rate | SERIOUS | Fixed, `4e536e0`; agreement test with the report. |
 | M-2 flow lines don't add up | MINOR | Fixed, `4e536e0`: the (category, month) cell is the rounding grain everywhere. |

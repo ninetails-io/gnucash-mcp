@@ -2233,3 +2233,199 @@ class TestBookkeeperSecondLoop:
         (plain / "audit").mkdir(parents=True)
         monkeypatch.setenv("GNUCASH_LOG_DIR", str(logs))
         assert resolve_mcp_dir(b) == plain
+
+
+def _rows(result) -> dict[str, dict]:
+    """``{ref: row}`` from a batch tool's results TSV."""
+    lines = result["results"].splitlines()
+    head = lines[0].split("\t")
+    return {r[0]: dict(zip(head, r)) for r in (ln.split("\t") for ln in lines[1:])}
+
+
+class TestIN7AmountsFitGnuCashsNumerator:
+    """GnuCash stores an amount as a 64-bit count of its commodity's
+    smallest unit. An amount under ``_to_decimal``'s magnitude bound
+    can still overflow that count (10^16 dollars is 10^18 cents);
+    it passed the dry run and then failed the whole batch at commit,
+    taking the good rows with it (second scoped review IN-7)."""
+
+    _HUGE = "99999999999999999"  # 1e17 cents, over 2**63
+
+    def _row(self, ref, amount):
+        return {
+            "ref": ref, "date": date(2026, 5, 10), "description": f"Row {ref}",
+            "splits": [
+                {"account": "Expenses:Groceries", "amount": amount},
+                {"account": "Assets:Checking", "amount": f"-{amount}"},
+            ],
+        }
+
+    def test_the_row_is_refused_in_the_dry_run(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        rows = _rows(gb.create_transactions(
+            [self._row("1", "12.00"), self._row("2", self._HUGE)],
+            dry_run=True, on_error="skip",
+        ))
+        assert rows["1"]["status"] == "would_create"
+        assert rows["2"]["status"] == "rejected"
+        assert "too large to store in USD" in rows["2"]["reason"]
+
+    def test_the_good_row_survives_the_commit(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        before = _q(test_book, "select count(*) from transactions")[0][0]
+        rows = _rows(gb.create_transactions(
+            [self._row("1", "12.00"), self._row("2", self._HUGE)],
+            on_error="skip",
+        ))
+        assert rows["1"]["status"] == "created"
+        assert rows["2"]["status"] == "rejected"
+        assert _q(test_book, "select count(*) from transactions")[0][0] == before + 1
+
+    def test_the_largest_storable_amount_is_accepted(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        largest = str((Decimal(2**63 - 1) / 100).quantize(Decimal("0.01")))
+        rows = _rows(gb.create_transactions(
+            [self._row("1", largest)], dry_run=True,
+        ))
+        assert rows["1"]["status"] == "would_create", rows
+
+    def test_a_price_with_too_many_digits_is_refused(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        gb.create_commodity(mnemonic="VTSAX", fullname="Vanguard Total",
+                            namespace="FUND")
+        rows = _rows(gb.create_prices([
+            {"ref": "1", "commodity": "VTSAX", "date": date(2026, 5, 10),
+             "value": "148.32"},
+            {"ref": "2", "commodity": "VTSAX", "date": date(2026, 5, 11),
+             "value": "12345678.123456789012"},
+        ], on_error="skip"))
+        assert rows["1"]["status"] == "created"
+        assert rows["2"]["status"] == "rejected"
+        assert "too many digits" in rows["2"]["reason"]
+        with pytest.raises(ValueError, match="too many digits"):
+            gb.create_price(commodity="VTSAX", namespace="FUND",
+                            value="12345678.123456789012",
+                            price_date=date(2026, 5, 12))
+
+
+class TestIN5EveryDatedWriteWarnsOfASlippedYear:
+    """The batch tool warned of a date more than a year ahead (C34);
+    update, post, pay and instantiate stored 2200 without a word
+    (second scoped review IN-5). One helper, ``_far_date_warning``,
+    now speaks on every path. A warning, never a refusal."""
+
+    FAR = date.today() + timedelta(days=800)
+
+    def _spend(self, gb):
+        return gb.create_transaction(
+            description="Lunch", trans_date=date.today(),
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "10.00"},
+                {"account": "Assets:Checking", "amount": "-10.00"},
+            ],
+            check_duplicates=False,
+        )["guid"]
+
+    def test_update_transaction(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        guid = self._spend(gb)
+        result = gb.update_transaction(guid, trans_date=self.FAR)
+        far = [w for w in result.get("warnings", []) if w["type"] == "far_date"]
+        assert far and "more than a year ahead" in far[0]["message"], result
+
+    def test_update_transactions(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        guid = self._spend(gb)
+        rows = _rows(gb.update_transactions([{"guid": guid, "date": self.FAR}]))
+        (row,) = rows.values()
+        assert row["status"] == "updated"
+        assert "more than a year ahead" in row["reason"]
+
+    def test_post_and_pay(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme")
+        inv = gb.create_invoice(customer_id="000001",
+                                date_opened=self.FAR.isoformat())
+        gb.add_invoice_entry(
+            invoice_id=inv["id"], account="Income:Sales",
+            description="Work", quantity="1", price="100.00",
+        )
+        posted = gb.post_invoice(inv["id"], AR, post_date=self.FAR.isoformat())
+        assert "more than a year ahead" in posted["date_warning"]
+        paid = gb.pay_invoice(
+            invoice_id=inv["id"], payment_account="Assets:Checking",
+            amount="40.00", payment_date=self.FAR.isoformat(),
+        )
+        assert "more than a year ahead" in paid["date_warning"]
+
+    def test_schedule_instance(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        sx = gb.create_scheduled_transaction(
+            name="Rent", description="Rent",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "100.00"},
+                {"account": "Assets:Checking", "amount": "-100.00"},
+            ],
+            start_date=date.today().isoformat(), frequency="monthly",
+        )
+        made = gb.create_transaction_from_scheduled(
+            sx["guid"], transaction_date=self.FAR.isoformat(),
+        )
+        assert made["status"] == "created"
+        assert "more than a year ahead" in made["date_warning"]
+
+    def test_an_ordinary_date_says_nothing(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        guid = self._spend(gb)
+        result = gb.update_transaction(guid, trans_date=date.today())
+        assert not [w for w in result.get("warnings", [])
+                    if w["type"] == "far_date"]
+
+
+class TestIN20RangesAndAmountsSayWhatIsWrong:
+    """Second scoped review IN-20: a report whose start is after its
+    end answered an empty total without comment; ``opening_balance=
+    "2,850.00"`` errored without naming the field; a statement line's
+    bad amount lost the "use plain digits" cure."""
+
+    @pytest.mark.parametrize("report", [
+        "spending_by_category", "income_by_source", "cash_flow",
+    ])
+    def test_a_report_whose_start_is_after_its_end_is_refused(
+        self, test_book, report,
+    ):
+        gb = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match="is after end_date.*Swap the dates"):
+            getattr(gb, report)(date(2026, 6, 30), date(2026, 6, 1))
+
+    def test_net_worth_and_the_vendor_report_too(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match="is after end_date"):
+            gb.net_worth(date(2026, 6, 1), start_date=date(2026, 6, 30),
+                         interval="month")
+        with pytest.raises(ValueError, match="is after end_date"):
+            gb.vendor_spending_report("2026-06-30", "2026-06-01")
+
+    def test_a_one_day_range_still_runs(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        gb.spending_by_category(date(2026, 6, 1), date(2026, 6, 1))
+
+    def test_the_balance_errors_name_their_field(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        line = [{"ref": "1", "date": date(2026, 5, 10), "amount": "-5.00",
+                 "description": "Coffee", "splits": []}]
+        with pytest.raises(ValueError, match=r"^opening_balance: .*plain digits"):
+            gb.enter_statement("Assets:Checking", date(2026, 5, 31),
+                               "2,850.00", "2845.00", line)
+        with pytest.raises(ValueError, match=r"^closing_balance: .*plain digits"):
+            gb.enter_statement("Assets:Checking", date(2026, 5, 31),
+                               "2850.00", "2,845.00", line)
+
+    def test_a_line_amount_keeps_its_cure(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match=r"^line 1: .*'1,234\.00'.*plain digits"):
+            gb.enter_statement(
+                "Assets:Checking", date(2026, 5, 31), "0.00", "1234.00",
+                [{"ref": "1", "date": date(2026, 5, 10), "amount": "1,234.00",
+                  "description": "Deposit", "splits": []}],
+            )
