@@ -2233,3 +2233,76 @@ class TestBookkeeperSecondLoop:
         (plain / "audit").mkdir(parents=True)
         monkeypatch.setenv("GNUCASH_LOG_DIR", str(logs))
         assert resolve_mcp_dir(b) == plain
+
+
+def _rows(result) -> dict[str, dict]:
+    """``{ref: row}`` from a batch tool's results TSV."""
+    lines = result["results"].splitlines()
+    head = lines[0].split("\t")
+    return {r[0]: dict(zip(head, r)) for r in (ln.split("\t") for ln in lines[1:])}
+
+
+class TestIN7AmountsFitGnuCashsNumerator:
+    """GnuCash stores an amount as a 64-bit count of its commodity's
+    smallest unit. An amount under ``_to_decimal``'s magnitude bound
+    can still overflow that count (10^16 dollars is 10^18 cents);
+    it passed the dry run and then failed the whole batch at commit,
+    taking the good rows with it (second scoped review IN-7)."""
+
+    _HUGE = "99999999999999999"  # 1e17 cents, over 2**63
+
+    def _row(self, ref, amount):
+        return {
+            "ref": ref, "date": date(2026, 5, 10), "description": f"Row {ref}",
+            "splits": [
+                {"account": "Expenses:Groceries", "amount": amount},
+                {"account": "Assets:Checking", "amount": f"-{amount}"},
+            ],
+        }
+
+    def test_the_row_is_refused_in_the_dry_run(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        rows = _rows(gb.create_transactions(
+            [self._row("1", "12.00"), self._row("2", self._HUGE)],
+            dry_run=True, on_error="skip",
+        ))
+        assert rows["1"]["status"] == "would_create"
+        assert rows["2"]["status"] == "rejected"
+        assert "too large to store in USD" in rows["2"]["reason"]
+
+    def test_the_good_row_survives_the_commit(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        before = _q(test_book, "select count(*) from transactions")[0][0]
+        rows = _rows(gb.create_transactions(
+            [self._row("1", "12.00"), self._row("2", self._HUGE)],
+            on_error="skip",
+        ))
+        assert rows["1"]["status"] == "created"
+        assert rows["2"]["status"] == "rejected"
+        assert _q(test_book, "select count(*) from transactions")[0][0] == before + 1
+
+    def test_the_largest_storable_amount_is_accepted(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        largest = str((Decimal(2**63 - 1) / 100).quantize(Decimal("0.01")))
+        rows = _rows(gb.create_transactions(
+            [self._row("1", largest)], dry_run=True,
+        ))
+        assert rows["1"]["status"] == "would_create", rows
+
+    def test_a_price_with_too_many_digits_is_refused(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        gb.create_commodity(mnemonic="VTSAX", fullname="Vanguard Total",
+                            namespace="FUND")
+        rows = _rows(gb.create_prices([
+            {"ref": "1", "commodity": "VTSAX", "date": date(2026, 5, 10),
+             "value": "148.32"},
+            {"ref": "2", "commodity": "VTSAX", "date": date(2026, 5, 11),
+             "value": "12345678.123456789012"},
+        ], on_error="skip"))
+        assert rows["1"]["status"] == "created"
+        assert rows["2"]["status"] == "rejected"
+        assert "too many digits" in rows["2"]["reason"]
+        with pytest.raises(ValueError, match="too many digits"):
+            gb.create_price(commodity="VTSAX", namespace="FUND",
+                            value="12345678.123456789012",
+                            price_date=date(2026, 5, 12))

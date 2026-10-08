@@ -533,19 +533,42 @@ def _set_split_amounts(split, value, quantity) -> None:
     _lot_forget_flag(split.lot)
 
 
+# GnuCash stores an amount as a 64-bit count of its commodity's
+# smallest unit (gnc_numeric's int64 numerator over the fraction).
+_GNC_INT64_MAX = 2**63 - 1
+
+
+def _unit_count_error(amount, unit: Decimal, mnemonic: str,
+                      what: str) -> ValueError | None:
+    """The refusal for an amount whose count of ``unit`` does not fit
+    GnuCash's 64-bit numerator. ``_to_decimal`` bounds magnitude and
+    places separately, without knowing the commodity, so 10^16 dollars
+    (10^18 cents) passed the dry run and failed the whole batch at
+    commit (review IN-7). None when it fits."""
+    if abs(amount / unit) <= _GNC_INT64_MAX:
+        return None
+    largest = (Decimal(_GNC_INT64_MAX) * unit).normalize()
+    return ValueError(
+        f"{what}: {amount} is too large to store in {mnemonic} — "
+        f"GnuCash keeps an amount as a 64-bit count of its smallest "
+        f"unit, so the largest it can hold is {largest:f}"
+    )
+
+
 def _money_precision_error(amount, commodity, what: str) -> ValueError | None:
     """The refusal for money typed finer than its currency's unit
     (maintainer ruling, 2026-09-27): "12.345" dollars is a typo to
-    catch, not a value to round. None when the amount fits."""
+    catch, not a value to round, and for money too large to store
+    (``_unit_count_error``). None when the amount fits."""
     quantum = _commodity_quantum(commodity)
-    if amount == amount.quantize(quantum, ROUND_HALF_UP):
-        return None
-    places = max(-quantum.as_tuple().exponent, 0)
-    return ValueError(
-        f"{what}: {amount} carries finer precision than "
-        f"{commodity.mnemonic} allows ({places} decimals) — re-check "
-        f"the transcription"
-    )
+    if amount != amount.quantize(quantum, ROUND_HALF_UP):
+        places = max(-quantum.as_tuple().exponent, 0)
+        return ValueError(
+            f"{what}: {amount} carries finer precision than "
+            f"{commodity.mnemonic} allows ({places} decimals) — re-check "
+            f"the transcription"
+        )
+    return _unit_count_error(amount, quantum, commodity.mnemonic, what)
 
 
 def _all_slot_columns():

@@ -40,6 +40,7 @@ from gnucash_mcp.book._base import (
     _to_decimal,
     _unique_prefix,
     _check_text,
+    _GNC_INT64_MAX,
     _TEXT_WIDTH,
     _SLOT_TEXT_WIDTH,
 )
@@ -608,6 +609,15 @@ class InvestmentsMixin:
         if abs(amount.adjusted()) > 15:
             raise ValueError(
                 f"Price {value} is out of range for a price."
+            )
+        # A price is stored as its digits over a power of ten, a
+        # 64-bit numerator, before it is reduced: 12345678.123456789012
+        # passed the dry run and failed the batch at commit (IN-7).
+        digits = int("".join(map(str, amount.as_tuple().digits)))
+        if digits > _GNC_INT64_MAX:
+            raise ValueError(
+                f"Price {value} has too many digits to store; round "
+                f"it to fewer decimal places."
             )
         if comm.guid == resolved_currency.guid:
             raise ValueError(

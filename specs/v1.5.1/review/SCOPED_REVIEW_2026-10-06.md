@@ -66,7 +66,7 @@ reproduction script re-run against the fixed code.
 | IN-4 a schedule starting 0001-01-01 breaks every listing | SERIOUS | Fixed, `3748c6a`: `_check_ledger_date`. |
 | IN-5 calendar guard and far-date warning only in the batch tool | MINOR | Range half fixed, `3748c6a`: every stored date passes `_check_ledger_date` where it binds. The far-date WARNING stays batch-only; listed. |
 | IN-6 `create_prices` drops cells past the header | SERIOUS | Fixed, `3748c6a`: refused, naming the row. |
-| IN-7 representability bound checks magnitude and scale separately | MINOR | Open. Known limitations. |
+| IN-7 representability bound checks magnitude and scale separately | MINOR | Fixed on `fix/1.5.0-input-gaps`: the count of the commodity's smallest unit is checked per row (`_unit_count_error`), and a price's digits in `_check_price`. |
 | IN-8 BOM stripped by one of four parsers | MINOR | Fixed, `3748c6a`: `_tsv_lines`. |
 | IN-9 bill-term day counts unbounded | MINOR | Fixed, `de67dc1`: 36,500 at most. |
 | IN-10 account names accept C1 controls and line separators | MINOR | Fixed, `3748c6a`: `_validate_account_name` runs the control-character and one-line rules. |

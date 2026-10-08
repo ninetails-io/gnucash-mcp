@@ -71,8 +71,10 @@ each listed under Known limitations in the CHANGELOG:
 - **BS-9** — the once-per-book marker leaves a 1.4.x server's later
   rows converted without a fresh snapshot (FC-20 names them).
   Re-arm the snapshot when a marked book shows a fingerprint.
-- **IN-7** — the representability bound should check the numerator
-  over the commodity's denominator, in the per-row validators.
+- **IN-7** — closed on `fix/1.5.0-input-gaps`: `_unit_count_error`
+  checks the count of the commodity's smallest unit against int64 in
+  `_money_precision_error` and the share-quantity branch, and
+  `_check_price` checks a price's digits.
 - **IN-5** (the warning half), **IN-20** (start after end;
   `opening_balance` and statement-line amount errors could name
   their field and cure), **IN-21** (piecash's `create_book` advice

@@ -17,7 +17,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 import piecash
 
@@ -86,6 +86,8 @@ from gnucash_mcp.book._base import (
     _is_voided,
     _lot_forget_flag,
     _money_precision_error,
+    _unit_count_error,
+    _account_unit,
     _format_account_amount,
     _new_split,
     _no_price_if_rounded,
@@ -4581,14 +4583,22 @@ class CoreMixin:
             elif "quantity" in split:
                 quantity = _to_decimal(split["quantity"])
                 # A foreign-currency account holds money too; shares
-                # round at storage instead (_split_amounts).
+                # round at storage instead (_split_amounts), and must
+                # still fit once rounded (IN-7).
                 if account.commodity.namespace == "CURRENCY":
                     error = _money_precision_error(
                         quantity, account.commodity,
                         f"Split for '{ref}' quantity",
                     )
-                    if error:
-                        raise error
+                else:
+                    unit = _account_unit(account)
+                    error = _unit_count_error(
+                        quantity.quantize(unit, ROUND_HALF_UP), unit,
+                        account.commodity.mnemonic,
+                        f"Split for '{ref}' quantity",
+                    )
+                if error:
+                    raise error
                 if quantity * value < 0:
                     raise ValueError(
                         f"Split for '{ref}': quantity and value "
