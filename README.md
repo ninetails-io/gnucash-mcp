@@ -48,50 +48,57 @@ This is what your AI assistant sees when it opens one of the
 sample books — a complete financial dashboard in a single call:
 
 ```
-Book: samples/alex-chen-morales.gnucash
+Book: alex-chen-morales.gnucash
 Currency: USD
-Data range: 2025-01-01 to 2026-05-31
-Last entry: 2026-04-30 (today) (1 future-dated, latest 2026-05-31)
-Warnings:
-  ⚠ Past due invoice: Berlin Digital GmbH 58 days overdue, EUR 4,200.00
-  ⚠ Stale price: GBP last updated 150 days ago
-Accounts: 108 total
-Assets: 12 accounts, USD 602680.49
-  Condo: USD 473250.00
-  VTSAX: 230.7620 VTSAX @ 170.99 (USD 39457.99)
-  Vehicle: USD 27845.00
-  401k: USD 13404.62
-  Checking Account: USD 12393.11
+Data range: 2025-01-01 to 2026-10-07
+Last entry: 2026-10-07 (today)
+Accounts: 111 total
+Assets: 16 accounts, USD 874418.54
+  Condo: USD 475000.00
+  VTSAX: 461.8411 VTSAX @ 186.19 (USD 85990.19)
+  UWRP 403(b): USD 74778.40
+  Savings Account: USD 60000.00
+  Cascade Code LLC Checking: USD 41431.21
   ...
-Liabilities: 4 accounts, USD 418457.79
-  Credit cards (2): USD 38044.26
-  Loans (2): USD 380413.53
-  Top 3: Mortgage USD 372199.55, Chase Sapphire USD 22383.23, Business Amex USD 15661.03
-Receivables: 3 accounts, USD 10246.46
-  Accounts Receivable EUR: USD 4908.96
-  Accounts Receivable: USD 3500.00
-  Accounts Receivable CAD: USD 1837.50
+Liabilities: 5 accounts, USD 389687.80
+  Credit cards (2): USD 1312.00
+  Loans & other (2): USD 385873.30
+  Top 3: Mortgage USD 373846.80, Auto Loan USD 12026.50, Chase Sapphire USD 868.32
+Receivables: 2 accounts, USD 26549.45 (4 invoices, 0 overdue; included in Assets total)
+  Accounts Receivable: USD 22425.00
+  Accounts Receivable EUR: USD 4124.45
+Payables: 1 account, USD 2502.50 (1 bill, 0 overdue; included in Liabilities total)
+  Accounts Payable: USD 2502.50
+Jobs: 3 active
+Income: 9 active (11 total)
+Expenses: 54 active (64 total)
+Frequently used accounts (last 180 days):
+  %d53d547	Assets:Current Assets:Checking Account [BANK]
+  %51166e7	Liabilities:Credit Card:Chase Sapphire [CREDIT]
+  %ebc01f8	Expenses:Dining
+  ...
 Reconciliation:
-  Checking Account: 174 splits unreconciled (4 months behind, oldest: 2025-12-30) ⚠
-  7 accounts never reconciled ⚠
+  6 accounts current
 Net worth trajectory:
-  12mo ago: USD 187,925
-   6mo ago: USD 180,614
-   3mo ago: USD 191,350
-   1mo ago: USD 185,444
-       now: USD 184,223
-Monthly net (last 6 months):
-  Apr 2026 (MTD): -9,056
-  Mar 2026: +3,092
-  Feb 2026: +5,202
-  Jan 2026: +1,086
-  Dec 2025: +4,853
-  Nov 2025: -1,494
-Runway: 121 days (USD 84,579 liquid / USD 694/day burn)
-Budget (2026 Annual Budget): USD 24,600 spent / USD 22,800 expected by today (+8%)
-Transactions: 2473
-Scheduled: 13 recurring, none due in next 7 days
-Business: 4 customers, 2 vendors, 1 employee
+  12mo ago: USD 335,644
+   6mo ago: USD 382,097
+   3mo ago: USD 425,590
+   1mo ago: USD 444,400
+       now: USD 484,731
+Monthly net (income - expenses, last 6 months):
+  Oct 2026 (MTD): +12,049 (vs Sep 1-7: -1,523)
+  Sep 2026: +25,082
+  Aug 2026: +7,594
+  Jul 2026: +10,307
+  Jun 2026: +24,092
+  May 2026: +9,017
+Runway: 581 days (USD 247,767 liquid / USD 426/day cash out incl. debt paydown, 180-day avg; cards owe USD 1,312)
+Budget (2026 Annual Budget): USD 27,682 spent / USD 28,586 expected by today (-3%)
+Transactions: 2223
+Scheduled: 20 recurring, none due in next 7 days
+Business: 8 customers, 3 vendors
+Budgets: 2
+Commodities: AAPL, CAD, ETH, EUR, MSFT, USD, VBTLX, VTSAX
 ```
 
 That's not a screenshot — that's the AI's actual orientation
@@ -136,28 +143,32 @@ Pick one, point the server at it, and start asking questions.
 
 ### `samples/alex-chen-morales.gnucash` — Personal + freelance
 
-A Seattle-based independent software contractor with a US LLC.
-USD-default. ~141 accounts, ~2,475 transactions across 2025–
-2026. Has a mortgage, a brokerage with VTSAX/VBTLX/AAPL/MSFT/ETH
-holdings, a 401(k), four customers spanning USD/EUR/GBP/CAD with
-foreign-currency invoices, scheduled bills, a budget — pretty
-much everything the server can do, all in one book.
+A Seattle-based independent software contractor with a
+single-member LLC and a spouse on a hospital payroll. USD-default.
+111 accounts and over 2,000 transactions from 2025 to the build
+date. Has a mortgage, a brokerage with VTSAX/VBTLX/AAPL/MSFT/ETH
+holdings, a Solo 401(k) beside the spouse's 403(b), eight
+customers invoiced in USD, EUR and CAD, a subcontractor billed
+through A/P, Washington B&O tax, scheduled bills, budgets —
+pretty much everything the server can do, all in one book.
 
 ### `samples/lin-wei.gnucash` — Cross-border small business
 
 A Shenzhen-based small-business owner running a cross-border
-e-commerce operation. CNY-default. ~105 accounts, ~1,960
-transactions. Chinese-named customers paying in CNY, USD/EUR
-customers paying in foreign currency with realized FX gain/loss
-on rate moves, domestic Chinese investments (茅台, 宁德时代,
-ETFs), an LPR-based mortgage, mixed payment rails (checking +
-Alipay + WeChat Pay).
+e-commerce operation. CNY-default, on a native zh_CN chart. 101
+accounts and about 3,000 transactions. Chinese-named customers
+paying in CNY, USD/EUR customers paying in foreign currency with
+realized FX gain/loss on rate moves, domestic Chinese investments
+(宁德时代 and two ETFs), a part-time employee, an HKD credit card,
+a mortgage, and mixed payment rails (corporate account + Alipay +
+WeChat Pay).
 
 ### `samples/sabine-brenner.gnucash` — German freelancer, SKR03 chart
 
-A Munich-based freelance consultant. EUR-default, on a German
-SKR03 chart of accounts — every account name in German. ~110
-accounts, ~1,500 transactions. This is the i18n oracle: if a
+A Munich-based freelance designer. EUR-default, on a German
+SKR03 chart of accounts — every account name in German. 125
+accounts and about 1,900 transactions, with live VAT returns and a
+company car under the 1% rule. This is the i18n oracle: if a
 feature secretly assumes English account names or USD, Sabine's
 book is where it breaks.
 
