@@ -42,7 +42,8 @@ def register(mcp, get_book) -> None:
         notes: BusinessNotes = "",
         address: BusinessAddressInput | None = None,
     ) -> str:
-        """Create a customer, vendor, or employee.
+        """Create a customer (client), vendor (supplier, contractor,
+        payee), or employee record.
 
         Additive: each call creates a fresh party — names are NOT
         checked for duplicates, so list_parties first when unsure.
@@ -52,8 +53,10 @@ def register(mcp, get_book) -> None:
         party_type is required everywhere.
 
         Args:
-            party_type: "customer" (pays you), "vendor" (you pay),
-                or "employee" (expense-voucher workflows).
+            party_type: "customer" (a client who pays you — accounts
+                receivable), "vendor" (a supplier, contractor, or
+                payee you pay — accounts payable), or "employee"
+                (expense-voucher workflows).
             name: Party name (e.g., "Acme Corp", "Jane Smith").
             currency: ISO currency code (e.g., "USD", "EUR").
                 Defaults to book's default currency.
@@ -460,8 +463,9 @@ def register(mcp, get_book) -> None:
         applies_to_id: str | None = None,
         force: bool = False,
     ) -> str:
-        """Create a customer invoice, vendor bill, employee expense
-        voucher, or credit note.
+        """Create a customer invoice (accounts receivable), vendor
+        bill (accounts payable), employee expense voucher, or credit
+        note (credit memo).
 
         The owner side derives from the document type — invoice →
         customer, bill → vendor, voucher → employee. Credit notes
@@ -478,7 +482,8 @@ def register(mcp, get_book) -> None:
                 vouchers). ID counters are per type.
             party_type: Required for credit notes only ("customer"
                 or "vendor" — which side the credit belongs to).
-                Derived from document_type otherwise.
+                Omit for invoices, bills, and vouchers; it is
+                derived from document_type.
             date_opened: ISO date. Defaults to today (echoed in the
                 response).
             notes: Optional notes (max 4096 characters).
@@ -841,8 +846,11 @@ def register(mcp, get_book) -> None:
             id: Document ID (e.g., "000001"). This is the
                 human-readable ID, not the internal GUID.
             document_type: "invoice", "bill", "voucher", or
-                "credit_note" — disambiguates when IDs collide
-                across per-type counters.
+                "credit_note". ID counters are PER TYPE, so invoice
+                "000001" and bill "000001" can both exist; an ID
+                that matches more than one document is refused
+                with the candidates listed unless this (plus
+                party_type for a credit note) is given.
             party_type: Owner side ("customer"/"vendor") — needed
                 only for credit notes, which exist on both sides.
         """
@@ -887,7 +895,11 @@ def register(mcp, get_book) -> None:
             due_date: Payment due date (YYYY-MM-DD). Optional.
             description: Description for the posting transaction. Optional.
             document_type: "invoice", "bill", "voucher", or
-                "credit_note" — disambiguates when IDs collide.
+                "credit_note". ID counters are PER TYPE, so invoice
+                "000001" and bill "000001" can both exist; an ID
+                that matches more than one document is refused
+                with the candidates listed unless this (plus
+                party_type for a credit note) is given.
             party_type: Owner side, credit notes only.
             force: Override the stale-FX-rate guard and post with a
                 7–90 day stale rate. Default False.
@@ -933,7 +945,11 @@ def register(mcp, get_book) -> None:
         Args:
             id: Document ID (e.g., "000001").
             document_type: "invoice", "bill", "voucher", or
-                "credit_note" — disambiguates when IDs collide.
+                "credit_note". ID counters are PER TYPE, so invoice
+                "000001" and bill "000001" can both exist; an ID
+                that matches more than one document is refused
+                with the candidates listed unless this (plus
+                party_type for a credit note) is given.
             party_type: Owner side, credit notes only.
         """
         owner_type = _document_owner_type(document_type, party_type)
@@ -965,8 +981,11 @@ def register(mcp, get_book) -> None:
         from_prepayment: bool = False,
         payment_account_amount: str | None = None,
     ) -> str:
-        """Record a payment against a posted customer invoice,
-        vendor bill, employee voucher, or credit note.
+        """Record a payment against a posted customer invoice
+        (receive a customer payment), vendor bill (pay a supplier),
+        employee voucher (reimburse an employee), or credit note
+        (refund). Handles partial payments, early-payment discounts,
+        cross-currency FX gain/loss, and prepayments.
 
         Creates a payment transaction from the specified bank/cash account
         to the document's A/R or A/P account. Partial payments are supported:
@@ -1046,7 +1065,11 @@ def register(mcp, get_book) -> None:
             payment_date: Payment date (YYYY-MM-DD). Defaults to today.
             description: Description for the payment transaction. Optional.
             document_type: "invoice", "bill", "voucher", or
-                "credit_note" — disambiguates when IDs collide.
+                "credit_note". ID counters are PER TYPE, so invoice
+                "000001" and bill "000001" can both exist; an ID
+                that matches more than one document is refused
+                with the candidates listed unless this (plus
+                party_type for a credit note) is given.
             party_type: Owner side, credit notes only.
             fx_account: Optional INCOME or EXPENSE account to receive
                 realized FX gain/loss (cross-currency payments only).
