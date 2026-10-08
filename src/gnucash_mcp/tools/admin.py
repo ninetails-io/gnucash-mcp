@@ -46,7 +46,7 @@ def register(mcp, get_book) -> None:
         credit limit, reward rates, or any custom data.
 
         Args:
-            account: Account ref: full path (e.g., "Liabilities:Credit Cards:Capital One"), %short GUID, or full 32-char GUID.
+            account: Account name ("Assets:Checking") or %short guid ("%d53d547").
             key: Specific slot key to retrieve. If omitted, returns all slots.
         """
         book = get_book()
@@ -71,7 +71,7 @@ def register(mcp, get_book) -> None:
         Use for APR, credit limits, reward rates, or any per-account metadata.
 
         Args:
-            account: Account ref: full path (e.g., "Liabilities:Credit Cards:Capital One"), %short GUID, or full 32-char GUID.
+            account: Account name ("Assets:Checking") or %short guid ("%d53d547").
             key: Slot key (e.g., "apr", "credit_limit"). GnuCash's own keys (reconcile-info, lot-mgmt, ofx, import-map, placeholder, hidden, …) are refused; use update_account for placeholder.
             value: Slot value (always stored as string).
         """
@@ -102,7 +102,7 @@ def register(mcp, get_book) -> None:
         a removed key.
 
         Args:
-            account: Account ref: full path (e.g., "Liabilities:Credit Cards:Capital One"), %short GUID, or full 32-char GUID.
+            account: Account name ("Assets:Checking") or %short guid ("%d53d547").
             key: Slot key to remove.
         """
         book = get_book()

@@ -1197,12 +1197,36 @@ def _fmt_transaction_update(entry: dict) -> list[str]:
 
 
 
+def _resolve_tsv_split_refs(rows: list[dict]) -> None:
+    """Resolve the ``account`` ref of every split in ``rows`` (the
+    re-parsed TSV submissions) to its canonical full name, in place.
+
+    The dispatcher's ref-normalizer walks top-level params only; a
+    TSV blob is re-parsed by its handler, so its ``acct`` cells
+    reached the log exactly as the caller typed them — a ``%guid``
+    entry and a by-name entry of the same transaction wrote
+    different audit records. One book open for the whole entry:
+    every split is normalized in one call and handed back to its
+    row (spec PLAN_BOOK_SUMMARY_MAP, acceptance 3).
+    """
+    flat = [sp for row in rows for sp in (row.get("splits") or [])]
+    if not flat:
+        return
+    resolved = _normalize_account_refs_for_audit(
+        {"splits": flat}, "", "",
+    ).get("splits") or flat
+    it = iter(resolved)
+    for row in rows:
+        if row.get("splits"):
+            row["splits"] = [next(it) for _ in row["splits"]]
+
+
 def _fmt_transaction_create_batch(entry: dict) -> list[str]:
     """Batch create audits as N individual create blocks — one per
     committed transaction, each rendered like a single-entry create.
     Joins the submitted TSV (params) with the results TSV (after_state)
-    by ref. Account refs render as the caller supplied them (the TSV
-    isn't run through the audit ref-normalizer)."""
+    by ref. Account refs in ``acct`` cells render as canonical full
+    names whichever form the caller used (``_resolve_tsv_split_refs``)."""
     time_part = _extract_time(entry)
     params = entry.get("params") or {}
     after = entry.get("after_state") or {}
@@ -1210,6 +1234,10 @@ def _fmt_transaction_create_batch(entry: dict) -> list[str]:
     results = _parse_audit_tsv_rows(after.get("results") or "")
     created = [r for r in results if r.get("status") == "created"]
     rejected = [r for r in results if r.get("status") == "rejected"]
+    _resolve_tsv_split_refs(
+        [submitted[r["ref"]] for r in created
+         if r.get("ref", "") in submitted]
+    )
 
     lines = [
         f"{time_part}  CREATE TRANSACTIONS (batch)  "
@@ -2923,6 +2951,13 @@ def _fmt_statement_enter(entry: dict) -> list[str]:
         submitted = {}
     results = _parse_audit_tsv_rows(after.get("results") or "")
     befores = {c.get("guid", ""): c for c in before.get("claims") or []}
+    # Counter-split ``acct`` cells render as canonical names, as a
+    # batch create's do, so the record reads the same whichever
+    # form the caller typed.
+    _resolve_tsv_split_refs(
+        [submitted[r["ref"]] for r in results
+         if r.get("status") == "created" and r.get("ref", "") in submitted]
+    )
 
     for r in results:
         ref = r.get("ref", "")
@@ -2945,6 +2980,10 @@ def _fmt_statement_enter(entry: dict) -> list[str]:
                 lines.append(
                     f"{_INDENT_SPLITS}auto-filled from "
                     f"guid:{note.split(':', 1)[1]}"
+                )
+            if src.get("splits"):
+                lines.append(
+                    _format_splits_text(src["splits"], _INDENT_SPLITS)
                 )
         elif status == "claimed":
             old = next(

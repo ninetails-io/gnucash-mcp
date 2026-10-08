@@ -431,7 +431,7 @@ def register(mcp, get_book) -> None:
         balance_sheet price holdings without lots.
 
         Args:
-            account: Account ref for the investment account: full path (e.g., "Assets:Investments:VTSAX"), %short GUID, or full 32-char GUID.
+            account: The investment account. Account name ("Assets:Checking") or %short guid ("%d53d547").
             title: Lot identifier (e.g., "VTSAX 2026-01-15 purchase").
             notes: Optional notes.
         """
@@ -457,7 +457,7 @@ def register(mcp, get_book) -> None:
         JSON with guid, title, notes, etc.
 
         Args:
-            account: Account ref (full path, %short GUID, or full 32-char GUID).
+            account: Account name ("Assets:Checking") or %short guid ("%d53d547").
             include_closed: If True, include fully-sold lots. Default False.
             verbose: If false (default), compact text output — optimized
                 for reading and token efficiency. If true, structured

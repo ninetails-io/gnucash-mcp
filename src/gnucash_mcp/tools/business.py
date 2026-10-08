@@ -331,7 +331,7 @@ def register(mcp, get_book) -> None:
                 ``type``: "value" or "percentage".
                 ``amount``: positive decimal as string. Percentages
                 are the rate ("5.00" = 5%, not "0.05").
-                ``account``: account path, %short-guid, or full GUID.
+                ``account``: Account name ("Assets:Checking") or %short guid ("%d53d547").
                 Must be ASSET or LIABILITY type. All entries on a
                 single taxtable must reference accounts in the same
                 commodity.
@@ -594,8 +594,8 @@ def register(mcp, get_book) -> None:
                 "credit_note".
             id: Document ID (e.g., "000001").
             account: Income account for invoices / credit notes;
-                expense account for bills and vouchers. Full path,
-                %short GUID, or full GUID.
+                expense account for bills and vouchers.
+                Account name ("Assets:Checking") or %short guid ("%d53d547").
             description: Line item description.
             quantity: Quantity as a decimal string (e.g., "3").
             price: Unit price as a decimal string (e.g., "125.00").
@@ -882,7 +882,7 @@ def register(mcp, get_book) -> None:
 
         Args:
             id: Document ID (e.g., "000001").
-            post_account: A/R or A/P account path (e.g., "Assets:Accounts Receivable").
+            post_account: The A/R or A/P account. Account name ("Assets:Checking") or %short guid ("%d53d547").
             post_date: Date in ISO format (YYYY-MM-DD). Defaults to today.
             due_date: Payment due date (YYYY-MM-DD). Optional.
             description: Description for the posting transaction. Optional.
@@ -1037,9 +1037,9 @@ def register(mcp, get_book) -> None:
 
         Args:
             id: Document ID (e.g., "000001").
-            payment_account: Bank or cash account for payment (e.g.,
-                "Assets:Checking"). Required unless
-                ``from_prepayment``.
+            payment_account: Bank or cash account the payment moves
+                through. Account name ("Assets:Checking") or %short guid ("%d53d547").
+                Required unless ``from_prepayment``.
             amount: Payment amount as decimal string (e.g., "500.00"),
                 in the document's currency. Required unless
                 ``from_prepayment``.
@@ -1050,7 +1050,7 @@ def register(mcp, get_book) -> None:
             party_type: Owner side, credit notes only.
             fx_account: Optional INCOME or EXPENSE account to receive
                 realized FX gain/loss (cross-currency payments only).
-                Accepts a full path, %short GUID, or full 32-char GUID.
+                Account name ("Assets:Checking") or %short guid ("%d53d547").
             apply_discount: When True, treat this payment as the
                 final settlement and absorb the early-payment
                 discount from the invoice's billterm. Default False
@@ -1058,8 +1058,7 @@ def register(mcp, get_book) -> None:
                 (refunds don't take discounts).
             discount_account: Optional INCOME or EXPENSE account to
                 receive the discount split. Auto-resolves when
-                omitted. Accepts full path, %short GUID, or full
-                32-char GUID.
+                omitted. Account name ("Assets:Checking") or %short guid ("%d53d547").
             force: Override the stale-FX-rate guard. A cross-currency
                 payment etches the rate at pay time; if the latest
                 price is 7–90 days from the payment date the payment

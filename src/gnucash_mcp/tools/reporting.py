@@ -188,8 +188,8 @@ def register(mcp, get_book) -> None:
         Args:
             start_date: Start of period (YYYY-MM-DD)
             end_date: End of period (YYYY-MM-DD)
-            account: Optional specific account to analyze (defaults
-                to all cash/bank accounts)
+            account: Optional single account to analyze; defaults
+                to all cash/bank accounts. Account name ("Assets:Checking") or %short guid ("%d53d547").
             include_transfers: When False (default), filter internal
                 transfers. When True, include every cash/bank
                 movement regardless of category.

@@ -102,7 +102,7 @@ def register(mcp, get_book) -> None:
         and the ``showing`` indicator as a structured field.
 
         Args:
-            account: Account ref: full path (e.g. 'Assets:Bank:Checking'), %short GUID, or full 32-char GUID
+            account: Account name ("Assets:Checking") or %short guid ("%d53d547").
             as_of_date: Only include splits on or before this date (YYYY-MM-DD)
             verbose: If false (default), compact text output — optimized
                 for reading and token efficiency. If true, structured
@@ -222,7 +222,7 @@ def register(mcp, get_book) -> None:
         future.
 
         Args:
-            account: Account ref: full path (e.g. 'Assets:Bank:Checking'), %short GUID, or full 32-char GUID
+            account: Account name ("Assets:Checking") or %short guid ("%d53d547").
             statement_date: Statement ending date (YYYY-MM-DD)
             closing_balance: The statement's closing balance, exactly as
                 printed (as string, e.g. '1234.56') — the same name

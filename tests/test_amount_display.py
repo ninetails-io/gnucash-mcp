@@ -106,7 +106,7 @@ class TestEverySurfaceAgrees:
 
     def test_dashboard(self, bhd_book):
         summary = GnuCashBook(str(bhd_book)).get_book_summary()
-        assert "Assets: 1 accounts, BHD 10.125" in summary
+        assert "Assets: BHD 10.125" in summary
         assert "Bank: BHD 10.125" in summary
 
     def test_net_worth(self, bhd_book):
