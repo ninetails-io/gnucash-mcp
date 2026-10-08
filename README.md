@@ -11,6 +11,9 @@ Your data stays on your machine. Your audit log stays on your
 machine. Nothing is uploaded anywhere — the AI reads and writes
 your local GnuCash file, and that's it.
 
+**Upgrading from 1.4?** Read [the upgrade guide](docs/UPGRADING.md)
+before your first write with 1.5.
+
 **Install in one click:** on Claude Desktop, download the
 `.mcpb` bundle from the
 [latest release](https://github.com/ninetails-io/gnucash-mcp/releases/latest),
