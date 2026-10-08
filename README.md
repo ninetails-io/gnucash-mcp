@@ -656,7 +656,7 @@ Contributor guide and design notes live in
 
 ```bash
 uv sync --extra dev
-uv run pytest                       # 2,100+ tests as of v1.4.4, parallel by default
+uv run pytest                       # 3,300+ tests as of v1.5.0, parallel by default
 uv run ruff check src/ tests/
 uv run black --check src/ tests/
 ```
