@@ -78,8 +78,10 @@ each listed under Known limitations in the CHANGELOG:
 - **IN-5** (the warning half) — closed on `fix/1.5.0-input-gaps`:
   `_far_date_warning` speaks on update (single and batch), post,
   pay and schedule instantiation, as the batch tool did.
-- **IN-20** — start after end; `opening_balance` and statement-line
-  amount errors could name their field and cure.
+- **IN-20** — closed on `fix/1.5.0-input-gaps`: `_check_report_range`
+  refuses a report whose start is after its end; the statement
+  balances name their field; every `_to_decimal` refusal carries the
+  "plain digits" cure, and a statement line keeps it.
 - **IN-21** — piecash's `create_book` advice on a missing database.
 
 ### Not the server's code

@@ -2380,3 +2380,52 @@ class TestIN5EveryDatedWriteWarnsOfASlippedYear:
         result = gb.update_transaction(guid, trans_date=date.today())
         assert not [w for w in result.get("warnings", [])
                     if w["type"] == "far_date"]
+
+
+class TestIN20RangesAndAmountsSayWhatIsWrong:
+    """Second scoped review IN-20: a report whose start is after its
+    end answered an empty total without comment; ``opening_balance=
+    "2,850.00"`` errored without naming the field; a statement line's
+    bad amount lost the "use plain digits" cure."""
+
+    @pytest.mark.parametrize("report", [
+        "spending_by_category", "income_by_source", "cash_flow",
+    ])
+    def test_a_report_whose_start_is_after_its_end_is_refused(
+        self, test_book, report,
+    ):
+        gb = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match="is after end_date.*Swap the dates"):
+            getattr(gb, report)(date(2026, 6, 30), date(2026, 6, 1))
+
+    def test_net_worth_and_the_vendor_report_too(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match="is after end_date"):
+            gb.net_worth(date(2026, 6, 1), start_date=date(2026, 6, 30),
+                         interval="month")
+        with pytest.raises(ValueError, match="is after end_date"):
+            gb.vendor_spending_report("2026-06-30", "2026-06-01")
+
+    def test_a_one_day_range_still_runs(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        gb.spending_by_category(date(2026, 6, 1), date(2026, 6, 1))
+
+    def test_the_balance_errors_name_their_field(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        line = [{"ref": "1", "date": date(2026, 5, 10), "amount": "-5.00",
+                 "description": "Coffee", "splits": []}]
+        with pytest.raises(ValueError, match=r"^opening_balance: .*plain digits"):
+            gb.enter_statement("Assets:Checking", date(2026, 5, 31),
+                               "2,850.00", "2845.00", line)
+        with pytest.raises(ValueError, match=r"^closing_balance: .*plain digits"):
+            gb.enter_statement("Assets:Checking", date(2026, 5, 31),
+                               "2850.00", "2,845.00", line)
+
+    def test_a_line_amount_keeps_its_cure(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match=r"^line 1: .*'1,234\.00'.*plain digits"):
+            gb.enter_statement(
+                "Assets:Checking", date(2026, 5, 31), "0.00", "1234.00",
+                [{"ref": "1", "date": date(2026, 5, 10), "amount": "1,234.00",
+                  "description": "Deposit", "splits": []}],
+            )

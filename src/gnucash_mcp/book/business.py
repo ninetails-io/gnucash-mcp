@@ -47,6 +47,7 @@ from gnucash_mcp.book._base import (
     _SLOT_TEXT_WIDTH,
     _check_one_line,
     _check_ledger_date,
+    _check_report_range,
     _far_date_warning,
 )
 from gnucash_mcp._format import (
@@ -11482,6 +11483,7 @@ class BusinessMixin:
 
         parsed_start = date.fromisoformat(start_date)
         parsed_end = date.fromisoformat(end_date)
+        _check_report_range(parsed_start, parsed_end)
 
         with self.open() as book:
             # Capture default currency for the compact formatter —

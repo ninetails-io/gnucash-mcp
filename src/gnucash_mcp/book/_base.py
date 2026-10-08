@@ -835,6 +835,20 @@ _LEDGER_DATE_MIN = date(1400, 1, 1)
 _LEDGER_DATE_MAX = date(9998, 12, 31)
 
 
+def _check_report_range(start, end) -> None:
+    """Refuse a report whose start is after its end: it answered an
+    empty total without comment (review IN-20). ``None`` or
+    ``date.max`` on either side is an open bound and passes."""
+    if start is None or end is None or end == date.max:
+        return
+    if start > end:
+        raise ValueError(
+            f"start_date {start.isoformat()} is after end_date "
+            f"{end.isoformat()}, so the report would cover nothing. "
+            f"Swap the dates."
+        )
+
+
 def _far_date_warning(value) -> "str | None":
     """The slipped-year warning every dated write attaches (C34,
     review IN-5): more than a year ahead ("2062 for 2026") or before
@@ -1003,8 +1017,11 @@ def _to_decimal(value) -> Decimal:
     try:
         d = Decimal(str(value))
     except InvalidOperation:
+        # The cure rides every refusal, a thousands separator above
+        # all ("2,850.00"): review IN-20.
         raise ValueError(
-            f"not a valid decimal amount: {value!r}"
+            f"not a valid decimal amount: {value!r} (use plain digits "
+            f"and a decimal point, e.g. 1234.56)"
         ) from None
     if not d.is_finite():
         raise ValueError(f"amount must be a finite number, got {value!r}")

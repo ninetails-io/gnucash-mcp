@@ -5542,8 +5542,16 @@ class CoreMixin:
                 "duplicate ref in statement — each line needs a "
                 "unique ref"
             )
-        opening = _to_decimal(opening_balance)
-        closing = _to_decimal(closing_balance)
+        # Name the field: "2,850.00" errored without saying which
+        # number it meant (review IN-20).
+        try:
+            opening = _to_decimal(opening_balance)
+        except ValueError as e:
+            raise ValueError(f"opening_balance: {e}") from None
+        try:
+            closing = _to_decimal(closing_balance)
+        except ValueError as e:
+            raise ValueError(f"closing_balance: {e}") from None
 
         with self.open(readonly=dry_run) as book:
             default_currency = self._require_default_currency(book)
@@ -5573,11 +5581,10 @@ class CoreMixin:
             for ln in lines:
                 try:
                     amt = _to_decimal(ln["amount"])
-                except ValueError:
-                    raise ValueError(
-                        f"line {ln['ref']}: amount "
-                        f"{ln['amount']!r} is not a decimal"
-                    )
+                except ValueError as e:
+                    # _to_decimal's message carries the cure ("use
+                    # plain digits"); keep it (review IN-20).
+                    raise ValueError(f"line {ln['ref']}: {e}") from None
                 # Sub-quantum precision is a transcription error,
                 # not a rounding job — and rounding here would let
                 # the self-check gate and the tie compute different

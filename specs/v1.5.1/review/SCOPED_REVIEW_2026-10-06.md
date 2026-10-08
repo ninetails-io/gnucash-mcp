@@ -79,7 +79,7 @@ reproduction script re-run against the fixed code.
 | IN-17 refusals name parameters the tool lacks | NIT | Fixed, `de67dc1`: `party_type`. |
 | IN-18 doubled backslash in three path cells | NIT | Fixed, `de67dc1`. |
 | IN-19 empty draft lists with `?` | NIT | Fixed, `de67dc1`: `0.00`. |
-| IN-20 small boundary inconsistencies | NIT | In part, `de67dc1`: a negative `offset` is refused. A report whose start is after its end still answers an empty total; listed. |
+| IN-20 small boundary inconsistencies | NIT | In part, `de67dc1`: a negative `offset` is refused. The rest fixed on `fix/1.5.0-input-gaps`: `_check_report_range` on every report, named statement balances, the "plain digits" cure on every `_to_decimal` refusal. |
 | IN-21 URI-mode errors give the wrong cure | NIT | In part, `3748c6a`: the not-found cure names `GNUCASH_BOOK_URI`. piecash's `create_book` advice on a missing database still surfaces; listed. |
 | SR2-B1 `create_billterm` takes a multi-line name (bookkeeper's live pass) | SERIOUS | Fixed, `TestBookkeeperSecondLoop`: bill-term and tax-table names pass `_check_one_line`. |
 | SR2-B2 a 300-character document ID is accepted (bookkeeper's live pass) | — | Not a defect: GnuCash's `MAX_ID_LEN` is 2048 on every backend, and the gate is that width; the test plan misstated PostgreSQL's column. |
