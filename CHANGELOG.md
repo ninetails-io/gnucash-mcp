@@ -56,7 +56,7 @@ Books can live in PostgreSQL or MySQL/MariaDB as well as a SQLite file, and ever
 - In a book with "Use Trading Accounts" on, enter cross-currency and stock or fund transactions in GnuCash desktop.
 - GnuCash's Balance Sheet does not balance on a multi-currency book without trading accounts; cross-currency payments made by 1.2–1.4.4 add to the gap. See `samples/README.md`.
 - Foreign-currency spending and income are valued at each month's closing rate, not the cash paid; `cash_flow` reports the cash.
-- A book whose path contains `?` cannot be opened.
+- A book whose path contains `?` cannot be opened; the server says so at startup and names the fix (rename the file or folder).
 - Fixed strings that GnuCash writes in the user's language ("Lot Link", "Voided transaction") are written in English.
 
 ### Credits

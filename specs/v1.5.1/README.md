@@ -48,7 +48,9 @@ branch). Find code by name, not by the review's line numbers.
 
 Three readers over the merged diff: `review/SCOPED_REVIEW_2026-10-05.md`
 holds the resolution table. All fixed on `fix/1.5.0-scoped-review`
-except S-9 (a `?` in the book path; pre-existing, listed).
+except S-9 (a `?` in the book path; pre-existing), now refused at
+startup by name on `fix/1.5.0-input-gaps`; opening such a path
+through a quoted URI is the remaining fix.
 
 ### The second scoped review of 2026-10-06
 
