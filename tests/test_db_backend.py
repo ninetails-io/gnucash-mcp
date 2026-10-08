@@ -1442,3 +1442,38 @@ class TestMySQLBackend(_RealDatabaseTests):
         "SELECT count(*) FROM information_schema.PROCESSLIST "
         "WHERE DB = DATABASE()"
     )
+
+
+class TestBareSchemesUseTheInstalledDriver:
+    """GnuCash desktop writes ``mysql://`` and ``postgres://``; a bare
+    ``mysql://`` loaded SQLAlchemy's default MySQL driver (MySQLdb,
+    not installed: "No module named 'MySQLdb'") and ``postgres://``
+    names no SQLAlchemy dialect at all. Each now means the driver
+    the matching extra installs."""
+
+    @pytest.mark.parametrize("given,expected", [
+        ("mysql://u:p@h:3306/gc", "mysql+pymysql://u:p@h:3306/gc"),
+        ("MySQL://u:p@h:3306/gc", "mysql+pymysql://u:p@h:3306/gc"),
+        ("mariadb://u:p@h:3306/gc", "mysql+pymysql://u:p@h:3306/gc"),
+        ("postgres://u:p@h:5432/gc", "postgresql://u:p@h:5432/gc"),
+        ("mysql+pymysql://u:p@h:3306/gc", "mysql+pymysql://u:p@h:3306/gc"),
+        ("postgresql+psycopg2://u:p@h/gc", "postgresql+psycopg2://u:p@h/gc"),
+        ("postgresql://u:p@h/gc", "postgresql://u:p@h/gc"),
+        ("sqlite:///tmp/x.gnucash", "sqlite:///tmp/x.gnucash"),
+    ])
+    def test_the_scheme_names_an_installed_driver(self, given, expected):
+        assert BookSource.from_uri(given).uri == expected
+
+    def test_the_password_is_untouched_and_still_masked(self):
+        secret = "p%40ss:w0rd"
+        src = BookSource.from_uri(f"mysql://gnucash:{secret}@db.local:3306/gc")
+        assert src.uri == f"mysql+pymysql://gnucash:{secret}@db.local:3306/gc"
+        assert secret not in src.display_name
+
+    def test_a_bare_mysql_uri_no_longer_asks_for_mysqldb(self):
+        gc = GnuCashBook(BookSource.from_uri(
+            "mysql://gnucash:x@127.0.0.1:1/gnucash"))
+        with pytest.raises(Exception) as exc:
+            with gc.open(max_retries=1):
+                pass
+        assert "MySQLdb" not in str(exc.value)

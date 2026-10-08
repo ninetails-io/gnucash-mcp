@@ -47,6 +47,7 @@ from gnucash_mcp._format import (
     _format_amount,
     _one_line,
     _parse_book_url,
+    _with_installed_driver,
     _tsv_cell,
     _pid_alive,
     register_secrets_from_url,
@@ -2004,6 +2005,7 @@ class BookSource:
         Raises:
             ValueError: the URI doesn't parse as a SQLAlchemy URL.
         """
+        uri = _with_installed_driver(uri)
         url = _parse_book_url(uri)
         register_secrets_from_url(uri)
         db_name = (url.database or "").strip("/") or "book"

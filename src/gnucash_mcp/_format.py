@@ -1040,6 +1040,28 @@ def _format_converted(value, commodity=None, *, separators: bool = False) -> str
 # ── Path display ───────────────────────────────────────────────────
 
 
+# The schemes GnuCash desktop writes, and the bare forms people type,
+# mapped to the driver this server installs: mysql:// and mariadb://
+# loaded SQLAlchemy's default MySQL driver (MySQLdb, not installed;
+# "No module named 'MySQLdb'"), and postgres:// no longer names a
+# SQLAlchemy dialect at all. A scheme that names a driver
+# (mysql+pymysql://, postgresql+psycopg2://) is left as written.
+_SCHEME_DEFAULTS = {
+    "mysql": "mysql+pymysql",
+    "mariadb": "mysql+pymysql",
+    "postgres": "postgresql",
+}
+
+
+def _with_installed_driver(uri: str) -> str:
+    """``uri`` with a bare MySQL/MariaDB/postgres scheme pointed at the
+    installed driver; anything else unchanged. Text-level, so the rest
+    of the string (a password included) is never re-encoded."""
+    scheme, sep, rest = uri.partition("://")
+    target = _SCHEME_DEFAULTS.get(scheme.lower()) if sep else None
+    return f"{target}://{rest}" if target else uri
+
+
 def _parse_book_url(uri: str):
     """Parse ``uri`` into a SQLAlchemy URL, or raise ValueError.
 

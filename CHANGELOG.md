@@ -14,7 +14,7 @@ Books can live in PostgreSQL or MySQL/MariaDB as well as a SQLite file, and ever
 - Step by step, with how to check and how to go back: [docs/UPGRADING.md](docs/UPGRADING.md).
 
 ### Added
-- **PostgreSQL and MySQL/MariaDB books** through `GNUCASH_BOOK_URI` (#175, #181). Install the `postgres` or `mysql` extra. CI tests both against real database servers. A database book is single-book, needs `GNUCASH_LOG_DIR`, and is backed up with the database's own dump tool, not by the server.
+- **PostgreSQL and MySQL/MariaDB books** through `GNUCASH_BOOK_URI` (#175, #181). The address can be written as GnuCash writes it (`mysql://`, `postgres://`). Install the `postgres` or `mysql` extra. CI tests both against real database servers. A database book is single-book, needs `GNUCASH_LOG_DIR`, and is backed up with the database's own dump tool, not by the server.
 - **Num and document link** on every transaction tool. A matching Num is used as a duplicate signal.
 - **Prepayments.** `pay_document` can record an overpayment as the party's unapplied payment, settle a document from earlier unapplied payments, and take the exact bank amount of a cross-currency payment. Unposting a paid document keeps its payments.
 - `update_account(hidden=…)` and `update_scheduled_transaction(start_date=…)`.

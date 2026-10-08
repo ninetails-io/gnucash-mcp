@@ -290,7 +290,9 @@ uv tool install -e ".[postgres]" --reinstall
 
 For MySQL / MariaDB the connection string is
 `mysql+pymysql://user:password@localhost:3306/gnucash` and the extra
-is `[mysql]`: `uv tool install -e ".[mysql]" --reinstall`.
+is `[mysql]`: `uv tool install -e ".[mysql]" --reinstall`. The
+shorter forms GnuCash itself writes, `mysql://` and `postgres://`,
+work too; the server uses the driver the extra installed.
 
 Install from the clone, as above, not by name: the name `gnucash-mcp`
 on PyPI belongs to a different project.
