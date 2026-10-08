@@ -835,6 +835,25 @@ _LEDGER_DATE_MIN = date(1400, 1, 1)
 _LEDGER_DATE_MAX = date(9998, 12, 31)
 
 
+def _far_date_warning(value) -> "str | None":
+    """The slipped-year warning every dated write attaches (C34,
+    review IN-5): more than a year ahead ("2062 for 2026") or before
+    1900 ("0026"). A warning, never a refusal — historical imports
+    are ordinary. None for an ordinary date or no date."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        value = value.date()
+    if (value - date.today()).days > 365:
+        return (
+            f"dated {value.isoformat()}, more than a year ahead — "
+            f"likely a typo; check the year"
+        )
+    if value.year < 1900:
+        return f"dated {value.isoformat()} — check the year"
+    return None
+
+
 def _check_ledger_date(value, what: str) -> None:
     """Refuse a date GnuCash cannot hold. ``None`` passes; a datetime
     is judged by its day."""

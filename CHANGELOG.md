@@ -46,6 +46,7 @@ Books can live in PostgreSQL or MySQL/MariaDB as well as a SQLite file, and ever
 - Input validation: control characters, over-length text, multi-line names, look-alike account names, out-of-range dates, and zero or negative prices are refused.
 - Intel Macs install without a Rust toolchain (#183).
 - An amount or price too large for GnuCash to store is refused on its own row, in the dry run as well as the commit, instead of failing the whole batch at commit.
+- A date more than a year ahead, or before 1900, draws a "check the year" warning on every dated write (updates, posting, payments, scheduled transactions), not only on batch entry.
 
 ### Known limitations
 - The server does not lock the book. Don't edit in GnuCash desktop and through the server at the same time.

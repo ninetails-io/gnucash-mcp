@@ -2306,3 +2306,77 @@ class TestIN7AmountsFitGnuCashsNumerator:
             gb.create_price(commodity="VTSAX", namespace="FUND",
                             value="12345678.123456789012",
                             price_date=date(2026, 5, 12))
+
+
+class TestIN5EveryDatedWriteWarnsOfASlippedYear:
+    """The batch tool warned of a date more than a year ahead (C34);
+    update, post, pay and instantiate stored 2200 without a word
+    (second scoped review IN-5). One helper, ``_far_date_warning``,
+    now speaks on every path. A warning, never a refusal."""
+
+    FAR = date.today() + timedelta(days=800)
+
+    def _spend(self, gb):
+        return gb.create_transaction(
+            description="Lunch", trans_date=date.today(),
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "10.00"},
+                {"account": "Assets:Checking", "amount": "-10.00"},
+            ],
+            check_duplicates=False,
+        )["guid"]
+
+    def test_update_transaction(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        guid = self._spend(gb)
+        result = gb.update_transaction(guid, trans_date=self.FAR)
+        far = [w for w in result.get("warnings", []) if w["type"] == "far_date"]
+        assert far and "more than a year ahead" in far[0]["message"], result
+
+    def test_update_transactions(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        guid = self._spend(gb)
+        rows = _rows(gb.update_transactions([{"guid": guid, "date": self.FAR}]))
+        (row,) = rows.values()
+        assert row["status"] == "updated"
+        assert "more than a year ahead" in row["reason"]
+
+    def test_post_and_pay(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme")
+        inv = gb.create_invoice(customer_id="000001",
+                                date_opened=self.FAR.isoformat())
+        gb.add_invoice_entry(
+            invoice_id=inv["id"], account="Income:Sales",
+            description="Work", quantity="1", price="100.00",
+        )
+        posted = gb.post_invoice(inv["id"], AR, post_date=self.FAR.isoformat())
+        assert "more than a year ahead" in posted["date_warning"]
+        paid = gb.pay_invoice(
+            invoice_id=inv["id"], payment_account="Assets:Checking",
+            amount="40.00", payment_date=self.FAR.isoformat(),
+        )
+        assert "more than a year ahead" in paid["date_warning"]
+
+    def test_schedule_instance(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        sx = gb.create_scheduled_transaction(
+            name="Rent", description="Rent",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "100.00"},
+                {"account": "Assets:Checking", "amount": "-100.00"},
+            ],
+            start_date=date.today().isoformat(), frequency="monthly",
+        )
+        made = gb.create_transaction_from_scheduled(
+            sx["guid"], transaction_date=self.FAR.isoformat(),
+        )
+        assert made["status"] == "created"
+        assert "more than a year ahead" in made["date_warning"]
+
+    def test_an_ordinary_date_says_nothing(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        guid = self._spend(gb)
+        result = gb.update_transaction(guid, trans_date=date.today())
+        assert not [w for w in result.get("warnings", [])
+                    if w["type"] == "far_date"]

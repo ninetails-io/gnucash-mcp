@@ -75,10 +75,12 @@ each listed under Known limitations in the CHANGELOG:
   checks the count of the commodity's smallest unit against int64 in
   `_money_precision_error` and the share-quantity branch, and
   `_check_price` checks a price's digits.
-- **IN-5** (the warning half), **IN-20** (start after end;
-  `opening_balance` and statement-line amount errors could name
-  their field and cure), **IN-21** (piecash's `create_book` advice
-  on a missing database).
+- **IN-5** (the warning half) — closed on `fix/1.5.0-input-gaps`:
+  `_far_date_warning` speaks on update (single and batch), post,
+  pay and schedule instantiation, as the batch tool did.
+- **IN-20** — start after end; `opening_balance` and statement-line
+  amount errors could name their field and cure.
+- **IN-21** — piecash's `create_book` advice on a missing database.
 
 ### Not the server's code
 

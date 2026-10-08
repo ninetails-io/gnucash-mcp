@@ -47,6 +47,7 @@ from gnucash_mcp.book._base import (
     _SLOT_TEXT_WIDTH,
     _check_one_line,
     _check_ledger_date,
+    _far_date_warning,
 )
 from gnucash_mcp._format import (
     _GROUP_BY_VALUES,
@@ -8016,6 +8017,9 @@ class BusinessMixin:
             )
             if closed:
                 result["read_only_period"] = closed
+            far = _far_date_warning(parsed_date)
+            if far:
+                result["date_warning"] = far
         result.update(shapes)
         return result
 
@@ -9312,6 +9316,9 @@ class BusinessMixin:
             )
             if closed:
                 result["read_only_period"] = closed
+            far = _far_date_warning(parsed_date)
+            if far:
+                result["date_warning"] = far
 
         result.update(shapes)
         return result

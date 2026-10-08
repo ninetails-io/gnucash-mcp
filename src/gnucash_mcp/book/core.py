@@ -108,6 +108,7 @@ from gnucash_mcp.book._base import (
     _check_control_chars,
     _check_one_line,
     _check_ledger_date,
+    _far_date_warning,
 )
 
 
@@ -5196,7 +5197,6 @@ class CoreMixin:
             # (non-blocking) — surfaced as a side table keyed by ref,
             # so a decimal slip in a bulk import is caught too.
             warn_rows: list = []
-            today = date.today()
             read_only_before = self._read_only_before(book)
             for p, _dc, _mc in accepted:
                 closed = self._read_only_period_note(
@@ -5211,16 +5211,9 @@ class CoreMixin:
                 # ahead ("2062 for 2026"), or a year no ledger holds
                 # ("0026"). Historical imports are the point of this
                 # tool, so an ordinary old date draws nothing.
-                row_date = p["trans_date"]
-                if (row_date - today).days > 365:
-                    warn_rows.append((p["ref"], (
-                        f"dated {row_date.isoformat()}, more than a "
-                        f"year ahead — likely a typo; check the year"
-                    )))
-                elif row_date.year < 1900:
-                    warn_rows.append((p["ref"], (
-                        f"dated {row_date.isoformat()} — check the year"
-                    )))
+                far = _far_date_warning(p["trans_date"])
+                if far:
+                    warn_rows.append((p["ref"], far))
                 for w in p["auto_fill_warnings"]:
                     warn_rows.append((p["ref"], w["message"]))
                 for w in self._fx_sanity_warnings(
@@ -7950,6 +7943,14 @@ class CoreMixin:
                 )
                 for u, txn in prepared
             } if read_only_before else {}
+            # The reason column also carries a slipped year on a new
+            # date (review IN-5).
+            for u, _txn in prepared:
+                far = _far_date_warning(u.get("date"))
+                if far:
+                    closed_notes[u["guid"]] = "; ".join(
+                        n for n in (closed_notes.get(u["guid"]), far) if n
+                    )
 
             for u, txn in prepared:
                 if "description" in u:
@@ -8219,6 +8220,11 @@ class CoreMixin:
             if closed:
                 fx_warnings = list(fx_warnings) + [
                     {"type": "read_only_period", "message": closed}
+                ]
+            far = _far_date_warning(trans_date)
+            if far:
+                fx_warnings = list(fx_warnings) + [
+                    {"type": "far_date", "message": far}
                 ]
             if fx_warnings:
                 result["warnings"] = fx_warnings
