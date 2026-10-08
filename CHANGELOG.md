@@ -20,6 +20,7 @@ Books can live in PostgreSQL or MySQL/MariaDB as well as a SQLite file, and ever
 - `update_account(hidden=…)` and `update_scheduled_transaction(start_date=…)`.
 - Dashboard warnings for overdrawn cash accounts, scheduled bills that exceed the week's cash, and unbalanced transactions. A dashboard check that fails says so instead of being skipped.
 - An `INTERRUPTED` audit entry for a write the server was stopped before logging.
+- **Demo books built from source.** The three sample books are no longer committed; `scripts/synthetic_book/` builds them deterministically, in the storage shapes GnuCash desktop reads, for the bundle, the Docker image, and any clone. Each persona was revised against a tax review for its country.
 
 ### Changed
 - **GnuCash desktop compatibility.** Schedules, budgets, invoice links, credit notes, billing terms, due dates, prices, voids, lots, and reconciliation state are stored as GnuCash desktop stores them, verified against GnuCash 5.12 (#176–#181). Schedules created here run in desktop's Since Last Run, and desktop can unvoid a transaction the server voided.

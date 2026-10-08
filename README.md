@@ -30,14 +30,15 @@ years of activity, mixed currencies, customers, invoices,
 budgets, the works. Walk through one in five minutes; if it
 clicks, point the server at your own book and you're done.
 
-The samples are living books: the committed copies are frozen at
-their last update, and the closed-loop updater
-(`scripts/synthetic_book/continue_book.py <persona>`) brings any
-of them current through today — statement payments from real
-balances, invoices settled, accounts reconciled. The bundle ships
-them current as of its build day. An un-updated copy just looks
-like a book after a vacation — stale prices, pending scheduled
-transactions — which is realistic too.
+The repo commits no book files, only the builders that make them.
+One command
+(`uv run python scripts/synthetic_book/rebuild_all.py --skip-refresh`)
+builds all three into full books through today in about four
+minutes, offline and deterministically:
+statement payments from real balances, invoices settled, accounts
+reconciled, every row in the shapes GnuCash desktop reads. The
+bundle ships them built as of its build day, so a bundle user never
+runs anything.
 
 ---
 
@@ -128,9 +129,10 @@ You don't need to be a developer. You need:
 
 ## Try it without risking anything
 
-The repo ships three sample books — fully-populated synthetic
-ledgers you can talk to without touching your real data. Pick
-one, point the server at it, and start asking questions.
+The repo ships three sample personas — synthetic ledgers you can
+talk to without touching your real data. The bundle carries them
+fully built; from a clone, one build command produces them (below).
+Pick one, point the server at it, and start asking questions.
 
 ### `samples/alex-chen-morales.gnucash` — Personal + freelance
 
@@ -217,13 +219,17 @@ exception: if an update changes *dependencies*, run
 
 ### 2. Make a working copy of a sample book
 
-The server writes audit logs and auto-backups alongside the
-book file. You don't want either of those committed back to the
-repo, so copy the book somewhere outside the repo first:
+The repo holds no book files, only their builders, so build the
+book first (about a minute and a half, offline). The server then writes audit logs
+and auto-backups alongside the book file, and you don't want either
+committed back to the repo, so copy the built book somewhere outside
+it:
 
 ```bash
+cd gnucash-mcp
+uv run python scripts/synthetic_book/rebuild_all.py --skip-refresh --only alex --no-promote
 mkdir -p ~/gnucash-mcp-scratch
-cp gnucash-mcp/samples/alex-chen-morales.gnucash ~/gnucash-mcp-scratch/alex.gnucash
+cp samples/alex.generated.gnucash ~/gnucash-mcp-scratch/alex.gnucash
 ```
 
 ### 3. Tell Claude Desktop about the server
@@ -340,16 +346,19 @@ string instead of a path:
 }
 ```
 
-Install the driver alongside the server — `postgres` or `mysql`
-(MariaDB uses the same one):
+Install the driver alongside the server from your clone — `postgres`
+or `mysql` (MariaDB uses the same one):
 
 ```bash
-uv tool install "gnucash-mcp[postgres]"
+uv tool install -e "./gnucash-mcp[postgres]"
 ```
 
 For MySQL / MariaDB the connection string is
 `mysql+pymysql://user:password@localhost:3306/gnucash` and the extra
-is `"gnucash-mcp[mysql]"`.
+is `[mysql]`: `uv tool install -e "./gnucash-mcp[mysql]"`.
+
+Install from the clone, as above, not by name: the name `gnucash-mcp`
+on PyPI belongs to a different project.
 
 To move an existing book across: open it in GnuCash,
 **File → Save As**, pick **postgres** or **mysql**, and fill in the

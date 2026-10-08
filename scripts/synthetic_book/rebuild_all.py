@@ -215,17 +215,28 @@ def main() -> int:
     # but the safe move is not to race it at all.
     # Boundary-aware pattern (see continue_book.py): matches a running
     # server's binary invocation, not this repo's own checkout path.
-    probe = subprocess.run(
-        ["pgrep", "-f", "gnucash-mcp( |$)"], capture_output=True, text=True,
-    )
-    if probe.stdout.strip() and not args.force:
-        raise SystemExit(
-            "A gnucash-mcp server appears to be running (pids: "
-            f"{' '.join(probe.stdout.split())}). Promotion rewrites "
-            "the canonical sample books in place — stop the client/"
-            "server first, or rerun with --force if you are certain "
-            "no configured server is serving these files."
-        )
+    # --force skips the probe entirely: a minimal image (the Docker
+    # build) has no pgrep, and there is nothing running to find.
+    if not args.force:
+        try:
+            probe = subprocess.run(
+                ["pgrep", "-f", "gnucash-mcp( |$)"],
+                capture_output=True, text=True,
+            )
+        except FileNotFoundError:
+            raise SystemExit(
+                "Cannot check for a running gnucash-mcp server (no pgrep "
+                "on this system). Rerun with --force if no configured "
+                "server is serving the sample books."
+            )
+        if probe.stdout.strip():
+            raise SystemExit(
+                "A gnucash-mcp server appears to be running (pids: "
+                f"{' '.join(probe.stdout.split())}). Promotion rewrites "
+                "the canonical sample books in place — stop the client/"
+                "server first, or rerun with --force if you are certain "
+                "no configured server is serving these files."
+            )
 
     stamp = datetime.now().strftime("%Y%m%dT%H%M%S")
     backup_dir = Path("/tmp") / f"sample-books-pre-rebuild-{stamp}"
@@ -236,8 +247,8 @@ def main() -> int:
     print(
         "Reminder: the oracles just changed — committed capture\n"
         "snapshots and test-plan expected values describe the OLD\n"
-        "build. Re-capture before the next live loop, and commit the\n"
-        "new sample books + market_data_cache.json together."
+        "build. Re-capture before the next live loop, and commit\n"
+        "market_data_cache.json if it was refreshed."
     )
     return 0
 
