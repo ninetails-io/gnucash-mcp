@@ -169,12 +169,52 @@ class _SummaryData:
     credit_total: Decimal = Decimal("0")
     other_liab_total: Decimal = Decimal("0")
 
-    # Counts.
-    total_accounts: int = 0
-    income_active: int = 0
-    income_total: int = 0
-    expense_active: int = 0
-    expense_total: int = 0
+    # Chart map: one entry per top-level account (direct child of
+    # ROOT), each with its second-level children. Branch counts are
+    # TOTALS of the subtree INCLUDING the branch node (hidden ones
+    # by ``_is_hidden``'s inherited rule called out beside them), so
+    # every count is exactly what ``list_accounts(root=<branch>)``
+    # returns under the same template filter. The header adds how
+    # many accounts are active: the account, or one under it,
+    # carries a split (a placeholder parent of used accounts is in
+    # use; an account nothing has ever posted to is not).
+    chart: list["_ChartBranch"] = field(default_factory=list)
+    chart_total: int = 0
+    chart_active_guids: set = field(default_factory=set)
+    chart_hidden: int = 0
+
+
+@dataclass
+class _ChartBranch:
+    """One node of the chart-of-accounts map (top or second level)."""
+
+    fullname: str
+    type: str
+    active: int = 0
+    hidden: int = 0
+    children: list["_ChartBranch"] = field(default_factory=list)
+
+    @property
+    def total(self) -> int:
+        return self.active + self.hidden
+
+
+# Where a top-level account sorts in the chart map: GnuCash's
+# account-tree order by type class (assets, liabilities, equity,
+# income, expenses, then trading and anything else), so a localized
+# chart renders in the same order as desktop's Accounts tab.
+_CHART_TYPE_ORDER = {
+    **{t: 0 for t in ("ASSET", "BANK", "CASH", "STOCK", "MUTUAL", "RECEIVABLE")},
+    **{t: 1 for t in ("LIABILITY", "CREDIT", "PAYABLE")},
+    "EQUITY": 2,
+    "INCOME": 3,
+    "EXPENSE": 4,
+    "TRADING": 5,
+}
+# Income and expense trees are the wide ones; their second level is
+# capped at this many branches by subtree size (spec rule d).
+_CHART_WIDE_CLASSES = {3, 4}
+_CHART_WIDE_CAP = 8
 
 
 # Shared correspondence thresholds — the ONE definition both
@@ -2686,15 +2726,14 @@ class CoreMixin:
         """
         asset_types = {"ASSET", "BANK", "CASH", "STOCK", "MUTUAL"}
         data = _SummaryData()
+        branches: dict[str, _ChartBranch] = {}
 
         for account in accounts:
             if account.type == "ROOT":
                 continue
             if account.guid in template_guids:
                 continue
-            data.total_accounts += 1
-
-            has_activity = len(account.splits) > 0
+            self._tally_chart_branch(account, branches, data)
 
             # Own-splits balance in the account's own commodity,
             # today-filtered so the snapshot agrees with trajectory's
@@ -2766,14 +2805,8 @@ class CoreMixin:
                         today=today,
                     )
                     data.payable_accts.append((leaf, usd_value))
-            elif account.type == "INCOME":
-                data.income_total += 1
-                if has_activity:
-                    data.income_active += 1
-            elif account.type == "EXPENSE":
-                data.expense_total += 1
-                if has_activity:
-                    data.expense_active += 1
+
+        data.chart = self._order_chart(branches)
 
         # Every figure is a value in the book's currency: round each
         # account's as GnuCash rounds a conversion (half-even, to the
@@ -2819,6 +2852,140 @@ class CoreMixin:
         )
         return data
 
+    @staticmethod
+    def _tally_chart_branch(
+        account, branches: dict[str, "_ChartBranch"], data: _SummaryData,
+    ) -> None:
+        """Count one account into its top-level and second-level
+        branches of the chart map (``_render_chart_map``).
+
+        Hidden is ``_is_hidden``'s inherited answer, so a hidden
+        parent's visible-flagged children count as hidden too — the
+        same rule the dashboard's other hidden filters apply.
+        """
+        lineage = []
+        a = account
+        while a is not None and a.type != "ROOT":
+            lineage.append(a)
+            a = a.parent
+        if not lineage:
+            return
+        lineage.reverse()  # top-level first
+        hidden = _is_hidden(account)
+        data.chart_total += 1
+        if hidden:
+            data.chart_hidden += 1
+        if account.splits:
+            data.chart_active_guids.update(a.guid for a in lineage)
+
+        top = lineage[0]
+        branch = branches.get(top.guid)
+        if branch is None:
+            branch = branches[top.guid] = _ChartBranch(
+                fullname=top.fullname, type=top.type,
+            )
+        nodes = [branch]
+        if len(lineage) > 1:
+            second = lineage[1]
+            child = next(
+                (c for c in branch.children if c.fullname == second.fullname),
+                None,
+            )
+            if child is None:
+                child = _ChartBranch(
+                    fullname=second.fullname, type=second.type,
+                )
+                branch.children.append(child)
+            nodes.append(child)
+        for node in nodes:
+            if hidden:
+                node.hidden += 1
+            else:
+                node.active += 1
+
+    @staticmethod
+    def _order_chart(branches: dict[str, "_ChartBranch"]) -> list["_ChartBranch"]:
+        """Top levels in GnuCash's type order then name; children
+        by subtree size descending then name (the wide-tree cap in
+        the renderer takes the biggest branches)."""
+        ordered = sorted(
+            branches.values(),
+            key=lambda b: (_CHART_TYPE_ORDER.get(b.type, 6), b.fullname),
+        )
+        for b in ordered:
+            b.children.sort(key=lambda c: (-c.total, c.fullname))
+        return ordered
+
+    @staticmethod
+    def _chart_count_label(total: int, hidden: int, word: str = "") -> str:
+        """A branch's count: its total, which is what
+        ``list_accounts(root=…)`` lists, with any hidden share named.
+        ``word`` ("total") marks a top-level branch."""
+        n = f"{total} {word}".rstrip()
+        if hidden and hidden == total and not word:
+            return f"{hidden} hidden"
+        if hidden:
+            return f"{n}, {hidden} hidden"
+        return n
+
+    def _render_chart_map(self, data: _SummaryData) -> list[str]:
+        """Render the chart of accounts as one tree, depth two.
+
+        Replaces the per-type count lines the dashboard used to
+        scatter ("Accounts: 99 total", "Assets: 16 accounts",
+        "Expenses: 39 active (56 total)"). The bookkeeper learned
+        every book's tree by bouncing off did-you-mean errors; this
+        hands over the shape in one place, in the book's own
+        language, with a drill-down call that validates (spec
+        ``specs/v1.5.1/PLAN_BOOK_SUMMARY_MAP.md``).
+
+        Only children that are themselves branches (a subtree of
+        more than one account) are listed; leaves are implied by
+        the parent's count and surface through ``list_accounts``.
+        Assets, liabilities, and equity list every branch child;
+        income and expenses list the ``_CHART_WIDE_CAP`` largest
+        and elide the rest with ``…``.
+        """
+        lines: list[str] = []
+        example: str | None = None
+        for branch in data.chart:
+            label = f"{_one_line(branch.fullname)} ({self._chart_count_label(branch.total, branch.hidden, 'total')})"
+            sub = [c for c in branch.children if c.total > 1]
+            cls = _CHART_TYPE_ORDER.get(branch.type, 6)
+            elided = False
+            if cls in _CHART_WIDE_CLASSES and len(sub) > _CHART_WIDE_CAP:
+                sub = sub[:_CHART_WIDE_CAP]
+                elided = True
+            if sub and example is None:
+                example = sub[0].fullname
+            parts = [
+                f"{_one_line(c.fullname.split(':')[-1])} "
+                f"({self._chart_count_label(c.total, c.hidden)})"
+                for c in sub
+            ]
+            if elided:
+                parts.append("…")
+            lines.append(
+                f"  {label}: {', '.join(parts)}" if parts else f"  {label}"
+            )
+        if example is None and data.chart:
+            example = data.chart[0].fullname
+        head = (
+            f"Chart of accounts: {data.chart_total} total "
+            f"({len(data.chart_active_guids)} active"
+            + (f", {data.chart_hidden} hidden" if data.chart_hidden else "")
+            + ")"
+        )
+        if example is not None:
+            # The hint names a call that validates: ``root`` is a
+            # real list_accounts parameter, prefix-matched on the
+            # path, and the example is a branch this book has.
+            head += (
+                " — drill into any branch with "
+                f'list_accounts(root="{_one_line(example)}")'
+            )
+        return [head + ":"] + lines
+
     def _frequent_accounts(
         self, book, transactions, days: int = 180, top: int = 15,
     ) -> list[str]:
@@ -2860,7 +3027,11 @@ class CoreMixin:
         if not ranked:
             return []
         short_map = self._account_short_guid_map(book)
-        lines = [f"Frequently used accounts (last {days} days):"]
+        lines = [
+            f"Frequently used accounts (last {days} days — any account "
+            f"parameter accepts the %guid or the full name; a %guid is "
+            f"fewer tokens and faster to write):"
+        ]
         for g, _n in ranked:
             lines.append(
                 f"  {short_map[g]}\t{_account_to_compact_line(by_guid[g])}"
@@ -3009,16 +3180,11 @@ class CoreMixin:
         """Render the Assets section: header + per-leaf lines
         sorted by USD value descending.
 
-        Count includes A/R accounts (which roll into
-        ``assets_total``) so the headline N agrees with the total;
-        per-account A/R detail lives in
-        ``_render_receivables_payables``.
+        The header carries the value only; account counts live in
+        the chart map. A/R rolls into ``assets_total``; per-account
+        A/R detail lives in ``_render_receivables_payables``.
         """
-        assets_count = len(data.asset_leaves) + len(data.receivable_accts)
-        lines = [
-            f"Assets: {assets_count} accounts, "
-            f"{currency} {data.assets_total}"
-        ]
+        lines = [f"Assets: {currency} {data.assets_total}"]
         for name, usd_value, note in sorted(
             data.asset_leaves, key=lambda x: x[1], reverse=True
         ):
@@ -3038,18 +3204,12 @@ class CoreMixin:
     ) -> list[str]:
         """Render Liabilities: header + grouped subtotals + top 3.
 
-        A/P accounts (rolled into ``liabilities_total``) are
-        included in the headline count; per-account A/P detail
-        lives in ``_render_receivables_payables``.
+        The header carries the value only; account counts live in
+        the chart map. A/P rolls into ``liabilities_total``;
+        per-account A/P detail lives in
+        ``_render_receivables_payables``.
         """
-        liab_count = (
-            len(data.credit_cards) + len(data.other_liab_accts)
-            + len(data.payable_accts)
-        )
-        lines = [
-            f"Liabilities: {liab_count} accounts, "
-            f"{currency} {data.liabilities_total}"
-        ]
+        lines = [f"Liabilities: {currency} {data.liabilities_total}"]
         if data.credit_cards:
             lines.append(
                 f"  Credit cards ({len(data.credit_cards)}): "
@@ -3442,7 +3602,7 @@ class CoreMixin:
                 for msg in warnings:
                     lines.append(f"  ⚠ {msg}")
 
-            lines.append(f"Accounts: {data.total_accounts} total")
+            lines.extend(self._render_chart_map(data))
             lines.extend(
                 self._render_assets_section(data, currency)
             )
@@ -3461,15 +3621,6 @@ class CoreMixin:
                 lines.append(
                     f"Jobs: {biz_counts['active_jobs']} active"
                 )
-
-            lines.append(
-                f"Income: {data.income_active} active "
-                f"({data.income_total} total)"
-            )
-            lines.append(
-                f"Expenses: {data.expense_active} active "
-                f"({data.expense_total} total)"
-            )
 
             lines.extend(
                 self._frequent_accounts(book, transactions)

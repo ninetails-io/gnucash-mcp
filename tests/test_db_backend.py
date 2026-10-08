@@ -1223,7 +1223,7 @@ class _RealDatabaseTests:
             GnuCashBook, "_overdue_scheduled_warnings", poisoned,
         )
         result = db_book.get_book_summary()
-        assert "Accounts:" in result
+        assert "Chart of accounts:" in result
         if self.ABORTS_ON_ERROR:
             assert "Overdue-schedule check failed" in result
             assert "InFailedSqlTransaction" in result

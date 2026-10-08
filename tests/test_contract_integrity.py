@@ -904,3 +904,127 @@ def _is_gnc_bool_call(value: ast.expr) -> bool:
         and isinstance(value.func, ast.Name)
         and value.func.id == "_gnc_bool"
     )
+
+
+# ── Account-ref docstrings ───────────────────────────────────────────
+
+class TestAccountRefDocstringConvention:
+    """Every tool parameter that resolves an account carries the one
+    sentence naming both forms the server accepts.
+
+    Across six live batteries the bookkeeper used the ``%short``
+    account guids exactly zero times in hundreds of calls, because
+    the docstrings said "account name" and nothing said the other
+    form existed (spec ``specs/v1.5.1/PLAN_BOOK_SUMMARY_MAP.md``,
+    change 3). The convention is prose, so the lock is the source:
+    every parameter whose name looks account-shaped is either in
+    the ref registry (and its Args entry carries the sentence) or in
+    the named list of look-alikes that are not refs. A new tool's
+    account parameter lands in one list or this fails.
+    """
+
+    SENTENCE = 'Account name ("Assets:Checking") or %short guid ("%d53d547").'
+    TOOLS_DIR = Path(__file__).resolve().parent.parent / "src" / "gnucash_mcp" / "tools"
+
+    REFS = {
+        ("get_account_slots", "account"), ("set_account_slot", "account"),
+        ("delete_account_slot", "account"),
+        ("set_budget_amount", "account"), ("get_budget_report", "account"),
+        ("add_document_entry", "account"), ("post_document", "post_account"),
+        ("pay_document", "payment_account"), ("pay_document", "fx_account"),
+        ("pay_document", "discount_account"),
+        ("list_accounts", "root"), ("get_account", "name"),
+        ("get_balance", "account_name"), ("list_transactions", "account"),
+        ("enter_statement", "account"), ("create_account", "parent"),
+        ("update_account", "name"), ("move_account", "name"),
+        ("move_account", "new_parent"), ("delete_account", "name"),
+        ("create_lot", "account"), ("list_lots", "account"),
+        ("get_unreconciled_splits", "account"),
+        ("reconcile_account", "account"), ("cash_flow", "account"),
+    }
+    # Account-shaped names that are not refs: a NEW leaf name, a
+    # type, an amount.
+    NOT_REFS = {
+        ("create_account", "name"), ("create_account", "account_type"),
+        ("update_account", "account_type"),
+        ("pay_document", "payment_account_amount"),
+    }
+
+    @staticmethod
+    def _is_tool(node: ast.FunctionDef) -> bool:
+        for d in node.decorator_list:
+            f = d.func if isinstance(d, ast.Call) else d
+            if isinstance(f, ast.Attribute) and f.attr == "tool":
+                return True
+        return False
+
+    @classmethod
+    def _candidates(cls):
+        found = {}
+        for path in sorted(cls.TOOLS_DIR.glob("*.py")):
+            tree = ast.parse(path.read_text(), filename=str(path))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.FunctionDef) or not cls._is_tool(node):
+                    continue
+                for a in node.args.args + node.args.kwonlyargs:
+                    n = a.arg
+                    looks = any(k in n for k in ("account", "parent", "root")) or (
+                        n == "name" and "account" in node.name
+                    )
+                    if looks:
+                        found[(node.name, n)] = ast.get_docstring(node) or ""
+        return found
+
+    @staticmethod
+    def _args_entry(doc: str, param: str) -> str:
+        lines = doc.splitlines()
+        out, grabbing, indent = [], False, 0
+        for line in lines:
+            stripped = line.lstrip()
+            if stripped.startswith(f"{param}: "):
+                grabbing, indent = True, len(line) - len(stripped)
+                out.append(stripped)
+                continue
+            if grabbing:
+                this = len(line) - len(stripped)
+                if not stripped or this <= indent:
+                    break
+                out.append(stripped)
+        return " ".join(out)
+
+    def test_every_account_shaped_parameter_is_classified(self):
+        found = set(self._candidates())
+        assert found == self.REFS | self.NOT_REFS, (
+            f"unclassified: {sorted(found - self.REFS - self.NOT_REFS)}; "
+            f"stale: {sorted((self.REFS | self.NOT_REFS) - found)}"
+        )
+
+    def test_every_ref_parameter_carries_the_sentence(self):
+        docs = self._candidates()
+        offenders = [
+            f"{tool}({param}): {self._args_entry(docs[(tool, param)], param)[:70]!r}"
+            for tool, param in sorted(self.REFS)
+            if self.SENTENCE not in self._args_entry(docs[(tool, param)], param)
+        ]
+        assert offenders == [], offenders
+
+    def test_tsv_and_split_inputs_carry_the_pitch(self):
+        """The TSV ``acct`` cells and the ``SplitInput`` field are the
+        account refs that are not parameters; the two TSV docs also
+        carry the payload pitch, which is where the savings are."""
+        core = (self.TOOLS_DIR / "core.py").read_text()
+        helpers = (self.TOOLS_DIR / "_helpers.py").read_text()
+        pitch = re.compile(r"%guids in ``acct`` cells shrink the\s+payload")
+        docs = {
+            name: ast.get_docstring(node) or ""
+            for node in ast.walk(ast.parse(core))
+            if isinstance(node, ast.FunctionDef)
+            for name in [node.name]
+            if name in {"create_transactions", "enter_statement"}
+        }
+        assert set(docs) == {"create_transactions", "enter_statement"}
+        for name, doc in docs.items():
+            assert pitch.search(doc), name
+            assert re.search(r"the audit log records the resolved\s+account", doc), name
+            assert "%short guid" in doc, name
+        assert 'Account name ("Assets:Checking") or %short guid' in helpers

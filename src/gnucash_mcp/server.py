@@ -86,6 +86,11 @@ DOUBLE-ENTRY SIGN CONVENTION:
 - Credit card payment: checking -200, card +200. Income: checking +3000, income -3000.
 INVESTMENT FLOW: create_lot → create_transactions (a one-row batch with qty/cost columns) → assign_split_to_lot → create_price → calculate_lot_gain.
 SLOTS: get_account_slots / set_account_slot store per-account metadata (APR, credit limit, statement day) as strings.
+BUSINESS (accounts receivable / accounts payable):
+- Parties (*_party tools, party_type + ID): customer = client who pays you; vendor = supplier, contractor, or payee you pay; employee = expense-voucher claimant.
+- Documents (*_document tools, document_type + ID): invoice = customer (A/R); bill = vendor (A/P); voucher = employee expense claim; credit_note = credit memo on either side (party_type required).
+- Lifecycle: create_document → add_document_entry (one call per line item) → post_document (puts it on the books) → pay_document (receive a customer payment, pay a bill, refund a credit note). get_outstanding_documents is the unpaid list.
+- ID counters are PER TYPE: invoice 000001 and bill 000001 can both exist. Pass document_type (and party_type for credit notes) whenever an ID could collide; an ambiguous ID is refused with the candidates listed.
 OUTPUT: every tool's compact default is complete — verbose=true adds structure (JSON), not information. Compact is cheaper; prefer it unless you need machine-readable fields.
 SAFETY: Reconciled splits are protected (use force=true to override). Prefer void_transaction over delete for audit trail. delete_account is blocked if account has children or transactions.
 """,

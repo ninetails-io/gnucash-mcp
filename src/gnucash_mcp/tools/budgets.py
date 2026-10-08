@@ -118,7 +118,7 @@ def register(mcp, get_book) -> None:
 
         Args:
             budget_name: Name of the budget.
-            account: Account ref: full path (e.g., "Expenses:Groceries"), %short GUID, or full 32-char GUID.
+            account: Account name ("Assets:Checking") or %short guid ("%d53d547").
             amount: Monthly budget amount as string (e.g., "500.00"),
                 as a magnitude for every account type — "5000" on an
                 income account means 5,000 expected in. The server
@@ -162,7 +162,8 @@ def register(mcp, get_book) -> None:
                 - Integer 0-11: Specific period
                 - "ytd": Year to date (all periods up to current)
                 - "all": All periods
-            account: Optional filter to specific account or parent account.
+            account: Optional filter to one account or a parent.
+                Account name ("Assets:Checking") or %short guid ("%d53d547").
             include_children: If True and account specified, include child accounts.
             verbose: If false (default), compact text output — optimized
                 for reading and token efficiency. If true, structured

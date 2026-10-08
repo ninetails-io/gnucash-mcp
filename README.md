@@ -51,16 +51,21 @@ sample books — a complete financial dashboard in a single call:
 Book: alex-chen-morales.gnucash
 Currency: USD
 Data range: 2025-01-01 to 2026-10-07
-Last entry: 2026-10-07 (today)
-Accounts: 111 total
-Assets: 16 accounts, USD 874418.54
+Last entry: 2026-10-07 (yesterday)
+Chart of accounts: 111 total (109 active) — drill into any branch with list_accounts(root="Assets:Investments"):
+  Assets (25 total): Investments (9), Current Assets (5), Fixed Assets (3), Receivables (3), Retirement (3)
+  Liabilities (8 total): Credit Card (3), Loans (3)
+  Equity (3 total)
+  Income (11 total): Investment Income (6)
+  Expenses (64 total): Business (14), Taxes (10), Utilities (6), Auto (4), Housing (4), Interest (4), Insurance (3), Pet (3)
+Assets: USD 874418.54
   Condo: USD 475000.00
   VTSAX: 461.8411 VTSAX @ 186.19 (USD 85990.19)
   UWRP 403(b): USD 74778.40
   Savings Account: USD 60000.00
   Cascade Code LLC Checking: USD 41431.21
   ...
-Liabilities: 5 accounts, USD 389687.80
+Liabilities: USD 389687.80
   Credit cards (2): USD 1312.00
   Loans & other (2): USD 385873.30
   Top 3: Mortgage USD 373846.80, Auto Loan USD 12026.50, Chase Sapphire USD 868.32
@@ -70,9 +75,7 @@ Receivables: 2 accounts, USD 26549.45 (4 invoices, 0 overdue; included in Assets
 Payables: 1 account, USD 2502.50 (1 bill, 0 overdue; included in Liabilities total)
   Accounts Payable: USD 2502.50
 Jobs: 3 active
-Income: 9 active (11 total)
-Expenses: 54 active (64 total)
-Frequently used accounts (last 180 days):
+Frequently used accounts (last 180 days — any account parameter accepts the %guid or the full name; a %guid is fewer tokens and faster to write):
   %d53d547	Assets:Current Assets:Checking Account [BANK]
   %51166e7	Liabilities:Credit Card:Chase Sapphire [CREDIT]
   %ebc01f8	Expenses:Dining
@@ -80,22 +83,22 @@ Frequently used accounts (last 180 days):
 Reconciliation:
   6 accounts current
 Net worth trajectory:
-  12mo ago: USD 335,644
-   6mo ago: USD 382,097
-   3mo ago: USD 425,590
-   1mo ago: USD 444,400
+  12mo ago: USD 345,974
+   6mo ago: USD 381,966
+   3mo ago: USD 429,398
+   1mo ago: USD 443,558
        now: USD 484,731
 Monthly net (income - expenses, last 6 months):
-  Oct 2026 (MTD): +12,049 (vs Sep 1-7: -1,523)
+  Oct 2026 (MTD): +12,049 (vs Sep 1-8: -2,365)
   Sep 2026: +25,082
   Aug 2026: +7,594
   Jul 2026: +10,307
   Jun 2026: +24,092
   May 2026: +9,017
 Runway: 581 days (USD 247,767 liquid / USD 426/day cash out incl. debt paydown, 180-day avg; cards owe USD 1,312)
-Budget (2026 Annual Budget): USD 27,682 spent / USD 28,586 expected by today (-3%)
+Budget (2026 Annual Budget): USD 27,682 spent / USD 28,683 expected by today (-3%)
 Transactions: 2223
-Scheduled: 20 recurring, none due in next 7 days
+Scheduled: 20 recurring, 16 due in next 7 days (USD 15,128 out)
 Business: 8 customers, 3 vendors
 Budgets: 2
 Commodities: AAPL, CAD, ETH, EUR, MSFT, USD, VBTLX, VTSAX
