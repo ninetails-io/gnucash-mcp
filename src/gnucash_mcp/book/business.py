@@ -15,26 +15,54 @@ in the ORM). All raw inserts are paired with `_verify_write` /
 """
 
 import logging
+import re
 from datetime import date, datetime, time, timedelta, timezone
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 
 import piecash
 
+from gnucash_mcp.book import _entry_math
 from gnucash_mcp.book._base import (
+    _check_text,
+    _TAXTABLE_NAME_WIDTH,
+    _TEXT_WIDTH,
+    _lot_cache_flag,
+    _LOT_CLOSED_UNKNOWN,
+    _LOT_OPEN,
+    _lot_hold_open,
+    _set_split_amounts,
     _commodity_quantum,
+    _dialect_name,
+    _gnc_bool,
+    _money_precision_error,
+    _new_split,
+    _rollback_if_aborted,
     _slot_value_str,
     _to_decimal,
     _unique_prefix,
     _verify_composite_write,
+    _neutral_time,
+    _verify_delete,
     _verify_write,
+    _SLOT_TEXT_WIDTH,
+    _check_one_line,
+    _check_ledger_date,
+    _check_report_range,
+    _far_date_warning,
 )
 from gnucash_mcp._format import (
     _GROUP_BY_VALUES,
     _enumerate_periods,
+    _format_amount,
+    _format_exact,
     _format_grouped_tsv,
+    _format_number,
     _paginate,
     _partial_period_labels,
     _period_label,
+    _tsv_cell,
+    _one_line,
+    _format_rate,
 )
 
 
@@ -123,7 +151,7 @@ def _format_vendor_spending_compact(
         d = Decimal(s)
         if d == d.to_integral_value():
             return f"{currency} {int(d):,}"
-        return f"{currency} {d:,.2f}"
+        return f"{currency} {_format_exact(d)}"
 
     billed_strs = [_money(v["total_billed"]) for v in vendors_list]
     paid_strs = [_money(v["total_paid"]) for v in vendors_list]
@@ -137,7 +165,7 @@ def _format_vendor_spending_compact(
         vendors_list, bills_strs, billed_strs, paid_strs, out_strs,
     ):
         lines.append(
-            f"{v['vendor_name']:<{name_width}}  "
+            f"{_one_line(v['vendor_name']):<{name_width}}  "
             f"{bills:<{bills_width}}  "
             f"{billed:>{billed_w}} billed  "
             f"{paid:>{paid_w}} paid  "
@@ -168,15 +196,14 @@ def _format_outstanding_invoices_compact(rows: list[dict]) -> str:
     apart at a glance. ``(CN)`` marks credit notes — their amount is
     unsettled credit available to apply or refund, not money owed,
     so the due column reads "credit available" instead of an aging
-    count. When the due date came from the 30-day default
-    (``no_terms``), the days count says "past 30-day default" so it
-    doesn't read as contractual.
+    count. The due date is desktop's: the document's terms over
+    the posting date, or the posting date itself with no terms.
     """
     if not rows:
         return ""
     lines = []
     for r in rows:
-        owner = r.get("owner_name") or f"#{r['id']}"
+        owner = _tsv_cell(r.get("owner_name")) or f"#{r['id']}"
         is_credit_note = r.get("is_credit_note", False)
         # (CN) wins over (BILL): the credit-note tag changes how
         # the whole amount column reads.
@@ -192,7 +219,7 @@ def _format_outstanding_invoices_compact(rows: list[dict]) -> str:
         ccy = r.get("currency") or ""
         # Strip trailing zeros for compact display: "4200.00" → "4,200".
         amount_dec = Decimal(r.get("amount_due") or "0")
-        amount_str = f"{int(amount_dec):,}" if amount_dec == int(amount_dec) else f"{amount_dec:,.2f}"
+        amount_str = f"{int(amount_dec):,}" if amount_dec == int(amount_dec) else _format_exact(amount_dec)
         posted = r.get("date_posted") or "?"
         # Credit notes have no due date — they sit as available
         # credit until applied or refunded.
@@ -217,12 +244,7 @@ def _format_outstanding_invoices_compact(rows: list[dict]) -> str:
         if days is None:
             days_str = ""
         elif days > 0:
-            # "past due" reads as contractual; "past 30-day default"
-            # anchors to the assumption when no term was set.
-            if r.get("no_terms"):
-                days_str = f"  {days} days past 30-day default"
-            else:
-                days_str = f"  {days} days past due"
+            days_str = f"  {days} day{'s' if days != 1 else ''} past due"
         elif days == 0:
             days_str = "  due today"
         else:
@@ -240,6 +262,25 @@ class BusinessMixin:
     # ── Finders and dict converters ───────────────────────────────
 
     @staticmethod
+    def _exact(query, attr: str, value: str):
+        """The first row of ``query`` whose ``attr`` IS ``value``,
+        compared in Python.
+
+        The database's own ``=`` is not that comparison everywhere. A
+        book GnuCash desktop created in MariaDB uses a
+        case-insensitive collation that also ignores accents and
+        trailing spaces, so ``name = 'Sales Tax'`` returns
+        ``SALES TAX``: ``delete_taxtable("Sales Tax")`` deleted the
+        other table and reported the name it was given (adversarial
+        review 2026-09-30, C66). Every name or ID lookup goes through
+        here; on SQLite and PostgreSQL it changes nothing.
+        """
+        for row in query.all():
+            if getattr(row, attr) == value:
+                return row
+        return None
+
+    @staticmethod
     def _find_customer(book, customer_id: str):
         """Find a customer by their human-readable ID (e.g., '000001').
 
@@ -248,13 +289,19 @@ class BusinessMixin:
         customer repeatedly.
         """
         from piecash.business.person import Customer
-        return book.session.query(Customer).filter_by(id=customer_id).first()
+        return BusinessMixin._exact(
+            book.session.query(Customer).filter_by(id=customer_id),
+            "id", customer_id,
+        )
 
     @staticmethod
     def _find_vendor(book, vendor_id: str):
         """Find a vendor by their human-readable ID (e.g., '000001')."""
         from piecash.business.person import Vendor
-        return book.session.query(Vendor).filter_by(id=vendor_id).first()
+        return BusinessMixin._exact(
+            book.session.query(Vendor).filter_by(id=vendor_id),
+            "id", vendor_id,
+        )
 
     @staticmethod
     def _find_customer_by_guid(book, guid: str):
@@ -300,6 +347,53 @@ class BusinessMixin:
                 book, job.owner_type, job.owner_guid,
             )
         return None
+
+    @staticmethod
+    def _document_owner_clause(
+        book, owner_type: int | None = None, owner_guid: str | None = None,
+    ):
+        """SQL filter matching every document owned by the given
+        side and/or party — DIRECTLY (``owner_type`` 2/4/5 on the
+        invoice row) or THROUGH A JOB (``owner_type=3`` whose Job
+        carries the requested side / party).
+
+        THE owner-filter chokepoint. ``invoices.owner_guid`` is a
+        polymorphic pointer: on a job-attached document it names the
+        Job, not the customer or vendor, so any site that filters on
+        ``Invoice.owner_type == N`` or ``Invoice.owner_guid == guid``
+        by hand silently drops every job-attached document — the
+        whole-tree review (2026-09-04) found six such sites, from the
+        collections list to the customer-delete guard. Every owner
+        filter routes here so the job indirection is handled once.
+
+        Employees (5) have no jobs, so their clause stays direct.
+        Both arguments ``None`` matches everything.
+        """
+        from sqlalchemy import and_, or_, true
+        from piecash.business.invoice import Invoice, Job
+
+        direct = []
+        via_job = []
+        if owner_type is not None:
+            direct.append(Invoice.owner_type == owner_type)
+            via_job.append(Job.owner_type == owner_type)
+        if owner_guid is not None:
+            direct.append(Invoice.owner_guid == owner_guid)
+            via_job.append(Job.owner_guid == owner_guid)
+        if not direct:
+            return true()
+        if owner_type == 5:
+            return and_(*direct)
+        job_guid_sq = book.session.query(Job.guid).filter(
+            *via_job
+        ).subquery()
+        return or_(
+            and_(*direct),
+            and_(
+                Invoice.owner_type == 3,
+                Invoice.owner_guid.in_(job_guid_sq),
+            ),
+        )
 
     # Path for the auto-created realized-FX-gain/loss income account.
     # Single credit-natural account: positive balance = net gain, negative
@@ -1037,15 +1131,13 @@ class BusinessMixin:
         if discount_days <= 0 or discount_pct <= 0:
             return None
 
-        # Use date_opened as the discount-window anchor — that's the
-        # invoice issuance date (what's printed on the invoice the
-        # customer received). date_posted is when it hit A/R, often
-        # the same day but not guaranteed; the customer's discount
-        # eligibility is measured from when they got the invoice.
-        anchor = inv.date_opened
-        if isinstance(anchor, datetime):
-            anchor = anchor.date()
-        eligible_until = anchor + timedelta(days=discount_days)
+        # The window runs from the posting date, by the same rule as
+        # the due date (C46): a window anchored on date_opened could
+        # close before the document was even posted.
+        posted = inv.date_posted
+        if isinstance(posted, datetime):
+            posted = posted.date()
+        eligible_until = self._billterm_discount_date(bt, posted)
 
         # Pre-tax principal for discount calculation. Catch the rare
         # corrupted-entries case the same way other callers do.
@@ -1055,9 +1147,20 @@ class BusinessMixin:
         except (ValueError, KeyError):
             return None
 
-        expected = (subtotal * discount_pct / Decimal(100)).quantize(
-            _commodity_quantum(inv.currency)
-        )
+        # A credit note applied to the document takes its share of
+        # the principal with it: what was credited back was never
+        # going to be paid, early or otherwise. Measuring the
+        # discount on the full subtotal regardless, a 1,000 invoice
+        # with 900 credited and "2/10" terms REFUSED the correct 98
+        # ("adjust amount to 80.00") and booked a 20.00 discount on
+        # a 100 balance when 80 was paid (adversarial review
+        # 2026-09-30, C47). Cash already paid does not reduce it: the
+        # settling payment takes the whole discount, as before.
+        credited_share = self._credited_share(book, inv)
+        expected = (
+            subtotal * (Decimal(1) - credited_share)
+            * discount_pct / Decimal(100)
+        ).quantize(_commodity_quantum(inv.currency), rounding=ROUND_HALF_UP)
 
         return {
             "discount_days": discount_days,
@@ -1066,6 +1169,37 @@ class BusinessMixin:
             "eligible_until": eligible_until,
             "currency": inv.currency.mnemonic,
         }
+
+    def _credited_share(self, book, inv) -> Decimal:
+        """The fraction of a posted document's total that credit
+        notes have settled (0 when none, 1 when all of it). A lot
+        split is a credit application, not a payment, when the other
+        leg of its transaction sits in a lot too — the lot-link
+        transaction ``apply_credit_note`` writes, and desktop's
+        (``_document_payments`` names its source the same way)."""
+        settlement = self._document_settlement(book, inv)
+        if settlement is None or settlement["grand_total"] <= 0:
+            return Decimal(0)
+        post_guid = inv.post_txn_guid
+        doc_currency_guid = inv.currency_guid
+        credited = Decimal(0)
+        for split in settlement["lot"].splits:
+            txn = split.transaction
+            if txn.guid == post_guid or split.reconcile_state == "v":
+                continue
+            # Only a lot-LINK transaction is a credit application. A
+            # payment that also fed a prepayment lot, or a desktop
+            # payment covering several documents, has another leg in
+            # a lot too and was counted as credit, shrinking the
+            # early-payment discount (scoped review 2026-10-06, BM-2).
+            if str(txn.get("trans-txn-type") or "") == "L" and any(
+                o.lot is not None for o in txn.splits if o is not split
+            ):
+                credited += -settlement["sign"] * self._lot_split_amount(
+                    split, doc_currency_guid,
+                )
+        share = credited / settlement["grand_total"]
+        return min(max(share, Decimal(0)), Decimal(1))
 
     @staticmethod
     def _rate_from_post_transaction(post_txn, target_commodity):
@@ -1091,6 +1225,37 @@ class BusinessMixin:
                 return s_quantity / s_value
         return None
 
+    def _record_payment_price(
+        self, book, doc_currency, pay_currency, doc_amount: Decimal,
+        pay_amount: Decimal, when: date, *, cash_leaves: bool,
+    ) -> None:
+        """The price a cross-currency payment leaves for its day: the
+        rate actually paid, through the exchange dialog's port
+        (desktop specimen, 2026-09-30: a EUR 900 receivable settled
+        with USD 1,000 left ``EUR/USD 10/9 user:xfer-dialog``).
+        ``cash_leaves`` is the direction: a bill payment or a
+        customer refund sends the pay currency out."""
+        from fractions import Fraction
+
+        from gnucash_mcp.book._piecash_shapes import _record_dialog_price
+
+        doc = Fraction(doc_amount)
+        paid = Fraction(pay_amount)
+        if not doc or not paid:
+            return
+        if cash_leaves:
+            frm, to, rate = pay_currency, doc_currency, abs(doc / paid)
+        else:
+            frm, to, rate = doc_currency, pay_currency, abs(paid / doc)
+        try:
+            default = self._require_default_currency(book)
+        except Exception:
+            default = None
+        _record_dialog_price(
+            book.session, frm, to, rate, _neutral_time(when), default,
+        )
+        self._invalidate_price_caches(book)
+
     def _compute_fx_gain_loss(
         self,
         book,
@@ -1108,8 +1273,20 @@ class BusinessMixin:
         discount_quantity: Decimal | None = None,
         discount_commodity=None,
         dry_run: bool = False,
+        txn_currency=None,
     ) -> dict | None:
         """Compute the realized FX gain/loss for a cross-currency payment.
+
+        ``txn_currency`` is the payment transaction's currency. When
+        it is the pay account's (desktop's rule,
+        ``gncOwnerCreatePaymentLotSecs``) the FX split carries a real
+        value in it — the drift itself, so the receivable/payable leg
+        can be relieved at its carrying amount and the transaction
+        balances in money. ``None`` or the invoice currency is the
+        pre-2026-09-30 form the server still uses for a document
+        posted to an account in another currency: value 0, the drift
+        in the quantity alone. ``"value"`` in the result is that
+        signed transaction-currency amount.
 
         ``dry_run=True`` computes identically but constructs no Split
         (``"split"`` is None) and resolves the FX account without
@@ -1209,6 +1386,12 @@ class BusinessMixin:
             ).quantize(_commodity_quantum(default_currency))
         else:
             fx_diff_default = fx_diff_pay
+        # The same drift in the transaction's currency, when that is
+        # the pay account's: the payment leg is already in it.
+        in_pay_currency = (
+            txn_currency is not None and txn_currency == pay_acct.commodity
+        )
+        fx_diff_txn = fx_diff_pay if in_pay_currency else Decimal("0")
 
         # Discount leg: booked at the pay-date rate while the A/R it
         # relieved was carried at the post-date rate — the difference
@@ -1240,6 +1423,20 @@ class BusinessMixin:
                     discount_amount * rate_at_post_disc
                 ).quantize(_commodity_quantum(discount_commodity))
                 diff_disc = discount_quantity - expected_disc_at_post
+                if in_pay_currency:
+                    if discount_commodity == pay_acct.commodity:
+                        fx_diff_txn += diff_disc
+                    else:
+                        disc_to_txn = self._find_exchange_rate(
+                            book,
+                            from_commodity=discount_commodity,
+                            to_commodity=pay_acct.commodity,
+                            as_of=parsed_date,
+                        )
+                        if disc_to_txn is not None:
+                            fx_diff_txn += (
+                                diff_disc * disc_to_txn
+                            ).quantize(_commodity_quantum(pay_acct.commodity))
                 if discount_commodity != default_currency:
                     disc_to_default = self._find_exchange_rate(
                         book,
@@ -1274,17 +1471,23 @@ class BusinessMixin:
             or (not is_bill and fx_diff_default < 0)
         )
         fx_quantity = quantity_sign * fx_diff_default
+        if not in_pay_currency:
+            fx_value = Decimal("0")
+        elif fx_acct.commodity == txn_currency:
+            # Same currency as the transaction: value IS quantity.
+            fx_value = fx_quantity
+        else:
+            fx_value = quantity_sign * fx_diff_txn
         fx_memo = (
             f"FX {'loss' if is_loss else 'gain'} on invoice "
             f"{inv.id}: post-rate {rate_at_post:.4f}, pay-rate "
-            f"{exchange_rate}"
+            f"{_format_rate(exchange_rate)}"
         )
         split = None
         if not dry_run:
-            split = piecash.Split(
-                account=fx_acct,
-                value=Decimal("0"),
-                quantity=fx_quantity,
+            split = _new_split(
+                fx_acct, fx_value, fx_quantity,
+                txn_currency if in_pay_currency else inv.currency,
                 memo=fx_memo,
                 action="Payment",
             )
@@ -1294,6 +1497,7 @@ class BusinessMixin:
             "fx_acct": fx_acct,
             "fx_notice": fx_notice,
             "quantity": fx_quantity,
+            "value": fx_value,
             "memo": fx_memo,
         }
 
@@ -1301,7 +1505,10 @@ class BusinessMixin:
     def _find_employee(book, employee_id: str):
         """Find an employee by their human-readable ID (e.g., '000001')."""
         from piecash.business.person import Employee
-        return book.session.query(Employee).filter_by(id=employee_id).first()
+        return BusinessMixin._exact(
+            book.session.query(Employee).filter_by(id=employee_id),
+            "id", employee_id,
+        )
 
     @staticmethod
     def _find_job(book, job_id: str):
@@ -1312,7 +1519,9 @@ class BusinessMixin:
         jobs alike.
         """
         from piecash.business.invoice import Job
-        return book.session.query(Job).filter_by(id=job_id).first()
+        return BusinessMixin._exact(
+            book.session.query(Job).filter_by(id=job_id), "id", job_id,
+        )
 
     @staticmethod
     def _find_taxtable(book, name: str):
@@ -1322,7 +1531,18 @@ class BusinessMixin:
         namespace. Returns None if not found; callers raise.
         """
         from piecash.business.tax import Taxtable
-        return book.session.query(Taxtable).filter_by(name=name).first()
+        # Never a hidden copy: desktop makes one (same name,
+        # ``invisible`` 1, ``parent`` set) when it posts a document,
+        # and a name lookup that returned it would attach new lines
+        # to a frozen table and edit the wrong row.
+        return BusinessMixin._exact(
+            book.session.query(Taxtable).filter(
+                Taxtable.name == name,
+                Taxtable.invisible == 0,
+                Taxtable.parent_guid.is_(None),
+            ),
+            "name", name,
+        )
 
     @staticmethod
     def _find_taxtable_by_guid(book, guid: str):
@@ -1359,7 +1579,7 @@ class BusinessMixin:
         if owner_type == "employee":
             return 5
         raise ValueError(
-            f"Invalid owner_type {owner_type!r}. "
+            f"Invalid party_type {owner_type!r}. "
             f"Must be 'customer', 'vendor', or 'employee'."
         )
 
@@ -1367,15 +1587,20 @@ class BusinessMixin:
     def _find_invoice(book, invoice_id: str, owner_type: int | None = None):
         """Find an invoice/bill by human-readable ID.
 
-        Self-heals malformed ``date_posted=''`` values to NULL
-        before the ORM query runs: piecash's ``_DateTime``
-        TypeDecorator hard-crashes loading a row whose
+        On SQLite books, self-heals malformed ``date_posted=''``
+        values to NULL before the ORM query runs: piecash's
+        ``_DateTime`` TypeDecorator hard-crashes loading a row whose
         ``date_posted`` is an empty string (a state some persistence
         paths leave on auto-id'd bills), blocking every subsequent
         invoice operation. piecash exposes no readonly flag, so the
-        heal is always attempted and the try/except absorbs the
-        failure on readonly sessions — one write operation heals the
-        book permanently.
+        heal is attempted on every SQLite lookup and the try/except
+        absorbs the failure on readonly sessions — one write
+        operation heals the book permanently.
+
+        PostgreSQL and MySQL books skip the heal: an empty string can
+        only reach a datetime column under SQLite's dynamic typing,
+        and on PostgreSQL the comparison itself is fatal (see the
+        guard below).
 
         Args:
             book: piecash Book instance.
@@ -1396,19 +1621,43 @@ class BusinessMixin:
         from piecash.business.invoice import Invoice
         from sqlalchemy import text
 
-        try:
-            book.session.execute(
-                text(
-                    "UPDATE invoices SET date_posted = NULL "
-                    "WHERE date_posted = ''"
-                )
-            )
-            book.session.flush()
-        except Exception:
-            # Best-effort heal — readonly sessions, locked
-            # connections, and other rare failures fall through;
-            # never break a lookup over a self-heal attempt.
-            pass
+        # SQLite-only. PostgreSQL types ``date_posted`` as
+        # ``timestamp`` and rejects the ``''`` literal outright:
+        # psycopg2 raises InvalidDatetimeFormat, which aborts the
+        # whole transaction, so the ORM query below then failed with
+        # InFailedSqlTransaction — every get/post/pay/entry on every
+        # invoice, on every PostgreSQL book, with an error naming the
+        # wrong statement. Found and fixed by @JamesRao98 on the
+        # 10xtechnology fork.
+        if _dialect_name(book) == "sqlite":
+            try:
+                # Look before writing. The UPDATE ran on every lookup,
+                # in read-only sessions too, and an UPDATE takes
+                # SQLite's RESERVED lock whether or not a row matches:
+                # every document READ held GnuCash desktop out of the
+                # file until it finished (adversarial review
+                # 2026-09-30, DS-12).
+                stale = book.session.execute(
+                    text(
+                        "SELECT 1 FROM invoices WHERE date_posted = '' "
+                        "LIMIT 1"
+                    )
+                ).first()
+                if stale is not None:
+                    book.session.execute(
+                        text(
+                            "UPDATE invoices SET date_posted = NULL "
+                            "WHERE date_posted = ''"
+                        )
+                    )
+                    book.session.flush()
+            except Exception:
+                # Best-effort heal — readonly sessions, locked
+                # connections, and other rare failures fall through;
+                # never break a lookup over a self-heal attempt. The
+                # rollback keeps "fall through" honest on a backend
+                # that aborts the transaction on error.
+                _rollback_if_aborted(book.session)
 
         query = book.session.query(Invoice).filter(Invoice.id == invoice_id)
         if owner_type is not None:
@@ -1419,24 +1668,19 @@ class BusinessMixin:
             # fails "not found" on job-attached invoices. Employee
             # (owner_type=5) is exempt: piecash jobs are
             # customer/vendor only.
-            from sqlalchemy import and_, or_
-            from piecash.business.invoice import Job
-            if owner_type in (2, 4):
-                job_guid_sq = book.session.query(Job.guid).filter(
-                    Job.owner_type == owner_type
-                ).subquery()
-                return query.filter(or_(
-                    Invoice.owner_type == owner_type,
-                    and_(
-                        Invoice.owner_type == 3,
-                        Invoice.owner_guid.in_(job_guid_sq),
-                    ),
-                )).first()
-            return query.filter(Invoice.owner_type == owner_type).first()
+            return BusinessMixin._exact(
+                query.filter(
+                    BusinessMixin._document_owner_clause(
+                        book, owner_type=owner_type,
+                    )
+                ),
+                "id", invoice_id,
+            )
 
         # owner_type=None: pull all matches and fail loud on
         # collision rather than returning a row-order-dependent pick.
-        matches = query.all()
+        # Exact matches only (see ``_exact``).
+        matches = [m for m in query.all() if m.id == invoice_id]
         if len(matches) <= 1:
             return matches[0] if matches else None
 
@@ -1455,8 +1699,9 @@ class BusinessMixin:
             candidates.append(f"{label} (currency={currency})")
         raise ValueError(
             f"Found {len(matches)} documents with ID {invoice_id!r}: "
-            f"{', '.join(candidates)}. Pass owner_type='customer', "
-            f"'vendor', or 'employee' to disambiguate."
+            f"{', '.join(candidates)}. Narrow the lookup with "
+            f"document_type ('invoice', 'bill', or 'voucher') or "
+            f"party_type ('customer', 'vendor', or 'employee')."
         )
 
     @staticmethod
@@ -1545,17 +1790,17 @@ class BusinessMixin:
     @staticmethod
     def _customer_to_compact_line(customer) -> str:
         """One-line compact: 'id  name  currency'."""
-        return f"{customer.id}\t{customer.name}\t{customer.currency.mnemonic}"
+        return f"{customer.id}\t{_tsv_cell(customer.name)}\t{customer.currency.mnemonic}"
 
     @staticmethod
     def _vendor_to_compact_line(vendor) -> str:
         """One-line compact: 'id  name  currency'."""
-        return f"{vendor.id}\t{vendor.name}\t{vendor.currency.mnemonic}"
+        return f"{vendor.id}\t{_tsv_cell(vendor.name)}\t{vendor.currency.mnemonic}"
 
     @staticmethod
     def _employee_to_compact_line(employee) -> str:
         """One-line compact: 'id  name  currency'."""
-        return f"{employee.id}\t{employee.name}\t{employee.currency.mnemonic}"
+        return f"{employee.id}\t{_tsv_cell(employee.name)}\t{employee.currency.mnemonic}"
 
     @staticmethod
     def _job_to_dict(job, owner_name: str | None = None) -> dict:
@@ -1571,7 +1816,9 @@ class BusinessMixin:
             "name": job.name,
             "reference": job.reference or "",
             "active": bool(job.active),
-            "owner_type": (
+            # ``party_type``: the tool-surface name (create_job takes
+            # party_type), so the field a client is handed round-trips.
+            "party_type": (
                 "customer" if job.owner_type == 2 else "vendor"
             ),
             "owner_name": owner_name,
@@ -1588,10 +1835,13 @@ class BusinessMixin:
         owner_tag = (
             "CUSTOMER" if job.owner_type == 2 else "VENDOR"
         )
-        owner_str = owner_name or "?"
-        ref_part = f"  ref:{job.reference}" if job.reference else ""
+        owner_str = _tsv_cell(owner_name) or "?"
+        ref_part = (
+            f"  ref:{_tsv_cell(job.reference)}" if job.reference else ""
+        )
         return (
-            f"{job.id}\t{job.name}\t{owner_tag}\t{owner_str}{ref_part}"
+            f"{job.id}\t{_tsv_cell(job.name)}\t{owner_tag}\t"
+            f"{owner_str}{ref_part}"
         )
 
     @staticmethod
@@ -1713,9 +1963,9 @@ class BusinessMixin:
         underlying counterparty via ``_find_invoice_owner_by_guid``.
         """
         if invoice.owner_type == 3 and job is not None:
-            # job['owner_type'] is the string form from the caller.
+            # job['party_type'] is the string form from the caller.
             type_field = (
-                "invoice" if job.get("owner_type") == "customer"
+                "invoice" if job.get("party_type") == "customer"
                 else "bill"
             )
         else:
@@ -1784,8 +2034,6 @@ class BusinessMixin:
         date_str = (
             str(opened.date()) if opened else "n/a"
         )
-        status = "posted" if _is_invoice_posted(invoice) else "open"
-
         # ``_find_invoice_owner_by_guid`` dispatches on owner_type,
         # chasing owner_type=3 through the Job to the counterparty.
         owner = self._find_invoice_owner_by_guid(
@@ -1798,13 +2046,20 @@ class BusinessMixin:
         if job is not None:
             owner_name = f"{owner_name} (job:{job.id})"
 
-        # Total: sum of (quantity * price) across entries. Falls back
-        # to "?" when entries can't be loaded — keeps the row legible
+        # Total: what a posted document was booked at (the
+        # settlement's), the entries' sum for a draft. Falls back to
+        # "?" when entries can't be loaded — keeps the row legible
         # even on data-corruption edge cases.
+        status, settlement = self._document_status(
+            book, invoice, is_bill=self._is_bill_side(effective_ot),
+        )
         try:
-            grand_total = self._get_invoice_entries_and_total(
-                book, invoice,
-            )["grand_total"]
+            if settlement is not None:
+                grand_total = settlement["grand_total"]
+            else:
+                grand_total = self._get_invoice_entries_and_total(
+                    book, invoice,
+                )["grand_total"]
             ccy = (
                 invoice.currency.mnemonic
                 if invoice.currency else ""
@@ -1812,15 +2067,25 @@ class BusinessMixin:
             if grand_total == int(grand_total):
                 amount_str = f"{ccy} {int(grand_total):,}".strip()
             else:
-                amount_str = f"{ccy} {grand_total:,.2f}".strip()
-        except (ValueError, AttributeError, TypeError):
+                amount_str = (
+                    f"{ccy} "
+                    f"{_format_amount(grand_total, invoice.currency, separators=True)}"
+                ).strip()
+        except ValueError:
+            # A draft with no lines yet comes to nothing (scoped
+            # review 2026-10-06, IN-19).
+            amount_str = (
+                f"{getattr(invoice.currency, 'mnemonic', '')} "
+                f"{_format_amount(Decimal(0), invoice.currency, separators=True)}"
+            ).strip()
+        except (AttributeError, TypeError):
             # Limited to the predictable shapes "?" is right for —
             # a bare ``except Exception`` would swallow programming
             # errors (KeyError/NameError) silently too.
             amount_str = "?"
 
         return (
-            f"{invoice.id}\t{inv_type}\t{owner_name}\t{amount_str}\t"
+            f"{invoice.id}\t{inv_type}\t{_tsv_cell(owner_name)}\t{amount_str}\t"
             f"{date_str}\t{status}"
         )
 
@@ -1830,6 +2095,7 @@ class BusinessMixin:
         is_bill: bool = False,
         account_paths: dict | None = None,
         taxtable_names: dict | None = None,
+        is_credit_note: bool = False,
     ) -> dict:
         """Convert an entry row (from raw SQL) to a serializable dict.
 
@@ -1843,6 +2109,9 @@ class BusinessMixin:
         q_num = entry_row.quantity_num or 0
         q_denom = entry_row.quantity_denom or 1
         quantity = Decimal(q_num) / Decimal(q_denom)
+        if is_credit_note:
+            # Stored negated (gncEntryGetDocQuantity negates back).
+            quantity = -quantity
 
         if is_bill:
             p_num = entry_row.b_price_num or 0
@@ -1880,6 +2149,24 @@ class BusinessMixin:
             "total": str(total),
         }
         # Conditional keys — plain entries keep their shape.
+        if not is_bill and (entry_row.i_discount_num or 0) != 0:
+            # Only desktop writes a line discount; the document total
+            # applies it (``_entry_math``), so the line must show it
+            # or ``total`` beside the document total reads as an error.
+            disc = Decimal(entry_row.i_discount_num) / Decimal(
+                entry_row.i_discount_denom or 1
+            )
+            result["discount"] = str(disc)
+            result["discount_type"] = (
+                "value" if entry_row.i_disc_type == _entry_math.AMT_VALUE
+                else "percent"
+            )
+            result["discount_how"] = (
+                entry_row.i_disc_how
+                if entry_row.i_disc_how in (
+                    _entry_math.DISC_SAMETIME, _entry_math.DISC_POSTTAX,
+                ) else _entry_math.DISC_PRETAX
+            ).lower()
         if entry_row.notes:
             result["notes"] = entry_row.notes
         if entry_row.action:
@@ -1906,18 +2193,38 @@ class BusinessMixin:
                     result["taxtable_guid"] = taxtable_guid
         return result
 
+    # gnc-engine.h, verbatim — the link GnuCash walks from a posting
+    # transaction or its lot back to the invoice (register "Jump to
+    # Invoice", the lot viewer, Process Payment's open-lot list):
+    #   #define GNC_INVOICE_ID    "gncInvoice"
+    #   #define GNC_INVOICE_GUID  "invoice-guid"
+    # On disk: a `gncInvoice` frame row on the object, and a GUID row
+    # named by the FULL path on the frame's guid. Before 1.5 the child
+    # was named `invoice`, which desktop never reads; the sweep below
+    # renames it on the next business write.
+    _GNC_INVOICE_ID = "gncInvoice"
+    _GNC_INVOICE_GUID = "invoice-guid"
+    _GNC_INVOICE_LINK = "gncInvoice/invoice-guid"
+    # Two spellings of the pre-1.5 child. The server wrote the bare
+    # ``invoice``; GnuCash desktop, on its next save of such a book,
+    # re-serializes every child under the frame's full path — so a
+    # book that has been through desktop since 1.2 carries
+    # ``gncInvoice/invoice`` instead (found on the MariaDB loop, where
+    # Save As did exactly that to all 108 of Alex's links). Neither is
+    # the key desktop reads; both are renamed.
+    _LEGACY_INVOICE_LINKS = ("invoice", "gncInvoice/invoice")
+    _LEGACY_INVOICE_LINK = "invoice"
+
     @staticmethod
     def _write_gncinvoice_slot(book, obj_guid: str, invoice_guid: str):
-        """Write a gncInvoice FRAME+GUID slot linking an object to an invoice.
+        """Write the gncInvoice frame + GUID link from an object (the
+        posting transaction, its lot) to its invoice, in GnuCash's
+        own two-row shape:
 
-        GnuCash stores invoice linkage as a two-row structure:
-          Row 1: obj_guid=<parent>, name='gncInvoice', slot_type=9 (FRAME),
-                 guid_val=<frame_guid>
-          Row 2: obj_guid=<frame_guid>, name='invoice', slot_type=5 (GUID),
-                 guid_val=<invoice_guid>
-
-        This is used on both posting transactions and lots to enable
-        GnuCash UI navigation from transaction/lot back to the invoice.
+          Row 1: obj_guid=<parent>, name='gncInvoice', slot_type=9
+                 (FRAME), guid_val=<frame_guid>
+          Row 2: obj_guid=<frame_guid>, name='gncInvoice/invoice-guid',
+                 slot_type=5 (GUID), guid_val=<invoice_guid>
         """
         import uuid
         from piecash.kvp import Slot, KVP_Type
@@ -1939,43 +2246,789 @@ class BusinessMixin:
         book.session.execute(
             Slot.__table__.insert().values(
                 obj_guid=frame_guid,
-                name="invoice",
+                name=BusinessMixin._GNC_INVOICE_LINK,
                 slot_type=KVP_Type.KVP_TYPE_GUID,
                 guid_val=invoice_guid,
             )
         )
         _verify_composite_write(
             book.session, Slot.__table__,
-            {"obj_guid": frame_guid, "name": "invoice"},
+            {"obj_guid": frame_guid, "name": BusinessMixin._GNC_INVOICE_LINK},
             f"gncInvoice ref slot for frame {frame_guid[:8]}",
         )
 
-    @staticmethod
-    def _write_gdate_slot(book, obj_guid: str, name: str, date_val: date):
-        """Write a gdate-typed slot on an object.
 
-        Used for trans-date-due and date-posted slots on invoice
-        posting transactions.
-        """
+    # ── Payment lots: a party's money with no document on it ─────────
+    #
+    # gncOwner.c, verbatim — how a lot says whose it is when no
+    # document claims it (the excess of an overpayment, a payment
+    # received ahead of its invoice, the payments left behind when a
+    # document is unposted):
+    #   #define GNC_OWNER_ID    "gncOwner"
+    #   #define GNC_OWNER_TYPE  "owner-type"
+    #   #define GNC_OWNER_GUID  "owner-guid"
+    # ``gncOwnerAttachToLot`` writes the type as a gint64 and the GUID
+    # as a GUID under the ``gncOwner`` frame (gnc-lot.cpp
+    # PROP_OWNER_TYPE / PROP_OWNER_GUID). On disk, like the invoice
+    # link: a frame row on the lot, the two children named by their
+    # FULL path on the frame's guid. Pinned row for row against the
+    # engine by tests/test_parity_prepayment.py.
+    _GNC_OWNER_ID = "gncOwner"
+    _GNC_OWNER_TYPE = "gncOwner/owner-type"
+    _GNC_OWNER_GUID = "gncOwner/owner-guid"
+
+    @staticmethod
+    def _attach_owner_to_lot(
+        book, lot_guid: str, owner_type: int, owner_guid: str,
+    ) -> None:
+        """``gncOwnerAttachToLot``: mark a lot as a party's."""
+        import uuid
         from piecash.kvp import Slot, KVP_Type
 
+        frame_guid = uuid.uuid4().hex
         book.session.execute(
             Slot.__table__.insert().values(
-                obj_guid=obj_guid,
-                name=name,
-                slot_type=KVP_Type.KVP_TYPE_GDATE,
-                gdate_val=date_val,
+                obj_guid=lot_guid,
+                name="gncOwner",
+                slot_type=KVP_Type.KVP_TYPE_FRAME,
+                guid_val=frame_guid,
             )
         )
         _verify_composite_write(
             book.session, Slot.__table__,
-            {"obj_guid": obj_guid, "name": name},
-            f"Gdate slot '{name}' for {obj_guid[:8]}",
+            {"obj_guid": lot_guid, "name": "gncOwner"},
+            f"gncOwner frame slot for lot {lot_guid[:8]}",
+        )
+        book.session.execute(
+            Slot.__table__.insert().values(
+                obj_guid=frame_guid,
+                name=BusinessMixin._GNC_OWNER_TYPE,
+                slot_type=KVP_Type.KVP_TYPE_GINT64,
+                int64_val=int(owner_type),
+            )
+        )
+        _verify_composite_write(
+            book.session, Slot.__table__,
+            {"obj_guid": frame_guid, "name": BusinessMixin._GNC_OWNER_TYPE},
+            f"gncOwner type slot for frame {frame_guid[:8]}",
+        )
+        book.session.execute(
+            Slot.__table__.insert().values(
+                obj_guid=frame_guid,
+                name=BusinessMixin._GNC_OWNER_GUID,
+                slot_type=KVP_Type.KVP_TYPE_GUID,
+                guid_val=owner_guid,
+            )
+        )
+        _verify_composite_write(
+            book.session, Slot.__table__,
+            {"obj_guid": frame_guid, "name": BusinessMixin._GNC_OWNER_GUID},
+            f"gncOwner guid slot for frame {frame_guid[:8]}",
+        )
+
+    @staticmethod
+    def _document_lot_guids(book) -> set[str]:
+        """GUIDs of every object that carries a LIVE document link —
+        a ``gncInvoice`` frame with a GUID inside it
+        (``gncInvoiceGetInvoiceFromLot`` reads the child, not the
+        frame). The frame alone is not a link: desktop leaves it
+        behind, empty, on a lot it has unposted."""
+        from sqlalchemy import text
+
+        return {
+            r[0] for r in book.session.execute(
+                text(
+                    "SELECT f.obj_guid FROM slots f "
+                    "JOIN slots c ON c.obj_guid = f.guid_val "
+                    "AND c.slot_type = 5 "
+                    "WHERE f.name = 'gncInvoice' AND f.slot_type = 9"
+                ),
+            ).fetchall()
+        }
+
+    @staticmethod
+    def _detach_invoice_from_lot(book, lot) -> None:
+        """``gncInvoiceDetachFromLot``: take the document link off a
+        lot, by raw SQL (the link is a GUID slot; see
+        ``_strip_guid_slots`` for why the ORM must not delete it).
+        The engine clears the value and leaves the ``gncInvoice``
+        frame standing, empty; so does this."""
+        from piecash.kvp import Slot
+        from sqlalchemy import text
+
+        frames = [
+            r[0] for r in book.session.execute(
+                text(
+                    "SELECT guid_val FROM slots WHERE obj_guid = :g "
+                    "AND name = 'gncInvoice' AND slot_type = 9"
+                ),
+                {"g": lot.guid},
+            ).fetchall() if r[0]
+        ]
+        for frame in frames:
+            book.session.execute(
+                Slot.__table__.delete().where(
+                    Slot.__table__.c.obj_guid == frame
+                )
+            )
+            _verify_delete(
+                book.session, Slot.__table__, {"obj_guid": frame},
+                f"invoice link of lot {lot.guid[:8]}",
+            )
+        book.session.expire(lot, ["slots"])
+
+    @staticmethod
+    def _lots_held_for(book, owner_guid: str) -> int:
+        """How many lots attached to this party or job still hold a
+        split — money on the books in its name with no document. The
+        lot names its owner by GUID; deleting the owner underneath it
+        leaves a balance nobody can be asked about."""
+        from sqlalchemy import text
+
+        return book.session.execute(
+            text(
+                "SELECT COUNT(DISTINCT f.obj_guid) FROM slots g "
+                "JOIN slots f ON f.guid_val = g.obj_guid "
+                "AND f.name = 'gncOwner' AND f.slot_type = 9 "
+                "JOIN splits s ON s.lot_guid = f.obj_guid "
+                "WHERE g.name = :gn AND g.guid_val = :owner"
+            ),
+            {"gn": BusinessMixin._GNC_OWNER_GUID, "owner": owner_guid},
+        ).scalar() or 0
+
+    def _destroy_lot(self, book, lot, label: str) -> None:
+        """``gnc_lot_destroy`` for a lot with nothing left in it."""
+        self._strip_guid_slots(book, [lot.guid], label, objects=[lot])
+        book.session.delete(lot)
+
+    def _end_owner(self, book, inv) -> tuple[int, str]:
+        """``gncOwnerGetEndOwner(gncInvoiceGetOwner(invoice))`` as
+        ``(owner_type, owner_guid)``: the customer or vendor behind a
+        job, the document's own owner otherwise. The party a payment
+        lot is attached to."""
+        _eff, job = self._resolve_owner_type_and_job(book, inv)
+        if job is not None:
+            return job.owner_type, job.owner_guid
+        return inv.owner_type, inv.owner_guid
+
+    @staticmethod
+    def _txn_type(txn) -> str:
+        """``xaccTransGetTxnType``: "I", "P", "L", or ""."""
+        if txn is None:
+            return ""
+        try:
+            return str(txn.get("trans-txn-type") or "")
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _lot_amount(lot) -> Decimal:
+        """``gnc_lot_get_balance``: the lot's split AMOUNTS summed, in
+        the account's commodity. What the payment-lot ports compare;
+        a document's settlement still reads through
+        ``_calculate_lot_balance``."""
+        return sum(
+            (
+                Decimal(str(s.quantity)) for s in lot.splits
+                if s.reconcile_state != "v"
+            ),
+            Decimal(0),
+        )
+
+    def _payment_lots(self, book, account=None) -> list[dict]:
+        """Every lot that is a party's and no document's, with money
+        in it: ``[{"lot", "owner": (type, guid), "amount", "since"}]``.
+
+        ``owner`` is the END owner (``gncOwnerLotMatchOwnerFunc``: a
+        lot attached to a job counts for the job's customer or
+        vendor). ``amount`` is ``_lot_amount`` — signed as the ledger
+        has it: negative in a receivable account is the customer's
+        credit, positive in a payable account is the business's with
+        the vendor. Empty lots (desktop leaves one behind after every
+        payment it moves into a document's lot, and sweeps them up
+        lazily) and lots that net to zero are skipped.
+        """
+        from sqlalchemy import text
+
+        rows = book.session.execute(
+            text(
+                "SELECT f.obj_guid, t.int64_val, g.guid_val "
+                "FROM slots f "
+                "JOIN slots t ON t.obj_guid = f.guid_val AND t.name = :tn "
+                "JOIN slots g ON g.obj_guid = f.guid_val AND g.name = :gn "
+                "WHERE f.name = :fn AND f.slot_type = 9"
+            ),
+            {
+                "tn": self._GNC_OWNER_TYPE, "gn": self._GNC_OWNER_GUID,
+                "fn": self._GNC_OWNER_ID,
+            },
+        ).fetchall()
+        owners = {r[0]: (int(r[1]), r[2]) for r in rows if r[2]}
+        if not owners:
+            return []
+        with_document = self._document_lot_guids(book)
+        guids = sorted(g for g in owners if g not in with_document)
+        out: list[dict] = []
+        for start in range(0, len(guids), 500):
+            query = book.session.query(piecash.Lot).filter(
+                piecash.Lot.guid.in_(guids[start:start + 500])
+            )
+            if account is not None:
+                query = query.filter(
+                    piecash.Lot.account_guid == account.guid
+                )
+            for lot in query.all():
+                splits = list(lot.splits)
+                amount = self._lot_amount(lot)
+                if not splits or amount == 0:
+                    continue
+                owner_type, owner_guid = owners[lot.guid]
+                if owner_type == 3:
+                    job = self._find_job_by_guid(book, owner_guid)
+                    if job is not None:
+                        owner_type, owner_guid = (
+                            job.owner_type, job.owner_guid,
+                        )
+                dates = [
+                    s.transaction.post_date for s in splits
+                    if s.transaction is not None
+                    and s.transaction.post_date
+                ]
+                out.append({
+                    "lot": lot,
+                    "owner": (owner_type, owner_guid),
+                    "amount": amount,
+                    "since": min(dates) if dates else None,
+                })
+        out.sort(key=lambda p: (p["since"] or date.min, p["lot"].guid))
+        return out
+
+    def _unapplied_payments(self, book) -> list[dict]:
+        """What each party has paid that no document has absorbed —
+        one row per party, account, and currency, oldest first.
+        ``amount`` is positive: money the party can settle a document
+        with (``pay_document`` with ``from_prepayment``). The one
+        reader behind the outstanding list, the dashboard's overdue
+        lines, and ``get_document``."""
+        grouped: dict[tuple, dict] = {}
+        for p in self._payment_lots(book):
+            acct = p["lot"].account
+            available = (
+                -p["amount"] if acct.type == "RECEIVABLE" else p["amount"]
+            )
+            if available <= 0:
+                continue
+            key = (p["owner"], acct.guid)
+            row = grouped.get(key)
+            if row is None:
+                owner = self._find_invoice_owner_by_guid(
+                    book, p["owner"][0], p["owner"][1],
+                )
+                row = grouped[key] = {
+                    "owner": p["owner"],
+                    "owner_type": self._OWNER_TYPE_TO_PARTY.get(
+                        p["owner"][0], "customer",
+                    ),
+                    "owner_id": getattr(owner, "id", None),
+                    "owner_name": owner.name if owner else None,
+                    "account": acct,
+                    "currency": acct.commodity.mnemonic,
+                    "amount": Decimal(0),
+                    "since": p["since"],
+                    "payments": 0,
+                }
+            row["amount"] += available
+            row["payments"] += 1
+            if p["since"] and (
+                row["since"] is None or p["since"] < row["since"]
+            ):
+                row["since"] = p["since"]
+        for row in grouped.values():
+            row["amount"] = row["amount"].quantize(
+                _commodity_quantum(row["account"].commodity)
+            )
+        return sorted(
+            grouped.values(),
+            key=lambda r: (r["since"] or date.min, r["owner_name"] or ""),
+        )
+
+    _OWNER_TYPE_TO_PARTY = {2: "customer", 4: "vendor", 5: "employee"}
+
+    @staticmethod
+    def _find_offsetting_split(lot, target_amount: Decimal):
+        """``gncOwnerFindOffsettingSplit``: the split in a payment lot
+        best suited to offset ``target_amount`` — opposite in sign,
+        ranked equal > larger > smaller, a real payment over a lot
+        link, and among equals the bigger amount."""
+        best = None
+        best_flags = 0
+        best_amount = Decimal(0)
+        for split in lot.splits:
+            txn = split.transaction
+            if txn is None:
+                continue
+            amount = Decimal(str(split.quantity))
+            if (target_amount > 0) == (amount > 0):
+                continue
+            if abs(amount) == abs(target_amount):
+                flags = 8
+            elif abs(amount) > abs(target_amount):
+                flags = 4
+            else:
+                flags = 2
+            if BusinessMixin._txn_type(txn) != "L":
+                flags += 1
+            if flags >= best_flags and abs(amount) > abs(best_amount):
+                best, best_flags, best_amount = split, flags, amount
+        return best
+
+    @staticmethod
+    def _reduce_split_to(split, target_amount: Decimal) -> bool:
+        """``gncOwnerReduceSplitTo``: cut a split down to
+        ``target_amount`` and put the rest in a new split beside it —
+        same transaction, same lot, same memo and action. The reduced
+        split's value is the target at the split's own rate, rounded
+        half-up to the transaction currency; the remainder's is what
+        is left of the original value, so the transaction still
+        balances to the cent."""
+        from fractions import Fraction
+
+        amount = Decimal(str(split.quantity))
+        if (amount > 0) != (target_amount > 0):
+            return False
+        if amount == target_amount or amount == 0:
+            return False
+        txn = split.transaction
+        value = Decimal(str(split.value))
+        target_value = _entry_math.round_half_up(
+            Fraction(target_amount) * Fraction(value) / Fraction(amount),
+            txn.currency.fraction,
+        )
+        lot = split.lot
+        _set_split_amounts(split, target_value, target_amount)
+        remainder = _new_split(
+            split.account, value - target_value, amount - target_amount,
+            txn.currency,
+            memo=split.memo, action=split.action,
+            reconcile_state=split.reconcile_state,
+            reconcile_date=split.reconcile_date,
+        )
+        remainder.transaction = txn
+        if lot is not None:
+            # _set_split_amounts reset the lot's flag to UNKNOWN (-1),
+            # which piecash reads as closed and refuses to add to.
+            _lot_hold_open(lot)
+            remainder.lot = lot
+        return True
+
+    def _offset_lots(self, from_lot, to_lot, cap: Decimal | None = None):
+        """``gncOwnerOffsetLots``: move a payment out of ``from_lot``
+        (never a document's lot) into ``to_lot``, cutting it down
+        first when it is more than ``to_lot`` needs. ``cap`` limits
+        how much may move — desktop always offsets all it can; a
+        caller applying a stated amount passes the rest of it.
+        Returns the moved split, or ``None`` when nothing could
+        move."""
+        target = self._lot_amount(to_lot)
+        if cap is not None and abs(target) > cap:
+            target = cap if target > 0 else -cap
+        if target == 0:
+            return None
+        split = self._find_offsetting_split(from_lot, target)
+        if split is None:
+            return None
+        if abs(Decimal(str(split.quantity))) > abs(target):
+            self._reduce_split_to(split, -target)
+        _lot_hold_open(to_lot)
+        split.lot = to_lot
+        return split
+
+    def _create_lot_link(self, book, from_lot, to_lot, owner_name: str):
+        """``gncOwnerCreateLotLink``: offset two DOCUMENT lots against
+        each other as far as the smaller allows, with one "Lot Link"
+        split per lot in a TXN_TYPE_LINK transaction — an existing
+        one on either lot extended, else a new one described by the
+        party's name and dated at the later of the two lots' latest
+        splits."""
+        post_acct = from_lot.account
+        from_balance = self._lot_amount(from_lot)
+        to_balance = self._lot_amount(to_lot)
+        if abs(from_balance) > abs(to_balance):
+            from_balance = -to_balance
+        else:
+            to_balance = -from_balance
+        link_date = self._lot_link_date(from_lot, to_lot)
+        txn = self._lot_link_transaction(from_lot, to_lot)
+        if txn is None:
+            from_split = _new_split(
+                post_acct, -from_balance, -from_balance,
+                post_acct.commodity, memo="", action="Lot Link",
+            )
+            to_split = _new_split(
+                post_acct, -to_balance, -to_balance,
+                post_acct.commodity, memo="", action="Lot Link",
+            )
+            txn = piecash.Transaction(
+                currency=post_acct.commodity,
+                description=owner_name,
+                post_date=link_date,
+                num="",
+                splits=[from_split, to_split],
+            )
+        else:
+            # One split per lot in a link (BS-4; see _merge_into_link).
+            from_split = self._merge_into_link(txn, from_lot, post_acct, -from_balance)
+            to_split = self._merge_into_link(txn, to_lot, post_acct, -to_balance)
+            if link_date > txn.post_date:
+                txn.post_date = link_date
+        _lot_hold_open(from_lot)
+        from_split.lot = from_lot
+        _lot_hold_open(to_lot)
+        to_split.lot = to_lot
+        book.flush()
+        txn["trans-txn-type"] = "L"
+        self._set_lot_link_memo(txn)
+        self._drop_date_posted_slot(book, txn)
+        return txn
+
+    @staticmethod
+    def _merge_into_link(txn, lot, post_acct, value):
+        """The leg of link transaction ``txn`` for ``lot``: the split
+        already in that lot with ``value`` added to it
+        (``xaccScrubMergeLotSubSplits`` — one split per lot), or a
+        new "Lot Link" split appended when there is none (scoped
+        review 2026-10-06, BS-4). ``value`` is in the post account's
+        commodity, the link's currency, so value and quantity agree."""
+        existing = next((sp for sp in txn.splits if sp.lot is lot), None)
+        if existing is None:
+            split = _new_split(
+                post_acct, value, value, post_acct.commodity,
+                memo="", action="Lot Link",
+            )
+            txn.splits.append(split)
+            return split
+        total = Decimal(str(existing.value)) + value
+        _set_split_amounts(existing, total, total)
+        return existing
+
+    def _auto_apply_lots(self, book, lots: list, owner_name: str) -> None:
+        """``gncOwnerAutoApplyPaymentsWithLots``: balance a set of one
+        party's lots against each other as far as they go. Two
+        document lots get a lot link; two payment lots, the bigger
+        closes the smaller; a document and a payment, the payment
+        moves into the document's lot. Lots found empty are
+        destroyed, as desktop destroys them.
+
+        Balances are re-read before each pairing (desktop reads the
+        left lot's once per pass and relies on the callee to notice
+        there is nothing left to offset)."""
+        from sqlalchemy import text
+
+        lots = [lot for lot in lots if lot is not None]
+        if not lots:
+            return
+        with_document = self._document_lot_guids(book)
+        for lot in lots:
+            # piecash refuses a split into a lot whose raw flag is
+            # truthy, and -1 is. Every lot here is left at -1 again
+            # by the caller once the session has flushed.
+            _lot_hold_open(lot)
+        slots = list(lots)
+
+        def live(index: int):
+            lot = slots[index]
+            if lot is None:
+                return None
+            if not list(lot.splits):
+                self._destroy_lot(book, lot, "empty lot")
+                slots[index] = None
+                return None
+            return lot
+
+        for i in range(len(slots)):
+            left = live(i)
+            if left is None or self._lot_amount(left) == 0:
+                continue
+            left_has_doc = left.guid in with_document
+            for j in range(i + 1, len(slots)):
+                right = live(j)
+                if right is None:
+                    continue
+                left_balance = self._lot_amount(left)
+                right_balance = self._lot_amount(right)
+                if left_balance == 0:
+                    break
+                if right_balance == 0:
+                    continue
+                if right.account_guid != left.account_guid:
+                    continue
+                if (left_balance > 0) == (right_balance > 0):
+                    continue
+                right_has_doc = right.guid in with_document
+                if left_has_doc and right_has_doc:
+                    self._create_lot_link(book, left, right, owner_name)
+                elif not left_has_doc and not right_has_doc:
+                    if abs(left_balance) >= abs(right_balance):
+                        self._offset_lots(left, right)
+                    else:
+                        self._offset_lots(right, left)
+                elif left_has_doc:
+                    self._offset_lots(right, left)
+                else:
+                    self._offset_lots(left, right)
+
+    @staticmethod
+    def _migrate_invoice_link_keys(book) -> int:
+        """Write path only: rename every pre-1.5 link child (`invoice`,
+        or `gncInvoice/invoice` once desktop has re-saved the book)
+        under a `gncInvoice` frame to GnuCash's key. A rename of rows,
+        nothing else changes and nothing posts; every business write
+        calls it so the first one after the upgrade converts the whole
+        book. Returns how many links were renamed."""
+        from piecash.kvp import Slot
+        from sqlalchemy import text
+
+        bare, prefixed = BusinessMixin._LEGACY_INVOICE_LINKS
+        frames = [
+            r[0] for r in book.session.execute(
+                text(
+                    "SELECT s.obj_guid FROM slots s "
+                    "WHERE s.name IN (:bare, :prefixed) "
+                    "AND s.slot_type = 5 AND s.obj_guid IN "
+                    "(SELECT guid_val FROM slots WHERE name = :frame "
+                    "AND slot_type = 9)"
+                ),
+                {"bare": bare, "prefixed": prefixed,
+                 "frame": BusinessMixin._GNC_INVOICE_ID},
+            ).fetchall()
+        ]
+        for frame_guid in frames:
+            book.session.execute(
+                Slot.__table__.update()
+                .where(
+                    (Slot.__table__.c.obj_guid == frame_guid)
+                    & (Slot.__table__.c.name.in_(
+                        BusinessMixin._LEGACY_INVOICE_LINKS
+                    ))
+                )
+                .values(name=BusinessMixin._GNC_INVOICE_LINK)
+            )
+            _verify_composite_write(
+                book.session, Slot.__table__,
+                {"obj_guid": frame_guid,
+                 "name": BusinessMixin._GNC_INVOICE_LINK},
+                f"renamed invoice link on frame {frame_guid[:8]}",
+            )
+        return len(frames)
+
+    def _doc_type_string(self, book, inv) -> str:
+        """gncInvoiceGetTypeString, verbatim: "Invoice", "Bill",
+        "Expense" (voucher), "Credit Note". GnuCash uses it for the
+        lot title ("%s %s" with the id) and every posting split's
+        action; so do we."""
+        if self._get_is_credit_note(inv):
+            return "Credit Note"
+        return {2: "Invoice", 4: "Bill", 5: "Expense"}.get(
+            self._effective_owner_type(book, inv), "Invoice",
+        )
+
+    @staticmethod
+    def _write_applies_to_slot(book, invoice_guid: str, source_guid: str):
+        """Write the ``gnc-mcp/applies-to-invoice`` link via Core.
+
+        piecash stores a path-style key as two rows: a FRAME slot on
+        the invoice named ``gnc-mcp`` (``guid_val`` = a fresh frame
+        guid) and the string value on the frame's guid under the full
+        path name. This is the raw-SQL twin of the ORM write in
+        ``_set_applies_to_invoice_guid``, for the one caller
+        (``unpost_invoice``) that must write after the posting-
+        transaction delete has swept the invoice's own slots — the
+        ORM accessors are unreliable in that state. Any leftover
+        ``gnc-mcp`` frame on the invoice is removed first so the key
+        never doubles.
+        """
+        import uuid
+        from piecash.kvp import KVP_Type, Slot
+
+        stale = book.session.execute(
+            Slot.__table__.select().where(
+                (Slot.__table__.c.obj_guid == invoice_guid)
+                & (Slot.__table__.c.name == "gnc-mcp")
+            )
+        ).fetchall()
+        for row in stale:
+            if row.guid_val:
+                book.session.execute(
+                    Slot.__table__.delete().where(
+                        Slot.__table__.c.obj_guid == row.guid_val
+                    )
+                )
+                _verify_delete(
+                    book.session, Slot.__table__,
+                    {"obj_guid": row.guid_val},
+                    f"stale gnc-mcp frame children for {invoice_guid[:8]}",
+                )
+        if stale:
+            book.session.execute(
+                Slot.__table__.delete().where(
+                    (Slot.__table__.c.obj_guid == invoice_guid)
+                    & (Slot.__table__.c.name == "gnc-mcp")
+                )
+            )
+            _verify_delete(
+                book.session, Slot.__table__,
+                {"obj_guid": invoice_guid, "name": "gnc-mcp"},
+                f"stale gnc-mcp frame for {invoice_guid[:8]}",
+            )
+
+        frame_guid = uuid.uuid4().hex
+        book.session.execute(
+            Slot.__table__.insert().values(
+                obj_guid=invoice_guid,
+                name="gnc-mcp",
+                slot_type=KVP_Type.KVP_TYPE_FRAME,
+                guid_val=frame_guid,
+            )
+        )
+        _verify_composite_write(
+            book.session, Slot.__table__,
+            {"obj_guid": invoice_guid, "name": "gnc-mcp"},
+            f"gnc-mcp frame slot for {invoice_guid[:8]}",
+        )
+        book.session.execute(
+            Slot.__table__.insert().values(
+                obj_guid=frame_guid,
+                name=BusinessMixin._APPLIES_TO_SLOT_KEY,
+                slot_type=KVP_Type.KVP_TYPE_STRING,
+                string_val=source_guid,
+            )
+        )
+        _verify_composite_write(
+            book.session, Slot.__table__,
+            {"obj_guid": frame_guid,
+             "name": BusinessMixin._APPLIES_TO_SLOT_KEY},
+            f"applies-to slot for frame {frame_guid[:8]}",
+        )
+
+    @staticmethod
+    def _drop_date_posted_slot(book, txn) -> None:
+        """piecash writes a ``date-posted`` GDate slot on every
+        transaction; desktop writes it on a posting transaction
+        (xaccTransSetDatePostedGDate) but not on the payment and
+        lot-link transactions it creates through
+        xaccTransSetDatePostedSecs. Remove it where desktop has none."""
+        from piecash.kvp import Slot
+        from sqlalchemy import text
+
+        book.flush()
+        book.session.execute(
+            Slot.__table__.delete().where(
+                (Slot.__table__.c.obj_guid == txn.guid)
+                & (Slot.__table__.c.name == "date-posted")
+            )
+        )
+        _verify_delete(
+            book.session, Slot.__table__,
+            {"obj_guid": txn.guid, "name": "date-posted"},
+            f"date-posted slot on {txn.guid[:8]}",
+        )
+        book.session.expire(txn, ["slots"])
+        # A stale row would otherwise survive in the ORM collection.
+        _ = book.session.execute(
+            text("SELECT 1 FROM slots WHERE obj_guid = :g AND name = 'date-posted'"),
+            {"g": txn.guid},
+        ).first()
+
+    @staticmethod
+    def _drop_empty_lot_notes(book, lot) -> None:
+        """piecash writes an empty ``notes`` slot when a Lot is
+        constructed; desktop writes none until someone types one."""
+        from piecash.kvp import Slot
+
+        book.flush()
+        book.session.execute(
+            Slot.__table__.delete().where(
+                (Slot.__table__.c.obj_guid == lot.guid)
+                & (Slot.__table__.c.name == "notes")
+                & ((Slot.__table__.c.string_val == "")
+                   | (Slot.__table__.c.string_val.is_(None)))
+            )
+        )
+        _verify_delete(
+            book.session, Slot.__table__,
+            {"obj_guid": lot.guid, "name": "notes"},
+            f"empty notes slot on lot {lot.guid[:8]}",
+        )
+        book.session.expire(lot, ["slots"])
+
+    @staticmethod
+    def _write_due_date_slot(book, txn_guid: str, due: date) -> None:
+        """Write ``trans-date-due`` the way GnuCash does — and only
+        that way.
+
+        ``xaccTransSetDateDue`` stores a ``Time64`` KVP value; the SQL
+        backend writes it as a ``slot_type`` 6 (timespec) row with
+        ``timespec_val`` at GnuCash's neutral clock time, 10:59:00
+        UTC — the same convention as ``transactions.post_date``.
+        Desktop-posted specimen (2026-09-28): ``6 |
+        2026-10-28 10:59:00``. The server wrote this key as a GDate
+        row (``slot_type`` 10, ``gdate_val`` ``YYYYMMDD``) from 1.2
+        through the first cut of 1.5 — a shape ``xaccTransRetDateDue``
+        cannot decode, so desktop showed no due date at all (Find
+        Invoice's Due column empty, the Invoices Due Reminder silent,
+        Receivable Aging all "Current"; bookkeeper report,
+        2026-09-28). An existing row of either type is rewritten in
+        place, never duplicated. The write is verified.
+        """
+        from datetime import timezone
+
+        from piecash.kvp import KVP_Type, Slot
+        from sqlalchemy import text
+
+        stamp = _neutral_time(due)
+        exists = book.session.execute(
+            text(
+                "SELECT 1 FROM slots WHERE obj_guid = :o "
+                "AND name = 'trans-date-due'"
+            ),
+            {"o": txn_guid},
+        ).first()
+        if exists:
+            book.session.execute(
+                Slot.__table__.update()
+                .where(
+                    (Slot.__table__.c.obj_guid == txn_guid)
+                    & (Slot.__table__.c.name == "trans-date-due")
+                )
+                .values(
+                    slot_type=KVP_Type.KVP_TYPE_TIMESPEC,
+                    timespec_val=stamp, gdate_val=None,
+                )
+            )
+        else:
+            book.session.execute(
+                # Column for column what desktop's SQL backend wrote
+                # for this key: the unused double is NULL there, and
+                # piecash's default would make it 0.0.
+                Slot.__table__.insert().values(
+                    obj_guid=txn_guid,
+                    name="trans-date-due",
+                    slot_type=KVP_Type.KVP_TYPE_TIMESPEC,
+                    timespec_val=stamp,
+                    double_val=None,
+                )
+            )
+        _verify_composite_write(
+            book.session, Slot.__table__,
+            {"obj_guid": txn_guid, "name": "trans-date-due",
+             "slot_type": KVP_Type.KVP_TYPE_TIMESPEC},
+            f"trans-date-due for {txn_guid[:8]}",
         )
 
     @staticmethod
     def _calculate_lot_balance(lot) -> Decimal:
-        """Sum of split values in a lot, skipping voided splits.
+        """A document lot's balance in the DOCUMENT's currency,
+        skipping voided splits.
 
         A/R lots: positive = outstanding receivable. A/P lots:
         negative = outstanding payable.
@@ -1985,13 +3038,108 @@ class BusinessMixin:
         them matches the void-aware treatment everywhere else;
         summing them would be right only by accident, and
         inconsistent with callers that count splits.
+
+        Each split contributes through ``_lot_split_amount``: a
+        payment desktop (or, since 2026-09-30, the server) writes in
+        the transfer account's currency carries the document's
+        amount in its QUANTITY, not its value.
         """
         total = Decimal(0)
+        doc_currency_guid: str | None = None
+        resolved = False
         for split in lot.splits:
             if split.reconcile_state == "v":
                 continue
-            total += Decimal(str(split.value))
+            if (
+                not resolved
+                and split.transaction.currency != split.account.commodity
+            ):
+                doc_currency_guid = BusinessMixin._lot_document_currency_guid(
+                    lot,
+                )
+                resolved = True
+            total += BusinessMixin._lot_split_amount(split, doc_currency_guid)
         return total
+
+    @staticmethod
+    def _lot_document_currency_guid(lot) -> str | None:
+        """GUID of the currency of the document a lot belongs to, or
+        ``None`` when no document claims it."""
+        from sqlalchemy import text
+        from sqlalchemy.orm import object_session
+
+        session = object_session(lot)
+        if session is None:
+            return None
+        row = session.execute(
+            text("SELECT currency FROM invoices WHERE post_lot = :g"),
+            {"g": lot.guid},
+        ).first()
+        return row[0] if row else None
+
+    @staticmethod
+    def _lot_split_amount(split, doc_currency_guid: str | None) -> Decimal:
+        """What one split in a document's lot settles, in the
+        document's currency. The one reader of that amount.
+
+        A split stores ``value`` in its transaction's currency and
+        ``quantity`` in its account's commodity. When the two are
+        the same currency the amounts are equal. When they differ,
+        exactly one of them is in the document's currency:
+
+        * the account's — a payment booked in the transfer account's
+          currency (desktop's rule, and the server's since
+          2026-09-30): the receivable/payable split's QUANTITY;
+        * the transaction's — the posting and the server's earlier
+          payments, and any document posted to an account in another
+          currency (a state only pre-1.5 servers created): its VALUE.
+
+        Summing values alone — what this read did before — mixes
+        currencies the moment a desktop-written payment is in the
+        lot."""
+        if (
+            doc_currency_guid is not None
+            and split.transaction.currency != split.account.commodity
+            and split.account.commodity.guid == doc_currency_guid
+        ):
+            return Decimal(str(split.quantity))
+        return Decimal(str(split.value))
+
+    @staticmethod
+    def _posted_total(inv, lot, sign: int) -> Decimal | None:
+        """What a POSTED document was booked at: its posting
+        transaction's split(s) in the document's lot, in the
+        document's currency, direction-normalized (``sign`` as in
+        ``_document_settlement``). The one reader of a posted total.
+
+        The posting is the record. A posted document's total used to
+        be re-derived from its entries on every read, so anything
+        that changed the derivation after posting — a tax table
+        edited, a rounding rule corrected, a discount this server did
+        not apply — moved the "total" away from what was booked and
+        showed the difference as money paid (adversarial review
+        2026-09-30, C10 / BL-14). Entries describe the document;
+        the posting says what it came to.
+
+        ``None`` when the posting can't be read — no posting
+        transaction, its split voided (the zeroed zombie is not a
+        total) or absent from the lot. Callers fall back to the
+        entries then.
+        """
+        post_txn_guid = inv.post_txn_guid
+        if not post_txn_guid:
+            return None
+        doc_currency_guid = inv.currency_guid
+        total = None
+        for split in lot.splits:
+            if split.transaction_guid != post_txn_guid:
+                continue
+            if split.reconcile_state == "v":
+                return None
+            total = (total or Decimal(0)) + BusinessMixin._lot_split_amount(
+                split, doc_currency_guid,
+            )
+        return None if total is None else sign * total
 
     @staticmethod
     def _calculate_lot_quantity(lot) -> Decimal:
@@ -2009,49 +3157,185 @@ class BusinessMixin:
             total += Decimal(str(split.quantity))
         return total
 
+    # GnuCash's two billing-term types, as the SQL backend stores
+    # them in ``billterms.type`` (gnc-bill-term-sql.cpp, a string
+    # column; gncBillTerm.c switches on the enum these name).
+    # Pinned by tests/test_billterm_due_date.py.
+    _TERM_TYPE_DAYS = "GNC_TERM_TYPE_DAYS"
+    _TERM_TYPE_PROXIMO = "GNC_TERM_TYPE_PROXIMO"
+
     @staticmethod
-    def _resolve_invoice_due_date(
-        book, inv,
-    ) -> tuple[date | None, bool]:
-        """Resolve an invoice/bill due date through three sources.
+    def _billterm_due_date(term, post_date: date) -> date:
+        """``gncBillTermComputeDueDate``: ``compute_time`` over the
+        term's due days. See ``_billterm_compute_time``."""
+        if term is None:
+            return post_date
+        return BusinessMixin._billterm_compute_time(
+            term, post_date, int(term.duedays or 0),
+        )
 
-        Returns ``(due_date, no_terms_flag)``; ``due_date`` is None
-        when the invoice isn't posted. ``no_terms_flag`` is True
-        when the 30-day default was used, so callers annotate the
-        rendering as approximated.
+    @staticmethod
+    def _billterm_discount_date(term, post_date: date) -> date:
+        """The last day of a term's early-payment window: the same
+        ``compute_time`` over the term's DISCOUNT days, from the same
+        posting date. GnuCash 5.12 computes no discount date (the
+        engine exports only ``gncBillTermComputeDueDate``), so this
+        is the server's rule, chosen to mean what the due date
+        means: a "2/10 net 30" window closes ten days after posting
+        as the due date falls thirty after, and on a proximo term the
+        discount days name a day of the month as the due days do.
+        Anchoring on ``date_opened`` let the window close before the
+        document was posted (review C46)."""
+        if term is None:
+            return post_date
+        return BusinessMixin._billterm_compute_time(
+            term, post_date, int(term.discountdays or 0),
+        )
 
-        Resolution order — first source that resolves wins:
+    @staticmethod
+    def _billterm_compute_time(term, post_date: date, days: int) -> date:
+        """``compute_time`` / ``compute_monthyear``, ported verbatim from
+        GnuCash ``libgnucash/engine/gncBillTerm.c`` (stable, read
+        2026-09-28): ``compute_time`` / ``compute_monthyear``. A
+        port, not a reinterpretation — like ``_recurrence_next``
+        and Recurrence.cpp — so the server and desktop's Due Bills
+        Reminder name the same day.
 
-        1. ``trans-date-due`` slot on the posting transaction
-           (present when the user passed ``due_date`` explicitly).
-        2. ``Invoice.terms`` billterm — ``duedays`` added to
-           ``date_posted``. Read raw via SQL; the ORM relationship
-           is unreliable through some access paths.
-        3. 30-day default.
+        ``days`` is the term's due days or discount days; the
+        callers handle ``None`` terms (``if (!term) return
+        post_date;``).
 
-        Single chokepoint so the warnings collector and
-        ``get_outstanding_invoices`` produce identical due-date math.
+        - **DAYS**: posting date + ``days``.
+        - **PROXIMO** (``compute_monthyear``): a ``cutoff`` of 0 or
+          below is relative to the posting month's end (``cutoff +=
+          gnc_date_get_last_mday(...)``: -3 is the 25th in February,
+          the 27th in June). A posting day on or before the cutoff
+          is due NEXT month; after it, the month after. The due
+          day is ``due_days`` clamped to the due month's last day
+          (``if (days < day) day = days``). ``gnc_dmy2time64_neutral``
+          normalizes a day below 1 the way ``mktime`` does — day 0
+          is the last day of the previous month — so a proximo
+          term with ``due_days = 0`` follows that too.
+
+        The C file's own worked example (cutoff 19, due day 20):
+        posted 14-06-2010 → due 20-07-2010; posted 22-06-2010 →
+        the month after next, the 20th (its comment says
+        20-02-2010, a typo for 20-08-2010 — the code is what is
+        ported here).
+        """
+        import calendar
+
+        due_days = days
+        term_type = term.type
+        if term_type == BusinessMixin._TERM_TYPE_DAYS:
+            return post_date + timedelta(days=due_days)
+        if term_type == BusinessMixin._TERM_TYPE_PROXIMO:
+            iday, imonth, iyear = post_date.day, post_date.month, post_date.year
+            cutoff = int(term.cutoff or 0)
+            if cutoff <= 0:
+                cutoff += calendar.monthrange(iyear, imonth)[1]
+            if iday <= cutoff:
+                # We apply this to next month
+                imonth += 1
+            else:
+                # We apply to the following month
+                imonth += 2
+            if imonth > 12:
+                iyear += 1
+                imonth -= 12
+            day = calendar.monthrange(iyear, imonth)[1]
+            if due_days < day:
+                day = due_days
+            if day < 1:
+                # mktime normalization: day 0 = last day of the
+                # month before, day -1 the one before that.
+                return date(iyear, imonth, 1) + timedelta(days=day - 1)
+            return date(iyear, imonth, day)
+        # ``switch`` with no default: the neutral posting date.
+        return post_date
+
+    @staticmethod
+    def _invoice_billterm(book, inv):
+        """The document's Billterm row, or ``None``. Read via the raw
+        ``terms`` column; the ORM relationship is unreliable through
+        some access paths. A lookup failure clears an aborted
+        PostgreSQL transaction and reads as no terms."""
+        from sqlalchemy import text
+
+        try:
+            terms_row = book.session.execute(
+                text("SELECT terms FROM invoices WHERE guid = :guid"),
+                {"guid": inv.guid},
+            ).first()
+            term_guid = terms_row[0] if terms_row else None
+            if not term_guid:
+                return None
+            from piecash.business.invoice import Billterm
+
+            return (
+                book.session.query(Billterm)
+                .filter_by(guid=term_guid)
+                .first()
+            )
+        except Exception:
+            _rollback_if_aborted(book.session)
+            return None
+
+    @staticmethod
+    def _resolve_invoice_due_date(book, inv) -> date | None:
+        """A posted document's due date; ``None`` when unposted.
+
+        1. The ``trans-date-due`` slot on the posting transaction —
+           what desktop writes on every post
+           (``gncInvoicePostToAccount`` → ``xaccTransSetDateDue``),
+           and what ``post_document`` writes since 1.5.
+        2. Otherwise the same math desktop would have used:
+           ``_billterm_due_date`` over the document's terms, which
+           is the posting date when there are none. A server-posted
+           document without the slot is a shape desktop never
+           writes; ``_backfill_due_dates`` adds the slot on the next
+           business write, so both paths give one answer.
+
+        The pre-1.5 30-day default is gone (spec A2, ruled
+        2026-09-28): a document with no terms is due on its posting
+        date, as in desktop. Single chokepoint so the warnings
+        collector and ``get_outstanding_invoices`` produce identical
+        due-date math.
         """
         from sqlalchemy import text
 
         if not _is_invoice_posted(inv):
-            return None, False
+            return None
 
         txn = inv.post_txn
         if txn is None:
-            return None, False
+            return None
 
-        # Step 1: explicit due-date slot.
+        # Step 1: the slot. GnuCash's row is a timespec (slot_type
+        # 6) at the neutral clock time, whose date is the due date;
+        # the server's pre-fix rows were GDate (slot_type 10,
+        # ``YYYYMMDD``), read here until the backfill rewrites them.
         row = book.session.execute(
             text(
-                "SELECT gdate_val FROM slots "
+                "SELECT timespec_val, gdate_val, slot_type FROM slots "
                 "WHERE obj_guid = :guid "
                 "AND name = 'trans-date-due'"
             ),
             {"guid": txn.guid},
         ).first()
-        if row and row[0]:
-            gdate_val = row[0]
+        # The row's TYPE says which column holds the date. Every slot
+        # row carries an epoch in ``timespec_val`` as filler, so a
+        # GDate row read timespec-first is due 1970-01-01 — "20726
+        # days past due" (adversarial review 2026-09-30, C64).
+        is_gdate = bool(row) and int(row[2] or 0) == 10
+        if row and row[0] and not is_gdate:
+            ts = row[0]
+            if isinstance(ts, datetime):
+                return ts.date()
+            digits = str(ts).strip().replace("-", "")[:8]
+            return date(int(digits[:4]), int(digits[4:6]), int(digits[6:8]))
+        if row and row[1]:
+            gdate_val = row[1]
             if isinstance(gdate_val, str):
                 # GnuCash GDATE columns return a compact ``YYYYMMDD``
                 # string; other paths yield ISO ``YYYY-MM-DD``. Python
@@ -2062,54 +3346,715 @@ class BusinessMixin:
                 # overdue warning. Normalize to digits first.
                 digits = gdate_val.strip().replace("-", "")[:8]
                 if len(digits) == 8 and digits.isdigit():
-                    return (
-                        date(int(digits[:4]), int(digits[4:6]),
-                             int(digits[6:8])),
-                        False,
+                    return date(
+                        int(digits[:4]), int(digits[4:6]), int(digits[6:8]),
                     )
-                return date.fromisoformat(gdate_val[:10]), False
+                return date.fromisoformat(gdate_val[:10])
             if isinstance(gdate_val, datetime):
-                return gdate_val.date(), False
-            return gdate_val, False
+                return gdate_val.date()
+            return gdate_val
 
-        # Step 2: billterm via the raw ``terms`` column.
-        try:
-            terms_row = book.session.execute(
-                text(
-                    "SELECT terms FROM invoices "
-                    "WHERE guid = :guid"
-                ),
-                {"guid": inv.guid},
-            ).first()
-            term_guid = terms_row[0] if terms_row else None
-            if term_guid:
-                from piecash.business.invoice import Billterm
-
-                bt = (
-                    book.session.query(Billterm)
-                    .filter_by(guid=term_guid)
-                    .first()
-                )
-                if bt and bt.duedays:
-                    posted = inv.date_posted
-                    if isinstance(posted, datetime):
-                        posted = posted.date()
-                    return (
-                        posted + timedelta(days=int(bt.duedays)),
-                        False,
-                    )
-        except Exception:
-            pass
-
-        # Step 3: 30-day default. Annotate.
+        # Step 2: the port, over the terms (posting date when none).
         posted = inv.date_posted
         if isinstance(posted, datetime):
             posted = posted.date()
-        return posted + timedelta(days=30), True
+        return BusinessMixin._billterm_due_date(
+            BusinessMixin._invoice_billterm(book, inv), posted,
+        )
+
+    def _migrate_business_shapes(self, book) -> dict:
+        """Write path only: bring every business row the server wrote
+        before 2026-09-29 to the shape desktop writes, and say what
+        moved. Found by the credit-note parity twin (the same flow on
+        two identical books, one side desktop, diffed row by row):
+
+        - ``credit_note_entries_migrated`` — a credit note's entry
+          quantities are stored negated (gncEntrySetDocQuantity); the
+          server stored them positive, so desktop showed a server
+          credit note as a charge. A posted credit note converts
+          when its stored entry sum disagrees in sign with its A/R or
+          A/P posting split (customer side: same sign; bill side:
+          opposite). An unposted one has no posting to read, so
+          it converts ROW BY ROW on the pre-1.5 fingerprint: an
+          entry the old server wrote carries ``i_disc_type = ''``
+          (1.5 and desktop write PERCENT or VALUE), and exactly
+          those rows are negated, whatever their sign. The first cut
+          guessed from the signs ("every line positive means old")
+          and so negated a current or desktop credit note whose
+          lines were all entered negative — stored positive, as
+          ``gncEntrySetDocQuantity`` stores them — turning a 40
+          charge into a 40 credit on the next unrelated business
+          write (adversarial review 2026-09-30, C9). The
+          ``entries_normalized`` pass below then rewrites the
+          fingerprint, in the same save, so a row converts once.
+        - ``credit_applications_migrated`` — the server's payment-
+          typed credit application becomes the TXN_TYPE_LINK
+          transaction gncOwnerCreateLotLink writes.
+        - ``document_dates_normalized`` — date_opened / date_posted at
+          the neutral 10:59:00 UTC instead of local midnight.
+        - ``entries_normalized`` — gncEntryCreate's defaults (discount
+          PERCENT / PRETAX, the unpriced side's taxable flag, payment
+          type CASH, no bill-to owner) and the entry date at local
+          noon, the entry ledger's convention.
+        - ``lot_flags_reset`` — document lots' closed flag back to
+          -1, which desktop leaves for gnc_lot_is_closed to compute.
+        - ``payment_memos_completed`` — the memo on both legs of a
+          payment.
+        - ``payment_slots_pruned`` — no date-posted slot on payment
+          and lot-link transactions.
+        - ``lot_notes_pruned`` — no empty notes slot on a document
+          lot.
+
+        Nothing posts; amounts never change. Runs through
+        ``_upgrade_book_shapes`` on every converting write.
+        """
+        from datetime import time, timezone
+
+        from piecash.business.invoice import Entry, Invoice
+        from piecash.core.transaction import Transaction
+        from piecash.kvp import Slot
+        from sqlalchemy import text
+
+        out: dict = {}
+        book.flush()
+
+        # ── whose rows are these? ──
+        # Every pass below changes a row only if the OLD SERVER wrote
+        # it, and it decides that from a mark the old server left —
+        # never from what the values look like. The first cut of two
+        # passes guessed from content, and each rewrote rows desktop
+        # had made: a credit note stored the way desktop stores it
+        # (review C9), and line dates written by desktop's Duplicate
+        # Invoice, which are at 10:59 UTC exactly as the old server's
+        # were (GUI gate 2026-10-01, G-1). The marks, read once here,
+        # before any pass can erase one:
+        #
+        # * an ENTRY the old server wrote carries ``i_disc_type = ''``
+        #   (desktop and 1.5 write PERCENT or VALUE);
+        # * a DOCUMENT is the old server's if any of its entries is,
+        #   or if its row carries ``billto_type = 0`` with no bill-to
+        #   owner (the old insert wrote 0; desktop writes NULL);
+        # * a SLOT ROW the old server wrote carries piecash's filler
+        #   columns (``double_val`` 0, ``timespec_val`` NULL), which
+        #   GnuCash's backend never writes — so its payments are the
+        #   ``P`` transactions whose ``date-posted`` slot is such a
+        #   row, and its lots the ones whose empty ``notes`` slot is.
+        #
+        # A row with no mark is left exactly as it is. Locked by
+        # tests/test_converter_false_positives.py.
+        old_entries = {
+            r[0] for r in book.session.execute(
+                text(
+                    "SELECT guid FROM entries "
+                    "WHERE LENGTH(COALESCE(i_disc_type, '')) = 0"
+                ),
+            ).fetchall()
+        }
+        old_documents = {
+            g for r in book.session.execute(
+                text(
+                    "SELECT invoice, bill FROM entries "
+                    "WHERE LENGTH(COALESCE(i_disc_type, '')) = 0"
+                ),
+            ).fetchall() for g in r if g
+        } | {
+            r[0] for r in book.session.execute(
+                text(
+                    "SELECT guid FROM invoices "
+                    "WHERE billto_type = 0 AND billto_guid IS NULL"
+                ),
+            ).fetchall()
+        }
+        _PIECASH_FILLER = (
+            "((double_val = 0 AND slot_type <> 2) OR "
+            "(timespec_val IS NULL AND slot_type <> 6))"
+        )
+        old_payments = {
+            r[0] for r in book.session.execute(
+                text(
+                    "SELECT obj_guid FROM slots WHERE name = 'date-posted' "
+                    f"AND {_PIECASH_FILLER}"
+                ),
+            ).fetchall()
+        }
+        old_lots = {
+            r[0] for r in book.session.execute(
+                text(
+                    "SELECT obj_guid FROM slots WHERE name = 'notes' "
+                    "AND LENGTH(COALESCE(string_val, '')) = 0 "
+                    f"AND {_PIECASH_FILLER}"
+                ),
+            ).fetchall()
+        }
+
+        # ── credit-note entries ──
+        migrated = unresolved = 0
+        for inv in book.session.query(Invoice).all():
+            if not self._get_is_credit_note(inv):
+                continue
+            rows = book.session.execute(
+                text(
+                    "SELECT guid, quantity_num, quantity_denom, "
+                    "i_price_num, i_price_denom, b_price_num, b_price_denom, "
+                    "invoice, i_disc_type "
+                    "FROM entries WHERE invoice = :g OR bill = :g"
+                ),
+                {"g": inv.guid},
+            ).fetchall()
+            if not rows:
+                continue
+            customer_side = rows[0][7] is not None
+            stored_sum = Decimal("0")
+            for r in rows:
+                qty = Decimal(r[1] or 0) / Decimal(r[2] or 1)
+                price = (
+                    Decimal(r[3] or 0) / Decimal(r[4] or 1) if customer_side
+                    else Decimal(r[5] or 0) / Decimal(r[6] or 1)
+                )
+                stored_sum += qty * price
+            # Posted or not, the row says who wrote it: only a line
+            # carrying the old server's mark is negated. The posted
+            # branch used to compare the sign of the lines' sum with
+            # the posting split's and negate every line when they
+            # disagreed — the C9 guess again, surviving on the posted
+            # path: a credit note whose tax or discount pushes its
+            # total across zero (+100 untaxed, −95 taxed 10%, posting
+            # −4.50 against lines summing −5) had its lines reversed on
+            # the next converting write, by the 1.5 server and by
+            # GnuCash's engine alike (scoped review 2026-10-06, BS-1).
+            to_negate = [r for r in rows if (r[8] or "") == ""]
+            if to_negate:
+                for r in to_negate:
+                    book.session.execute(
+                        Entry.__table__.update()
+                        .where(Entry.__table__.c.guid == r[0])
+                        .values(quantity_num=-(r[1] or 0))
+                    )
+                    _verify_write(
+                        book.session, Entry.__table__, r[0],
+                        f"credit-note entry sign on {inv.id}",
+                    )
+                migrated += 1
+        if migrated:
+            out["credit_note_entries_migrated"] = migrated
+        if unresolved:
+            out["credit_note_entries_unresolved"] = unresolved
+
+        # ── payment-typed credit applications → lot links ──
+        p_txns = [
+            r[0] for r in book.session.execute(
+                text(
+                    "SELECT obj_guid FROM slots WHERE name = 'trans-txn-type' "
+                    "AND string_val = 'P'"
+                ),
+            ).fetchall()
+        ]
+        relinked = 0
+        for guid in p_txns:
+            txn = book.session.query(Transaction).filter_by(guid=guid).first()
+            if txn is None or not (txn.description or "").startswith("Credit applied: "):
+                continue
+            if guid not in old_payments:
+                continue  # the mark, not the words, says who wrote it
+            splits = list(txn.splits)
+            if len(splits) != 2 or any(sp.lot is None for sp in splits):
+                continue
+            if any(sp.account.type not in ("RECEIVABLE", "PAYABLE") for sp in splits):
+                continue
+            lot_inv = None
+            for sp in splits:
+                cand = self._find_invoice_for_lot(book, sp.lot)
+                if cand is not None:
+                    lot_inv = cand
+                    break
+            txn.description = (
+                self._end_owner_name(book, lot_inv) if lot_inv is not None
+                else "(Unknown)"
+            )
+            for sp in splits:
+                sp.action = "Lot Link"
+            txn["trans-txn-type"] = "L"
+            self._set_lot_link_memo(txn)
+            self._drop_date_posted_slot(book, txn)
+            relinked += 1
+        if relinked:
+            out["credit_applications_migrated"] = relinked
+
+        # ── document dates at the neutral time ──
+        dated = 0
+        for inv in book.session.query(Invoice).all():
+            if inv.guid not in old_documents:
+                continue
+            changed = False
+            for col in ("date_opened", "date_posted"):
+                val = getattr(inv, col)
+                if val is None or val == "":
+                    continue
+                if not isinstance(val, datetime):
+                    continue
+                as_utc = (
+                    val.astimezone(timezone.utc) if val.tzinfo
+                    else val.replace(tzinfo=timezone.utc)
+                )
+                if as_utc.time() == time(10, 59):
+                    continue
+                # Desktop's own stamp in a zone beyond UTC-10/UTC+13
+                # (11:59 or 09:59 UTC) is already right; leave it.
+                neutral = _neutral_time(as_utc.astimezone().date())
+                if as_utc == neutral:
+                    continue
+                setattr(inv, col, neutral)
+                changed = True
+            if changed:
+                dated += 1
+        if dated:
+            out["document_dates_normalized"] = dated
+
+        # ── entry defaults and the entry date ──
+        normalized = 0
+        for e in book.session.query(Entry).all():
+            if e.guid not in old_entries:
+                continue
+            changed = False
+            if (e.i_disc_type or "") == "":
+                e.i_disc_type = "PERCENT"; changed = True
+            if (e.i_disc_how or "") == "":
+                e.i_disc_how = "PRETAX"; changed = True
+            if not e.b_paytype:
+                e.b_paytype = 1; changed = True
+            if e.billto_type is not None and int(e.billto_type) == 0 and not e.billto_guid:
+                e.billto_type = None; changed = True
+            if e.i_acct is not None and not e.b_taxable:
+                e.b_taxable = 1; changed = True
+            if e.b_acct is not None and not e.i_taxable:
+                e.i_taxable = 1; changed = True
+            d = e.date
+            if isinstance(d, datetime):
+                as_utc = d.astimezone(timezone.utc) if d.tzinfo else d.replace(tzinfo=timezone.utc)
+                if as_utc.time() == time(10, 59):
+                    e.date = datetime.combine(
+                        as_utc.astimezone().date(), time(12, 0),
+                    ).astimezone(timezone.utc)
+                    changed = True
+            if changed:
+                normalized += 1
+        for inv in book.session.query(Invoice).all():
+            if inv.guid not in old_documents:
+                continue
+            if inv.billto_type is not None and int(inv.billto_type) == 0 and not inv.billto_guid:
+                inv.billto_type = None
+        if normalized:
+            out["entries_normalized"] = normalized
+
+        # ── document lots: closed flag left for GnuCash to compute ──
+        reset = 0
+        doc_lots = {
+            r[0] for r in book.session.execute(
+                text("SELECT obj_guid FROM slots WHERE name = 'gncInvoice' AND slot_type = 9"),
+            ).fetchall()
+        }
+        from piecash.core.transaction import Lot
+        # The stored flag is read here by SQL, not through the ORM:
+        # ``_lot_is_closed`` is the one reader of the column.
+        stored = {
+            r[0] for r in book.session.execute(
+                text("SELECT guid FROM lots WHERE is_closed >= 0"),
+            ).fetchall()
+        }
+        for lot in book.session.query(Lot).all():
+            if (
+                lot.guid in doc_lots and lot.guid in stored
+                and lot.guid in old_lots
+            ):
+                lot.is_closed = _LOT_CLOSED_UNKNOWN
+                reset += 1
+        if reset:
+            out["lot_flags_reset"] = reset
+
+        # ── payment memos on both legs; no date-posted on P/L ──
+        memos = pruned = 0
+        for guid, ttype in book.session.execute(
+            text(
+                "SELECT obj_guid, string_val FROM slots WHERE name = 'trans-txn-type' "
+                "AND string_val IN ('P', 'L')"
+            ),
+        ).fetchall():
+            # Desktop makes a payment out of a register transaction
+            # too (Assign as Payment): that one has its own
+            # date-posted slot and whatever memos the user typed.
+            if guid not in old_payments:
+                continue
+            txn = book.session.query(Transaction).filter_by(guid=guid).first()
+            if txn is None:
+                continue
+            if ttype == "P":
+                doc_splits = [sp for sp in txn.splits if sp.account.type in ("RECEIVABLE", "PAYABLE")]
+                others = [sp for sp in txn.splits if sp.account.type not in ("RECEIVABLE", "PAYABLE")]
+                memo = next((sp.memo for sp in others if sp.memo), None)
+                if memo:
+                    for sp in doc_splits:
+                        if not sp.memo:
+                            sp.memo = memo
+                            memos += 1
+            if book.session.execute(
+                text("SELECT 1 FROM slots WHERE obj_guid = :g AND name = 'date-posted'"),
+                {"g": guid},
+            ).first():
+                self._drop_date_posted_slot(book, txn)
+                pruned += 1
+        if memos:
+            out["payment_memos_completed"] = memos
+        if pruned:
+            out["payment_slots_pruned"] = pruned
+
+        # ── billterm refcounts: documents + customers + vendors ──
+        from piecash.business.invoice import Billterm
+        recounted = 0
+        for bt in book.session.query(Billterm).all():
+            refs = book.session.execute(
+                text(
+                    "SELECT (SELECT COUNT(*) FROM invoices WHERE terms = :g) + "
+                    "(SELECT COUNT(*) FROM customers WHERE terms = :g) + "
+                    "(SELECT COUNT(*) FROM vendors WHERE terms = :g)"
+                ),
+                {"g": bt.guid},
+            ).scalar()
+            # A posted document's frozen copy carries no count
+            # ("children don't need refcounts", gncBillTerm.c).
+            if bt.parent_guid:
+                continue
+            # RAISED, never lowered. The old server left every count
+            # at 0, which let desktop delete a term still in use;
+            # that is the defect to repair. Desktop's own counts run
+            # HIGH (it adds one for each reference it loads and saves
+            # the sum), which only keeps a term from being deleted —
+            # and lowering one is rewriting a row desktop wrote.
+            if int(bt.refcount or 0) < int(refs):
+                bt.refcount = int(refs)
+                recounted += 1
+        if recounted:
+            out["billterm_refcounts_recomputed"] = recounted
+
+        # ── credit-note 0 on every document that isn't one ──
+        flagged = 0
+        for inv in book.session.query(Invoice).all():
+            if inv.guid not in old_documents:
+                continue
+            try:
+                inv[self._CREDIT_NOTE_SLOT_KEY]
+            except KeyError:
+                self._set_is_credit_note(inv, False)
+                flagged += 1
+        if flagged:
+            out["credit_note_flags_completed"] = flagged
+
+        # ── no empty notes slot on a document lot ──
+        empty_notes = [
+            r[0] for r in book.session.execute(
+                text(
+                    "SELECT obj_guid FROM slots WHERE name = 'notes' "
+                    "AND LENGTH(COALESCE(string_val, '')) = 0"
+                ),
+            ).fetchall()
+            if r[0] in doc_lots and r[0] in old_lots
+        ]
+        for lot_guid in empty_notes:
+            book.session.execute(
+                Slot.__table__.delete().where(
+                    (Slot.__table__.c.obj_guid == lot_guid)
+                    & (Slot.__table__.c.name == "notes")
+                )
+            )
+            _verify_delete(
+                book.session, Slot.__table__,
+                {"obj_guid": lot_guid, "name": "notes"},
+                f"empty notes slot on lot {lot_guid[:8]}",
+            )
+        if empty_notes:
+            out["lot_notes_pruned"] = len(empty_notes)
+
+        book.flush()
+        return out
+
+    def _find_invoice_for_lot(self, book, lot):
+        """The document a lot belongs to, through its gncInvoice link."""
+        from piecash.business.invoice import Invoice
+        return book.session.query(Invoice).filter_by(post_lot_guid=lot.guid).first()
+
+    def _backfill_due_dates(self, book) -> int:
+        """Write path only: give every posted document whose posting
+        transaction lacks ``trans-date-due`` — or carries the
+        server's old GDate row for it — the slot desktop would
+        have written — ``_billterm_due_date`` over its terms, the
+        posting date when there are none. Server posts before 1.5
+        wrote the slot only when the caller passed ``due_date``;
+        desktop writes it on every post. A rename of nothing, an
+        insert of one slot per document, nothing posted; every
+        business write calls it through ``_upgrade_book_shapes``.
+        Returns how many slots were written.
+        """
+        from sqlalchemy import text
+        from piecash.business.invoice import Invoice
+
+        n = 0
+        # Rows the server wrote as GDate (slot_type 10) before the
+        # fix: rewrite each in place as GnuCash's timespec row,
+        # keeping the date it holds (an explicit due date, or the
+        # port's answer) — desktop can't decode the old row at all.
+        with_slot: set[str] = set()
+        for obj_guid, slot_type, gdate_val in book.session.execute(
+            text(
+                "SELECT obj_guid, slot_type, gdate_val FROM slots "
+                "WHERE name = 'trans-date-due'"
+            ),
+        ).fetchall():
+            with_slot.add(obj_guid)
+            if int(slot_type) == 6 or not gdate_val:
+                continue
+            if isinstance(gdate_val, datetime):
+                held = gdate_val.date()
+            elif isinstance(gdate_val, date):
+                held = gdate_val
+            else:
+                digits = str(gdate_val).strip().replace("-", "")[:8]
+                held = date(
+                    int(digits[:4]), int(digits[4:6]), int(digits[6:8]),
+                )
+            self._write_due_date_slot(book, obj_guid, held)
+            n += 1
+        for inv in book.session.query(Invoice).filter(
+            Invoice.date_posted.isnot(None),
+        ).all():
+            if not _is_invoice_posted(inv):
+                continue
+            txn = inv.post_txn
+            if txn is None or txn.guid in with_slot:
+                continue
+            posted = inv.date_posted
+            if isinstance(posted, datetime):
+                posted = posted.date()
+            due = self._billterm_due_date(
+                self._invoice_billterm(book, inv), posted,
+            )
+            self._write_due_date_slot(book, txn.guid, due)
+            with_slot.add(txn.guid)
+            n += 1
+        return n
+
+    def _document_settlement(
+        self, book, inv, *, is_bill=None, is_credit_note=None,
+    ) -> dict | None:
+        """Payment state of a POSTED document, read from its A/R or
+        A/P lot. ``None`` when the document is unposted or its lot
+        cannot be found.
+
+        This is the one place total/paid/due are derived.
+        ``get_invoice``, the document lists, and
+        ``get_outstanding_invoices`` all read from here so the
+        surfaces agree by construction; ``pay_invoice`` derives
+        ``total_paid`` from the same seam. ``grand_total`` is the
+        amount the document was POSTED at (``_posted_total``), so
+        ``amount_paid`` is always the sum of what the lot's other
+        splits settled; the entries are summed only when the posting
+        can't be read. Callers that already resolved the side may
+        pass ``is_bill`` / ``is_credit_note`` to save a Job query.
+
+        Returns a dict of ``post_account``, ``lot``, ``balance``
+        (signed lot balance), ``grand_total``, ``amount_paid``,
+        ``amount_due`` (direction-normalized: positive = still owed,
+        NEGATIVE = overpaid, never abs()'d), ``overpaid``, and
+        ``sign`` (``amount_due == sign * balance``).
+        """
+        if not _is_invoice_posted(inv):
+            return None
+        if is_credit_note is None:
+            is_credit_note = self._get_is_credit_note(inv)
+        if is_bill is None:
+            is_bill = self._is_bill_side(
+                self._effective_owner_type(book, inv)
+            )
+        # By primary key, so an account already in the session costs
+        # no SQL — a listing asks once per document.
+        post_acct = book.session.get(piecash.Account, inv.post_acc_guid)
+        if not post_acct:
+            return None
+        lot_obj = next(
+            (l for l in post_acct.lots if l.guid == inv.post_lot_guid),
+            None,
+        )
+        if lot_obj is None:
+            return None
+        balance = self._calculate_lot_balance(lot_obj)
+        # Every amount leaves here at the lot commodity's quantum, so
+        # paid/due/total read alike (250.00, not 250 beside 200.00)
+        # on every surface and in the audit line that echoes them.
+        quantum = _commodity_quantum(post_acct.commodity)
+        sign = -1 if (is_bill ^ is_credit_note) else 1
+        amount_due = (sign * balance).quantize(quantum)
+        grand_total = self._posted_total(inv, lot_obj, sign)
+        if grand_total is not None:
+            grand_total = grand_total.quantize(quantum)
+        else:
+            try:
+                grand_total = self._get_invoice_entries_and_total(
+                    book, inv,
+                )["grand_total"].quantize(quantum)
+            except ValueError:
+                grand_total = max(amount_due, Decimal("0"))
+        # Signed arithmetic keeps amount_paid honest when overpaid:
+        # grand 3500, due -1000 -> paid 4500.
+        return {
+            "post_account": post_acct,
+            "lot": lot_obj,
+            "balance": balance,
+            "grand_total": grand_total,
+            "amount_paid": grand_total - amount_due + Decimal(0),
+            "amount_due": amount_due + Decimal(0),  # never "-0.00"
+            # More was paid than was owed. A document whose own total
+            # is negative (lines that net to a refund) owes the party
+            # from the moment it posts: that is its balance, not an
+            # overpayment (adversarial review 2026-09-30, C44).
+            "overpaid": (
+                amount_due < 0 and not is_credit_note and grand_total >= 0
+            ),
+            "owed_to_party": grand_total < 0 and amount_due < 0,
+            "sign": sign,
+        }
+
+    def _document_payments(self, book, inv, settlement) -> list[dict]:
+        """What has settled a posted document: every non-voided split
+        in its lot except the posting, oldest first.
+
+        ``guid`` is the settling transaction, short, so the caller can
+        void or delete it directly. ``amount`` is what it settled, in
+        the lot's currency, in the direction ``amount_due`` reads.
+        ``from`` names the other side: a lot's title when the other leg
+        sits in one (a credit note applied, or the invoice it was
+        applied to), otherwise the account the money moved through.
+        """
+        post_guid = inv.post_txn.guid if inv.post_txn is not None else None
+        quantum = _commodity_quantum(settlement["post_account"].commodity)
+        prefixes = self._transaction_prefix_map(book)
+        doc_currency_guid = inv.currency.guid if inv.currency else None
+        rows = []
+        for split in settlement["lot"].splits:
+            txn = split.transaction
+            if txn.guid == post_guid or split.reconcile_state == "v":
+                continue
+            others = [o for o in txn.splits if o is not split]
+            # A lot link names the other document. A payment names the
+            # account the money moved through — never the sibling
+            # receivable/payable split an overpayment (or a payment
+            # shared between documents) leaves beside this one.
+            in_lot = (
+                next((o for o in others if o.lot is not None), None)
+                if self._txn_type(txn) == "L" else None
+            )
+            elsewhere = [
+                o for o in others if o.account_guid != split.account_guid
+            ]
+            if in_lot is not None:
+                source = in_lot.lot.title or in_lot.account.fullname
+            elif elsewhere:
+                source = max(
+                    elsewhere, key=lambda o: abs(o.value),
+                ).account.fullname
+            elif others:
+                source = max(others, key=lambda o: abs(o.value)).account.fullname
+            else:
+                source = ""
+            rows.append({
+                "guid": prefixes.get(txn.guid, txn.guid[:8]),
+                "date": txn.post_date.isoformat() if txn.post_date else None,
+                "amount": str(
+                    (-settlement["sign"] * self._lot_split_amount(
+                        split, doc_currency_guid,
+                    )).quantize(quantum)
+                ),
+                "from": source,
+            })
+        rows.sort(key=lambda r: (r["date"] or "", r["guid"]))
+        return rows
+
+    def _preload_document_lots(self, book, invoices) -> list:
+        """Load the posting accounts of a page of documents with every
+        lot and lot split, in one query per level; the caller holds the
+        returned list for as long as it reads settlements. The session's
+        identity map is weak, so without the reference each row reloaded
+        its account, lots, and splits."""
+        from sqlalchemy.orm import selectinload
+
+        guids = {
+            i.post_acc_guid for i in invoices
+            if _is_invoice_posted(i) and i.post_acc_guid
+        }
+        if not guids:
+            return []
+        return (
+            book.session.query(piecash.Account)
+            .options(
+                selectinload(piecash.Account.lots)
+                .selectinload(piecash.Lot.splits)
+            )
+            .filter(piecash.Account.guid.in_(guids))
+            .all()
+        )
+
+    def _document_currency(self, book, code: str):
+        """The currency a party or document names: from the book, or
+        added from the ISO table if unseen — the rule
+        ``create_transaction`` and ``create_price`` already follow.
+        Refusing an unseen code sent a caller to ``create_commodity``
+        to invent one (a USD at fraction 10000). A code that isn't ISO
+        4217 is refused."""
+        try:
+            return self._get_or_create_currency(book, code)
+        except ValueError:
+            raise ValueError(
+                f"Currency not found: {code} is not an ISO 4217 code"
+                + (
+                    f" (did you mean {code.upper()}? codes are upper case)"
+                    if code != code.upper() else ""
+                )
+            )
+
+    def _document_status(
+        self, book, inv, **known,
+    ) -> tuple[str, dict | None]:
+        """The shared status word and the settlement it came from.
+
+        open = not yet booked; posted = booked, balance owed; paid =
+        balance zero or below (``overpaid`` flags below); a credit note
+        at zero reads applied, since it settles by application, not
+        cash. The one rule every document surface speaks, read off
+        ``_document_settlement``; a posted document whose lot can't be
+        found reads posted with no settlement. ``known`` passes a
+        caller's already-resolved ``is_bill`` through to the
+        settlement.
+        """
+        if not _is_invoice_posted(inv):
+            return "open", None
+        settlement = self._document_settlement(book, inv, **known)
+        if settlement is None or settlement["amount_due"] > 0:
+            return "posted", settlement
+        # A negative total still to be refunded is open, not paid.
+        if settlement.get("owed_to_party"):
+            return "posted", settlement
+        settled = "applied" if self._get_is_credit_note(inv) else "paid"
+        return settled, settlement
 
     def _get_invoice_entries_and_total(self, book, inv):
-        """Query entries for an invoice/bill and compute totals,
-        absorbing per-line tax math (via ``_compute_entry_tax``).
+        """Query a document's entries and compute what it comes to —
+        GnuCash's arithmetic, via ``_entry_math`` (ports of
+        ``gncEntryComputeValueInt`` and
+        ``gncInvoiceGetNetAndTaxesInternal``).
+
+        Each line's net is rounded half-up to the document currency;
+        tax is summed UNROUNDED per tax account across the document
+        and rounded once; a line's discount (which only desktop
+        writes) is applied the way the line says. This is the entry
+        math for a DRAFT and for posting. A posted document's total
+        is read from its posting (``_posted_total``), not from here.
 
         Aggregates revenue/expense AND tax-payable amounts into one
         ``acct_totals`` dict so ``post_invoice`` emits one split per
@@ -2123,15 +4068,21 @@ class BusinessMixin:
               revenue/expense AND tax-payable accounts together.
             - ``grand_total``: gross customer-facing total
               (includes tax).
-            - ``subtotal``: sum of per-line pretax amounts.
+            - ``subtotal``: sum of per-line rounded net values.
             - ``tax_breakdown``: ``{account_guid: Decimal}`` —
-              tax-only portion, for display surfaces.
+              tax-only portion, as it posts.
             - ``tax_by_taxtable``: ``{taxtable_guid: Decimal}`` —
-              tax by source taxtable; zero-tax taxtables absent.
+              tax by source taxtable, for display; zero-tax
+              taxtables absent. Each is its own unrounded sum
+              rounded once, so when two tables share an account
+              these need not add up to ``tax_breakdown`` to the
+              cent; ``tax_breakdown`` is what posts.
 
         Raises:
             ValueError: when the invoice has no entries.
         """
+        from fractions import Fraction
+
         from sqlalchemy import text
         from piecash.business.tax import Taxtable
 
@@ -2149,13 +4100,14 @@ class BusinessMixin:
 
         if not rows:
             raise ValueError(
-                f"Cannot post: invoice {inv.id} has no entries"
+                f"Cannot post: {self._doc_noun(inv).lower()} {inv.id} "
+                f"has no entries"
             )
 
         # Taxtable resolution is cached so an invoice with many
         # lines sharing the same taxtable hits SQL once per
         # distinct taxtable, not once per line.
-        taxtable_cache: dict[str, list[dict]] = {}
+        taxtable_cache: dict[str, list] = {}
 
         def _resolve_taxtable_entries(taxtable_guid):
             if not taxtable_guid:
@@ -2173,94 +4125,283 @@ class BusinessMixin:
                 taxtable_cache[taxtable_guid] = []
                 return []
             resolved = [
-                {
-                    "type": e.type,
-                    "amount": e.amount,
-                    "account_guid": e.account_guid,
-                }
+                _entry_math.TaxEntry(
+                    kind=(
+                        _entry_math.AMT_PERCENT
+                        if e.type == "percentage"
+                        else _entry_math.AMT_VALUE
+                    ),
+                    amount=Fraction(e.amount),
+                    account=e.account_guid,
+                )
                 for e in tt.entries
             ]
             taxtable_cache[taxtable_guid] = resolved
             return resolved
 
-        quantum = _commodity_quantum(inv.currency)
-        acct_totals: dict[str, Decimal] = {}
-        tax_breakdown: dict[str, Decimal] = {}
-        tax_by_taxtable: dict[str, Decimal] = {}
-        grand_total = Decimal(0)
-        subtotal = Decimal(0)
+        fraction = inv.currency.fraction
+        is_cn = self._get_is_credit_note(inv)
+        sign = -1 if is_cn else 1
 
+        lines = []
+        raw_by_taxtable: dict[str, Fraction] = {}
         for row in rows:
-            q_num = row.quantity_num or 0
-            q_denom = row.quantity_denom or 1
-            quantity = Decimal(q_num) / Decimal(q_denom)
-
-            if is_bill:
-                p_num = row.b_price_num or 0
-                p_denom = row.b_price_denom or 1
-                acct_guid = row.b_acct
-                taxable = bool(row.b_taxable)
-                tax_included = bool(row.b_taxincluded)
-                taxtable_guid = row.b_taxtable
-            else:
-                p_num = row.i_price_num or 0
-                p_denom = row.i_price_denom or 1
-                acct_guid = row.i_acct
-                taxable = bool(row.i_taxable)
-                tax_included = bool(row.i_taxincluded)
-                taxtable_guid = row.i_taxtable
-
-            price = Decimal(p_num) / Decimal(p_denom)
-            taxtable_entries = _resolve_taxtable_entries(taxtable_guid)
-
-            tax_result = self._compute_entry_tax(
-                quantity=quantity,
-                price=price,
-                taxable=taxable,
-                tax_included=tax_included,
-                taxtable_entries=taxtable_entries,
-                quantum=quantum,
+            taxtable_guid = row.b_taxtable if is_bill else row.i_taxtable
+            account, values = self._entry_line_values(
+                row, is_bill, _resolve_taxtable_entries(taxtable_guid),
             )
-
-            # Revenue/expense account gets the pretax portion.
-            acct_totals[acct_guid] = (
-                acct_totals.get(acct_guid, Decimal(0))
-                + tax_result["pretax"]
-            )
-            # Tax-payable accounts get their per-entry components
-            # (same-account composites already collapse upstream).
-            for tax_acct, tax_amount in (
-                tax_result["tax_by_acct"].items()
-            ):
-                acct_totals[tax_acct] = (
-                    acct_totals.get(tax_acct, Decimal(0))
-                    + tax_amount
-                )
-                tax_breakdown[tax_acct] = (
-                    tax_breakdown.get(tax_acct, Decimal(0))
-                    + tax_amount
+            lines.append((account, values))
+            if taxtable_guid and values.taxes:
+                raw_by_taxtable[taxtable_guid] = (
+                    raw_by_taxtable.get(taxtable_guid, Fraction(0))
+                    + sign * values.tax_total
                 )
 
-            # Per-taxtable rollup for display surfaces.
-            if taxtable_guid and tax_result["tax_total"] != 0:
-                tax_by_taxtable[taxtable_guid] = (
-                    tax_by_taxtable.get(taxtable_guid, Decimal(0))
-                    + tax_result["tax_total"]
-                )
+        totals = _entry_math.document_totals(lines, fraction, is_cn)
 
-            grand_total += tax_result["gross"]
-            subtotal += tax_result["pretax"]
+        tax_by_taxtable = {}
+        for taxtable_guid, raw in raw_by_taxtable.items():
+            rounded = _entry_math.round_half_up(raw, fraction)
+            if rounded != 0:
+                tax_by_taxtable[taxtable_guid] = rounded
 
         return {
             "rows": rows,
-            "acct_totals": acct_totals,
-            "grand_total": grand_total,
-            "subtotal": subtotal,
-            "tax_breakdown": tax_breakdown,
+            # ``(account_guid, EntryValues)`` per row, same order.
+            "lines": lines,
+            "acct_totals": totals.by_account,
+            "grand_total": totals.total,
+            "subtotal": totals.net,
+            "tax_breakdown": totals.tax_by_account,
             "tax_by_taxtable": tax_by_taxtable,
         }
 
+    # gncEntry.h GncEntryPaymentType, as stored in entries.b_paytype:
+    # GNC_PAYMENT_CASH = 1, GNC_PAYMENT_CARD = 2.
+    _PAYMENT_CARD = 2
+
+    def _card_charges(self, book, inv, totals: dict | None = None) -> dict:
+        """What an employee's expense voucher charges to the company
+        card instead of owing to the employee — the
+        ``GNC_PAYMENT_CARD`` branch of ``gncInvoicePostToAccount``.
+
+        Applies only when the voucher's employee has a credit-card
+        account (``employees.ccard_guid``): each line paid by card
+        (``b_paytype`` 2) at its rounded value, plus the voucher's
+        "extra to charge card" amount (``invoices.charge_amt``).
+        Desktop sets both in its voucher window; this server writes
+        neither, so they are only ever read here, off a voucher
+        drafted in desktop.
+
+        Returns ``{"account": Account | None, "lines": [(description,
+        Decimal)], "extra": Decimal, "total": Decimal}`` in the
+        document's sign; ``account`` is ``None`` (and the rest zero)
+        when nothing goes to a card.
+        """
+        from fractions import Fraction
+
+        nothing = {
+            "account": None, "lines": [], "extra": Decimal(0),
+            "total": Decimal(0),
+        }
+        if inv.owner_type != 5:
+            return nothing
+        employee = self._find_employee_by_guid(book, inv.owner_guid)
+        card_guid = getattr(employee, "ccard_guid", None)
+        if not card_guid:
+            return nothing
+        account = book.session.get(piecash.Account, card_guid)
+        if account is None:
+            return nothing
+        if totals is None:
+            try:
+                totals = self._get_invoice_entries_and_total(book, inv)
+            except ValueError:
+                return nothing
+        fraction = inv.currency.fraction
+        sign = -1 if self._get_is_credit_note(inv) else 1
+        lines = []
+        for row, (_acct, values) in zip(totals["rows"], totals["lines"]):
+            if int(row.b_paytype or 0) != self._PAYMENT_CARD:
+                continue
+            lines.append((
+                row.description or "",
+                _entry_math.round_half_up(sign * values.value, fraction),
+            ))
+        extra = Decimal(0)
+        num = inv._charge_amt_num
+        if num:
+            extra = _entry_math.round_half_up(
+                Fraction(int(num), int(inv._charge_amt_denom or 1)),
+                fraction,
+            )
+        total = sum((v for _, v in lines), Decimal(0)) + extra
+        if not lines and not extra:
+            return nothing
+        return {
+            "account": account, "lines": lines, "extra": extra,
+            "total": total,
+        }
+
+    def _billterm_return_child(self, book, term):
+        """``gncBillTermReturnChild(term, TRUE)``: the frozen copy of
+        a billing term that a POSTED document points at, so editing
+        the term later changes what new documents get and not what
+        old ones were posted under.
+
+        A term that is already a child (or hidden) is returned as it
+        is. Otherwise an existing child of this term is reused when
+        it still matches the term field for field, and a new one is
+        written when none does: the same name and values,
+        ``invisible`` 1, ``parent`` the term, ``refcount`` 0
+        ("children don't need refcounts", gncBillTerm.c). The
+        engine tracks "the" child of a term in memory and forgets it
+        when the term is edited; matching on the fields is that rule
+        for a process that keeps nothing in memory.
+        """
+        import uuid
+        from piecash.business.invoice import Billterm
+
+        if term is None:
+            return None
+        if term.parent_guid or term.invisible:
+            return term
+
+        def fields(t):
+            return (
+                t.name, t.description, t.type, t.duedays, t.discountdays,
+                t._discount_num, t._discount_denom, t.cutoff,
+            )
+
+        for child in book.session.query(Billterm).filter(
+            Billterm.parent_guid == term.guid,
+        ).order_by(Billterm.guid).all():
+            if child.invisible and fields(child) == fields(term):
+                return child
+        child_guid = uuid.uuid4().hex
+        book.session.execute(
+            Billterm.__table__.insert().values(
+                guid=child_guid,
+                name=term.name,
+                description=term.description,
+                refcount=0,
+                invisible=_gnc_bool(True),
+                parent=term.guid,
+                type=term.type,
+                duedays=term.duedays,
+                discountdays=term.discountdays,
+                discount_num=term._discount_num,
+                discount_denom=term._discount_denom,
+                cutoff=term.cutoff,
+            )
+        )
+        _verify_write(
+            book.session, Billterm.__table__, child_guid,
+            f"posted copy of billterm '{term.name}'",
+        )
+        return book.session.query(Billterm).filter_by(guid=child_guid).first()
+
     # ── Customer / Vendor / Billterm CRUD ─────────────────────────
+
+    # piecash's names for the book's ID counters (``counters/gnc…``).
+    _COUNTER_SLOTS = {
+        "counter_customer": "counters/gncCustomer",
+        "counter_vendor": "counters/gncVendor",
+        "counter_employee": "counters/gncEmployee",
+        "counter_invoice": "counters/gncInvoice",
+        "counter_job": "counters/gncJob",
+        "counter_bill": "counters/gncBill",
+        "counter_exp_voucher": "counters/gncExpVoucher",
+        "counter_order": "counters/gncOrder",
+    }
+
+    # A counter format as File > Properties > Counters stores it: a
+    # printf format with exactly one integer conversion (li / lli /
+    # I64i, GnuCash's PRIi64 spellings; ``%.6li`` is the default) and
+    # optional literal text either side
+    # (qof_book_validate_counter_format).
+    _COUNTER_FORMAT = re.compile(
+        r"(?P<prefix>(?:[^%]|%%)*)"
+        r"%(?P<flags>[-+ #0']*)(?P<width>[0-9]*)(?:\.(?P<precision>[0-9]+))?"
+        r"(?:lli|li|I64i|lld|ld|I64d|d|i)"
+        r"(?P<suffix>(?:[^%]|%%)*)"
+    )
+
+    @classmethod
+    def _counter_id(cls, book, counter_attr: str, value: int) -> str:
+        """The ID GnuCash would issue for a counter value: the book's
+        own format for that counter when it has one
+        (``counter_formats/gncInvoice`` and its siblings,
+        ``qof_book_increment_and_format_counter``), six zero-padded
+        digits otherwise. The server ignored the format, so a book
+        numbering its invoices ``INV-47`` got ``000048`` next and
+        carried two schemes (adversarial review 2026-09-30, FC-17).
+        """
+        from sqlalchemy import text
+
+        default = f"{int(value):06d}"
+        key = cls._COUNTER_SLOTS.get(counter_attr)
+        if not key:
+            return default
+        try:
+            row = book.session.execute(
+                text(
+                    "SELECT c.string_val FROM slots f "
+                    "JOIN slots c ON c.obj_guid = f.guid_val "
+                    "WHERE f.obj_guid = :book AND f.slot_type = 9 "
+                    "AND f.name = 'counter_formats' AND c.name = :name"
+                ),
+                {
+                    "book": book.guid,
+                    "name": "counter_formats/" + key.split("/", 1)[1],
+                },
+            ).first()
+        except Exception:
+            _rollback_if_aborted(book.session)
+            return default
+        fmt = row[0] if row else None
+        match = cls._COUNTER_FORMAT.fullmatch(fmt) if fmt else None
+        if match is None:
+            return default
+        spec = (
+            "%" + match["flags"].replace("'", "") + match["width"]
+            + (f".{match['precision']}" if match["precision"] else "") + "d"
+        )
+        return (
+            match["prefix"].replace("%%", "%")
+            + spec % int(value)
+            + match["suffix"].replace("%%", "%")
+        )
+
+    @classmethod
+    def _repair_double_counters(cls, book) -> int:
+        """Rewrite any ID counter stored as a DOUBLE as the int64
+        GnuCash means it to be. Called before every auto-numbered
+        create.
+
+        GnuCash 5.0 and 5.1 saved the counters set in File >
+        Properties as doubles (bug 798930). Desktop reads such a
+        counter anyway — ``qof_book_get_counter``: "Might be a double
+        because of bug 798930", then a cast — and stores it back as
+        an integer the next time it issues an ID. Here the float
+        went into ``f"{cnt:06d}"`` (and piecash's own ``"{:06d}"``
+        for parties and jobs) and every auto-numbered create raised
+        ``Unknown format code 'd' for object of type 'float'``; a
+        customer, which takes no ID of its own, could not be created
+        at all (adversarial review 2026-09-30, FC-2). piecash will
+        not put an int in a double slot, so the row is replaced.
+        """
+        repaired = 0
+        for attr, key in cls._COUNTER_SLOTS.items():
+            value = getattr(book, attr)
+            if isinstance(value, float):
+                # Drop the double row, then set through piecash's own
+                # counter attribute — the path every counter advance
+                # already takes — which writes the int64 row.
+                del book[key]
+                setattr(book, attr, int(value))
+                repaired += 1
+        return repaired
 
     def _create_business_person(
         self,
@@ -2285,6 +4426,13 @@ class BusinessMixin:
         Returns:
             ``{"id": ..., "name": ..., "currency": ..., "status": "created"}``
         """
+        # Every free-text argument through the one text gate (scoped
+        # review 2026-10-05, I-4): no control characters, GnuCash's
+        # column width.
+        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic", "memo", "action", "billing_id"):
+            _check_text(locals().get(_field), _TEXT_WIDTH, _field)
+            if _field in ("name", "title", "reference", "fullname", "mnemonic", "action", "billing_id"):
+                _check_one_line(locals().get(_field), _field)
         from piecash.business.person import Address
 
         # Cap free-text byte lengths up front.
@@ -2294,13 +4442,7 @@ class BusinessMixin:
         )
 
         if currency:
-            currency_obj = None
-            for c in book.currencies:
-                if c.mnemonic == currency:
-                    currency_obj = c
-                    break
-            if not currency_obj:
-                raise ValueError(f"Currency not found: {currency}")
+            currency_obj = self._document_currency(book, currency)
         else:
             currency_obj = self._require_default_currency(book)
 
@@ -2317,6 +4459,7 @@ class BusinessMixin:
                 email=address.get("email", ""),
             )
 
+        self._repair_double_counters(book)
         entity = cls(
             name=name,
             currency=currency_obj,
@@ -2324,6 +4467,12 @@ class BusinessMixin:
             book=book,
             **extra_kwargs,
         )
+        # piecash issued six digits; the book's own format wins.
+        counter_attr = getattr(cls, "_counter_name", None)
+        if counter_attr:
+            entity.id = self._counter_id(
+                book, counter_attr, getattr(book, counter_attr),
+            )
         book.save()
 
         # Business-object ``guid`` is omitted from write
@@ -2363,6 +4512,10 @@ class BusinessMixin:
         offending field; empty/missing values pass through.
         """
         if notes is not None:
+            # The notes columns are VARCHAR(2048) in GnuCash's schema;
+            # a longer note fit the byte cap below and failed as a raw
+            # DataError on PostgreSQL and MySQL (C65).
+            _check_text(notes, _TEXT_WIDTH, "notes")
             byte_len = len(notes.encode("utf-8"))
             if byte_len > cls._NOTES_MAX_BYTES:
                 raise ValueError(
@@ -2373,6 +4526,7 @@ class BusinessMixin:
         if address:
             for key in cls._ADDRESS_FIELDS:
                 value = address.get(key)
+                _check_text(value, _TEXT_WIDTH, f"address.{key}")
                 if value is None:
                     continue
                 if not isinstance(value, str):
@@ -2458,12 +4612,7 @@ class BusinessMixin:
             changed["name"] = name
 
         if currency is not None:
-            # ``_get_or_create_currency`` auto-loads unseen ISO codes
-            # (same convention as ``create_price``).
-            try:
-                new_currency = self._get_or_create_currency(book, currency)
-            except ValueError:
-                raise ValueError(f"Currency not found: {currency}")
+            new_currency = self._document_currency(book, currency)
             if new_currency != entity.currency:
                 entity.currency = new_currency
                 changed["currency"] = currency
@@ -2483,7 +4632,7 @@ class BusinessMixin:
                 changed["notes"] = notes
 
         if active is not None and bool(active) != bool(entity.active):
-            entity.active = bool(active)
+            entity.active = _gnc_bool(active)
             changed["active"] = bool(active)
 
         if address is not None:
@@ -2805,6 +4954,13 @@ class BusinessMixin:
         only. See ``_update_business_person`` for address-merge
         semantics, the diff-style response, and failure modes.
         """
+        # Every free-text argument through the one text gate (scoped
+        # review 2026-10-05, I-4): no control characters, GnuCash's
+        # column width.
+        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic", "memo", "action", "billing_id"):
+            _check_text(locals().get(_field), _TEXT_WIDTH, _field)
+            if _field in ("name", "title", "reference", "fullname", "mnemonic", "action", "billing_id"):
+                _check_one_line(locals().get(_field), _field)
         with self.open(readonly=False) as book:
             customer = self._find_customer(book, customer_id)
             if not customer:
@@ -2885,7 +5041,34 @@ class BusinessMixin:
         import uuid
         from piecash.business.invoice import Billterm
 
+        _check_text(name, _TEXT_WIDTH, "Billterm name")
+        _check_one_line(name, "Billterm name")
+        _check_text(description, _TEXT_WIDTH, "Billterm description")
         discount = _to_decimal(discount_percent)
+        # gncBillTerm has no meaning for a negative day count or a
+        # discount outside 0–100%, and a discount window longer than
+        # the term can never be met (adversarial review 2026-09-30,
+        # BL-23).
+        if due_days < 0 or discount_days < 0:
+            raise ValueError(
+                f"due_days and discount_days cannot be negative "
+                f"(got {due_days} and {discount_days})"
+            )
+        if discount_days > due_days:
+            raise ValueError(
+                f"discount_days ({discount_days}) is longer than "
+                f"due_days ({due_days}): the discount window would "
+                f"outlast the term"
+            )
+        if due_days > 36500:
+            # A century. An unbounded count overflowed the posting's
+            # due-date arithmetic (scoped review 2026-10-06, IN-9).
+            raise ValueError(f"due_days must be at most 36500, got {due_days}")
+        if not Decimal(0) <= discount <= Decimal(100):
+            raise ValueError(
+                f"discount_percent must be between 0 and 100, got "
+                f"{discount}"
+            )
         disc_str = str(discount)
         if "." in disc_str:
             decimals = len(disc_str.split(".")[1])
@@ -2896,6 +5079,22 @@ class BusinessMixin:
             disc_denom = 1
 
         with self.open(readonly=False) as book:
+            # Billterms are addressed by name everywhere else
+            # (``term=`` on the document tools resolves the first
+            # visible match) — a second row with the same name
+            # would make every lookup silently ambiguous.
+            existing = self._exact(
+                book.session.query(Billterm).filter(
+                    Billterm.name == name, Billterm.invisible == 0
+                ),
+                "name", name,
+            )
+            if existing is not None:
+                raise ValueError(
+                    f"Billterm already exists: '{name}' "
+                    f"(due in {existing.duedays} days)"
+                )
+
             bt_guid = uuid.uuid4().hex
 
             book.session.execute(
@@ -2955,7 +5154,9 @@ class BusinessMixin:
             )
             if compact:
                 lines = [indicator]
-                lines += [f"{t.name}\t{t.duedays} days" for t in page]
+                lines += [
+                    f"{_tsv_cell(t.name)}\t{t.duedays} days" for t in page
+                ]
                 return "\n".join(lines)
             else:
                 return {
@@ -2971,10 +5172,10 @@ class BusinessMixin:
     # Taxtables route sales-tax math on document line entries. Each
     # ``TaxtableEntry`` contributes either a percentage rate (5.00 =
     # 5%) or a flat value routed to a specific GL account; a
-    # multi-entry taxtable (GST 5% + PST 7%) produces N tax splits
-    # per line at posting (math in ``_compute_entry_tax`` /
-    # ``_get_invoice_entries_and_total``; ``_add_entry`` wires
-    # entries to taxtables).
+    # multi-entry taxtable (GST 5% + PST 7%) produces one tax split
+    # per tax account at posting (math in ``_entry_math``, GnuCash's
+    # own, via ``_get_invoice_entries_and_total``; ``_add_entry``
+    # wires entries to taxtables).
     #
     # **Refcount discipline.** GnuCash desktop maintains
     # ``Taxtable.refcount``; piecash does not. We bump it manually
@@ -3058,20 +5259,17 @@ class BusinessMixin:
                     f"Entry {i}: amount {e.get('amount')!r} not a "
                     f"valid decimal"
                 )
-            if amount <= 0:
+            # GnuCash's own rule (dialog-tax-table.c): a percentage
+            # runs from -100 to 100 inclusive, and negative entries
+            # are allowed on purpose — a reverse-charge table pairs
+            # +20 with -20. Zero is a rate too (zero-rated supplies).
+            # The server refused all three (adversarial review
+            # 2026-09-30, C51).
+            if type_val == "percentage" and abs(amount) > Decimal("100"):
                 raise ValueError(
-                    f"Entry {i}: amount must be > 0, got {amount}"
-                )
-            if (
-                type_val == "percentage"
-                and amount >= Decimal("100")
-            ):
-                raise ValueError(
-                    f"Entry {i}: percentage rate {amount} >= 100 "
-                    f"is almost certainly user error. Rates are "
-                    f"expressed as a percentage (5.0 for 5%, not "
-                    f"0.05). If you genuinely want a rate this "
-                    f"large, file an issue."
+                    f"Entry {i}: percentage rate {amount} is outside "
+                    f"-100 to 100. Rates are expressed as a percentage "
+                    f"(5.0 for 5%, not 0.05)."
                 )
 
             account_ref = e.get("account")
@@ -3110,167 +5308,58 @@ class BusinessMixin:
         return resolved
 
     @staticmethod
-    def _compute_entry_tax(
-        quantity: Decimal,
-        price: Decimal,
-        taxable: bool,
-        tax_included: bool,
-        taxtable_entries: list[dict],
-        quantum: Decimal,
-    ) -> dict:
-        """Per-line tax math. Pure function; no book access.
-
-        Caller resolves the taxtable to a list of
-        ``{type, amount, account_guid}`` dicts before invoking
-        (``type`` is ``'value'`` or ``'percentage'``; ``amount``
-        is ``Decimal``; ``account_guid`` is the FK to wherever the
-        tax component routes).
-
-        Four quadrants of behavior:
-
-        1. ``taxable=False``: no tax. ``pretax = Q × P``,
-           ``tax_total = 0``, ``tax_by_acct = {}``, ``gross = Q × P``.
-
-        2. ``taxable=True, tax_included=False`` (tax-exclusive):
-           Line value IS pre-tax; tax adds on top. For each entry,
-           percentage entries contribute ``pretax × rate / 100``,
-           value entries contribute their flat amount. Each is
-           quantized independently per the per-line rounding policy
-           (auditable line-by-line, matches GnuCash desktop).
-
-        3. ``taxable=True, tax_included=True``, all-percentage
-           taxtable: Line value is gross. Pretax extracted via
-           ``pretax = gross / (1 + Σ rate / 100)``. Per-entry tax
-           computed from extracted pretax.
-
-        4. ``taxable=True, tax_included=True``, mixed value +
-           percentage: Pretax extracted via
-           ``pretax = (gross − Σ value) / (1 + Σ rate / 100)``.
-           Value entries contribute their flat amount unchanged;
-           percentage entries contribute ``pretax × rate / 100``.
-
-        **Rounding residual policy** (Quadrants 3/4): after
-        independent per-entry quantization, ``gross == pretax +
-        Σ tax`` may differ by at most one quantum. The residual is
-        applied to the largest-rate percentage entry (or the first
-        value entry as fallback for all-value tax-inclusive — an
-        edge case that's algebraically degenerate but harmless).
-        Done this way to keep the dominant tax authority's bucket
-        carrying the rounding noise rather than smearing it across
-        all entries.
-
-        Args:
-            taxable: whether this line has a taxtable applied.
-            tax_included: whether ``Q × P`` is gross (tax-inclusive)
-                or pre-tax (tax-exclusive).
-            taxtable_entries: resolved ``{type, amount, account_guid}``
-                dicts.
-            quantum: smallest unit of the invoice currency (from
-                ``_commodity_quantum``).
-
-        Returns:
-            ``{pretax, tax_total, tax_by_acct, gross}`` — all
-            ``Decimal`` values; ``tax_by_acct`` is
-            ``{account_guid: Decimal}`` with one entry per distinct
-            payable account (composite taxtables routing to the
-            same account collapse to one entry by sum).
+    def _entry_line_values(row, is_bill: bool, tax_entries):
+        """One ``entries`` row through ``_entry_math.entry_values``
+        (GnuCash's ``gncEntryComputeValueInt``), the way
+        ``gncEntryRecomputeValues`` calls it: the invoice side with
+        the line's discount, the bill side with none, and the tax
+        table only when the line is flagged taxable. Returns
+        ``(account_guid, EntryValues)`` from the STORED quantity;
+        ``_entry_math.document_totals`` applies the credit-note sign.
         """
-        line_value = quantity * price
+        from fractions import Fraction
 
-        if not taxable or not taxtable_entries:
-            # Quadrant 1, or defensive no-entries fallback (the
-            # caller should have validated; behave as no-tax).
-            qv = line_value.quantize(quantum)
-            return {
-                "pretax": qv,
-                "tax_total": Decimal(0),
-                "tax_by_acct": {},
-                "gross": qv,
-            }
-
-        sum_values = sum(
-            (
-                e["amount"]
-                for e in taxtable_entries
-                if e["type"] == "value"
-            ),
-            Decimal(0),
-        )
-        sum_rates = sum(
-            (
-                e["amount"]
-                for e in taxtable_entries
-                if e["type"] == "percentage"
-            ),
-            Decimal(0),
-        )
-        rate_factor = sum_rates / Decimal(100)
-
-        if tax_included:
-            # Quadrants 3/4: extract pretax from gross.
-            gross = line_value.quantize(quantum)
-            if rate_factor == 0:
-                # All-value tax-inclusive: pretax = gross − values.
-                pretax = (gross - sum_values).quantize(quantum)
-            else:
-                pretax = (
-                    (gross - sum_values)
-                    / (Decimal(1) + rate_factor)
-                ).quantize(quantum)
+        qty = Fraction(row.quantity_num or 0, row.quantity_denom or 1)
+        if is_bill:
+            price = Fraction(row.b_price_num or 0, row.b_price_denom or 1)
+            taxable = bool(row.b_taxable)
+            tax_included = bool(row.b_taxincluded)
+            account = row.b_acct
+            # gncEntryRecomputeValues: the bill side is computed with
+            # gnc_numeric_zero(), GNC_AMT_TYPE_VALUE, GNC_DISC_PRETAX.
+            discount = Fraction(0)
+            disc_type = _entry_math.AMT_VALUE
+            disc_how = _entry_math.DISC_PRETAX
         else:
-            # Quadrant 2: line value IS pretax.
-            pretax = line_value.quantize(quantum)
-            gross = None  # computed after tax_total
-
-        tax_by_acct: dict[str, Decimal] = {}
-        for e in taxtable_entries:
-            acct_guid = e["account_guid"]
-            if e["type"] == "percentage":
-                tax_e = (
-                    pretax * e["amount"] / Decimal(100)
-                ).quantize(quantum)
-            else:
-                tax_e = e["amount"].quantize(quantum)
-            tax_by_acct[acct_guid] = (
-                tax_by_acct.get(acct_guid, Decimal(0)) + tax_e
+            price = Fraction(row.i_price_num or 0, row.i_price_denom or 1)
+            taxable = bool(row.i_taxable)
+            tax_included = bool(row.i_taxincluded)
+            account = row.i_acct
+            discount = Fraction(
+                row.i_discount_num or 0, row.i_discount_denom or 1,
             )
-
-        tax_total = sum(tax_by_acct.values(), Decimal(0))
-
-        if tax_included:
-            # Residual adjustment: enforce gross = pretax + tax_total
-            # exactly. The residual is at most ±1 quantum from the
-            # independent per-entry rounding.
-            residual = gross - pretax - tax_total
-            if residual != 0:
-                # Find largest-rate percentage entry; fall back to
-                # first value entry if no percentage entries exist.
-                target_acct = None
-                largest_rate = Decimal(0)
-                for e in taxtable_entries:
-                    if (
-                        e["type"] == "percentage"
-                        and e["amount"] > largest_rate
-                    ):
-                        largest_rate = e["amount"]
-                        target_acct = e["account_guid"]
-                if target_acct is None:
-                    target_acct = (
-                        taxtable_entries[0]["account_guid"]
-                    )
-                tax_by_acct[target_acct] = (
-                    tax_by_acct[target_acct] + residual
-                )
-                tax_total = tax_total + residual
-        else:
-            gross = pretax + tax_total
-
-        return {
-            "pretax": pretax,
-            "tax_total": tax_total,
-            "tax_by_acct": tax_by_acct,
-            "gross": gross,
-        }
+            # A string GnuCash does not recognize keeps gncEntryCreate's
+            # default (its loader warns and moves on); rows written by
+            # server 1.2-1.4 hold ''.
+            disc_type = (
+                row.i_disc_type
+                if row.i_disc_type in (
+                    _entry_math.AMT_VALUE, _entry_math.AMT_PERCENT,
+                ) else _entry_math.DEFAULT_DISC_TYPE
+            )
+            disc_how = (
+                row.i_disc_how
+                if row.i_disc_how in (
+                    _entry_math.DISC_PRETAX, _entry_math.DISC_SAMETIME,
+                    _entry_math.DISC_POSTTAX,
+                ) else _entry_math.DEFAULT_DISC_HOW
+            )
+        return account, _entry_math.entry_values(
+            qty, price,
+            tax_entries if taxable else None,
+            tax_included,
+            discount, disc_type, disc_how,
+        )
 
     def create_taxtable(
         self,
@@ -3298,6 +5387,9 @@ class BusinessMixin:
         """
         from piecash.business.tax import Taxtable, TaxtableEntry
 
+        # taxtables.name is the narrowest text column GnuCash has.
+        _check_text(name, _TAXTABLE_NAME_WIDTH, "Taxtable name")
+        _check_one_line(name, "Taxtable name")
         with self.open(readonly=False) as book:
             existing = self._find_taxtable(book, name)
             if existing:
@@ -3362,9 +5454,11 @@ class BusinessMixin:
         from piecash.business.tax import Taxtable
 
         with self.open() as book:
-            tables = book.session.query(Taxtable).order_by(
-                Taxtable.name,
-            ).all()
+            # Live tables only; see _find_taxtable.
+            tables = book.session.query(Taxtable).filter(
+                Taxtable.invisible == 0,
+                Taxtable.parent_guid.is_(None),
+            ).order_by(Taxtable.name).all()
 
             page, indicator = _paginate(
                 tables, offset=offset, limit=limit,
@@ -3380,7 +5474,7 @@ class BusinessMixin:
                     n = len(tt.entries)
                     suffix = "entry" if n == 1 else "entries"
                     lines.append(
-                        f"{tt.name}\t{n} {suffix}: {summary}"
+                        f"{_tsv_cell(tt.name)}\t{n} {suffix}: {summary}"
                     )
                 return "\n".join(lines)
 
@@ -3494,6 +5588,8 @@ class BusinessMixin:
             changed: dict = {}
 
             if new_name is not None and new_name != tt.name:
+                _check_text(new_name, _TAXTABLE_NAME_WIDTH, "Taxtable name")
+                _check_one_line(new_name, "Taxtable name")
                 collision = self._find_taxtable(book, new_name)
                 if collision and collision.guid != tt.guid:
                     raise ValueError(
@@ -3760,6 +5856,16 @@ class BusinessMixin:
             owner_type, "Document"
         )
 
+    @staticmethod
+    def _doc_noun(inv) -> str:
+        """What to call THIS document in a sentence: ``Credit note``
+        when its slot says so, else the owner type's label. A refusal
+        on a credit note read "Invoice CN3" (bookkeeper, second-review
+        loop)."""
+        if BusinessMixin._get_is_credit_note(inv):
+            return "Credit note"
+        return BusinessMixin._doc_label_for(inv.owner_type)
+
     # ── Credit-note slot helpers ─────────────────────────────────
     #
     # GnuCash stores the credit-note flag in slots, not as a
@@ -3795,17 +5901,13 @@ class BusinessMixin:
     def _set_is_credit_note(invoice, value: bool = True) -> None:
         """Set or clear the GnuCash ``credit-note`` slot.
 
-        Stores integer ``1`` for credit notes (GnuCash convention);
-        clearing removes the slot entirely so the absence-means-False
-        invariant holds for both desktop and MCP readers.
+        Stores integer ``1`` for credit notes and ``0`` otherwise, as
+        gncInvoiceSetIsCreditNote does; the reader treats an absent
+        slot as 0 too.
         """
-        if value:
-            invoice[BusinessMixin._CREDIT_NOTE_SLOT_KEY] = 1
-        else:
-            try:
-                del invoice[BusinessMixin._CREDIT_NOTE_SLOT_KEY]
-            except KeyError:
-                pass
+        # Desktop stores 1 or 0 (g_value_set_int64 (&v, credit_note ?
+        # 1 : 0)); the reader treats absence as 0.
+        invoice[BusinessMixin._CREDIT_NOTE_SLOT_KEY] = 1 if value else 0
 
     @staticmethod
     def _get_applies_to_invoice_guid(invoice) -> str | None:
@@ -3861,6 +5963,7 @@ class BusinessMixin:
         doc_id: str | None = None,
         extra_slots: dict | None = None,
         job_id: str | None = None,
+        force: bool = False,
     ) -> dict:
         """Shared create path for invoices, bills, and vouchers.
 
@@ -3885,13 +5988,14 @@ class BusinessMixin:
         config = self._BUSINESS_DOC_CONFIG[owner_type]
         find_owner = getattr(self, config["find_owner_method"])
 
-        open_date = (
-            datetime.strptime(date_opened, "%Y-%m-%d")
-            if date_opened
-            else datetime.now()
+        # Desktop: date_opened at the neutral time (10:59:00 UTC,
+        # dialog-invoice.c gnc_time64_get_day_neutral).
+        open_date = _neutral_time(
+            date.fromisoformat(date_opened) if date_opened else date.today()
         )
 
         with self.open(readonly=False) as book:
+            self._repair_double_counters(book)
             owner = find_owner(book, owner_id)
             if not owner:
                 raise ValueError(
@@ -3941,15 +6045,60 @@ class BusinessMixin:
                         f"customer/vendor."
                     )
 
+            currency_warning = None
             if currency:
-                currency_obj = None
-                for c in book.currencies:
-                    if c.mnemonic == currency:
-                        currency_obj = c
-                        break
-                if not currency_obj:
-                    raise ValueError(f"Currency not found: {currency}")
+                currency_obj = self._document_currency(book, currency)
                 currency_guid = currency_obj.guid
+                # Desktop has no such document. Its invoice window
+                # takes the currency from the owner
+                # (dialog-invoice.c, gncInvoiceSetCurrency(invoice,
+                # gncOwnerGetCurrency(owner)), bug 728074) and sets
+                # it back when the document is saved there; and its
+                # party balance (gncOwnerGetBalanceInCurrency) counts
+                # only receivable/payable accounts in the OWNER's
+                # currency, so the document is left out of what the
+                # party owes — the engine answered 220 for a customer
+                # with 220 in USD invoices and an unpaid EUR 100 one
+                # (engine twin, 2026-09-30). The ruling on finding
+                # C48 of the adversarial review was: warn, and refuse
+                # by default if desktop is shown to misread it. It
+                # was. ``force`` keeps the door open for a party
+                # really billed in a second currency.
+                owner_currency = getattr(owner, "currency", None)
+                if (
+                    owner_currency is not None
+                    and owner_currency.guid != currency_guid
+                ):
+                    owner_label = getattr(owner, "name", owner_id)
+                    divergence = (
+                        f"GnuCash desktop only creates a document in "
+                        f"its owner's currency: its invoice window "
+                        f"sets the currency back to the owner's when "
+                        f"the document is saved there, and its "
+                        f"balance for {owner_label} counts only "
+                        f"{owner_currency.mnemonic} receivables and "
+                        f"payables, so this document would be left "
+                        f"out of it."
+                    )
+                    if not force:
+                        raise ValueError(
+                            f"currency={currency_obj.mnemonic!r} is not "
+                            f"{owner_label}'s currency "
+                            f"({owner_currency.mnemonic}). {divergence} "
+                            f"Omit currency to bill in "
+                            f"{owner_currency.mnemonic}; or, if this "
+                            f"party is billed in "
+                            f"{currency_obj.mnemonic}, give it a party "
+                            f"record in that currency (create_party "
+                            f"with currency="
+                            f"{currency_obj.mnemonic!r}). force=true "
+                            f"creates the document as asked."
+                        )
+                    currency_warning = (
+                        f"This document is in {currency_obj.mnemonic}, "
+                        f"but {owner_label}'s currency is "
+                        f"{owner_currency.mnemonic}. {divergence}"
+                    )
             else:
                 # Owner currency first, book default as defensive
                 # fallback (see docstring). Falling back to the book
@@ -3968,9 +6117,12 @@ class BusinessMixin:
 
             term_guid = None
             if term:
-                bt = book.session.query(Billterm).filter(
-                    Billterm.name == term, Billterm.invisible == 0
-                ).first()
+                bt = self._exact(
+                    book.session.query(Billterm).filter(
+                        Billterm.name == term, Billterm.invisible == 0
+                    ),
+                    "name", term,
+                )
                 if not bt:
                     raise ValueError(f"Billterm not found: {term}")
                 term_guid = bt.guid
@@ -3979,6 +6131,17 @@ class BusinessMixin:
                 if not doc_id.strip():
                     raise ValueError(
                         f"{config['doc_id_param']} must not be blank"
+                    )
+                # One line, no padding, GnuCash's column width: a
+                # caller-supplied ID skipped every gate and could
+                # forge a listing row or be stored padded and then
+                # not found (scoped review 2026-10-06, IN-2).
+                _check_one_line(doc_id, config["doc_id_param"])
+                _check_text(doc_id, _TEXT_WIDTH, config["doc_id_param"])
+                if doc_id != doc_id.strip():
+                    raise ValueError(
+                        f"{config['doc_id_param']} {doc_id!r} begins or "
+                        f"ends with whitespace"
                     )
                 existing = self._find_invoice(
                     book, doc_id, owner_type=owner_type
@@ -4009,7 +6172,7 @@ class BusinessMixin:
                         continue
                 cnt = max(book_counter, max_numeric) + 1
                 setattr(book, config["counter_attr"], cnt)
-                doc_id = f"{cnt:06d}"
+                doc_id = self._counter_id(book, config["counter_attr"], cnt)
 
             inv_guid = uuid.uuid4().hex
             book.session.execute(
@@ -4034,7 +6197,7 @@ class BusinessMixin:
                     post_txn=None,
                     post_lot=None,
                     post_acc=None,
-                    billto_type=0,
+                    billto_type=None,
                     billto_guid=None,
                     charge_amt_num=0,
                     charge_amt_denom=1,
@@ -4045,26 +6208,46 @@ class BusinessMixin:
                 f"{config['doc_label']} '{doc_id}'",
             )
 
+            # Desktop's gncInvoiceSetTerms increments the term's
+            # refcount; the column is the number of documents (and
+            # customers, vendors) referencing it (billterm twin,
+            # 2026-09-29).
+            if term_guid:
+                from piecash.business.invoice import Billterm
+                bt = book.session.query(Billterm).filter_by(guid=term_guid).first()
+                if bt is not None:
+                    bt.refcount = (bt.refcount or 0) + 1
+
             # Apply caller-supplied slots BEFORE save so slot writes
             # and the row insert land in one transaction — preserves
             # the "one book open per write" invariant.
+            new_inv = book.session.query(Invoice).filter_by(
+                guid=inv_guid,
+            ).first()
             if extra_slots:
-                new_inv = book.session.query(Invoice).filter_by(
-                    guid=inv_guid,
-                ).first()
                 for key, value in extra_slots.items():
                     new_inv[key] = value
+            # Desktop writes credit-note 0 on every document that is
+            # not a credit note (gncInvoiceSetIsCreditNote(FALSE)
+            # stores int64 0); absence is the server's old shape.
+            if not self._get_is_credit_note(new_inv):
+                self._set_is_credit_note(new_inv, False)
 
             book.save()
 
             # ``guid`` omitted — invoices/bills/vouchers/
             # credit notes addressed by ``id``.
-            return {
+            result = {
                 "id": doc_id,
                 config["owner_id_key"]: owner_id,
+                # The audit CREATE line renders ``Name (id)`` from this.
+                "owner_name": getattr(owner, "name", None),
                 "date_opened": str(open_date.date()),
                 "status": "created",
             }
+            if currency_warning is not None:
+                result["warnings"] = [currency_warning]
+            return result
 
     def create_invoice(
         self,
@@ -4075,6 +6258,7 @@ class BusinessMixin:
         term: str | None = None,
         invoice_id: str | None = None,
         job_id: str | None = None,
+        force: bool = False,
     ) -> dict:
         """Create a customer invoice.
 
@@ -4094,6 +6278,13 @@ class BusinessMixin:
         Returns:
             Dict with id, customer_id, date_opened, status.
         """
+        # Every free-text argument through the one text gate (scoped
+        # review 2026-10-05, I-4): no control characters, GnuCash's
+        # column width.
+        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic", "memo", "action", "billing_id"):
+            _check_text(locals().get(_field), _TEXT_WIDTH, _field)
+            if _field in ("name", "title", "reference", "fullname", "mnemonic", "action", "billing_id"):
+                _check_one_line(locals().get(_field), _field)
         return self._create_business_document(
             owner_type=2,
             owner_id=customer_id,
@@ -4103,6 +6294,7 @@ class BusinessMixin:
             term=term,
             doc_id=invoice_id,
             job_id=job_id,
+            force=force,
         )
 
     def create_bill(
@@ -4114,6 +6306,7 @@ class BusinessMixin:
         term: str | None = None,
         bill_id: str | None = None,
         job_id: str | None = None,
+        force: bool = False,
     ) -> dict:
         """Create a vendor bill.
 
@@ -4130,6 +6323,13 @@ class BusinessMixin:
         Returns:
             Dict with id, vendor_id, date_opened, status.
         """
+        # Every free-text argument through the one text gate (scoped
+        # review 2026-10-05, I-4): no control characters, GnuCash's
+        # column width.
+        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic", "memo", "action", "billing_id"):
+            _check_text(locals().get(_field), _TEXT_WIDTH, _field)
+            if _field in ("name", "title", "reference", "fullname", "mnemonic", "action", "billing_id"):
+                _check_one_line(locals().get(_field), _field)
         return self._create_business_document(
             owner_type=4,
             owner_id=vendor_id,
@@ -4139,6 +6339,7 @@ class BusinessMixin:
             term=term,
             doc_id=bill_id,
             job_id=job_id,
+            force=force,
         )
 
     def create_voucher(
@@ -4149,6 +6350,7 @@ class BusinessMixin:
         currency: str | None = None,
         term: str | None = None,
         voucher_id: str | None = None,
+        force: bool = False,
     ) -> dict:
         """Create an employee expense voucher.
 
@@ -4168,6 +6370,13 @@ class BusinessMixin:
         Returns:
             Dict with id, employee_id, date_opened, status.
         """
+        # Every free-text argument through the one text gate (scoped
+        # review 2026-10-05, I-4): no control characters, GnuCash's
+        # column width.
+        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic", "memo", "action", "billing_id"):
+            _check_text(locals().get(_field), _TEXT_WIDTH, _field)
+            if _field in ("name", "title", "reference", "fullname", "mnemonic", "action", "billing_id"):
+                _check_one_line(locals().get(_field), _field)
         return self._create_business_document(
             owner_type=5,
             owner_id=employee_id,
@@ -4176,6 +6385,7 @@ class BusinessMixin:
             currency=currency,
             term=term,
             doc_id=voucher_id,
+            force=force,
         )
 
     # ── Credit-note resolution ─────────────────────────────────
@@ -4244,6 +6454,7 @@ class BusinessMixin:
         currency: str | None = None,
         term: str | None = None,
         credit_note_id: str | None = None,
+        force: bool = False,
     ) -> dict:
         """Create a credit note against a customer invoice or
         vendor bill.
@@ -4283,6 +6494,13 @@ class BusinessMixin:
             ValueError: invalid/employee owner_type, or any
                 source-link validation failure.
         """
+        # Every free-text argument through the one text gate (scoped
+        # review 2026-10-05, I-4): no control characters, GnuCash's
+        # column width.
+        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic", "memo", "action", "billing_id"):
+            _check_text(locals().get(_field), _TEXT_WIDTH, _field)
+            if _field in ("name", "title", "reference", "fullname", "mnemonic", "action", "billing_id"):
+                _check_one_line(locals().get(_field), _field)
         int_owner_type = self._parse_owner_type(owner_type)
         if int_owner_type == 5:
             raise ValueError(
@@ -4297,7 +6515,7 @@ class BusinessMixin:
             # Defensive — _parse_owner_type would only return 2,
             # 4, or 5; this guards against a future addition.
             raise ValueError(
-                f"Credit notes require owner_type 'customer' or "
+                f"Credit notes require party_type 'customer' or "
                 f"'vendor', got {owner_type!r}."
             )
 
@@ -4372,6 +6590,10 @@ class BusinessMixin:
                 )
             if currency is None and source_currency_mnemonic:
                 currency = source_currency_mnemonic
+            # A credit note takes its source's currency, whatever the
+            # party's own is: the source was already created in it.
+            if currency and currency == source_currency_mnemonic:
+                force = True
 
             extra_slots[self._APPLIES_TO_SLOT_KEY] = source_guid
             applies_to_dict = {
@@ -4390,6 +6612,7 @@ class BusinessMixin:
             term=term,
             doc_id=credit_note_id,
             extra_slots=extra_slots,
+            force=force,
         )
 
         # Augment with credit-note keys; the customer_id/vendor_id
@@ -4429,7 +6652,11 @@ class BusinessMixin:
             inv = self._resolve_credit_note(
                 book, credit_note_id, owner_type=owner_type,
             )
-            resolved_owner_type = inv.owner_type
+            # The SIDE (customer / vendor / employee), chased through
+            # the Job when the credit note hangs off one: desktop
+            # stores a job-attached document with owner_type 3, which
+            # is not a side and raised KeyError: 3 downstream.
+            resolved_owner_type = self._effective_owner_type(book, inv)
 
         result = self._add_entry(
             owner_type=resolved_owner_type,
@@ -4469,7 +6696,11 @@ class BusinessMixin:
             inv = self._resolve_credit_note(
                 book, credit_note_id, owner_type=owner_type,
             )
-            resolved_owner_type = inv.owner_type
+            # The SIDE (customer / vendor / employee), chased through
+            # the Job when the credit note hangs off one: desktop
+            # stores a job-attached document with owner_type 3, which
+            # is not a side and raised KeyError: 3 downstream.
+            resolved_owner_type = self._effective_owner_type(book, inv)
 
         result = self._delete_invoice_or_bill(
             credit_note_id, owner_type=resolved_owner_type,
@@ -4565,6 +6796,13 @@ class BusinessMixin:
         Side effect: the taxtable's stored ``refcount`` is bumped
         for desktop interop (our checks use SQL-computed counts).
         """
+        # Every free-text argument through the one text gate (scoped
+        # review 2026-10-05, I-4): no control characters, GnuCash's
+        # column width.
+        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic", "memo", "action", "billing_id"):
+            _check_text(locals().get(_field), _TEXT_WIDTH, _field)
+            if _field in ("name", "title", "reference", "fullname", "mnemonic", "action", "billing_id"):
+                _check_one_line(locals().get(_field), _field)
         import uuid
         from piecash.business.invoice import Entry
 
@@ -4612,7 +6850,7 @@ class BusinessMixin:
 
             acct = self._resolve_account(book, account)
             if not acct:
-                raise ValueError(f"Account not found: {account}")
+                raise self._account_not_found_error(book, account)
             if acct.type not in cfg["allowed_types"]:
                 raise ValueError(
                     cfg["type_error_msg"].format(
@@ -4635,8 +6873,6 @@ class BusinessMixin:
                         f"Taxtable not found: {taxtable!r}"
                     )
 
-            taxable_int = 1 if taxtable else 0
-            taxincl_int = 1 if tax_included else 0
             tt_guid = tt_obj.guid if tt_obj else None
 
             # Parallel ``i_*`` / ``b_*`` column groups: exactly one
@@ -4648,9 +6884,9 @@ class BusinessMixin:
                     invoice=None,
                     b_acct=acct.guid, b_price_num=p_num,
                     b_price_denom=p_denom, bill=inv.guid,
-                    i_taxable=0, i_taxincluded=0, i_taxtable=None,
-                    b_taxable=taxable_int,
-                    b_taxincluded=taxincl_int,
+                    i_taxable=1, i_taxincluded=0, i_taxtable=None,
+                    b_taxable=_gnc_bool(taxtable),
+                    b_taxincluded=_gnc_bool(tax_included),
                     b_taxtable=tt_guid,
                 )
             else:
@@ -4659,10 +6895,10 @@ class BusinessMixin:
                     i_price_denom=p_denom, invoice=inv.guid,
                     b_acct=None, b_price_num=0, b_price_denom=1,
                     bill=None,
-                    i_taxable=taxable_int,
-                    i_taxincluded=taxincl_int,
+                    i_taxable=_gnc_bool(taxtable),
+                    i_taxincluded=_gnc_bool(tax_included),
                     i_taxtable=tt_guid,
-                    b_taxable=0, b_taxincluded=0, b_taxtable=None,
+                    b_taxable=1, b_taxincluded=0, b_taxtable=None,
                 )
 
             # Entry date follows the DOCUMENT's opened date, not the
@@ -4676,11 +6912,22 @@ class BusinessMixin:
             # eastern ones. date_entered stays a true "when was
             # this typed" timestamp.
             opened_dt = _safe_invoice_date(inv, "date_opened")
+            # Desktop's entry ledger stores the line's date at LOCAL
+            # noon (datecell-gnome.c: gnc_mktime of the cell's tm;
+            # the twin specimen for a PDT desktop reads 19:00:00
+            # UTC) — not the neutral time the document dates use.
             entry_date = datetime.combine(
                 opened_dt.date() if opened_dt else date.today(),
-                time(10, 59),
-                tzinfo=timezone.utc,
-            )
+                time(12, 0),
+            ).astimezone(timezone.utc)
+            # GnuCash stores a credit note's quantity NEGATED
+            # (gncEntrySetDocQuantity: ``is_cn ? neg(quantity) :
+            # quantity``) and negates it back on every read; the
+            # document-facing quantity stays positive on both
+            # surfaces. Stored positive, desktop showed a server
+            # credit note as −1 × price — a charge (parity twin,
+            # 2026-09-29).
+            is_cn = self._get_is_credit_note(inv)
             book.session.execute(
                 Entry.__table__.insert().values(
                     guid=entry_guid,
@@ -4689,15 +6936,17 @@ class BusinessMixin:
                     description=description,
                     action=action,
                     notes=notes,
-                    quantity_num=q_num,
+                    quantity_num=-q_num if is_cn else q_num,
                     quantity_denom=q_denom,
                     i_discount_num=0,
                     i_discount_denom=1,
-                    i_disc_type="",
-                    i_disc_how="",
-                    b_paytype=0,
+                    # gncEntryCreate's defaults, as desktop stores
+                    # them on a line nobody discounted or billed on.
+                    i_disc_type="PERCENT",
+                    i_disc_how="PRETAX",
+                    b_paytype=1,
                     billable=0,
-                    billto_type=0,
+                    billto_type=None,
                     billto_guid=None,
                     order_guid=None,
                     **values,
@@ -4898,8 +7147,8 @@ class BusinessMixin:
                     )
                     raise ValueError(
                         f"Job {job_id!r} is a {expected} job; "
-                        f"owner_type={owner_type!r} doesn't match. "
-                        f"Drop the owner_type filter or pass a "
+                        f"party_type={owner_type!r} doesn't match. "
+                        f"Drop the party_type filter or pass a "
                         f"matching job_id."
                     )
                 query = query.filter(
@@ -4907,7 +7156,11 @@ class BusinessMixin:
                     Invoice.owner_guid == job.guid,
                 )
             elif ot is not None:
-                query = query.filter(Invoice.owner_type == ot)
+                # Job-aware: a customer listing must include the
+                # customer's job-attached invoices (owner_type=3).
+                query = query.filter(
+                    self._document_owner_clause(book, owner_type=ot)
+                )
 
             invoices = query.order_by(Invoice.date_opened.desc()).all()
 
@@ -4946,6 +7199,8 @@ class BusinessMixin:
                 date_key=lambda i: i.date_opened,
             )
             invoices = page
+            # Held for the rows below: each reads its settlement.
+            _held_accounts = self._preload_document_lots(book, invoices)
 
             if compact:
                 lines = [indicator]
@@ -4977,13 +7232,13 @@ class BusinessMixin:
                         j_obj = jobs_by_guid.get(i.owner_guid)
                         if j_obj is not None:
                             j_dict = self._job_to_dict(j_obj)
-                    results.append(
-                        self._invoice_to_dict(
-                            i,
-                            owner_name=o.name if o else None,
-                            job=j_dict,
-                        )
+                    row = self._invoice_to_dict(
+                        i,
+                        owner_name=o.name if o else None,
+                        job=j_dict,
                     )
+                    row["status"], _ = self._document_status(book, i)
+                    results.append(row)
                 # Envelope matches the other list tools: ``count`` =
                 # page length, ``total`` = full filter-set size,
                 # ``showing`` = the indicator compact leads with.
@@ -5063,6 +7318,7 @@ class BusinessMixin:
                 self._entry_to_dict(
                     r,
                     is_bill=is_bill,
+                    is_credit_note=self._get_is_credit_note(inv),
                     account_paths=account_paths,
                     taxtable_names=taxtable_names,
                 )
@@ -5133,6 +7389,63 @@ class BusinessMixin:
                 tax_summary=tax_summary,
             )
             result["total"] = str(total)
+
+            # Payment state from the same lot arithmetic the unpaid
+            # list uses, so the surfaces agree by construction.
+            result["status"], settlement = self._document_status(book, inv)
+            if settlement is not None:
+                # A posted document's total is what it was posted at.
+                # When the entries no longer sum to that (a tax table
+                # edited since, or math this server did not apply at
+                # posting), say so rather than show the difference as
+                # a payment.
+                posted_total = settlement["grand_total"]
+                entries_total = total.quantize(posted_total)
+                result["total"] = str(posted_total)
+                # A voucher's card lines post to the card, not the
+                # payable: its lot carries less than its entries by
+                # exactly that, and that is not drift.
+                card = self._card_charges(book, inv)
+                if card["account"] is not None:
+                    result["charged_to_card"] = {
+                        "account": card["account"].fullname,
+                        "amount": str(card["total"]),
+                        "document_total": str(entries_total),
+                    }
+                    entries_total = (total - card["total"]).quantize(
+                        posted_total
+                    )
+                if entries_total != posted_total:
+                    result["total_note"] = (
+                        f"Posted at {posted_total}; the entries now "
+                        f"compute to {entries_total}. The posted "
+                        f"amount is what was booked and what payments "
+                        f"settle. Unpost and re-post to rebook at the "
+                        f"entries' amount."
+                    )
+                result["amount_paid"] = str(settlement["amount_paid"])
+                result["amount_due"] = str(settlement["amount_due"])
+                if settlement["overpaid"]:
+                    result["overpaid"] = True
+                result["payments"] = self._document_payments(
+                    book, inv, settlement,
+                )
+                if settlement["amount_due"] > 0:
+                    owner_key = self._end_owner(book, inv)
+                    on_account = sum(
+                        (
+                            u["amount"]
+                            for u in self._unapplied_payments(book)
+                            if u["owner"] == owner_key
+                            and u["account"].guid
+                            == settlement["post_account"].guid
+                        ),
+                        Decimal(0),
+                    )
+                    if on_account > 0:
+                        result["unapplied_payments_available"] = str(
+                            on_account
+                        )
 
             # Forward signal: surface available (or just-expired)
             # early-payment discount so get_invoice is actionable
@@ -5213,12 +7526,20 @@ class BusinessMixin:
             _fx_staleness_days,
         )
 
-        aged = self._find_exchange_rate_aged(
-            book,
-            from_commodity=invoice_currency,
-            to_commodity=target_commodity,
-            as_of=as_of,
-        )
+        # The rate the server CHOOSES for a posting comes from quotes
+        # somebody entered or fetched, never from a transaction's
+        # implied rate. Valuation counts those rows, as desktop does;
+        # but desktop asks a human for the rate at this point, and a
+        # posting that priced itself off the last posting's echo
+        # would refresh that echo forever — the guard below would
+        # never see a stale rate again.
+        with self._market_prices_only(book):
+            aged = self._find_exchange_rate_aged(
+                book,
+                from_commodity=invoice_currency,
+                to_commodity=target_commodity,
+                as_of=as_of,
+            )
         if aged is None:
             cap = _fx_staleness_days()
             staleness_note = (
@@ -5251,12 +7572,21 @@ class BusinessMixin:
                     f"{invoice_currency.mnemonic}/"
                     f"{target_commodity.mnemonic} rate is {age_days} "
                     f"days from the {context} date ({as_of}); last "
-                    f"quoted {price_date.isoformat()} at {rate}. This "
-                    f"rate is locked at {context} time and cannot be "
-                    f"updated retroactively. Either run create_price("
+                    f"quoted {price_date.isoformat()} at "
+                    f"{_format_number(rate, decimals=6, strip_trailing=True)}. "
+                    f"This rate is locked at {context} time and cannot "
+                    f"be updated retroactively. Either run create_price("
                     f"commodity='{invoice_currency.mnemonic}', "
-                    f"value='...') to add a rate near {as_of}, or pass "
-                    f"force=true to proceed with the stale rate.",
+                    f"namespace='CURRENCY', "
+                    # Both sides named: left to its default, the
+                    # price lands against the BOOK's currency, which
+                    # is the wrong pair whenever that isn't the
+                    # target (and a self-price when it is the
+                    # invoice's own).
+                    f"currency='{target_commodity.mnemonic}', "
+                    f"value='...', "
+                    f"date='{as_of}') to add a rate near {as_of}, or "
+                    f"pass force=true to proceed with the stale rate.",
                     {
                         "currency": invoice_currency.mnemonic,
                         "rate": str(rate),
@@ -5311,6 +7641,10 @@ class BusinessMixin:
             ValueError: If invoice not found, already posted, no entries,
                         or invalid account type.
         """
+        # Every free-text argument through the one text gate (scoped
+        # review 2026-10-06, IN-3).
+        for _field in ("description", "memo"):
+            _check_text(locals().get(_field), _TEXT_WIDTH, _field)
         from piecash.business.invoice import Invoice
         from piecash.core.transaction import Lot
 
@@ -5320,8 +7654,12 @@ class BusinessMixin:
             date.fromisoformat(post_date) if post_date
             else date.today()
         )
+        _check_ledger_date(parsed_date, "post_date")
 
         with self.open(readonly=False) as book:
+            # Every pre-1.5 shape in the book converts on this write
+            # (nothing posted) — see _upgrade_book_shapes.
+            shapes = self._upgrade_book_shapes(book)
             # Customer-invoice and vendor-bill ID sequences collide
             # in the shared ``invoices`` table — without an
             # owner_type filter, posting bill 000010 can fetch an
@@ -5351,7 +7689,7 @@ class BusinessMixin:
                 raise ValueError(
                     f"Document not found: {invoice_id}. If the ID "
                     f"is shared across document types, pass "
-                    f"owner_type ('customer', 'vendor', or "
+                    f"party_type ('customer', 'vendor', or "
                     f"'employee' for vouchers) explicitly."
                 )
 
@@ -5367,9 +7705,7 @@ class BusinessMixin:
 
             post_acct = self._resolve_account(book, post_account)
             if not post_acct:
-                raise ValueError(
-                    f"Account not found: {post_account}"
-                )
+                raise self._account_not_found_error(book, post_account)
             expected_type = "PAYABLE" if is_bill else "RECEIVABLE"
             if post_acct.type != expected_type:
                 raise ValueError(
@@ -5404,32 +7740,61 @@ class BusinessMixin:
             acct_totals = totals["acct_totals"]
             grand_total = totals["grand_total"]
 
+            type_string = self._doc_type_string(book, inv)
+            # Desktop leaves a lot's closed flag at -1 (recompute) and
+            # resets it to -1 on every split change; a stored 0 or 1 is
+            # a shape desktop never writes here (parity twin).
             lot = Lot(
-                title=f"Invoice {inv.id}",
+                title=f"{type_string} {inv.id}",
                 account=post_acct,
-                is_closed=0,
+                is_closed=_LOT_CLOSED_UNKNOWN,
             )
             # Lot auto-registers via the account back-pop —
             # an explicit session.add would be redundant (see
             # the matching note in investments.py).
 
-            # GnuCash UI uses the customer/vendor name, not "Invoice NNNNNN"
-            if is_bill:
-                owner = self._find_vendor_by_guid(book, inv.owner_guid)
-            else:
-                owner = self._find_customer_by_guid(
-                    book, inv.owner_guid
-                )
-            owner_name = owner.name if owner else f"Invoice {inv.id}"
+            # GnuCash UI uses the counterparty's name, not "Invoice
+            # NNNNNN". Resolved through the polymorphic finder: a
+            # side-keyed customer/vendor lookup returns None for
+            # vouchers (employee owner) and job-attached documents
+            # (owner_guid names the Job), which posted every such
+            # document as "Invoice NNN" (whole-tree review, 1a).
+            owner = self._find_invoice_owner_by_guid(
+                book, inv.owner_type, inv.owner_guid,
+            )
+            owner_name = (
+                owner.name if owner else f"{self._doc_noun(inv)} {inv.id}"
+            )
             # description=None falls back to the owner name (GnuCash
             # UI convention); an explicit "" deliberately blanks the
             # field — ``or owner_name`` would collapse "" into the
             # fallback. Same pattern as pay_invoice.
             txn_desc = description if description is not None else owner_name
 
-            parsed_due = (
+            # Desktop always writes trans-date-due on post, and
+            # terms win: gncBillTermComputeDueDate overrides the
+            # dialog's date. A tool response has no field for the
+            # user to watch change, so a caller's due_date that
+            # disagrees with the terms is refused instead of
+            # overridden (spec A2). Without terms the caller's date
+            # stands, defaulting to the posting date as in desktop.
+            requested_due = (
                 date.fromisoformat(due_date) if due_date else None
             )
+            term = self._invoice_billterm(book, inv)
+            if term is not None:
+                parsed_due = self._billterm_due_date(term, parsed_date)
+                if requested_due is not None and requested_due != parsed_due:
+                    raise ValueError(
+                        f"due_date {requested_due.isoformat()} disagrees "
+                        f"with the document's terms '{term.name}', "
+                        f"which put it due {parsed_due.isoformat()} "
+                        f"for a {parsed_date.isoformat()} posting. Omit "
+                        f"due_date to use the terms (as GnuCash does), "
+                        f"or change the document's terms first."
+                    )
+            else:
+                parsed_due = requested_due or parsed_date
 
             # Converts invoice-currency values to each account's
             # commodity via the shared ``_convert_invoice_amount``
@@ -5466,26 +7831,40 @@ class BusinessMixin:
             effective_is_bill = is_bill ^ is_credit_note
             piecash_splits = []
 
+            # An employee's voucher: lines paid with the company card,
+            # and any "extra to charge card", go to the card account
+            # and come off what is owed to the employee
+            # (gncInvoicePostToAccount, GNC_PAYMENT_CARD). They used
+            # to post to the payable with everything else — the
+            # employee was owed, and later reimbursed, for what the
+            # card had paid (adversarial review 2026-09-30, C3).
+            card = self._card_charges(book, inv, totals)
+            owed_total = grand_total - card["total"]
+
             if effective_is_bill:
-                ar_ap_value = -grand_total
+                ar_ap_value = -owed_total
             else:
-                ar_ap_value = grand_total
+                ar_ap_value = owed_total
             # Desktop vocabulary on EVERY leg ("Invoice" / "Credit
             # Note"), not just A/R: a leg left with action="" gets
             # auto-stamped "Buy"/"Sell" by piecash when its account
             # commodity differs from the transaction currency —
             # brokerage vocabulary on a client bill. Forward-only:
             # existing transactions are never rewritten to conform.
-            doc_action = (
-                "Credit Note" if is_credit_note else "Invoice"
-            )
-            ar_ap_split = piecash.Split(
-                account=post_acct,
-                value=ar_ap_value,
-                quantity=_qty_for_split(post_acct, ar_ap_value),
+            #
+            # gnc_set_num_action (engine-helpers.c), which every one
+            # of these legs and the transaction's number go through
+            # in gncInvoicePostToAccount: with the book option "Use
+            # Split Action Field for Number" on, the document's ID is
+            # each split's action and the type is the transaction's
+            # number; off, the other way round (review C67).
+            num_on_split = self._num_is_split_action(book)
+            doc_action = inv.id if num_on_split else type_string
+            ar_ap_split = _new_split(
+                post_acct, ar_ap_value,
+                _qty_for_split(post_acct, ar_ap_value), inv.currency,
                 memo="",
                 action=doc_action,
-                reconcile_date=datetime(1970, 1, 1),
             )
             piecash_splits.append(ar_ap_split)
 
@@ -5504,29 +7883,72 @@ class BusinessMixin:
                     split_value = -acct_total
 
                 piecash_splits.append(
-                    piecash.Split(
-                        account=entry_acct,
-                        value=split_value,
-                        quantity=_qty_for_split(entry_acct, split_value),
+                    _new_split(
+                        entry_acct, split_value,
+                        _qty_for_split(entry_acct, split_value),
+                        inv.currency,
                         memo="",
                         action=doc_action,
                     )
                 )
 
-            # num = invoice ID, matching GnuCash UI behavior
+            # One split per card line, its memo the line's
+            # description, on the same side as the payable; then the
+            # extra, under desktop's memo.
+            card_side = -1 if effective_is_bill else 1
+            for memo_text, value in card["lines"] + (
+                [("Extra to Charge Card", card["extra"])]
+                if card["extra"] else []
+            ):
+                card_value = card_side * value
+                piecash_splits.append(
+                    _new_split(
+                        card["account"], card_value,
+                        _qty_for_split(card["account"], card_value),
+                        inv.currency,
+                        memo=memo_text,
+                        action=doc_action,
+                    )
+                )
+
+            # Stabilize the billing terms: the posted document points
+            # at a frozen copy (gncBillTermReturnChild). Posting used
+            # to leave it on the live term, so editing the term
+            # changed the terms of documents already posted under it
+            # (adversarial review 2026-09-30, C10). The tax table on
+            # each line is NOT repointed here, and that is OPEN: the
+            # source repoints it (gncTaxTableReturnChild), but in the
+            # headless engine run the line was never re-saved and the
+            # entries still named the parent table. Two oracles
+            # disagree, so the GUI gate decides (bookkeeper ruling,
+            # 2026-09-30 round 2, item 4). What a posted document
+            # totals does not depend on the answer: it is read from
+            # the posting (``_posted_total``).
+            if term is not None:
+                child_term = self._billterm_return_child(book, term)
+                if child_term.guid != term.guid:
+                    inv.term_guid = child_term.guid
+                    if (term.refcount or 0) > 0:
+                        term.refcount = term.refcount - 1
+
+            # num = invoice ID (the type, with Num on split actions).
             txn = piecash.Transaction(
                 currency=inv.currency,
                 description=txn_desc,
                 post_date=parsed_date,
-                num=inv.id,
+                num=type_string if num_on_split else inv.id,
                 splits=piecash_splits,
             )
 
+            _lot_cache_flag(lot)
             ar_ap_split.lot = lot
 
-            inv.date_posted = datetime.combine(
-                parsed_date, datetime.min.time()
-            )
+            # Desktop: date_posted at the neutral time (10:59:00 UTC,
+            # gnc_time64_get_day_neutral), the lot flag at -1, and no
+            # notes slot on a lot nobody annotated (piecash writes an
+            # empty one on construction).
+            inv.date_posted = _neutral_time(parsed_date)
+            lot.is_closed = _LOT_CLOSED_UNKNOWN
             inv.post_txn = txn
             inv.post_lot = lot
             inv.post_account = post_acct
@@ -5535,20 +7957,17 @@ class BusinessMixin:
 
             # Metadata slots matching GnuCash UI behavior
             txn["trans-txn-type"] = "I"
-            txn["trans-read-only"] = (
-                "Generated from an invoice. "
-                "Try unposting the invoice."
-            )
+            txn["trans-read-only"] = self._POSTING_READ_ONLY_REASON
             self._write_gncinvoice_slot(
                 book, txn.guid, inv.guid
             )
             self._write_gncinvoice_slot(
                 book, lot.guid, inv.guid
             )
-            if parsed_due:
-                self._write_gdate_slot(
-                    book, txn.guid, "trans-date-due", parsed_due
-                )
+            self._drop_empty_lot_notes(book, lot)
+            # Every post carries trans-date-due, as desktop's does
+            # (gncInvoicePostToAccount → xaccTransSetDateDue).
+            self._write_due_date_slot(book, txn.guid, parsed_due)
 
             book.save()
 
@@ -5561,11 +7980,13 @@ class BusinessMixin:
                     "credit_note"
                     if is_credit_note
                     else self._OWNER_TYPE_TO_RESPONSE_TYPE.get(
-                        inv.owner_type, "invoice"
+                        self._effective_owner_type(book, inv), "invoice"
                     )
                 ),
                 "status": "posted",
-                "total": str(grand_total),
+                # What the lot carries: all of it, or — a voucher with
+                # card lines — what is owed to the employee.
+                "total": str(owed_total),
                 "post_date": str(parsed_date),
                 # GUIDs emitted as short prefixes — consumers pass
                 # them back through _resolve_guid (8+ chars accepted).
@@ -5579,6 +8000,12 @@ class BusinessMixin:
                 ),
                 "post_account": post_acct.fullname,
             }
+            if card["account"] is not None:
+                result["charged_to_card"] = {
+                    "account": card["account"].fullname,
+                    "amount": str(card["total"]),
+                    "document_total": str(grand_total),
+                }
             # Surface the worst-aged forced override (if any) as a
             # single fx_stale block — the common case is one foreign
             # currency, so there is usually exactly one.
@@ -5586,6 +8013,15 @@ class BusinessMixin:
                 result["fx_stale"] = max(
                     fx_stale_overrides, key=lambda m: m["age_days"]
                 )
+            closed = self._read_only_period_note(
+                book, [parsed_date], "", dialog="Post Invoice dialog",
+            )
+            if closed:
+                result["read_only_period"] = closed
+            far = _far_date_warning(parsed_date)
+            if far:
+                result["date_warning"] = far
+        result.update(shapes)
         return result
 
     def unpost_invoice(
@@ -5596,13 +8032,22 @@ class BusinessMixin:
         """Unpost a previously-posted document (invoice, bill,
         voucher, or credit note).
 
-        Reverses ``post_invoice``: deletes the posting transaction
-        and lot, clears the posted-state metadata. The document
-        returns to "open" — editable and re-postable.
+        Reverses ``post_invoice`` the way ``gncInvoiceUnpost`` does:
+        deletes the posting transaction, clears the posted-state
+        metadata, and returns the document to "open" — editable and
+        re-postable.
 
-        Refuses if the invoice has live payments applied —
-        unposting a partially-paid invoice would orphan the payment
-        splits and corrupt the lot's balance. Void payments first.
+        Payments are KEPT. A lot with payments in it loses its link
+        to the document and is attached to the document's owner
+        instead (``gncOwnerAttachToLot``): the money stays on the
+        books as the party's unapplied payment, and after re-posting
+        ``pay_invoice(from_prepayment=True)`` settles the document
+        from it. A lot-link transaction (a credit note applied, or
+        the document this one was applied to) is removed, and the
+        lots it joined are balanced against each other again. An
+        empty lot is destroyed. The old refusal ("void payments
+        first") sent callers to void a bank line that may already be
+        reconciled (adversarial review 2026-09-30, C49).
 
         Args:
             invoice_id: Human-readable ID (e.g., '000001').
@@ -5613,11 +8058,14 @@ class BusinessMixin:
             ``{"id": "000015", "type": "invoice", "status": "unposted"}``.
 
         Raises:
-            ValueError: not found, not posted, or payments applied.
+            ValueError: not found or not posted.
         """
         ot = self._parse_owner_type(owner_type)
 
         with self.open(readonly=False) as book:
+            # Every pre-1.5 shape in the book converts on this write
+            # (nothing posted) — see _upgrade_book_shapes.
+            shapes = self._upgrade_book_shapes(book)
             inv = self._find_invoice(book, invoice_id, owner_type=ot)
             if not inv:
                 raise ValueError(
@@ -5648,7 +8096,7 @@ class BusinessMixin:
                     "credit_note"
                     if self._get_is_credit_note(inv)
                     else self._OWNER_TYPE_TO_RESPONSE_TYPE.get(
-                        inv.owner_type, "invoice"
+                        self._effective_owner_type(book, inv), "invoice"
                     )
                 ),
                 "date_posted": (
@@ -5660,29 +8108,53 @@ class BusinessMixin:
             txn = inv.post_txn
             lot = inv.post_lot
 
-            # Only *live* payment splits block unposting. The lot
-            # always holds the posting split; each pay_invoice adds
-            # one more. Voided payments keep zeroed splits for audit
-            # trail, so a naive ``len(lot.splits) > 1`` would count
-            # them as still-applied — filter to non-posting,
-            # non-zero-value splits.
+            # What else is in the lot besides the posting: payments
+            # (kept, with the lot, as the owner's) and lot-link
+            # transactions (removed; the lots they joined re-balanced)
+            # — gncInvoiceUnpost. Captured before anything is deleted.
             posting_txn_guid = txn.guid if txn else None
-            real_payment_splits = []
-            if lot is not None:
-                for s in lot.splits:
-                    if (
-                        posting_txn_guid is not None
-                        and s.transaction_guid == posting_txn_guid
-                    ):
-                        continue
-                    if Decimal(str(s.value)) == 0:
-                        continue
-                    real_payment_splits.append(s)
-            if real_payment_splits:
-                raise ValueError(
-                    f"{doc_label} {invoice_id} has payments applied. "
-                    f"Void payments first, then unpost."
-                )
+            others = [
+                s for s in (lot.splits if lot is not None else [])
+                if s.transaction_guid != posting_txn_guid
+            ]
+            link_txns: list = []
+            for s in others:
+                if (
+                    self._txn_type(s.transaction) == "L"
+                    and s.transaction not in link_txns
+                ):
+                    link_txns.append(s.transaction)
+            kept_splits = [
+                s for s in others if s.transaction not in link_txns
+            ]
+            quantum = (
+                _commodity_quantum(lot.account.commodity)
+                if lot is not None else Decimal("0.01")
+            )
+            prefixes = self._transaction_prefix_map(book)
+            payments_kept = [
+                {
+                    "guid": prefixes.get(
+                        s.transaction_guid, s.transaction_guid[:8],
+                    ),
+                    "date": (
+                        s.transaction.post_date.isoformat()
+                        if s.transaction.post_date else None
+                    ),
+                    "amount": str(
+                        abs(Decimal(str(s.quantity))).quantize(quantum)
+                    ),
+                }
+                for s in kept_splits if s.reconcile_state != "v"
+            ]
+            kept_total = sum(
+                (Decimal(p["amount"]) for p in payments_kept), Decimal(0),
+            )
+            kept_currency = (
+                lot.account.commodity.mnemonic if lot is not None else ""
+            )
+            owner_name = self._end_owner_name(book, inv)
+            lot_owner = (inv.owner_type, inv.owner_guid)
 
             # Clear posted-state pointers BEFORE deleting the
             # transaction/lot — the ORM cascade can otherwise
@@ -5693,57 +8165,88 @@ class BusinessMixin:
             inv.post_account = None
             book.flush()
 
-            # Read the credit-note flag BEFORE deleting: slot reads
+            # Read what the response needs BEFORE deleting: slot reads
             # can flake ("Multiple rows returned with uselist=False")
             # while lots/transactions are being deleted in the same
             # session.
             is_credit_note = self._get_is_credit_note(inv)
             inv_id_snapshot = inv.id
-            owner_type_snapshot = inv.owner_type
-            inv_guid_snapshot = inv.guid
+            # The side the response names: a job-attached bill is a
+            # bill, not the "invoice" its owner_type of 3 fell back to.
+            owner_type_snapshot = self._effective_owner_type(book, inv)
 
-            # The transaction delete cascades its splits; the lot is
-            # empty now that the posted-state pointers are cleared.
+            # Strip GUID-valued slots and frames off the posting
+            # transaction, its splits, and the lot by raw SQL FIRST.
+            # Each carries a ``gncInvoice/invoice-guid`` GUID slot
+            # pointing at the invoice, and piecash's SlotGUID cascade
+            # treats every slot on the referenced invoice as that
+            # slot's children: an unstripped delete swept the
+            # invoice's OWN slots — desktop's document link
+            # (``assoc_uri``), the ``credit-note`` flag, the
+            # applies-to link. gncInvoiceUnpost never touches them.
+            # This site used to let the sweep happen and re-insert
+            # two of the slots by hand, for credit notes only
+            # (adversarial review 2026-09-30, C5).
+            label = f"unpost of {doc_label} {inv_id_snapshot}"
+            owners = []
+            objects = []
+            if txn is not None:
+                txn_splits = list(txn.splits)
+                owners += [txn.guid] + [s.guid for s in txn_splits]
+                objects += [txn, *txn_splits]
+            if owners:
+                self._strip_guid_slots(book, owners, label, objects=objects)
+            # The transaction delete cascades its splits.
             if txn is not None:
                 book.session.delete(txn)
-            if lot is not None:
-                book.session.delete(lot)
+            book.flush()
 
-            if is_credit_note:
-                # Deleting the posting transaction sweeps the
-                # invoice's OWN slots along with the txn's: the
-                # txn carries a ``gncInvoice`` GUID slot, and
-                # piecash's overlapping slot-hierarchy relationship
-                # treats every slot on the referenced invoice as
-                # that slot's child frame, cascading them away.
-                # Restore the identity flag or this document comes
-                # back from unpost as a plain invoice.
-                # Core-table insert + the _verify_* chokepoint —
-                # the same idiom as the applies-to slot writes
-                # above. This site once used text() DML with a
-                # hand-rolled COUNT check, which the
-                # TestWriteVerificationCoverage scanner could not
-                # see (release-review finding 10).
-                from piecash.kvp import KVP_Type, Slot
+            # Lot links: remember the lots each one joined, remove it,
+            # and balance those lots against each other again.
+            for link in link_txns:
+                link_splits = list(link.splits)
+                other_lots: list = []
+                for s in link_splits:
+                    if (
+                        s.lot is not None and s.lot is not lot
+                        and s.lot not in other_lots
+                    ):
+                        other_lots.append(s.lot)
+                self._strip_guid_slots(
+                    book, [link.guid] + [s.guid for s in link_splits],
+                    label, objects=[link, *link_splits],
+                )
+                book.session.delete(link)
                 book.flush()
-                book.session.execute(
-                    Slot.__table__.insert().values(
-                        obj_guid=inv_guid_snapshot,
-                        name="credit-note",
-                        slot_type=KVP_Type.KVP_TYPE_GINT64,
-                        int64_val=1,
+                for other in other_lots:
+                    book.session.expire(other, ["splits"])
+                self._auto_apply_lots(book, other_lots, owner_name)
+                book.flush()
+                for other in other_lots:
+                    if other in book.session.deleted:
+                        continue
+                    if not list(other.splits):
+                        self._destroy_lot(book, other, label)
+                    else:
+                        other.is_closed = _LOT_CLOSED_UNKNOWN
+
+            if lot is not None:
+                book.session.expire(lot, ["splits"])
+                if list(lot.splits):
+                    # Payments remain: the lot stops being the
+                    # document's and becomes its owner's.
+                    self._detach_invoice_from_lot(book, lot)
+                    self._attach_owner_to_lot(
+                        book, lot.guid, lot_owner[0], lot_owner[1],
                     )
-                )
-                _verify_composite_write(
-                    book.session, Slot.__table__,
-                    {"obj_guid": inv_guid_snapshot,
-                     "name": "credit-note"},
-                    "credit-note flag restore",
-                )
+                    lot.is_closed = _LOT_CLOSED_UNKNOWN
+                else:
+                    self._destroy_lot(book, lot, label)
 
             book.save()
 
-            return {
+            result = {
+                **shapes,
                 "id": inv_id_snapshot,
                 "type": (
                     "credit_note"
@@ -5754,12 +8257,35 @@ class BusinessMixin:
                 ),
                 "status": "unposted",
             }
+            if payments_kept:
+                n = len(payments_kept)
+                result["payments_kept"] = payments_kept
+                result["note"] = (
+                    f"{n} payment{'' if n == 1 else 's'} totalling "
+                    f"{kept_currency} {kept_total.quantize(quantum)} "
+                    f"stay{'s' if n == 1 else ''} on the books as "
+                    f"{owner_name}'s unapplied payment. After "
+                    f"re-posting, settle the document from "
+                    f"{'it' if n == 1 else 'them'} with pay_document "
+                    f"(from_prepayment=true)."
+                )
+            if link_txns:
+                result["links_removed"] = len(link_txns)
+            closed = self._read_only_period_note(
+                book,
+                [prev_post_date.date() if prev_post_date else None],
+                "", dialog="Unpost command",
+                outcome="the posting it removed was dated inside the closed period",
+            )
+            if closed:
+                result["read_only_period"] = closed
+            return result
 
     def pay_invoice(
         self,
         invoice_id: str,
-        payment_account: str,
-        amount: str,
+        payment_account: str | None = None,
+        amount: str | None = None,
         payment_date: str | None = None,
         description: str | None = None,
         owner_type: str | None = None,
@@ -5769,6 +8295,9 @@ class BusinessMixin:
         force: bool = False,
         memo: str = "",
         dry_run: bool = False,
+        allow_prepayment: bool = False,
+        from_prepayment: bool = False,
+        payment_account_amount: str | None = None,
     ) -> dict:
         """Record a payment against a posted invoice or bill.
 
@@ -5807,6 +8336,29 @@ class BusinessMixin:
         payment. ``discount_account`` overrides the routed account
         (resolution mirrors ``fx_account``).
 
+        ``payment_account_amount`` is what the payment account
+        actually moved, for a cross-currency payment — the figure on
+        the bank line, as desktop's payment dialog lets the user set
+        it. The rate paid is then that amount over ``amount``; no
+        quote is consulted (or needed), and it is the rate recorded
+        as the day's price.
+
+        ``allow_prepayment=True`` accepts an ``amount`` above what the
+        document still owes: the balance settles the document and the
+        excess stays in the receivable or payable account in a lot of
+        its own, attached to the party — GnuCash's pre-payment lot
+        (``gncOwnerApplyPaymentSecs``; the receivable/payable leg is
+        split in two inside the one payment transaction, as
+        ``gncOwnerReduceSplitTo`` splits it).
+
+        ``from_prepayment=True`` settles the document from the party's
+        unapplied payments instead of new money: no transaction is
+        created — the earlier payment's own split moves into the
+        document's lot, cut down first when it is more than is owed
+        (``gncOwnerAutoApplyPaymentsWithLots``). ``payment_account``
+        does not apply; ``amount`` is optional and defaults to all
+        that can be applied.
+
         Returns:
             Payment details and remaining balance. ``status`` is
             ``"paid"`` when the lot settles to zero, ``"partial"``
@@ -5822,18 +8374,66 @@ class BusinessMixin:
                 no discount, outside window, amount mismatch,
                 overpayment, credit-note target).
         """
+        # Every free-text argument through the one text gate (scoped
+        # review 2026-10-06, IN-3).
+        for _field in ("description", "memo"):
+            _check_text(locals().get(_field), _TEXT_WIDTH, _field)
         ot = self._parse_owner_type(owner_type)
+
+        if from_prepayment:
+            # No money moves and no transaction is written, so every
+            # argument that describes one is refused rather than
+            # ignored.
+            described = {
+                "payment_account": payment_account,
+                "payment_account_amount": payment_account_amount,
+                "payment_date": payment_date,
+                "description": description,
+                "memo": memo,
+                "fx_account": fx_account,
+                "discount_account": discount_account,
+                "apply_discount": apply_discount,
+                "allow_prepayment": allow_prepayment,
+            }
+            given = [name for name, value in described.items() if value]
+            if given:
+                raise ValueError(
+                    f"{', '.join(given)} "
+                    f"{'does' if len(given) == 1 else 'do'} not apply "
+                    f"with from_prepayment=True: no money moves and no "
+                    f"transaction is created — the party's earlier "
+                    f"payment is applied as it stands. Pass only the "
+                    f"document and, optionally, amount."
+                )
+            return self._settle_from_prepayment(
+                invoice_id, amount, ot, dry_run,
+            )
+        if payment_account is None or amount is None:
+            raise ValueError(
+                "payment_account and amount are required. (Only "
+                "from_prepayment=True, which settles a document from "
+                "the party's unapplied payments, goes without them.)"
+            )
 
         payment_amount = _to_decimal(amount)
         if payment_amount <= 0:
             raise ValueError("Payment amount must be positive")
+        received = None
+        if payment_account_amount is not None:
+            received = _to_decimal(payment_account_amount)
+            if received <= 0:
+                raise ValueError("payment_account_amount must be positive")
 
         parsed_date = (
             date.fromisoformat(payment_date) if payment_date
             else date.today()
         )
+        _check_ledger_date(parsed_date, "payment_date")
 
         with self.open(readonly=dry_run) as book:
+            # Every pre-1.5 shape in the book converts on a real
+            # payment (nothing posted) — see _upgrade_book_shapes.
+            shapes = {} if dry_run else self._upgrade_book_shapes(book)
             inv = self._find_invoice(book, invoice_id, owner_type=ot)
             if not inv:
                 raise ValueError(
@@ -5847,12 +8447,36 @@ class BusinessMixin:
                     f"post it before recording payment"
                 )
 
+            # In the invoice's currency; a sub-unit amount is a typo,
+            # and rounding it at storage would pay what the reply
+            # didn't say.
+            error = _money_precision_error(
+                payment_amount, inv.currency, "Payment amount",
+            )
+            if error:
+                raise error
+
             is_bill = self._is_bill_side(self._effective_owner_type(book, inv))
 
             pay_acct = self._resolve_account(book, payment_account)
+            if pay_acct is not None and pay_acct.placeholder:
+                raise self._placeholder_error(pay_acct)
             if not pay_acct:
+                raise self._account_not_found_error(book, payment_account)
+            # The payment account is where the money moved. A
+            # receivable or payable there (the document's own A/R
+            # included) moved nothing: the invoice read "paid", left
+            # the outstanding list, and A/R still held the balance.
+            # Desktop's payment dialog leaves these accounts out of
+            # the transfer list (gnc_payment_set_account_types:
+            # ``!xaccAccountIsAPARType``).
+            if pay_acct.type in ("RECEIVABLE", "PAYABLE"):
                 raise ValueError(
-                    f"Account not found: {payment_account}"
+                    f"Payment account {pay_acct.fullname!r} is a "
+                    f"{pay_acct.type.lower()} account. Name the "
+                    f"account the money moved through (bank, cash, "
+                    f"or card). To settle one document against "
+                    f"another, use apply_credit_note."
                 )
 
             post_acc_guid = inv.post_acc_guid
@@ -5894,29 +8518,30 @@ class BusinessMixin:
                         f"then retry payment."
                     )
 
-            if is_bill:
-                owner = self._find_vendor_by_guid(
-                    book, inv.owner_guid
-                )
-            else:
-                owner = self._find_customer_by_guid(
-                    book, inv.owner_guid
-                )
-            owner_name = owner.name if owner else ""
+            # Polymorphic owner lookup — the side-keyed finder
+            # returned None for vouchers and job-attached documents,
+            # and every such payment landed with an EMPTY description
+            # (whole-tree review, 1b). Same fallback as post_invoice
+            # so a dangling owner still yields a readable line.
+            owner = self._find_invoice_owner_by_guid(
+                book, inv.owner_type, inv.owner_guid,
+            )
+            owner_name = (
+                owner.name if owner else f"{self._doc_noun(inv)} {inv.id}"
+            )
             # description: None → owner name; explicit "" blanks the
             # field deliberately. Same pattern as post_invoice.
             txn_desc = description if description is not None else owner_name
 
-            # Cross-currency: the transaction currency stays the
-            # invoice currency (values balance in EUR for a EUR
-            # invoice); each account's quantity reflects its own
-            # commodity. BOTH legs convert — converting only the
-            # bank side would liquidate a USD A/R holding a EUR
+            # Cross-currency: each account's quantity reflects its
+            # own commodity, and BOTH legs convert — converting only
+            # the bank side would liquidate a USD A/R holding a EUR
             # invoice in EUR-as-USD on payment. Rate lookup +
             # quantization route through _convert_invoice_amount;
             # pay also consumes the rate (it feeds
             # _compute_fx_gain_loss below) and collects stale_meta
-            # for the fx_stale response block.
+            # for the fx_stale response block. The transaction's
+            # currency is settled just below (``txn_currency``).
             fx_stale_overrides: list[dict] = []
 
             def _convert(amount, target_commodity):
@@ -5933,12 +8558,59 @@ class BusinessMixin:
                     fx_stale_overrides.append(stale_meta)
                 return qty, rate
 
-            pay_quantity, exchange_rate = _convert(
-                payment_amount, pay_acct.commodity,
-            )
+            if received is not None:
+                # What the bank moved is a fact; the quote is a guess
+                # at it. Desktop's payment dialog lets the user set
+                # the transfer amount for exactly this reason
+                # (adversarial review 2026-09-30, C22: a two-day-old
+                # quote booked USD 1,120.00 against a statement line
+                # of 1,003.47 and re-dated the quote as today's
+                # price).
+                if pay_acct.commodity == inv.currency:
+                    raise ValueError(
+                        f"payment_account_amount applies only when the "
+                        f"payment account is in another currency than "
+                        f"the document. {pay_acct.fullname!r} and "
+                        f"{self._doc_label_for(inv.owner_type)} "
+                        f"{invoice_id} are both in "
+                        f"{inv.currency.mnemonic}: pass amount alone."
+                    )
+                error = _money_precision_error(
+                    received, pay_acct.commodity,
+                    "payment_account_amount",
+                )
+                if error:
+                    raise error
+                pay_quantity = received
+                exchange_rate = received / payment_amount
+            else:
+                pay_quantity, exchange_rate = _convert(
+                    payment_amount, pay_acct.commodity,
+                )
             post_quantity, _post_rate = _convert(
                 payment_amount, post_acct.commodity,
             )
+
+            # Which currency the payment transaction is IN. Desktop
+            # (gncOwnerCreatePaymentLotSecs, gncOwner.c) gives a new
+            # payment transaction the TRANSFER account's commodity:
+            # a EUR invoice paid from a USD account is a USD
+            # transaction whose receivable split carries the USD
+            # value and the EUR quantity (payment twin, 2026-09-30).
+            # The server booked it in the invoice's currency until
+            # then. The one state desktop cannot create keeps the
+            # old form: a document posted to an account in a
+            # currency other than its own (refused since 1.5.0),
+            # where only the transaction's values are in the
+            # invoice's currency at all.
+            desktop_currency = (
+                exchange_rate is not None
+                and post_acct.commodity == inv.currency
+            )
+            txn_currency = (
+                pay_acct.commodity if desktop_currency else inv.currency
+            )
+            txn_quantum = _commodity_quantum(txn_currency)
 
             # A tiny exchange rate can quantize the converted
             # quantity to zero — a "successful" payment recording
@@ -5961,6 +8633,23 @@ class BusinessMixin:
             # post_invoice.
             is_credit_note = self._get_is_credit_note(inv)
             effective_is_bill = is_bill ^ is_credit_note
+            # So does a document whose own total is negative (lines
+            # that net to a refund): it posts on the other side, and
+            # settling it moves cash the other way. Nothing could
+            # settle one before (adversarial review 2026-09-30, C44).
+            posted_as = self._posted_total(
+                inv, lot_obj, -1 if effective_is_bill else 1,
+            )
+            negative_document = posted_as is not None and posted_as < 0
+            if negative_document:
+                if apply_discount:
+                    raise ValueError(
+                        f"apply_discount does not apply to "
+                        f"{self._doc_label_for(inv.owner_type)} "
+                        f"{invoice_id}: its total is negative, so "
+                        f"settling it is a refund, not a payment."
+                    )
+                effective_is_bill = not effective_is_bill
 
             # ── Overpayment guard ─────────────────────────────────
             # The lot balance is signed: positive for A/R invoices,
@@ -5975,20 +8664,88 @@ class BusinessMixin:
             remaining_before_pay = self._calculate_lot_balance(lot_obj)
             if effective_is_bill:
                 remaining_before_pay = -remaining_before_pay
+            # The part of ``amount`` that settles this document, and
+            # the part beyond it. The excess is refused unless the
+            # caller says the money really moved
+            # (``allow_prepayment``); it then stays in the post
+            # account in a lot of its own, attached to the party, as
+            # desktop keeps it. The refusal used to recommend a
+            # credit note for the excess, which books cash the bank
+            # never saw short and income the business never earned
+            # down (adversarial review 2026-09-30, C37).
+            settle_amount = payment_amount
+            excess = Decimal("0")
             if payment_amount > remaining_before_pay:
-                doc_label = self._doc_label_for(inv.owner_type)
-                raise ValueError(
-                    f"Payment of {payment_amount} "
-                    f"{inv.currency.mnemonic} exceeds the "
-                    f"outstanding balance of {remaining_before_pay} "
-                    f"{inv.currency.mnemonic} on {doc_label} "
-                    f"{invoice_id}. Pay at most the outstanding "
-                    f"balance. To record a genuine overpayment, pay "
-                    f"the outstanding balance and book the excess as "
-                    f"a credit note (create_document with "
-                    f"document_type='credit_note') so it shows "
-                    f"as credit owed to the counterparty rather than "
-                    f"a phantom receivable."
+                doc_label = self._doc_noun(inv)
+                ccy = inv.currency.mnemonic
+                if is_credit_note or negative_document:
+                    # The document owes the party (a credit note, a
+                    # refund). Paying more than it owes would hold the
+                    # excess on the side where the PARTY owes us, which
+                    # no surface lists as a prepayment and
+                    # from_prepayment cannot use (scoped review
+                    # 2026-10-06, BM-5).
+                    raise ValueError(
+                        f"{payment_amount} {ccy} exceeds what {doc_label} "
+                        f"{invoice_id} owes ({remaining_before_pay} {ccy}); "
+                        f"the excess cannot be held as a prepayment. "
+                        f"Pay what is owed."
+                    )
+                owed_now = remaining_before_pay.quantize(
+                    _commodity_quantum(inv.currency)
+                )
+                if not allow_prepayment:
+                    raise ValueError(
+                        f"Payment of {payment_amount} {ccy} exceeds "
+                        f"the outstanding balance of "
+                        f"{owed_now} {ccy} on {doc_label} "
+                        f"{invoice_id}. If {payment_amount} {ccy} is "
+                        f"what really moved, pass "
+                        f"allow_prepayment=true: "
+                        f"{max(owed_now, Decimal(0))} "
+                        f"settles the document and the rest is held "
+                        f"as the party's unapplied payment, which a "
+                        f"later document can be settled from "
+                        f"(from_prepayment=true). Otherwise pay at "
+                        f"most the outstanding balance."
+                    )
+                if remaining_before_pay <= 0:
+                    raise ValueError(
+                        f"{doc_label} {invoice_id} has nothing left to "
+                        f"pay (balance {owed_now} {ccy}). "
+                        f"allow_prepayment holds the excess of a "
+                        f"payment that also settles a document; record "
+                        f"this payment against a document that is "
+                        f"still open."
+                    )
+                if apply_discount:
+                    raise ValueError(
+                        f"apply_discount=True with an amount "
+                        f"({payment_amount} {ccy}) above the "
+                        f"outstanding balance ({owed_now} "
+                        f"{ccy}): a payment cannot both fall short by "
+                        f"a discount and exceed the balance."
+                    )
+                if post_acct.commodity != inv.currency:
+                    raise ValueError(
+                        f"allow_prepayment is not available on "
+                        f"{doc_label} {invoice_id}: it is posted to "
+                        f"{post_acct.fullname!r} "
+                        f"({post_acct.commodity.mnemonic}), not an "
+                        f"account in its own currency ({ccy}), and a "
+                        f"prepayment is held in the account's "
+                        f"currency. Pay the outstanding balance."
+                    )
+                settle_amount = remaining_before_pay
+                excess = payment_amount - remaining_before_pay
+            # The settled part's share of what the payment account
+            # moved (all of it when nothing is in excess).
+            settle_pay_quantity = pay_quantity
+            if excess:
+                settle_pay_quantity = (
+                    pay_quantity * settle_amount / payment_amount
+                ).quantize(
+                    _commodity_quantum(pay_acct.commodity), ROUND_HALF_UP,
                 )
 
             # ── Early-payment discount validation ────────────────
@@ -6003,6 +8760,7 @@ class BusinessMixin:
             discount_amount_invoice_ccy = Decimal("0")
             disc_quantity: Decimal | None = None
             disc_value_sign = 1
+            discount_value_txn = Decimal("0")
             if apply_discount:
                 if is_credit_note:
                     raise ValueError(
@@ -6039,14 +8797,15 @@ class BusinessMixin:
 
                 eligible_until = disc_summary["eligible_until"]
                 if parsed_date > eligible_until:
-                    anchor = inv.date_opened
-                    if isinstance(anchor, datetime):
-                        anchor = anchor.date()
+                    posted = inv.date_posted
+                    if isinstance(posted, datetime):
+                        posted = posted.date()
                     raise ValueError(
                         f"Payment date {parsed_date.isoformat()} is "
                         f"beyond the billterm discount window "
-                        f"({disc_summary['discount_days']} days "
-                        f"from {anchor.isoformat()}; deadline was "
+                        f"(posted {posted.isoformat()}, "
+                        f"{disc_summary['discount_days']} discount "
+                        f"days; deadline was "
                         f"{eligible_until.isoformat()}). Pay without "
                         f"apply_discount for a normal late payment, "
                         f"or issue a credit note to formally write "
@@ -6085,10 +8844,17 @@ class BusinessMixin:
                         f"principal: {expected} "
                         f"{inv.currency.mnemonic} "
                         f"({disc_summary['discount_percent']}%). "
-                        f"Either adjust amount to "
-                        f"{(remaining_before - expected).quantize(quantum)} "
-                        f"to take the full discount, or pay without "
-                        f"apply_discount for a partial payment."
+                        + (
+                            f"Either adjust amount to "
+                            f"{(remaining_before - expected).quantize(quantum)} "
+                            f"to take the full discount, or pay "
+                            f"without apply_discount for a partial "
+                            f"payment."
+                            # Never suggest paying a negative amount.
+                            if remaining_before > expected else
+                            f"The discount exceeds what is still "
+                            f"owed; pay without apply_discount."
+                        )
                     )
 
                 # Book the ACTUAL shortfall, not the computed
@@ -6108,18 +8874,40 @@ class BusinessMixin:
                         dry_run=dry_run,
                     )
                 )
-                disc_quantity, _disc_rate = _convert(
-                    expected, discount_acct.commodity,
-                )
+                if received is not None and discount_acct.commodity == txn_currency:
+                    # The bank amount fixes the rate; no quote is
+                    # needed, and a quote would value the discount at
+                    # a rate nobody paid (scoped review 2026-10-06, BM-4).
+                    disc_quantity = (expected * exchange_rate).quantize(
+                        _commodity_quantum(discount_acct.commodity),
+                        rounding=ROUND_HALF_UP,
+                    )
+                else:
+                    disc_quantity, _disc_rate = _convert(
+                        expected, discount_acct.commodity,
+                    )
                 # Customer payment: discount is EXPENSE (debit), +value
                 # Vendor bill payment: discount is INCOME (credit), -value
                 disc_value_sign = -1 if effective_is_bill else 1
                 discount_booked = True
+                # The discount's value in the transaction's currency:
+                # the invoice-currency amount itself in the old form;
+                # at the pay-date rate when the transaction is in the
+                # pay account's currency (its own quantity when the
+                # discount account shares that currency — value and
+                # quantity must agree there).
+                if not desktop_currency:
+                    discount_value_txn = expected
+                elif discount_acct.commodity == txn_currency:
+                    discount_value_txn = disc_quantity
+                else:
+                    discount_value_txn = (
+                        expected * exchange_rate
+                    ).quantize(txn_quantum, rounding=ROUND_HALF_UP)
                 if not dry_run:
-                    discount_split = piecash.Split(
-                        account=discount_acct,
-                        value=disc_value_sign * expected,
-                        quantity=disc_value_sign * disc_quantity,
+                    discount_split = _new_split(
+                        discount_acct, disc_value_sign * discount_value_txn,
+                        disc_value_sign * disc_quantity, txn_currency,
                         memo="Early-payment discount",
                         action="Payment",
                     )
@@ -6133,8 +8921,13 @@ class BusinessMixin:
                     full_settle_amount, post_acct.commodity,
                 )
             else:
-                full_settle_amount = payment_amount
-                full_settle_post_qty = post_quantity
+                full_settle_amount = settle_amount
+                # With an excess the post account is in the
+                # document's currency (checked above), so the settled
+                # quantity is the settled amount itself.
+                full_settle_post_qty = (
+                    settle_amount if excess else post_quantity
+                )
 
             # When the post account's commodity differs from the
             # invoice currency, relieve the lot at the rate it is
@@ -6168,6 +8961,13 @@ class BusinessMixin:
             # values feeds both the rehearsal's proposed-splits
             # table and the real Split construction below — the
             # rehearsal cannot diverge from the booking.
+            # Values are in ``txn_currency``. In the pay account's
+            # currency the bank leg's value is its own quantity, and
+            # the receivable/payable leg's value is whatever balances
+            # the transaction once the discount and FX legs are
+            # known (set below): the pay-date amount when no FX is
+            # booked, exactly desktop's split; its carrying amount
+            # at the posting rate when the drift is booked beside it.
             sgn = 1 if effective_is_bill else -1
             proposed: list[dict] = [
                 {
@@ -6179,7 +8979,9 @@ class BusinessMixin:
                 },
                 {
                     "account": pay_acct.fullname,
-                    "value": -sgn * payment_amount,
+                    "value": -sgn * (
+                        pay_quantity if desktop_currency else payment_amount
+                    ),
                     "quantity": -sgn * pay_quantity,
                     "memo": memo,
                 },
@@ -6187,17 +8989,37 @@ class BusinessMixin:
             if discount_booked:
                 proposed.append({
                     "account": discount_acct.fullname,
-                    "value": disc_value_sign * discount_amount_invoice_ccy,
+                    "value": disc_value_sign * discount_value_txn,
                     "quantity": disc_value_sign * disc_quantity,
                     "memo": "Early-payment discount",
                 })
+            # The excess: a second split in the post account, for its
+            # own lot. Its value is its share of what the payment
+            # account moved (gncOwnerReduceSplitTo: the remainder
+            # keeps what is left of the original value).
+            prepay_row: dict | None = None
+            if excess:
+                prepay_row = {
+                    "account": post_acct.fullname,
+                    "value": sgn * (
+                        pay_quantity - settle_pay_quantity
+                        if desktop_currency else excess
+                    ),
+                    "quantity": sgn * excess,
+                    "memo": memo,
+                    "action": "Payment",
+                    "prepayment": True,
+                }
+                proposed.append(prepay_row)
 
             # Realized FX gain/loss on post→pay rate drift, factored
             # into _compute_fx_gain_loss (the four sign quadrants
-            # are unit-testable there). The split is value=0 in the
-            # transaction currency, non-zero quantity in the FX
-            # account's commodity (book default). One account both
-            # directions; sign decides gain vs loss.
+            # are unit-testable there). In the pay account's
+            # currency the split carries the drift as a real value;
+            # in the old invoice-currency form it is value=0 with a
+            # non-zero quantity in the FX account's commodity (book
+            # default). One account both directions; sign decides
+            # gain vs loss.
             fx_result: dict | None = None
             default_currency = self._require_default_currency(book)
             if exchange_rate is not None:
@@ -6209,8 +9031,10 @@ class BusinessMixin:
                     inv=inv,
                     is_bill=effective_is_bill,
                     pay_acct=pay_acct,
-                    payment_amount=payment_amount,
-                    pay_quantity=pay_quantity,
+                    # Realized on what settles the document; an
+                    # excess has no posting rate to drift from.
+                    payment_amount=settle_amount,
+                    pay_quantity=settle_pay_quantity,
                     parsed_date=parsed_date,
                     exchange_rate=exchange_rate,
                     fx_account=fx_account,
@@ -6224,14 +9048,19 @@ class BusinessMixin:
                         if discount_acct is not None else None
                     ),
                     dry_run=dry_run,
+                    txn_currency=txn_currency,
                 )
                 if fx_result is not None:
                     proposed.append({
                         "account": fx_result["fx_acct"].fullname,
-                        "value": Decimal("0"),
+                        "value": fx_result["value"],
                         "quantity": fx_result["quantity"],
                         "memo": fx_result["memo"],
                     })
+            if desktop_currency:
+                proposed[0]["value"] = -sum(
+                    (row["value"] for row in proposed[1:]), Decimal("0"),
+                )
 
             # Shared result tail — identical blocks on the rehearsal
             # and the booked response, built from the same locals.
@@ -6272,6 +9101,17 @@ class BusinessMixin:
                         }
                         if fx_result["fx_notice"] is not None:
                             result["fx_notice"] = fx_result["fx_notice"]
+                if excess:
+                    result["prepayment"] = {
+                        "amount": str(excess),
+                        "currency": inv.currency.mnemonic,
+                        "party": owner_name,
+                        "note": (
+                            "Held in the post account as the party's "
+                            "unapplied payment. Settle a later document "
+                            "from it with from_prepayment=true."
+                        ),
+                    }
                 if discount_booked:
                     # ``account`` is the canonical path — the resolver
                     # may have picked an account the caller didn't pass.
@@ -6292,7 +9132,7 @@ class BusinessMixin:
                 "credit_note"
                 if is_credit_note
                 else self._OWNER_TYPE_TO_RESPONSE_TYPE.get(
-                    inv.owner_type, "invoice"
+                    self._effective_owner_type(book, inv), "invoice"
                 )
             )
 
@@ -6303,7 +9143,7 @@ class BusinessMixin:
             if dry_run:
                 remaining_after = (
                     remaining_before_pay - full_settle_amount
-                )
+                ).quantize(_commodity_quantum(inv.currency))
                 result = {
                     "dry_run": True,
                     "id": inv.id,
@@ -6335,43 +9175,96 @@ class BusinessMixin:
                 _attach_extras(result)
                 return result
 
-            ar_ap_split = piecash.Split(
-                account=post_acct,
-                value=proposed[0]["value"],
-                quantity=proposed[0]["quantity"],
-                memo="",
+            ar_ap_split = _new_split(
+                post_acct, proposed[0]["value"], proposed[0]["quantity"],
+                txn_currency,
+                memo=memo,  # desktop puts the memo on both legs
                 action="Payment",
             )
-            bank_split = piecash.Split(
-                account=pay_acct,
-                value=proposed[1]["value"],
-                quantity=proposed[1]["quantity"],
+            # gncOwnerCreatePaymentLotSecs sends the transfer split
+            # alone through gnc_set_num_action(NULL, xfer_split, num,
+            # "Payment"): with Num on split actions its action is the
+            # payment's number, which this tool never has, so it is
+            # empty. The post-account split is "Payment" either way.
+            bank_split = _new_split(
+                pay_acct, proposed[1]["value"], proposed[1]["quantity"],
+                txn_currency,
                 memo=memo,
-                action="Payment",
+                action=(
+                    "" if self._num_is_split_action(book) else "Payment"
+                ),
             )
             splits = [ar_ap_split, bank_split]
             if discount_split is not None:
                 splits.append(discount_split)
             if fx_result is not None:
                 splits.append(fx_result["split"])
+            prepay_split = None
+            if prepay_row is not None:
+                prepay_split = _new_split(
+                    post_acct, prepay_row["value"], prepay_row["quantity"],
+                    txn_currency, memo=memo, action="Payment",
+                )
+                splits.append(prepay_split)
 
             txn = piecash.Transaction(
-                currency=inv.currency,
+                currency=txn_currency,
                 description=txn_desc,
                 post_date=parsed_date,
                 num="",
                 splits=splits,
             )
 
+            _lot_cache_flag(lot_obj)
             ar_ap_split.lot = lot_obj
+            prepay_lot = None
+            if prepay_split is not None:
+                # gncOwnerCreatePaymentLotSecs: a lot with no title,
+                # attached to the END owner (the customer or vendor
+                # behind a job).
+                prepay_lot = piecash.Lot(
+                    title=None, account=post_acct, notes=None,
+                    is_closed=_LOT_OPEN,
+                )
+                _lot_cache_flag(prepay_lot)
+                prepay_split.lot = prepay_lot
+
+            if desktop_currency:
+                # The day's price is the rate PAID, written once the
+                # way desktop's payment dialog writes it. No split
+                # may imply one: with the drift booked beside it the
+                # receivable leg's value/quantity is the POSTING
+                # rate, which is not today's price.
+                from gnucash_mcp.book._piecash_shapes import (
+                    SKIP_IMPLIED_PRICE_ATTR,
+                )
+                for s_ in splits:
+                    setattr(s_, SKIP_IMPLIED_PRICE_ATTR, True)
 
             book.flush()
 
+            if desktop_currency:
+                self._record_payment_price(
+                    book, inv.currency, pay_acct.commodity,
+                    payment_amount, pay_quantity, parsed_date,
+                    cash_leaves=effective_is_bill,
+                )
+
             txn["trans-txn-type"] = "P"
+            # Desktop's payment (gncOwnerApplyPaymentSecs) carries no
+            # date-posted slot and leaves the lot flag at -1.
+            self._drop_date_posted_slot(book, txn)
+            lot_obj.is_closed = _LOT_CLOSED_UNKNOWN
+            if prepay_lot is not None:
+                end_type, end_guid = self._end_owner(book, inv)
+                self._attach_owner_to_lot(
+                    book, prepay_lot.guid, end_type, end_guid,
+                )
+                prepay_lot.is_closed = _LOT_CLOSED_UNKNOWN
 
             remaining = self._calculate_lot_balance(lot_obj)
             if remaining == Decimal(0):
-                lot_obj.is_closed = -1
+                lot_obj.is_closed = _LOT_CLOSED_UNKNOWN
 
             book.save()
 
@@ -6379,8 +9272,19 @@ class BusinessMixin:
             # abs() a lot balance — if some other path left it
             # negative, a credit must surface as negative rather
             # than masquerade as money owed.
+            quantum = _commodity_quantum(lot_obj.account.commodity)
             remaining_directional = (
                 -remaining if effective_is_bill else remaining
+            ).quantize(quantum)
+            # Cumulative, from the settlement chokepoint: a second
+            # partial payment must not read as the only one (the
+            # per-call amount is ``payment``), and it must agree with
+            # get_invoice's ``amount_paid`` — both measure from the
+            # POSTED total.
+            settlement = self._document_settlement(book, inv)
+            total_paid = (
+                settlement["amount_paid"] if settlement is not None
+                else None
             )
 
             result = {
@@ -6392,7 +9296,7 @@ class BusinessMixin:
                 "status": (
                     "partial" if remaining_directional > 0 else "paid"
                 ),
-                "amount_paid": str(payment_amount),
+                "payment": str(payment_amount),
                 "remaining_balance": str(remaining_directional),
                 # Transaction GUID emitted as a short prefix —
                 # consumers (e.g. get_transaction lookup) accept
@@ -6404,9 +9308,290 @@ class BusinessMixin:
                 "payment_account": pay_acct.fullname,
                 "payment_date": str(parsed_date),
             }
+            if total_paid is not None:
+                result["total_paid"] = str(total_paid)
             _attach_extras(result)
+            closed = self._read_only_period_note(
+                book, [parsed_date], "",
+                dialog="Process Payment dialog",
+            )
+            if closed:
+                result["read_only_period"] = closed
+            far = _far_date_warning(parsed_date)
+            if far:
+                result["date_warning"] = far
 
+        result.update(shapes)
         return result
+
+    def _settle_from_prepayment(
+        self, invoice_id: str, amount: str | None, ot, dry_run: bool,
+    ) -> dict:
+        """``pay_invoice(from_prepayment=True)``: settle a posted
+        document from what its party has already paid.
+
+        ``gncInvoiceAutoApplyPayments`` narrowed to payments: the
+        party's payment lots in the document's post account, oldest
+        first, each moved into the document's lot through
+        ``_offset_lots`` until the document is settled, the payments
+        run out, or ``amount`` (when given) is reached. Nothing is
+        created: the earlier payment transaction's own split changes
+        lot, and is cut in two first when it is more than is needed.
+        A payment lot left empty is destroyed.
+        """
+        with self.open(readonly=dry_run) as book:
+            shapes = {} if dry_run else self._upgrade_book_shapes(book)
+            inv = self._find_invoice(book, invoice_id, owner_type=ot)
+            if not inv:
+                raise ValueError(f"Document not found: {invoice_id}")
+            doc_label = self._doc_noun(inv)
+            if not _is_invoice_posted(inv):
+                raise ValueError(
+                    f"{doc_label} {invoice_id} is not posted — post it "
+                    f"before settling it from a prepayment"
+                )
+            settlement = self._document_settlement(book, inv)
+            if settlement is None:
+                raise ValueError(f"Lot not found for invoice {invoice_id}")
+            post_acct = settlement["post_account"]
+            doc_lot = settlement["lot"]
+            if inv.post_txn is not None and all(
+                s.reconcile_state == "v" for s in inv.post_txn.splits
+            ):
+                raise ValueError(
+                    f"Cannot settle {doc_label} {invoice_id}: its "
+                    f"posting transaction has been voided. Unvoid it "
+                    f"(or unpost and re-post the document) first."
+                )
+            ccy = post_acct.commodity.mnemonic
+            if post_acct.commodity != inv.currency:
+                raise ValueError(
+                    f"from_prepayment is not available on {doc_label} "
+                    f"{invoice_id}: it is posted to "
+                    f"{post_acct.fullname!r} ({ccy}), not an account in "
+                    f"its own currency ({inv.currency.mnemonic})."
+                )
+            quantum = _commodity_quantum(post_acct.commodity)
+            owed_signed = self._lot_amount(doc_lot)
+            if owed_signed == 0:
+                raise ValueError(
+                    f"{doc_label} {invoice_id} has no remaining "
+                    f"balance — nothing to settle."
+                )
+            owner_key = self._end_owner(book, inv)
+            owner = self._find_invoice_owner_by_guid(
+                book, owner_key[0], owner_key[1],
+            )
+            owner_name = owner.name if owner else "the party"
+            # Usable: the same party's, in the same account, on the
+            # other side of the ledger from what the document owes.
+            lots = [
+                p for p in self._payment_lots(book, post_acct)
+                if p["owner"] == owner_key
+                and (p["amount"] > 0) != (owed_signed > 0)
+            ]
+            available = sum((abs(p["amount"]) for p in lots), Decimal(0))
+            if not lots:
+                raise ValueError(
+                    f"{owner_name} has no unapplied payment in "
+                    f"{post_acct.fullname!r} to settle {doc_label} "
+                    f"{invoice_id} from. Record the payment itself: "
+                    f"pass payment_account and amount."
+                )
+            owed = abs(owed_signed)
+            if amount is None:
+                apply_amount = min(owed, available)
+            else:
+                apply_amount = _to_decimal(amount)
+                if apply_amount <= 0:
+                    raise ValueError("amount must be positive")
+                error = _money_precision_error(
+                    apply_amount, post_acct.commodity, "amount",
+                )
+                if error:
+                    raise error
+                if apply_amount > owed or apply_amount > available:
+                    raise ValueError(
+                        f"amount {apply_amount} {ccy} is more than can "
+                        f"be applied: {doc_label} {invoice_id} owes "
+                        f"{owed.quantize(quantum)} {ccy} and "
+                        f"{owner_name} has "
+                        f"{available.quantize(quantum)} {ccy} unapplied. "
+                        f"Omit amount to apply "
+                        f"{min(owed, available).quantize(quantum)}."
+                    )
+            is_credit_note = self._get_is_credit_note(inv)
+            doc_type = (
+                "credit_note" if is_credit_note
+                else self._OWNER_TYPE_TO_RESPONSE_TYPE.get(
+                    self._effective_owner_type(book, inv), "invoice",
+                )
+            )
+            prefixes = self._transaction_prefix_map(book)
+
+            if dry_run:
+                left = apply_amount
+                plan = []
+                for p in lots:
+                    if left <= 0:
+                        break
+                    take = min(abs(p["amount"]), left)
+                    left -= take
+                    plan.append({
+                        "since": p["since"].isoformat() if p["since"] else None,
+                        "amount": str(take.quantize(quantum)),
+                    })
+                return {
+                    "dry_run": True,
+                    "id": inv.id,
+                    "type": doc_type,
+                    "status": "would_apply",
+                    "applied_from_prepayment": str(
+                        apply_amount.quantize(quantum)
+                    ),
+                    "remaining_balance_after": str(
+                        (settlement["amount_due"] - apply_amount).quantize(
+                            quantum
+                        )
+                    ),
+                    "unapplied_after": str(
+                        (available - apply_amount).quantize(quantum)
+                    ),
+                    "currency": ccy,
+                    "from_payments": plan,
+                }
+
+            left = apply_amount
+            used: list[dict] = []
+            touched = [doc_lot]
+            _lot_cache_flag(doc_lot)
+            for p in lots:
+                if left <= 0:
+                    break
+                lot = p["lot"]
+                _lot_hold_open(lot)
+                touched.append(lot)
+                while left > 0:
+                    split = self._offset_lots(lot, doc_lot, cap=left)
+                    if split is None:
+                        break
+                    moved = abs(Decimal(str(split.quantity)))
+                    left -= moved
+                    txn = split.transaction
+                    used.append({
+                        "guid": prefixes.get(txn.guid, txn.guid[:8]),
+                        "date": (
+                            txn.post_date.isoformat()
+                            if txn.post_date else None
+                        ),
+                        "amount": str(moved.quantize(quantum)),
+                    })
+            if left > 0:
+                # Unreachable while the sums above hold; refuse rather
+                # than report an application that did not happen.
+                raise RuntimeError(
+                    f"could not apply {left} of {apply_amount} {ccy} "
+                    f"from {owner_name}'s unapplied payments"
+                )
+            book.flush()
+            for lot in touched:
+                if lot is not doc_lot and not list(lot.splits):
+                    self._destroy_lot(book, lot, "emptied payment lot")
+                else:
+                    lot.is_closed = _LOT_CLOSED_UNKNOWN
+            book.save()
+
+            settlement = self._document_settlement(book, inv)
+            remaining = settlement["amount_due"]
+            result = {
+                "id": inv.id,
+                "type": doc_type,
+                "status": "partial" if remaining > 0 else "paid",
+                "applied_from_prepayment": str(
+                    apply_amount.quantize(quantum)
+                ),
+                "remaining_balance": str(remaining),
+                "total_paid": str(settlement["amount_paid"]),
+                "unapplied_remaining": str(
+                    (available - apply_amount).quantize(quantum)
+                ),
+                "currency": ccy,
+                "from_payments": used,
+            }
+            closed = self._read_only_period_note(
+                book,
+                [date.fromisoformat(u["date"]) for u in used if u["date"]],
+                "", dialog="Process Payment dialog",
+            )
+            if closed:
+                result["read_only_period"] = closed
+        result.update(shapes)
+        return result
+
+    @staticmethod
+    def _lot_latest_split_date(lot) -> date | None:
+        """``gnc_lot_get_latest_split``'s post date: the latest
+        posting among the lot's splits."""
+        dates = [
+            s.transaction.post_date for s in lot.splits
+            if s.transaction is not None and s.transaction.post_date
+        ]
+        return max(dates) if dates else None
+
+    def _lot_link_date(self, from_lot, to_lot) -> date:
+        """gncOwnerCreateLotLink: the later of the two lots' latest
+        split dates."""
+        a = self._lot_latest_split_date(from_lot)
+        b = self._lot_latest_split_date(to_lot)
+        return max(d for d in (a, b) if d is not None)
+
+    @staticmethod
+    def _lot_link_transaction(*lots):
+        """``get_ll_transaction_from_lot``: an existing TXN_TYPE_LINK
+        transaction on any of the lots, to extend rather than
+        duplicate; ``None`` when there is none."""
+        for lot in lots:
+            for s in lot.splits:
+                txn = s.transaction
+                if txn is None:
+                    continue
+                try:
+                    if str(txn.get("trans-txn-type") or "") == "L":
+                        return txn
+                except Exception:
+                    continue
+        return None
+
+    @staticmethod
+    def _set_lot_link_memo(txn) -> None:
+        """``gncOwnerSetLotLinkMemo``: every split of a lot-link
+        transaction carries one memo, the prefix plus the titles of
+        the document lots it touches, sorted, joined by " - ". The
+        prefix is the one the running desktop writes (GnuCash 5.x:
+        "Offset between documents: "; the stable source now reads
+        "Offset between business items: ")."""
+        titles = sorted(
+            {s.lot.title for s in txn.splits if s.lot is not None and s.lot.title}
+        )
+        if not titles:
+            return
+        memo = "Offset between documents: " + " - ".join(titles)
+        for s in txn.splits:
+            s.memo = memo
+
+    def _end_owner_name(self, book, inv) -> str:
+        """``gncOwnerGetName(gncOwnerGetEndOwner(owner))``: the
+        customer or vendor behind the document, through a job."""
+        eff_ot, job = self._resolve_owner_type_and_job(book, inv)
+        if job is not None:
+            owner = self._find_invoice_owner_by_guid(
+                book, job.owner_type, job.owner_guid,
+            )
+        else:
+            owner = self._find_invoice_owner_by_guid(
+                book, inv.owner_type, inv.owner_guid,
+            )
+        return owner.name if owner is not None else "(Unknown)"
 
     def apply_credit_note(
         self,
@@ -6453,6 +9638,9 @@ class BusinessMixin:
         )
 
         with self.open(readonly=False) as book:
+            # Every pre-1.5 shape in the book converts on this write
+            # (nothing posted) — see _upgrade_book_shapes.
+            shapes = self._upgrade_book_shapes(book)
             # Resolve the credit note (validates it IS a credit note).
             cn = self._resolve_credit_note(
                 book, credit_note_id, owner_type=owner_type,
@@ -6461,7 +9649,10 @@ class BusinessMixin:
             # to disambiguate (they must match anyway).
             target = self._find_invoice(
                 book, applies_to_invoice_id,
-                owner_type=cn.owner_type,
+                # The side, not the raw owner_type: a job-attached
+                # credit note (owner_type 3) applies to any document
+                # on its customer's or vendor's side, job or not.
+                owner_type=self._effective_owner_type(book, cn),
             )
             if not target:
                 raise ValueError(
@@ -6587,10 +9778,31 @@ class BusinessMixin:
 
             # Signed lot balances (A/R positive, A/P negative);
             # abs() gives the available amount on each side.
-            cn_remaining = abs(self._calculate_lot_balance(cn_lot))
-            target_remaining = abs(
-                self._calculate_lot_balance(target_lot)
-            )
+            cn_balance = self._calculate_lot_balance(cn_lot)
+            target_balance = self._calculate_lot_balance(target_lot)
+            # An application offsets a credit against a debit. Two
+            # lots on the SAME side have nothing to offset: abs() on
+            # both hid that, and "applying" a credit note whose lines
+            # net to a charge moved 70 of what the customer owed
+            # into the note's lot and reported it as credit owed TO
+            # them. gncOwnerAutoApplyPaymentsWithLots skips such a
+            # pair (``if (gnc_numeric_positive_p (left_lot_bal) ==
+            # gnc_numeric_positive_p (right_lot_bal)) continue;``).
+            if cn_balance != 0 and target_balance != 0 \
+                    and (cn_balance > 0) == (target_balance > 0):
+                # A debit balance, on A/R or A/P alike, is theirs to pay.
+                side = "owed by" if cn_balance > 0 else "owed to"
+                raise ValueError(
+                    f"Cannot apply {credit_note_id} to "
+                    f"{applies_to_invoice_id}: both carry a balance "
+                    f"{side} the counterparty, so there is nothing "
+                    f"to offset. (A credit note whose lines net to a "
+                    f"charge, or a document with a negative total, "
+                    f"sits on the other side of the ledger from an "
+                    f"ordinary one.)"
+                )
+            cn_remaining = abs(cn_balance)
+            target_remaining = abs(target_balance)
 
             if cn_remaining == 0:
                 raise ValueError(
@@ -6628,6 +9840,13 @@ class BusinessMixin:
             # account) would produce a no-op netting transaction
             # that reports success. Same guard shape as pay_invoice.
             quantum_pre = _commodity_quantum(post_acct.commodity)
+            # Finer than the currency's unit is a typo; it was
+            # rounded without a word (MM-11).
+            error = _money_precision_error(
+                apply_amount, post_acct.commodity, "Apply amount",
+            )
+            if error:
+                raise error
             apply_amount = apply_amount.quantize(quantum_pre)
             if apply_amount == 0:
                 raise ValueError(
@@ -6638,69 +9857,96 @@ class BusinessMixin:
                     f"divisible unit."
                 )
 
-            # Customer side: +apply on the CN lot (settles toward
-            # zero), −apply on the target lot. Vendor side symmetric.
-            is_bill_side = self._is_bill_side(cn_eff_ot)
-            if is_bill_side:
-                cn_split_value = -apply_amount
-                target_split_value = apply_amount
-            else:
-                cn_split_value = apply_amount
-                target_split_value = -apply_amount
+            # Each lot moves toward zero: the link split's sign is the
+            # opposite of the lot's balance (gncOwnerCreateLotLink
+            # offsets the two balances). The signs used to be fixed
+            # by side (customer: +apply on the credit note, −apply on
+            # the target), which is right only while the credit note
+            # holds the credit; a credit note whose lines net to a
+            # charge, applied to an overpaid invoice, pushed both lots
+            # further from zero and reported "applied" (scoped review
+            # 2026-10-06, BM-1). The same-sign refusal above (C15)
+            # guarantees the two signs differ, so the values still
+            # sum to zero.
+            cn_balance = self._lot_amount(cn_lot)
+            target_balance = self._lot_amount(target_lot)
+            cn_split_value = -apply_amount if cn_balance > 0 else apply_amount
+            target_split_value = (
+                -apply_amount if target_balance > 0 else apply_amount
+            )
 
             # Quantize to the post-account's commodity.
             quantum = _commodity_quantum(post_acct.commodity)
             cn_split_value = cn_split_value.quantize(quantum)
             target_split_value = target_split_value.quantize(quantum)
 
-            txn_desc = (
-                f"Credit applied: {credit_note_id} → "
-                f"{applies_to_invoice_id}"
-            )
-            cn_split = piecash.Split(
-                account=post_acct,
-                value=cn_split_value,
-                quantity=cn_split_value,
-                memo=f"Net against {applies_to_invoice_id}",
-                action="Payment",
-            )
-            target_split = piecash.Split(
-                account=post_acct,
-                value=target_split_value,
-                quantity=target_split_value,
-                memo=f"Credit from {credit_note_id}",
-                action="Payment",
-            )
-
-            txn = piecash.Transaction(
-                currency=post_acct.commodity,
-                description=txn_desc,
-                post_date=parsed_date,
-                num="",
-                splits=[cn_split, target_split],
-            )
+            # gncOwnerCreateLotLink, shape for shape (gncOwner.c):
+            # a TXN_TYPE_LINK transaction described by the owner's
+            # name, dated at the later of the two lots' latest
+            # splits, with one "Lot Link" split per lot whose memo
+            # names both documents — or, when either lot already
+            # carries a lot-link transaction, that transaction
+            # extended. The caller's ``apply_date`` must agree with
+            # GnuCash's date or the call is refused naming both;
+            # desktop has no date to type here at all.
+            link_date = self._lot_link_date(cn_lot, target_lot)
+            if apply_date is not None and parsed_date != link_date:
+                raise ValueError(
+                    f"apply_date {parsed_date.isoformat()} disagrees with "
+                    f"the date GnuCash gives a lot link — the later of "
+                    f"the two documents' latest activity, "
+                    f"{link_date.isoformat()}. Omit apply_date."
+                )
+            owner_name = self._end_owner_name(book, cn)
+            txn = self._lot_link_transaction(cn_lot, target_lot)
+            if txn is None:
+                cn_split = _new_split(
+                    post_acct, cn_split_value, cn_split_value,
+                    post_acct.commodity, memo="", action="Lot Link",
+                )
+                target_split = _new_split(
+                    post_acct, target_split_value, target_split_value,
+                    post_acct.commodity, memo="", action="Lot Link",
+                )
+                txn = piecash.Transaction(
+                    currency=post_acct.commodity,
+                    description=owner_name,
+                    post_date=link_date,
+                    num="",
+                    splits=[cn_split, target_split],
+                )
+            else:
+                # One split per lot in a link (BS-4; see _merge_into_link).
+                cn_split = self._merge_into_link(txn, cn_lot, post_acct, cn_split_value)
+                target_split = self._merge_into_link(
+                    txn, target_lot, post_acct, target_split_value,
+                )
+                if link_date > txn.post_date:
+                    txn.post_date = link_date
 
             # Assign splits to the respective lots — this is what
             # tells GnuCash the lots are being settled.
+            _lot_cache_flag(cn_lot)
+            _lot_cache_flag(target_lot)
             cn_split.lot = cn_lot
             target_split.lot = target_lot
 
             book.flush()
 
-            # Payment-type marker (GnuCash UI convention).
-            txn["trans-txn-type"] = "P"
+            txn["trans-txn-type"] = "L"
+            self._set_lot_link_memo(txn)
+            self._drop_date_posted_slot(book, txn)
 
-            # Close whichever lots reached zero.
             new_cn_remaining = abs(
                 self._calculate_lot_balance(cn_lot)
             )
             new_target_remaining = abs(
                 self._calculate_lot_balance(target_lot)
             )
-            if new_cn_remaining == 0:
-                cn_lot.is_closed = -1
-            if new_target_remaining == 0:
-                target_lot.is_closed = -1
+            # Desktop's shape: the closed flag is left for GnuCash to
+            # recompute (gnc_lot_is_closed on -1), never stored.
+            cn_lot.is_closed = _LOT_CLOSED_UNKNOWN
+            target_lot.is_closed = _LOT_CLOSED_UNKNOWN
 
             book.save()
 
@@ -6721,9 +9967,18 @@ class BusinessMixin:
                     txn.guid,
                     self._transaction_prefix_map(book).keys(),
                 ),
-                "apply_date": str(parsed_date),
+                # The date the link transaction carries — GnuCash's,
+                # the later of the two documents' latest activity —
+                # not today's.
+                "apply_date": str(link_date),
                 "status": "applied",
             }
+            closed = self._read_only_period_note(
+                book, [link_date], "",
+                dialog="Process Payment dialog",
+            )
+            if closed:
+                result["read_only_period"] = closed
             # The stored applies-to link is provenance, not a
             # constraint — netting against whatever's open next is
             # the normal flow. When the applied target diverges
@@ -6735,6 +9990,7 @@ class BusinessMixin:
                     f"applied to {target.id} (credit note "
                     f"references {linked['id']})"
                 )
+            result.update(shapes)
             return result
 
     # ── Delete paths ──────────────────────────────────────────────
@@ -6813,6 +10069,9 @@ class BusinessMixin:
         entry_fk_col = getattr(Entry.__table__.c, entry_fk)
 
         with self.open(readonly=False) as book:
+            # Every pre-1.5 shape in the book converts on this write
+            # (nothing posted) — see _upgrade_book_shapes.
+            shapes = self._upgrade_book_shapes(book)
             inv = self._find_invoice(book, doc_id, owner_type=owner_type)
             if not inv:
                 raise ValueError(f"{type_label} not found: {doc_id}")
@@ -6856,17 +10115,26 @@ class BusinessMixin:
                     # Deliberately NOT paired with a _verify_*: the
                     # stored refcount has no in-process consumer
                     # (checks use _compute_taxtable_refcount's live
-                    # COUNT), and MAX(0, …) makes a miss a harmless
-                    # no-op. The write-verification contract test
-                    # scans Table.__table__ DML, not raw text() —
+                    # COUNT), and the clamp at zero makes a miss a
+                    # harmless no-op. The write-verification contract
+                    # test scans Table.__table__ DML, not raw text() —
                     # this site is deliberately outside its scope.
+                    #
+                    # The clamp is a CASE, not MAX(0, …): the scalar
+                    # two-argument MAX is SQLite-only. PostgreSQL and
+                    # MySQL know MAX solely as an aggregate (their
+                    # scalar form is GREATEST), so the old statement
+                    # was rejected outright on every database book
+                    # and no tax-bearing draft could be deleted.
                     book.session.execute(
                         text(
                             "UPDATE taxtables "
-                            "SET refcount = MAX(0, refcount - :n) "
+                            "SET refcount = CASE "
+                            "WHEN refcount - :n < 0 THEN 0 "
+                            "ELSE refcount - :n END "
                             "WHERE guid = :guid"
                         ),
-                        {"n": ref.n, "guid": ref.taxtable_guid},
+                        {"n": int(ref.n), "guid": ref.taxtable_guid},
                     )
 
                 book.session.execute(
@@ -6879,6 +10147,17 @@ class BusinessMixin:
                     f"Entries for {type_label.lower()} '{doc_id}'",
                 )
 
+            # gncInvoiceDestroy → gncBillTermDecRef on the document's term.
+            from sqlalchemy import text as _sql_text
+            term_guid = book.session.execute(
+                _sql_text("SELECT terms FROM invoices WHERE guid = :g"),
+                {"g": inv_guid},
+            ).scalar()
+            if term_guid:
+                from piecash.business.invoice import Billterm
+                bt = book.session.query(Billterm).filter_by(guid=term_guid).first()
+                if bt is not None and (bt.refcount or 0) > 0:
+                    bt.refcount = bt.refcount - 1
             book.session.execute(
                 Invoice.__table__.delete().where(
                     Invoice.__table__.c.guid == inv_guid
@@ -6894,8 +10173,15 @@ class BusinessMixin:
             # Slots (credit-note flag, applies-to link, date slots)
             # have no ON DELETE CASCADE on obj_guid — clean up
             # explicitly, same as _delete_business_person.
+            # Frames first (the ``gnc-mcp`` applies-to frame, any
+            # frame desktop hung on the document): deleting only the
+            # document's own rows orphaned their children.
             from piecash.kvp import Slot
 
+            self._strip_guid_slots(
+                book, [inv_guid],
+                f"delete of {type_label.lower()} '{doc_id}'",
+            )
             book.session.execute(
                 Slot.__table__.delete().where(
                     Slot.__table__.c.obj_guid == inv_guid
@@ -6911,6 +10197,7 @@ class BusinessMixin:
             book.save()
 
             return {
+                **shapes,
                 "id": doc_id,
                 "guid": inv_guid,
                 "type": type_label.lower(),
@@ -6960,6 +10247,16 @@ class BusinessMixin:
             if dependency_check is not None:
                 dependency_check(book, entity_guid)
 
+            # Frames first, the way gnc_sql_slots_delete walks them:
+            # desktop hangs ``payment/last_acct`` (a GUID) off a
+            # ``payment`` frame on customers and vendors, and deleting
+            # only the owner's own rows left the frame's children
+            # behind as orphans.
+            self._strip_guid_slots(
+                book, [entity_guid],
+                f"delete of {entity_label.lower()} '{entity_id}'",
+                objects=[entity],
+            )
             book.session.execute(
                 Slot.__table__.delete().where(
                     Slot.__table__.c.obj_guid == entity_guid
@@ -6991,30 +10288,79 @@ class BusinessMixin:
         delete: raises ValueError (posted/unposted-specific wording)
         if any Invoice rows match the owner_type.
         """
-        from piecash.business.invoice import Invoice
+        from piecash.business.invoice import Invoice, Job
 
         def check(book, entity_guid):
+            # Job-aware: a job-attached document's owner_guid names
+            # the Job, so a direct owner_guid match missed it and
+            # delete_customer succeeded with POSTED invoices on the
+            # books — leaving an owner that resolved to nothing
+            # forever (whole-tree review, 1g).
             invoices = book.session.query(Invoice).filter(
-                Invoice.owner_guid == entity_guid,
-                Invoice.owner_type == owner_type,
+                BusinessMixin._document_owner_clause(
+                    book, owner_type=owner_type, owner_guid=entity_guid,
+                )
             ).all()
-            if not invoices:
-                return
+            # Every blocker in ONE refusal. Raising on the first
+            # match masked the rest — a customer with a posted
+            # job-attached invoice AND the job was told only about
+            # the invoice, voided it, and hit the job guard on the
+            # retry (bookkeeper, PR #172).
+            label = entity_label.lower()
+            blockers: list[str] = []
+            remedies: list[str] = []
             posted = [i for i in invoices if _is_invoice_posted(i)]
             unposted = [i for i in invoices if not _is_invoice_posted(i)]
             if posted:
-                posted_ids = ", ".join(i.id for i in posted)
-                raise ValueError(
-                    f"Cannot delete {entity_label.lower()} with posted "
-                    f"{doc_label}: {posted_ids}. "
-                    f"Void them or issue credit notes first."
+                blockers.append(
+                    f"posted {doc_label}: "
+                    + ", ".join(i.id for i in posted)
                 )
-            unposted_ids = ", ".join(i.id for i in unposted)
-            raise ValueError(
-                f"Cannot delete {entity_label.lower()} with "
-                f"{doc_label}: {unposted_ids}. "
-                f"Delete the {doc_label} first."
-            )
+                # Credit notes are customer/vendor instruments; an
+                # employee's only remedy is the void.
+                credit = (
+                    " or issue credit notes" if owner_type in (2, 4)
+                    else ""
+                )
+                remedies.append(f"Void the {doc_label}{credit} first.")
+            if unposted:
+                blockers.append(
+                    f"{doc_label}: " + ", ".join(i.id for i in unposted)
+                )
+                remedies.append(f"Delete the {doc_label} first.")
+            # The party's jobs reference it by GUID too; deleting
+            # underneath them leaves list_jobs / get_job_report
+            # rendering "?" for the owner with no way to repair it.
+            if owner_type in (2, 4):
+                jobs = book.session.query(Job).filter(
+                    Job.owner_guid == entity_guid,
+                    Job.owner_type == owner_type,
+                ).all()
+                if jobs:
+                    blockers.append(
+                        "jobs: " + ", ".join(j.id for j in jobs)
+                    )
+                    remedies.append(
+                        f"Delete the jobs first (delete_job), or "
+                        f"retire the {label} with active=false."
+                    )
+            held = BusinessMixin._lots_held_for(book, entity_guid)
+            if held:
+                blockers.append(
+                    f"{held} unapplied payment"
+                    f"{'' if held == 1 else 's'} on the books"
+                )
+                remedies.append(
+                    f"Settle a document from "
+                    f"{'it' if held == 1 else 'them'} (pay_document "
+                    f"from_prepayment=true), or retire the {label} "
+                    f"with active=false."
+                )
+            if blockers:
+                raise ValueError(
+                    f"Cannot delete {label} with "
+                    + "; ".join(blockers) + ". " + " ".join(remedies)
+                )
 
         return check
 
@@ -7071,12 +10417,13 @@ class BusinessMixin:
         )
 
     def delete_employee(self, employee_id: str) -> dict:
-        """Delete an employee.
+        """Delete an employee with no expense vouchers.
 
-        Employees in the 1.3.0 release have no associated documents —
-        expense vouchers (``counter_exp_voucher`` / ``owner_type=5``)
-        are out of scope. The delete proceeds unconditionally after
-        slot cleanup.
+        Employees with any vouchers (posted or unposted) cannot be
+        deleted — the same guard customers and vendors have had since
+        their documents existed. Vouchers arrived in v1.3 and the
+        guard did not follow until the whole-tree review (2026-09-04):
+        an employee could be deleted from under a posted voucher.
 
         Args:
             employee_id: Employee ID (e.g., '000001').
@@ -7085,13 +10432,17 @@ class BusinessMixin:
             Dict with id, name, type, status.
 
         Raises:
-            ValueError: If employee not found.
+            ValueError: If employee not found or has vouchers.
         """
         return self._delete_business_person(
             entity_id=employee_id,
             entity_label="Employee",
             find_entity_method="_find_employee",
-            # Employees own nothing in 1.3.0 — no dependency check.
+            dependency_check=self._invoice_dependency_check(
+                entity_label="Employee",
+                owner_type=5,
+                doc_label="vouchers",
+            ),
         )
 
     # ── Job CRUD ─────────────────────────────────────────────────
@@ -7141,6 +10492,13 @@ class BusinessMixin:
             ValueError: invalid/employee owner_type, or owner not
                 found.
         """
+        # Every free-text argument through the one text gate (scoped
+        # review 2026-10-05, I-4): no control characters, GnuCash's
+        # column width.
+        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic", "memo", "action", "billing_id"):
+            _check_text(locals().get(_field), _TEXT_WIDTH, _field)
+            if _field in ("name", "title", "reference", "fullname", "mnemonic", "action", "billing_id"):
+                _check_one_line(locals().get(_field), _field)
         from piecash.business.invoice import Job
 
         int_owner_type = self._parse_owner_type(owner_type)
@@ -7165,6 +10523,7 @@ class BusinessMixin:
             else self._find_vendor
         )
         with self.open(readonly=False) as book:
+            self._repair_double_counters(book)
             owner = find_owner(book, owner_id)
             if not owner:
                 label = (
@@ -7181,6 +10540,8 @@ class BusinessMixin:
                 reference=reference,
                 active=1,
             )
+            # piecash issued six digits; the book's own format wins.
+            job.id = self._counter_id(book, "counter_job", book.counter_job)
 
             book.save()
 
@@ -7198,7 +10559,8 @@ class BusinessMixin:
                 "name": name,
                 "reference": reference,
                 "active": True,
-                "owner_type": owner_type,
+                "party_type": owner_type,
+                "owner_name": owner.name,
                 "status": "created",
             }
 
@@ -7241,7 +10603,7 @@ class BusinessMixin:
 
         if owner_id and not owner_type:
             raise ValueError(
-                "owner_id requires owner_type to be set — "
+                "owner_id requires party_type to be set — "
                 "customer and vendor IDs share a sequence space, "
                 "so disambiguation is required."
             )
@@ -7359,6 +10721,13 @@ class BusinessMixin:
         Raises:
             ValueError: If job not found or no fields supplied.
         """
+        # Every free-text argument through the one text gate (scoped
+        # review 2026-10-05, I-4): no control characters, GnuCash's
+        # column width.
+        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic", "memo", "action", "billing_id"):
+            _check_text(locals().get(_field), _TEXT_WIDTH, _field)
+            if _field in ("name", "title", "reference", "fullname", "mnemonic", "action", "billing_id"):
+                _check_one_line(locals().get(_field), _field)
         if name is None and reference is None and active is None:
             raise ValueError(
                 "update_job requires at least one of name, "
@@ -7385,7 +10754,7 @@ class BusinessMixin:
                 job.reference = reference
                 changed["reference"] = reference
             if active is not None and bool(job.active) != active:
-                job.active = 1 if active else 0
+                job.active = _gnc_bool(active)
                 changed["active"] = active
 
             book.save()
@@ -7425,6 +10794,21 @@ class BusinessMixin:
                 Invoice.owner_type == 3,
                 Invoice.owner_guid == job.guid,
             ).all()
+
+            # A lot left behind by unposting one of the job's paid
+            # documents is attached to the JOB (gncInvoiceUnpost
+            # attaches the document's own owner).
+            held = self._lots_held_for(book, job.guid)
+            if held:
+                raise ValueError(
+                    f"Job '{job_id}' has {held} unapplied payment"
+                    f"{'' if held == 1 else 's'} on the books (kept "
+                    f"when one of its documents was unposted). Settle "
+                    f"a document from "
+                    f"{'it' if held == 1 else 'them'} first "
+                    f"(pay_document from_prepayment=true), or retire "
+                    f"the job with active=false."
+                )
 
             reparented_count = 0
             if linked:
@@ -7500,8 +10884,14 @@ class BusinessMixin:
                 Invoice.date_posted.isnot(None)
             )
 
+            # Every owner filter is job-aware via the chokepoint —
+            # a plain owner_type / owner_guid match dropped every
+            # job-attached document from the collections list
+            # (whole-tree review, 1e).
             if ot is not None:
-                query = query.filter(Invoice.owner_type == ot)
+                query = query.filter(
+                    self._document_owner_clause(book, owner_type=ot)
+                )
 
             if customer_id:
                 customer = self._find_customer(book, customer_id)
@@ -7510,7 +10900,9 @@ class BusinessMixin:
                         f"Customer not found: {customer_id}"
                     )
                 query = query.filter(
-                    Invoice.owner_guid == customer.guid
+                    self._document_owner_clause(
+                        book, owner_type=2, owner_guid=customer.guid,
+                    )
                 )
 
             if vendor_id:
@@ -7520,7 +10912,9 @@ class BusinessMixin:
                         f"Vendor not found: {vendor_id}"
                     )
                 query = query.filter(
-                    Invoice.owner_guid == vendor.guid
+                    self._document_owner_clause(
+                        book, owner_type=4, owner_guid=vendor.guid,
+                    )
                 )
 
             invoices = query.order_by(
@@ -7541,44 +10935,20 @@ class BusinessMixin:
                 )
                 is_bill = self._is_bill_side(effective_ot)
 
-                post_acc_guid = inv.post_acc_guid
-                post_acct = book.session.query(
-                    piecash.Account
-                ).filter_by(guid=post_acc_guid).first()
-                if not post_acct:
+                settlement = self._document_settlement(
+                    book, inv, is_bill=is_bill,
+                    is_credit_note=is_credit_note,
+                )
+                # Unposted, lot missing, or settled: not outstanding.
+                if settlement is None or settlement["balance"] == Decimal(0):
                     continue
-
-                lot_obj = None
-                for lot in post_acct.lots:
-                    if lot.guid == inv.post_lot_guid:
-                        lot_obj = lot
-                        break
-                if not lot_obj:
-                    continue
-
-                balance = self._calculate_lot_balance(lot_obj)
-                if balance == Decimal(0):
-                    continue
-
-                # Direction-normalize the signed lot balance to
-                # "amount still owed" (credit notes: credit still
-                # available). NEGATIVE means overpaid — never abs()
-                # it, or an overpaid invoice renders as money owed
-                # and invites double-collection.
-                amount_due = -balance if (is_bill ^ is_credit_note) else balance
-                overpaid = amount_due < 0 and not is_credit_note
-
-                try:
-                    grand_total = self._get_invoice_entries_and_total(
-                        book, inv,
-                    )["grand_total"]
-                except ValueError:
-                    grand_total = max(amount_due, Decimal("0"))
-
-                # Signed arithmetic keeps amount_paid honest in the
-                # overpaid case: grand 3500, due −1000 → paid 4500
-                # (an abs() derivation would show paid 2500).
-                amount_paid = grand_total - amount_due
+                post_acct = settlement["post_account"]
+                lot_obj = settlement["lot"]
+                balance = settlement["balance"]
+                amount_due = settlement["amount_due"]
+                overpaid = settlement["overpaid"]
+                grand_total = settlement["grand_total"]
+                amount_paid = settlement["amount_paid"]
 
                 # Polymorphic owner dispatch — the direct finders
                 # return None on job-attached invoices (owner_guid
@@ -7593,14 +10963,13 @@ class BusinessMixin:
                 # collector. No aging clock on credit notes (nothing
                 # past due about money the business owes) or
                 # overpaid docs (nothing left to collect).
-                due_date, no_terms = self._resolve_invoice_due_date(
-                    book, inv,
-                )
+                due_date = self._resolve_invoice_due_date(book, inv)
                 days_past_due = (
                     (today - due_date).days
                     if due_date is not None
                     and not is_credit_note
                     and not overpaid
+                    and amount_due > 0
                     else None
                 )
                 currency = (
@@ -7633,7 +11002,6 @@ class BusinessMixin:
                         else None
                     ),
                     "days_past_due": days_past_due,
-                    "no_terms": False if is_credit_note else no_terms,
                     "original_amount": str(grand_total),
                     "amount_paid": str(amount_paid),
                     "amount_due": str(amount_due),
@@ -7648,6 +11016,35 @@ class BusinessMixin:
                 key=lambda r: -(r["days_past_due"] or 0),
             )
 
+            # What parties have paid that no document has absorbed —
+            # the other half of "what is outstanding". Without it a
+            # customer who prepaid reads as owing the whole invoice
+            # (adversarial review 2026-09-30, C50).
+            wanted_side = (
+                None if ot is None else self._is_bill_side(ot)
+            )
+            wanted_owner = (
+                customer.guid if customer_id
+                else vendor.guid if vendor_id else None
+            )
+            unapplied = [
+                {
+                    "party_type": u["owner_type"],
+                    "party_id": u["owner_id"],
+                    "party_name": u["owner_name"],
+                    "account": u["account"].fullname,
+                    "currency": u["currency"],
+                    "amount": str(u["amount"]),
+                    "since": u["since"].isoformat() if u["since"] else None,
+                }
+                for u in self._unapplied_payments(book)
+                if (
+                    wanted_side is None
+                    or self._is_bill_side(u["owner"][0]) == wanted_side
+                )
+                and (wanted_owner is None or u["owner"][1] == wanted_owner)
+            ]
+
             page, indicator = _paginate(
                 results,
                 offset=offset,
@@ -7657,14 +11054,31 @@ class BusinessMixin:
             )
             if compact:
                 body = _format_outstanding_invoices_compact(page)
-                return f"{indicator}\n{body}" if body else indicator
-            return {
+                text_out = f"{indicator}\n{body}" if body else indicator
+                if unapplied:
+                    lines = [
+                        "Unapplied payments (settle a document from one "
+                        "with pay_document from_prepayment=true):"
+                    ]
+                    for u in unapplied:
+                        lines.append("\t".join([
+                            _tsv_cell(u["party_name"] or ""),
+                            f"{u['currency']} {u['amount']}",
+                            f"since {u['since']}",
+                            _one_line(u["account"]),
+                        ]))
+                    text_out += "\n" + "\n".join(lines)
+                return text_out
+            envelope = {
                 "showing": indicator,
                 "total": len(results),
                 "offset": offset,
                 "count": len(page),
                 "invoices": page,
             }
+            if unapplied:
+                envelope["unapplied_payments"] = unapplied
+            return envelope
 
     def get_job_report(self, job_id: str) -> dict:
         """Per-job summary: billed / paid / outstanding totals
@@ -7716,52 +11130,38 @@ class BusinessMixin:
 
             for inv in invoices:
                 ccy = inv.currency.mnemonic if inv.currency else "?"
-                # Face value falls back to 0 on entry-load failure
-                # rather than aborting the whole report.
-                try:
-                    billed = self._get_invoice_entries_and_total(
-                        book, inv,
-                    )["grand_total"]
-                except (ValueError, AttributeError):
-                    billed = Decimal("0")
+                # Posted: billed / paid / outstanding straight off
+                # the settlement chokepoint (billed is the POSTED
+                # amount; outstanding is direction-normalized, never
+                # abs()'d, so an overpaid invoice keeps ``paid``
+                # honest). This loop used to carry its own copy of
+                # the lot arithmetic, measured from the entries.
+                settlement = self._document_settlement(
+                    book, inv, is_bill=job_is_bill,
+                )
+                if settlement is not None:
+                    billed = settlement["grand_total"]
+                    outstanding = settlement["amount_due"]
+                    paid = settlement["amount_paid"]
+                else:
+                    # A draft — or a posted document whose lot is
+                    # missing: fully owed rather than a crash. Face
+                    # value falls back to 0 on entry-load failure
+                    # rather than aborting the whole report.
+                    try:
+                        billed = self._get_invoice_entries_and_total(
+                            book, inv,
+                        )["grand_total"]
+                    except (ValueError, AttributeError):
+                        billed = Decimal("0")
+                    outstanding = billed
+                    paid = Decimal("0")
 
                 if _is_invoice_posted(inv):
                     posted_count += 1
-                    # paid = billed − outstanding from the lot.
-                    # Direction-normalized, NOT abs()'d: an overpaid
-                    # invoice carries NEGATIVE outstanding, keeping
-                    # ``paid`` honest.
-                    post_acct_guid = inv.post_acc_guid
-                    post_acct = book.session.query(
-                        piecash.Account
-                    ).filter_by(guid=post_acct_guid).first()
-                    lot_obj = None
-                    if post_acct:
-                        for lot in post_acct.lots:
-                            if lot.guid == inv.post_lot_guid:
-                                lot_obj = lot
-                                break
-                    if lot_obj:
-                        lot_balance = self._calculate_lot_balance(
-                            lot_obj
-                        )
-                        flip = job_is_bill ^ self._get_is_credit_note(
-                            inv
-                        )
-                        outstanding = (
-                            -lot_balance if flip else lot_balance
-                        )
-                        paid = billed - outstanding
-                    else:
-                        # Lot missing despite posted state — treat
-                        # as fully owed rather than crash.
-                        outstanding = billed
-                        paid = Decimal("0")
                     status = "posted"
                 else:
                     open_count += 1
-                    paid = Decimal("0")
-                    outstanding = billed
                     status = "open"
 
                 posted_dt = _safe_invoice_date(inv, "date_posted")
@@ -7794,7 +11194,7 @@ class BusinessMixin:
             return {
                 "job_id": job.id,
                 "job_name": job.name,
-                "owner_type": owner_type,
+                "party_type": owner_type,
                 "owner_name": owner_name,
                 "linked_invoices_count": len(invoices),
                 "posted_count": posted_count,
@@ -7840,7 +11240,12 @@ class BusinessMixin:
         if rate is None:
             return Decimal(str(split.value)), False
         quantum = _commodity_quantum(default_currency)
-        return (Decimal(str(split.value)) * rate).quantize(quantum), True
+        return (
+            (Decimal(str(split.value)) * rate).quantize(
+                quantum, rounding=ROUND_HALF_UP,
+            ),
+            True,
+        )
 
     def _bill_amounts_in_default(
         self, book, bill, default_currency,
@@ -7883,25 +11288,55 @@ class BusinessMixin:
                 billed += amt
         billed = abs(billed)
 
-        # Outstanding = magnitude of the post-lot balance.
+        # Outstanding: what the settlement chokepoint says is due, in
+        # the document's currency, converted at the POSTING rate.
+        # Summing the lot splits' default-currency values mixed a
+        # payment's pay-date amount with the posting's, which only
+        # tied when the server's own FX split sat beside it; a
+        # desktop-paid EUR bill read as 100 outstanding with nothing
+        # due (scoped review 2026-10-06, BM-3).
         outstanding = Decimal(0)
-        post_acct = book.session.query(
-            piecash.Account
-        ).filter_by(guid=bill.post_acc_guid).first()
-        if post_acct:
-            for lot in post_acct.lots:
-                if lot.guid != bill.post_lot_guid:
-                    continue
-                for s in lot.splits:
-                    if s.reconcile_state == "v":
+        settlement = self._document_settlement(book, bill, is_bill=True)
+        if settlement is not None:
+            due = abs(settlement["amount_due"])
+            if bill.currency != default_currency and due:
+                # The posting's own rate; when the posting is entirely
+                # in the bill's currency, the price on file for its day.
+                rate = (
+                    self._rate_from_post_transaction(
+                        bill.post_txn, default_currency,
+                    ) if bill.post_txn is not None else None
+                )
+                if rate is None:
+                    posted = _safe_invoice_date(bill, "date_posted")
+                    as_of = posted.date() if posted is not None else date.today()
+                    rate = self._rates_as_of(
+                        book, as_of, default_currency,
+                    ).get(bill.currency.guid)
+                if rate is None:
+                    converted_ok = False
+                else:
+                    due = due * rate
+            outstanding = due
+        else:
+            # No lot to read: the ledger sum, as before.
+            post_acct = book.session.query(
+                piecash.Account
+            ).filter_by(guid=bill.post_acc_guid).first()
+            if post_acct:
+                for lot in post_acct.lots:
+                    if lot.guid != bill.post_lot_guid:
                         continue
-                    amt, ok = self._posting_split_in_default(
-                        book, s, default_currency,
-                    )
-                    converted_ok = converted_ok and ok
-                    outstanding += amt
-                break
-        outstanding = abs(outstanding)
+                    for s in lot.splits:
+                        if s.reconcile_state == "v":
+                            continue
+                        amt, ok = self._posting_split_in_default(
+                            book, s, default_currency,
+                        )
+                        converted_ok = converted_ok and ok
+                        outstanding += amt
+                    break
+            outstanding = abs(outstanding)
 
         paid = billed - outstanding
         unconverted = None if converted_ok else bill.currency.mnemonic
@@ -7962,7 +11397,9 @@ class BusinessMixin:
                 u["bill_count"] += 1
                 continue
 
-            v = self._find_vendor_by_guid(book, bill.owner_guid)
+            v = self._find_invoice_owner_by_guid(
+                book, bill.owner_type, bill.owner_guid,
+            )
             v_name = v.name if v else "Unknown"
             bucket = totals.setdefault(v_name, {})
             bucket[plabel] = bucket.get(plabel, Decimal(0)) + total
@@ -7994,6 +11431,7 @@ class BusinessMixin:
             partial_labels=_partial_period_labels(
                 start_date, end_date, group_by,
             ),
+            currency=default_currency,
         )
         if unconverted:
             mnem = default_currency.mnemonic
@@ -8016,8 +11454,12 @@ class BusinessMixin:
         """Get spending breakdown by vendor for a period.
 
         Analyzes posted vendor bills: total billed, paid, and
-        outstanding per vendor, converted to the book's default
-        currency at period-end rates.
+        outstanding per vendor in the book's default currency, read
+        off the ledger as booked — each amount at the rate applied
+        when it was posted or paid, never a report-time rate. A split
+        with no default-currency side converts at its own
+        transaction's date (``_posting_split_in_default``); a bill
+        with no rate on file is left out of the totals and warned.
 
         Args:
             start_date / end_date: Period bounds (YYYY-MM-DD).
@@ -8041,6 +11483,7 @@ class BusinessMixin:
 
         parsed_start = date.fromisoformat(start_date)
         parsed_end = date.fromisoformat(end_date)
+        _check_report_range(parsed_start, parsed_end)
 
         with self.open() as book:
             # Capture default currency for the compact formatter —
@@ -8048,20 +11491,23 @@ class BusinessMixin:
             default_currency = self._require_default_currency(book)
             default_currency_mnemonic = default_currency.mnemonic
 
-            query = book.session.query(Invoice).filter(
-                Invoice.owner_type == 4,
-                Invoice.date_posted.isnot(None),
-            )
-
+            # Job-aware (chokepoint): a vendor bill grouped under a
+            # job is owner_type=3 and was excluded from spend totals
+            # by the direct owner_type match (whole-tree review, 1f).
+            vendor_guid = None
             if vendor_id:
                 vendor = self._find_vendor(book, vendor_id)
                 if not vendor:
                     raise ValueError(
                         f"Vendor not found: {vendor_id}"
                     )
-                query = query.filter(
-                    Invoice.owner_guid == vendor.guid
-                )
+                vendor_guid = vendor.guid
+            query = book.session.query(Invoice).filter(
+                self._document_owner_clause(
+                    book, owner_type=4, owner_guid=vendor_guid,
+                ),
+                Invoice.date_posted.isnot(None),
+            )
 
             bills = query.all()
 
@@ -8094,8 +11540,8 @@ class BusinessMixin:
             # as a warning.
             unconverted: dict[str, dict] = {}
             for bill in bills:
-                v = self._find_vendor_by_guid(
-                    book, bill.owner_guid
+                v = self._find_invoice_owner_by_guid(
+                    book, bill.owner_type, bill.owner_guid,
                 )
                 v_name = v.name if v else "Unknown"
                 v_id = v.id if v else ""

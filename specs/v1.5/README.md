@@ -169,11 +169,21 @@ The rest of this section remains unscheduled.
   foreign-currency invoices at reporting date (the unrealized FX
   side; today only realized gain/loss books at settlement).
   Idea-only, no spec.
-- **DB backend (Postgres/MySQL)** — open books via a SQLAlchemy
-  `uri_conn` / `GNUCASH_BOOK_URI` instead of a file path. piecash
-  supports it; needs driver extras and graceful degradation of
-  the file-based features (backup, `os.pathsep` multi-book,
-  `gnclock` recovery). Low demand — build on request. Idea-only.
+- ~~**DB backend (Postgres/MySQL)**~~ — **CLOSED** by
+  `GNUCASH_BOOK_URI` / `--book-uri`, generic on the SQLAlchemy URL
+  with PostgreSQL as the tested and documented backend
+  (`[postgres]` extra; CI runs the suite against a `postgres:16`
+  service container). Degradations landed as scoped: backups
+  refuse with a `pg_dump` pointer and the auto-hook no-ops;
+  multi-book stays file-only, which needed no special-casing
+  because URI mode simply leaves `_book_paths` empty; `gnclock`
+  recovery IMPROVED for both backends — piecash's bare
+  `GnucashException("Lock on the file")` now maps onto
+  `GnuCashLockError` and its "close GnuCash and try again"
+  handler. Two bug classes surfaced on the way: Python bools
+  written into GnuCash's INTEGER flag columns (silent on SQLite,
+  fatal on PostgreSQL — now `_gnc_bool`), and a percent-escaped
+  book filename breaking short-GUID resolution.
 - **Batch-entry follow-ons** — per-row `force` column; persisted
   duplicate-match `guid` column. _Spec:
   [BATCH_TRANSACTION_ENTRY_SPEC.md](../v1.4/features/BATCH_TRANSACTION_ENTRY_SPEC.md) (marked "deferred to v2")._

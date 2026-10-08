@@ -9,21 +9,43 @@ piecash blocks the Budget / Recurrence / BudgetAmount constructors
 SQLAlchemy Core API paired with _verify_* round-trip checks.
 """
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from decimal import ROUND_HALF_EVEN, Decimal
 
 import piecash
-from dateutil.relativedelta import relativedelta
 from piecash._common import Recurrence
 from piecash.budget import Budget, BudgetAmount
+from piecash.kvp import Slot
 
 from gnucash_mcp.book._base import (
+    _BUDGET_SCRUB_FLIP,
+    _budget_period_bounds,
+    _BUDGET_UNREVERSED_BOGUS_KEY,
+    _BUDGET_UNREVERSED_DESCRIPTION,
+    _BUDGET_UNREVERSED_KEY,
+    _budget_scrub_policy,
+    _budget_stored_sign,
+    _budget_targets,
+    _money_precision_error,
+    _budget_unreversed,
+    _verify_delete,
     _to_decimal,
     _unique_prefix,
     _verify_composite_write,
     _verify_write,
+    _check_text,
+    _TEXT_WIDTH,
+    _SLOT_TEXT_WIDTH,
+    _check_one_line,
+    _check_ledger_date,
 )
-from gnucash_mcp._format import _paginate
+from gnucash_mcp._format import (
+    _format_exact,
+    _paginate,
+    _period_label,
+    _round_converted,
+    _one_line,
+)
 
 
 def _collapse_period_runs(
@@ -93,14 +115,19 @@ def _format_budget_report_compact(report: dict) -> str:
 
     ``⚠`` fires above 110% used — same threshold as the
     get_book_summary headline. A common ``Expenses:`` / ``Income:``
-    prefix is stripped.
+    prefix is stripped. A budget with both income and expense
+    targets ends in INCOME / EXPENSES / NET lines instead of one
+    TOTAL. The marker never fires on an income row or the INCOME
+    line — beating an income target is not a warning — and NET
+    carries no %Used (a difference, not a ratio).
     """
     accounts = report.get("accounts", [])
     totals = report.get("totals", {})
+    subtotals = report.get("subtotals")
     budget_name = report.get("budget", "?")
     period_info = report.get("period", "")
 
-    header_line = f"{budget_name} — {period_info}"
+    header_line = f"{_one_line(budget_name)} — {period_info}"
     if not accounts:
         return f"{header_line}\n(no budgeted accounts)"
 
@@ -114,8 +141,19 @@ def _format_budget_report_compact(report: dict) -> str:
             common_prefix = candidate
     leaves = [n[len(common_prefix):] for n in full_names]
 
+    # (label, row, marker-eligible) for the closing lines.
+    if subtotals:
+        closing = [
+            ("INCOME", subtotals["income"], False),
+            ("EXPENSES", subtotals["expenses"], True),
+            ("NET", totals, False),
+        ]
+    else:
+        closing = [("TOTAL", totals, True)]
+
     name_width = max(
-        max(len(l) for l in leaves), len("Account"), len("TOTAL"),
+        max(len(l) for l in leaves), len("Account"),
+        max(len(label) for label, _, _ in closing),
     )
 
     def _fmt(value: str) -> str:
@@ -123,31 +161,43 @@ def _format_budget_report_compact(report: dict) -> str:
         # Whole-dollar values render simpler.
         if d == d.to_integral_value():
             return f"{int(d):,}"
-        return f"{d:,.2f}"
+        return _format_exact(d)
 
     budget_strs = [_fmt(r["budgeted"]) for r in accounts]
     actual_strs = [_fmt(r["actual"]) for r in accounts]
     remaining_strs = [_fmt(r["remaining"]) for r in accounts]
     pct_strs = [f"{r['percent_used']}%" for r in accounts]
 
-    total_budget = _fmt(totals.get("budgeted", "0"))
-    total_actual = _fmt(totals.get("actual", "0"))
-    total_remaining = _fmt(totals.get("remaining", "0"))
-    total_pct = f"{totals.get('percent_used', '0')}%"
+    closing_strs = [
+        (
+            label,
+            _fmt(row.get("budgeted", "0")),
+            _fmt(row.get("actual", "0")),
+            _fmt(row.get("remaining", "0")),
+            (
+                f"{row['percent_used']}%"
+                if "percent_used" in row else "—"
+            ),
+            markable,
+        )
+        for label, row, markable in closing
+    ]
 
     budget_w = max(
-        max(len(s) for s in budget_strs), len(total_budget), len("Budget"),
+        max(len(s) for s in budget_strs),
+        max(len(c[1]) for c in closing_strs), len("Budget"),
     )
     actual_w = max(
-        max(len(s) for s in actual_strs), len(total_actual), len("Actual"),
+        max(len(s) for s in actual_strs),
+        max(len(c[2]) for c in closing_strs), len("Actual"),
     )
     remaining_w = max(
         max(len(s) for s in remaining_strs),
-        len(total_remaining),
-        len("Remaining"),
+        max(len(c[3]) for c in closing_strs), len("Remaining"),
     )
     pct_w = max(
-        max(len(s) for s in pct_strs), len(total_pct), len("%Used"),
+        max(len(s) for s in pct_strs),
+        max(len(c[4]) for c in closing_strs), len("%Used"),
     )
 
     def _pct_marker(pct_str: str) -> str:
@@ -166,23 +216,26 @@ def _format_budget_report_compact(report: dict) -> str:
         f"{'Remaining':>{remaining_w}}  "
         f"{'%Used':>{pct_w}}"
     )
-    for leaf, b, a, rem, pct in zip(
-        leaves, budget_strs, actual_strs, remaining_strs, pct_strs,
+    for row, leaf, b, a, rem, pct in zip(
+        accounts, leaves, budget_strs, actual_strs, remaining_strs,
+        pct_strs,
     ):
+        markable = row.get("side", "expenses") != "income"
         lines.append(
             f"{leaf:<{name_width}}  "
             f"{b:>{budget_w}}  "
             f"{a:>{actual_w}}  "
             f"{rem:>{remaining_w}}  "
-            f"{pct:>{pct_w}}{_pct_marker(pct)}"
+            f"{pct:>{pct_w}}{_pct_marker(pct) if markable else ''}"
         )
-    lines.append(
-        f"{'TOTAL':<{name_width}}  "
-        f"{total_budget:>{budget_w}}  "
-        f"{total_actual:>{actual_w}}  "
-        f"{total_remaining:>{remaining_w}}  "
-        f"{total_pct:>{pct_w}}{_pct_marker(total_pct)}"
-    )
+    for label, b, a, rem, pct, markable in closing_strs:
+        lines.append(
+            f"{label:<{name_width}}  "
+            f"{b:>{budget_w}}  "
+            f"{a:>{actual_w}}  "
+            f"{rem:>{remaining_w}}  "
+            f"{pct:>{pct_w}}{_pct_marker(pct) if markable else ''}"
+        )
     return "\n".join(lines)
 
 
@@ -201,7 +254,7 @@ def _format_get_budget_compact(
     period_type = info.get("period_type", "")
     start = info.get("start_date", "?")
     header = (
-        f"{name}  {num_periods} periods"
+        f"{_one_line(name)}  {num_periods} periods"
         + (f" ({period_type})" if period_type else "")
         + f"  starts:{start}"
     )
@@ -279,25 +332,15 @@ class BudgetsMixin:
                 f"(0-{budget.num_periods - 1})"
             )
 
-        rec = budget.recurrence
-        anchor = rec.recurrence_period_start
-        if isinstance(anchor, datetime):
-            anchor = anchor.date()
-
-        period_type = rec.recurrence_period_type
-        mult = rec.recurrence_mult
-
-        if period_type == "month":
-            delta = relativedelta(months=mult)
-        elif period_type == "week":
-            delta = relativedelta(weeks=mult)
-        else:
-            raise ValueError(f"Unsupported period type: {period_type}")
-
-        start = anchor + delta * period_num
-        end = anchor + delta * (period_num + 1) - timedelta(days=1)
-
-        return start, end
+        # One rule for period boundaries, shared with the dashboard
+        # headline: the Recurrence.cpp port (spec B5).
+        bounds = _budget_period_bounds(budget)
+        if bounds is None:
+            raise ValueError(
+                f"Unsupported period type: "
+                f"{budget.recurrence.recurrence_period_type}"
+            )
+        return bounds[period_num]
 
     def _current_period(self, budget) -> int | None:
         """Get the current period number based on today's date.
@@ -427,7 +470,7 @@ class BudgetsMixin:
                 start = d.get("start_date", "?")
                 ptype_str = f" ({ptype})" if ptype else ""
                 lines.append(
-                    f"{d['name']:<{name_width}}  "
+                    f"{_one_line(d['name']):<{name_width}}  "
                     f"{periods} periods{ptype_str}  starts:{start}"
                 )
             return "\n".join(lines)
@@ -457,11 +500,11 @@ class BudgetsMixin:
             result = self._budget_to_dict(budget)
 
             accounts: dict[str, dict[int, str]] = {}
-            for ba in budget.amounts:
+            for ba, magnitude in _budget_targets(book, budget):
                 acct_name = ba.account.fullname
                 if acct_name not in accounts:
                     accounts[acct_name] = {}
-                accounts[acct_name][ba.period_num] = str(ba.amount)
+                accounts[acct_name][ba.period_num] = str(magnitude)
 
             account_rows = [
                 {"account": acct_name, "periods": periods}
@@ -473,6 +516,53 @@ class BudgetsMixin:
                 return result
 
             return _format_get_budget_compact(result, account_rows)
+
+    def _ensure_budget_unreversed(self, book) -> dict:
+        """Write path only: bring an un-stamped book to GnuCash 3.8+
+        natural-sign storage exactly as its own open-time scrub
+        would (same policy, same rows), then stamp it. Returns
+        ``{"stamped", "scrubbed", "migrated"}`` booleans so the
+        caller can put the stamp in its audit entry — a book-level
+        slot write must never be invisible in the log. Every budget
+        write calls this first so the new row and the existing ones
+        share one convention; readers never call it."""
+        migrated = False
+        try:
+            book[_BUDGET_UNREVERSED_BOGUS_KEY]
+            has_bogus = True
+        except KeyError:
+            has_bogus = False
+        if has_bogus:
+            # The pre-merge key GnuCash refuses. Delete the row; the
+            # real stamp is written below if it isn't there already.
+            book.session.execute(
+                Slot.__table__.delete().where(
+                    Slot.__table__.c.name == _BUDGET_UNREVERSED_BOGUS_KEY
+                )
+            )
+            _verify_delete(
+                book.session, Slot.__table__,
+                {"name": _BUDGET_UNREVERSED_BOGUS_KEY},
+                "unrecognized budget feature stamp",
+            )
+            book.session.expire_all()
+            migrated = True
+        if _budget_unreversed(book):
+            return {"stamped": False, "scrubbed": False, "migrated": migrated}
+        scrubbed = False
+        for budget in book.session.query(Budget).all():
+            flip = _BUDGET_SCRUB_FLIP[_budget_scrub_policy(budget)]
+            for ba in budget.amounts:
+                if ba.account.type in flip:
+                    # Negate the numerator, as gnc_numeric_neg does:
+                    # the Decimal setter would re-derive the
+                    # denominator from the value's exponent and turn
+                    # 500000/100 into 5000/1 — same value, different
+                    # bytes than GnuCash's own scrub leaves behind.
+                    ba._amount_num = -ba._amount_num
+                    scrubbed = True
+        book[_BUDGET_UNREVERSED_KEY] = _BUDGET_UNREVERSED_DESCRIPTION
+        return {"stamped": True, "scrubbed": scrubbed, "migrated": migrated}
 
     def create_budget(
         self,
@@ -500,6 +590,16 @@ class BudgetsMixin:
             ValueError: duplicate name, invalid period_type /
                 num_periods / start_date.
         """
+        # Every free-text argument through the one text gate (scoped
+        # review 2026-10-05, I-4): no control characters, GnuCash's
+        # column width.
+        for _field in ("name", "description", "notes", "title", "reference", "fullname", "mnemonic", "memo", "action"):
+            _check_text(
+                locals().get(_field),
+                _SLOT_TEXT_WIDTH if _field == "notes" else _TEXT_WIDTH, _field,
+            )
+            if _field in ("name", "title", "reference", "fullname", "mnemonic", "action"):
+                _check_one_line(locals().get(_field), _field)
         import uuid
 
 
@@ -510,10 +610,20 @@ class BudgetsMixin:
             )
         if num_periods < 1:
             raise ValueError("num_periods must be at least 1")
+        # 100,000 periods were accepted, and set_budget_amount without
+        # a period then wrote 100,000 rows (IV-25). A century of
+        # monthly periods is 1,200.
+        if num_periods > 1200:
+            raise ValueError(
+                f"num_periods must be at most 1200, got {num_periods}"
+            )
+        if not name or not name.strip():
+            raise ValueError("Budget name cannot be empty")
 
         if start_date is not None:
             try:
                 period_start = date.fromisoformat(start_date)
+                _check_ledger_date(period_start, "start_date")
             except ValueError as e:
                 raise ValueError(
                     f"Invalid start_date {start_date!r}: must be "
@@ -522,6 +632,8 @@ class BudgetsMixin:
         else:
             if year is None:
                 year = date.today().year
+            if not 1400 <= year <= 9999:
+                raise ValueError(f"year {year} is outside 1400..9999")
             period_start = date(year, 1, 1)
 
         recurrence_map = {
@@ -567,6 +679,9 @@ class BudgetsMixin:
                 f"Recurrence for budget '{name}'",
             )
 
+            # A budget written by this server is natural-sign from
+            # birth; stamp the book so GnuCash never runs its scrub.
+            shapes = self._upgrade_book_shapes(book)
             book.save()
 
 
@@ -575,12 +690,14 @@ class BudgetsMixin:
                 for row in book.session.query(Budget.guid).all()
             ]
             short_guid = _unique_prefix(budget_guid, all_budget_guids)
-            return {
+            result = {
                 "guid": short_guid,
                 "name": name,
                 "start_date": period_start.isoformat(),
                 "status": "created",
             }
+            result.update(shapes)
+            return result
 
     def set_budget_amount(
         self,
@@ -609,6 +726,21 @@ class BudgetsMixin:
         """
 
         amount_decimal = _to_decimal(amount)
+        # A budget amount on this surface is a MAGNITUDE: 5000 is a
+        # 5,000 income target on an income account and a 5,000
+        # spending limit on an expense account; the account's type
+        # supplies the direction (``_budget_stored_sign``). The
+        # ledger's own convention writes income as a negative, so
+        # "-5000" is the natural slip, and it stored a target in the
+        # WRONG direction that cancelled a correct one in the report.
+        if amount_decimal < 0:
+            raise ValueError(
+                f"Budget amounts are entered as positive numbers "
+                f"(got {amount}): {abs(amount_decimal)} is the target "
+                f"for an income account and the limit for an expense "
+                f"account alike. The account's type supplies the "
+                f"direction."
+            )
 
         with self.open(readonly=False) as book:
             budget = self._find_budget(book, budget_name)
@@ -617,19 +749,25 @@ class BudgetsMixin:
 
             acct = self._resolve_account(book, account)
             if not acct:
-                raise ValueError(f"Account not found: {account}")
+                raise self._account_not_found_error(book, account)
 
             periods = self._resolve_periods(budget, period)
 
+            # Storage is GnuCash's natural sign. Bring an un-stamped
+            # book there first so this row and the existing ones
+            # share one convention, then apply the account's sign.
+            shapes = self._upgrade_book_shapes(book)
+            sign = _budget_stored_sign(acct)
+
             # Prior per-period amounts for the audit log's
-            # before/after diff.
+            # before/after diff (surface magnitudes).
             prior_amounts: dict = {}
             for p in periods:
                 try:
                     existing = budget.amounts(
                         account=acct, period_num=p
                     )
-                    prior_amounts[p] = str(existing.amount)
+                    prior_amounts[p] = str(existing.amount * sign)
                 except KeyError:
                     prior_amounts[p] = None
             self._stage_audit_before({
@@ -645,17 +783,27 @@ class BudgetsMixin:
             # different values for the same input.
             amount_denom = acct.commodity.fraction
             quantum = Decimal(1) / Decimal(amount_denom)
+            # An amount finer than the currency's unit is a typo, as
+            # everywhere else money is entered (ruling 2026-09-27);
+            # this path still rounded 12.345 to 12.34 and 0.001 to
+            # nothing (adversarial review 2026-09-30, C40).
+            if acct.commodity.namespace == "CURRENCY":
+                error = _money_precision_error(
+                    amount_decimal, acct.commodity, "Budget amount",
+                )
+                if error:
+                    raise error
             quantized = amount_decimal.quantize(
                 quantum, rounding=ROUND_HALF_EVEN,
             )
-            amount_num = int(quantized * amount_denom)
+            amount_num = int(quantized * amount_denom) * sign
 
             for p in periods:
                 try:
                     existing = budget.amounts(
                         account=acct, period_num=p
                     )
-                    existing.amount = quantized
+                    existing.amount = quantized * sign
                 except KeyError:
                     # No existing amount — insert via table (BudgetAmount constructor blocked)
                     book.session.execute(
@@ -681,10 +829,13 @@ class BudgetsMixin:
 
             # periods_set is computed ("q1" → [0, 1, 2]); the echoed
             # inputs come from tool params in the audit log.
-            return {
+            result = {
                 "periods_set": periods,
                 "status": "updated",
             }
+            # Book-level shape changes are never silent in the log.
+            result.update(shapes)
+            return result
 
     def get_budget_report(
         self,
@@ -760,7 +911,7 @@ class BudgetsMixin:
             if account:
                 filter_acct = self._resolve_account(book, account)
                 if not filter_acct:
-                    raise ValueError(f"Account not found: {account}")
+                    raise self._account_not_found_error(book, account)
 
                 if include_children:
                     target_accounts = set()
@@ -771,11 +922,24 @@ class BudgetsMixin:
             else:
                 target_accounts = None
 
-            # One factors map, period-end-anchored, used for BOTH
-            # targets and actuals — converting only the actuals
-            # leaves targets in raw account commodities and makes
-            # used_pct meaningless on multi-currency budgets.
-            factors = self._account_conversion_factors(book, last_end)
+            # A budget report is a FLOW report (MM-12 ruling,
+            # 2026-10-02): every actual converts at its own month's
+            # close, as spending_by_category / income_by_source do,
+            # so the two agree on the same data. Targets convert too
+            # — converting only the actuals leaves targets in raw
+            # account commodities and makes used_pct meaningless on
+            # multi-currency budgets — each at the close of the month
+            # its period ends in.
+            monthly_factors = self._monthly_conversion_factors(
+                book, first_start, last_end,
+            )
+            period_end_month = {
+                p: _period_label(
+                    min(self._period_to_date_range(budget, p)[1], last_end),
+                    "month",
+                )
+                for p in report_periods
+            }
             default_currency = self._require_default_currency(book)
             # Currencies of budgeted accounts folded in raw for lack of
             # an FX rate — surfaced as a warning so the converted totals
@@ -786,7 +950,7 @@ class BudgetsMixin:
             budgeted: dict[str, Decimal] = {}
             # Keep a handle to each budgeted account for descendant walking.
             budgeted_accounts: dict[str, object] = {}
-            for ba in budget.amounts:
+            for ba, magnitude in _budget_targets(book, budget):
                 if ba.period_num not in report_periods:
                     continue
                 acct_name = ba.account.fullname
@@ -797,8 +961,10 @@ class BudgetsMixin:
                 # _split_in_default_currency. Record the currency so a
                 # foreign fold isn't silent (it stays in the totals —
                 # a caveated budget line beats a dropped one).
-                factor = factors.get(ba.account.guid)
-                ba_amount = Decimal(str(ba.amount))
+                factor = monthly_factors.get(
+                    period_end_month[ba.period_num], {}
+                ).get(ba.account.guid)
+                ba_amount = magnitude
                 if factor is not None:
                     target_in_default = ba_amount * factor
                 else:
@@ -847,7 +1013,7 @@ class BudgetsMixin:
                     continue
                 amount = self._split_in_default_currency(
                     split, account,
-                    factors.get(account.guid),
+                    self._monthly_factor(monthly_factors, _txn, account),
                 )
                 # SIGNED accumulation so contra splits net — same
                 # convention as spending_by_category /
@@ -863,39 +1029,81 @@ class BudgetsMixin:
                         rollup_target, Decimal("0")
                     ) + (-amount)
 
+            # Each account's figures are values in the book currency:
+            # rounded as GnuCash rounds a conversion (review C20), so
+            # the rows, the side sums, and the TOTAL are exact sums of
+            # what is shown.
+            budgeted = {
+                k: _round_converted(v, default_currency)
+                for k, v in budgeted.items()
+            }
+            actuals = {
+                k: _round_converted(v, default_currency)
+                for k, v in actuals.items()
+            }
+
             accounts_result = []
-            total_budgeted = Decimal("0")
-            total_actual = Decimal("0")
+            # Income and expense targets are tallied on their own
+            # sides. A single TOTAL that adds a 5,000 income target
+            # to 300 of expenses is a number that means nothing; it
+            # only looked like spending while no income row existed
+            # (bookkeeper, 2026-09-09). One side present → the
+            # TOTAL is that side, as it always was. Both → per-side
+            # subtotals and a NET (income − expenses) line.
+            side_sums = {
+                "income": [Decimal("0"), Decimal("0")],
+                "expenses": [Decimal("0"), Decimal("0")],
+            }
+            sides_seen: set[str] = set()
+
+            def _totals_row(b: Decimal, a: Decimal) -> dict:
+                pct = (
+                    (a / b * 100).quantize(Decimal("0.1"))
+                    if b > 0 else Decimal("0")
+                )
+                return {
+                    "budgeted": str(b),
+                    "actual": str(a),
+                    "remaining": str(b - a),
+                    "percent_used": str(pct),
+                }
 
             for acct_name in sorted(budgeted.keys()):
                 b = budgeted[acct_name]
                 a = actuals.get(acct_name, Decimal("0"))
-                remaining = b - a
-                pct = (
-                    (a / b * 100).quantize(Decimal("0.1"))
-                    if b > 0
-                    else Decimal("0")
+                side = (
+                    "income"
+                    if budgeted_accounts[acct_name].type == "INCOME"
+                    else "expenses"
                 )
-
                 accounts_result.append({
                     "account": acct_name,
-                    "budgeted": str(b),
-                    "actual": str(a),
-                    "remaining": str(remaining),
-                    "percent_used": str(pct),
+                    "side": side,
+                    **_totals_row(b, a),
                 })
+                sides_seen.add(side)
+                side_sums[side][0] += b
+                side_sums[side][1] += a
 
-                total_budgeted += b
-                total_actual += a
-
-            total_remaining = total_budgeted - total_actual
-            total_pct = (
-                (total_actual / total_budgeted * 100).quantize(
-                    Decimal("0.1")
-                )
-                if total_budgeted > 0
-                else Decimal("0")
-            )
+            subtotals = None
+            if len(sides_seen) == 2:
+                inc_b, inc_a = side_sums["income"]
+                exp_b, exp_a = side_sums["expenses"]
+                subtotals = {
+                    "income": _totals_row(inc_b, inc_a),
+                    "expenses": _totals_row(exp_b, exp_a),
+                }
+                totals = _totals_row(inc_b - exp_b, inc_a - exp_a)
+                # NET is a difference, not a ratio: net actual ÷ net
+                # budgeted goes negative whenever expenses post
+                # before income and flips meaning with the sign of
+                # the planned net (bookkeeper, 2026-09-10). No pace
+                # number on this line.
+                del totals["percent_used"]
+                totals["basis"] = "net (income - expenses)"
+            else:
+                only = next(iter(sides_seen)) if sides_seen else "expenses"
+                totals = _totals_row(*side_sums[only])
 
             if len(report_periods) == 1:
                 p_start, p_end = self._period_to_date_range(
@@ -915,13 +1123,10 @@ class BudgetsMixin:
                 "budget": budget_name,
                 "period": period_info,
                 "accounts": accounts_result,
-                "totals": {
-                    "budgeted": str(total_budgeted),
-                    "actual": str(total_actual),
-                    "remaining": str(total_remaining),
-                    "percent_used": str(total_pct),
-                },
+                "totals": totals,
             }
+            if subtotals:
+                full["subtotals"] = subtotals
             warning = None
             if unconverted_currencies:
                 warning = (

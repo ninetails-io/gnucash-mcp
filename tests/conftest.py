@@ -19,9 +19,96 @@ def _quiet_restart_guards():
     outcomes depend on execution order. Tests that exercise the
     guards re-arm these globals explicitly in their own bodies."""
     import gnucash_mcp.server as _server
+    from gnucash_mcp.book.backup import BackupMixin
     _server._startup_notice_pending = False
     _server._writes_armed = True
+    # The one-time pre-upgrade snapshot (a full copy of the book
+    # before its first converting write) would be taken by nearly
+    # every test, each on a throwaway book. Off by default; the tests
+    # of the feature switch the class flag back.
+    saved = BackupMixin._pre_upgrade_checked
+    BackupMixin._pre_upgrade_checked = True
     yield
+    BackupMixin._pre_upgrade_checked = saved
+
+
+def void_posting_record(gb, txn_guid: str, reason: str = "test setup"):
+    """Void a document's posting transaction, as servers before 1.5
+    allowed (review C4a): the real void writer with the read-only
+    guard switched off for the one call, so the rows are exactly what
+    such a book holds. ``void_transaction`` refuses this now, but the
+    state outlives the door that made it — the guards that protect
+    it (``pay_document``'s refusal, the posted-total fallback,
+    ``unvoid``'s repair) need tests that can still construct it.
+    """
+    from unittest import mock
+
+    with mock.patch.object(
+        type(gb), "_refuse_posting_record", lambda *a, **k: None,
+    ):
+        return gb.void_transaction(txn_guid, reason)
+
+
+def leak_same_day_price(book_path, value: str, source: str) -> str:
+    """Give the pair of the book's NEWEST price row a second price on
+    the same day, and return the new row's GUID.
+
+    ``create_price`` keeps one price per pair per day since the 1.5
+    adversarial review (GnuCash's own ``add_price`` rule), so it can
+    no longer make this state — but real books hold it: GnuCash's SQL
+    backend saves a price its price database then turns away (the
+    engine twin, ``tests/test_parity_prices.py``), and servers before
+    1.5 wrote one row per source. Tests whose subject is the
+    multi-row day build it here, byte for byte the way those rows
+    sit: same pair, same stored time, another source.
+    """
+    import sqlite3
+    import uuid
+    from fractions import Fraction
+
+    amount = Fraction(value)
+    guid = uuid.uuid4().hex
+    con = sqlite3.connect(str(book_path))
+    try:
+        commodity, currency, stored, kind = con.execute(
+            "select commodity_guid, currency_guid, date, type from prices "
+            "order by rowid desc limit 1"
+        ).fetchone()
+        con.execute(
+            "insert into prices (guid, commodity_guid, currency_guid, date, "
+            "source, type, value_num, value_denom) "
+            "values (?, ?, ?, ?, ?, ?, ?, ?)",
+            (guid, commodity, currency, stored, source, kind,
+             amount.numerator, amount.denominator),
+        )
+        con.commit()
+    finally:
+        con.close()
+    return guid
+
+
+def drop_transaction_prices(book_path) -> int:
+    """Delete every ``type='transaction'`` price row from the book at
+    ``book_path`` and return how many went.
+
+    Since the 2026-09-29 ruling those rows (piecash's, and desktop's,
+    implied rate on every cross-currency transaction) value holdings
+    as desktop does. A book with a holding and NO price row of any
+    type is still real — prices deleted in desktop's Price Editor,
+    or books older than the rows — so tests whose subject is that
+    state build it with the fixture's transactions, then this.
+    """
+    from sqlalchemy import text
+
+    with piecash.open_book(
+        str(book_path), readonly=False, open_if_lock=True,
+        do_backup=False,
+    ) as book:
+        n = book.session.execute(
+            text("DELETE FROM prices WHERE type = 'transaction'")
+        ).rowcount
+        book.save()
+    return n
 
 
 @pytest.fixture
@@ -1356,6 +1443,11 @@ def pathological_book(tmp_path: Path) -> PathologicalBook:
                 piecash.Split(account=chk, value=Decimal("300")),
             ],
         )
+        # The stored flag is desktop's -1; piecash's guard reads -1 as
+        # closed, so cache the computed answer first, as every server
+        # write path does.
+        from gnucash_mcp.book._base import _lot_cache_flag
+        _lot_cache_flag(lot_obj)
         ar_split.lot = lot_obj
         b.save()
 

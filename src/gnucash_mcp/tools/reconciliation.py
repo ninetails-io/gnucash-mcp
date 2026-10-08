@@ -102,7 +102,7 @@ def register(mcp, get_book) -> None:
         and the ``showing`` indicator as a structured field.
 
         Args:
-            account: Account ref: full path (e.g. 'Assets:Bank:Checking'), %short GUID, or full 32-char GUID
+            account: Account name ("Assets:Checking") or %short guid ("%d53d547").
             as_of_date: Only include splits on or before this date (YYYY-MM-DD)
             verbose: If false (default), compact text output — optimized
                 for reading and token efficiency. If true, structured
@@ -130,7 +130,8 @@ def register(mcp, get_book) -> None:
     def reconcile_account(
         account: str,
         statement_date: str,
-        statement_balance: str,
+        statement_balance: str | None = None,
+        closing_balance: str | None = None,
         split_guids: Annotated[
             list[str] | None,
             Field(
@@ -216,21 +217,49 @@ def register(mcp, get_book) -> None:
         through_date default keeps each sweep inside its own
         statement.
 
+        A statement dated after today goes through but the response
+        carries a ``warning`` — a statement is not dated in the
+        future.
+
         Args:
-            account: Account ref: full path (e.g. 'Assets:Bank:Checking'), %short GUID, or full 32-char GUID
+            account: Account name ("Assets:Checking") or %short guid ("%d53d547").
             statement_date: Statement ending date (YYYY-MM-DD)
-            statement_balance: Expected balance from statement (as string, e.g., '1234.56')
+            closing_balance: The statement's closing balance, exactly as
+                printed (as string, e.g. '1234.56') — the same name
+                enter_statement uses. One of closing_balance or
+                statement_balance is required.
+            statement_balance: Same value under this tool's original
+                name; still accepted.
             split_guids: List of split GUIDs to reconcile (targeted mode). Omit for bulk mode.
             reconcile_all: When true, reconcile all unreconciled splits up to through_date.
             through_date: Date filter for bulk mode (YYYY-MM-DD); defaults to statement_date.
         """
+        if closing_balance is None and statement_balance is None:
+            raise ValueError(
+                "closing_balance is required (statement_balance is the "
+                "same value under this tool's original name)"
+            )
+        if (
+            closing_balance is not None
+            and statement_balance is not None
+            and closing_balance != statement_balance
+        ):
+            raise ValueError(
+                f"closing_balance {closing_balance} and statement_balance "
+                f"{statement_balance} name the same number and disagree — "
+                f"pass one"
+            )
+        balance = (
+            closing_balance if closing_balance is not None
+            else statement_balance
+        )
         book = get_book()
         stmt_date = date.fromisoformat(statement_date)
         through = _parse_iso_date(through_date)
         result = book.reconcile_account(
             account_name=account,
             statement_date=stmt_date,
-            statement_balance=statement_balance,
+            statement_balance=balance,
             split_guids=split_guids,
             reconcile_all=reconcile_all,
             through_date=through,
@@ -244,6 +273,7 @@ def register(mcp, get_book) -> None:
     def void_transaction(
         guid: TransactionGuid,
         reason: str,
+        force: bool = False,
     ) -> str:
         """Void a transaction (proper accounting void, not delete).
 
@@ -251,12 +281,19 @@ def register(mcp, get_book) -> None:
         all split values. Use this instead of delete when you need to maintain
         an audit trail.
 
+        An invoice's or bill's posting transaction cannot be voided
+        (it is read-only, as in GnuCash): use unpost_document. A
+        PAYMENT can be voided, e.g. when it bounces.
+
         Args:
             guid: Transaction GUID to void (32-character hex string, or 8+ char prefix)
             reason: Reason for voiding (required for audit trail)
+            force: Void even though a split is reconciled. Refused
+                without it; the affected account then needs
+                reconciling again.
         """
         book = get_book()
-        result = book.void_transaction(guid=guid, reason=reason)
+        result = book.void_transaction(guid=guid, reason=reason, force=force)
         return _json(result)
 
     @mcp.tool()
@@ -269,7 +306,9 @@ def register(mcp, get_book) -> None:
 
         The inverse of void_transaction: original split values come
         back from the slots the void stored, and the void markers
-        and reason are cleared. All-or-nothing — if any split's
+        and reason are cleared. The notes it had before the void
+        come back; a transaction that had none keeps the void's
+        note, as in GnuCash. All-or-nothing — if any split's
         stored void data is missing, the tool errors and restores
         nothing (no partial resurrection). Errors too if the
         transaction isn't found or isn't voided. Restored splits

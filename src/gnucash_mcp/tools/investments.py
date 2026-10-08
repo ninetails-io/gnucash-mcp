@@ -51,6 +51,15 @@ def _parse_prices_tsv(tsv: str) -> list[dict]:
         fields = ln.split("\t")
         while fields and not fields[-1].strip():
             fields.pop()
+        if len(fields) > len(tokens):
+            # A tab inside a value, or a cell past the header: it was
+            # dropped, and "1<TAB>234.56" stored a price of 1 (scoped
+            # review 2026-10-06, IN-6).
+            raise ValueError(
+                f"row {i}: {len(fields)} cells for a {len(tokens)}-column "
+                f"header — a value with a tab in it, or a cell past the "
+                f"header"
+            )
         if len(fields) < 4:
             raise ValueError(
                 f"row {i}: expected at least ref, commodity, date, value"
@@ -142,7 +151,7 @@ def register(mcp, get_book) -> None:
         mnemonic: str,
         fullname: str,
         namespace: str = "FUND",
-        fraction: int = 10000,
+        fraction: int | None = None,
         cusip: str | None = None,
     ) -> str:
         """Create a new commodity (stock, mutual fund, etc.).
@@ -154,7 +163,11 @@ def register(mcp, get_book) -> None:
                 "AMEX" for stocks, or any custom string.
             fraction: Smallest fractional unit. 1 = whole units, 100 =
                 2 decimals, 10000 = 4 decimals (default, shares),
-                1000000 = 6 decimals (crypto).
+                1000000 = 6 decimals (crypto). Omit it for
+                namespace "CURRENCY": a currency is GnuCash's, from
+                the ISO 4217 table (USD 100, JPY 1), and a fraction
+                that disagrees is refused. Other tools that take a
+                currency code add an unseen ISO currency themselves.
             cusip: Optional CUSIP/ISIN identifier.
         """
         book = get_book()
@@ -197,12 +210,17 @@ def register(mcp, get_book) -> None:
         - ``source``: where the quote came from (provenance —
           default "user:price"); ``type``: nav/last/bid/ask.
 
-        Per-row semantics are ``create_price``'s exactly: an existing
-        price with the same commodity/currency/date/source is UPDATED
-        in place (``status: updated``), never duplicated. One book
-        open, one save, ``on_error="abort"`` (default) sinks the
-        whole batch on any bad row; ``dry_run=true`` previews as
-        ``would_create`` / ``would_update``.
+        Per-row semantics are ``create_price``'s exactly: GnuCash
+        keeps ONE price per pair per day. A row whose source ranks
+        equal to or better than the day's existing price takes its
+        place (``updated`` for the same source, ``replaced``
+        otherwise); one that ranks worse is not written (``kept``,
+        with the reason). Two rows of one batch for the same pair and
+        date are a duplicate; the second is rejected. One book open,
+        one save, ``on_error="abort"`` (default) sinks the whole
+        batch on any bad row; ``dry_run=true`` previews as
+        ``would_create`` / ``would_update`` / ``would_replace`` /
+        ``would_keep``.
 
         The companion work list: ``list_commodities(stale_days=30,
         held_only=true)``.
@@ -224,13 +242,23 @@ def register(mcp, get_book) -> None:
         value: str,
         currency: str | None = None,
         date: str | None = None,
-        price_type: str = "nav",
+        price_type: str = "last",
         source: str = "user:price",
     ) -> str:
         """Record a price for a commodity (stock, NAV, exchange rate).
 
-        An existing price with the same commodity/currency/date/source
-        is updated rather than duplicated.
+        GnuCash keeps ONE price per pair per day, and so does this
+        tool. ``status`` says what happened: ``created``; ``updated``
+        (the same source, rewritten); ``replaced`` (the day's price
+        from a lower-ranked source, or quoted the other way round,
+        gave way); or ``kept`` — NOTHING WAS WRITTEN, because the
+        day already has a price from a source that outranks this one
+        (``note`` and ``existing`` say which). Sources rank in the
+        order listed under ``source`` below: a feed quote
+        ("Finance::Quote") outranks the default "user:price", and
+        "user:price-editor" outranks both. To override a feed quote
+        with a figure you trust more, pass
+        ``source="user:price-editor"``.
 
         Args:
             commodity: Symbol (e.g., "VTSAX").
@@ -242,9 +270,16 @@ def register(mcp, get_book) -> None:
                 natural reading). Pass explicitly for cross-currency
                 pairs that don't involve the book default.
             date: ISO date (YYYY-MM-DD). Defaults to today.
-            price_type: "nav" (default, mutual funds), "last", "bid",
+            price_type: "last" (default, as desktop's price editor), "nav" (mutual funds), "bid",
                 "ask", or "unknown".
-            source: Source identifier. Default "user:price".
+            source: Where the price came from, one of the strings GnuCash's
+                price editor recognizes, here in GnuCash's own rank order,
+                best first: "user:price-editor", "Finance::Quote" (a quote
+                feed), "user:price" (default, a price you typed),
+                "user:xfer-dialog", "user:split-register", "user:split-import",
+                "user:stock-split", "user:stock-transaction",
+                "user:invoice-post", "temporary". Anything else would show as
+                Invalid in desktop and is refused.
         """
         book = get_book()
         price_date = date_type.fromisoformat(date) if date else None
@@ -396,7 +431,7 @@ def register(mcp, get_book) -> None:
         balance_sheet price holdings without lots.
 
         Args:
-            account: Account ref for the investment account: full path (e.g., "Assets:Investments:VTSAX"), %short GUID, or full 32-char GUID.
+            account: The investment account. Account name ("Assets:Checking") or %short guid ("%d53d547").
             title: Lot identifier (e.g., "VTSAX 2026-01-15 purchase").
             notes: Optional notes.
         """
@@ -422,7 +457,7 @@ def register(mcp, get_book) -> None:
         JSON with guid, title, notes, etc.
 
         Args:
-            account: Account ref (full path, %short GUID, or full 32-char GUID).
+            account: Account name ("Assets:Checking") or %short guid ("%d53d547").
             include_closed: If True, include fully-sold lots. Default False.
             verbose: If false (default), compact text output — optimized
                 for reading and token efficiency. If true, structured
@@ -519,10 +554,13 @@ def register(mcp, get_book) -> None:
     def close_lot(
         guid: LotGuid,
     ) -> str:
-        """Mark a lot as closed.
+        """Mark a zero-balance lot as closed.
 
-        Use when a lot is fully sold but wasn't automatically marked closed,
-        or to manually close a lot with zero shares.
+        GnuCash defines a closed lot as one whose assigned quantities
+        sum to zero, and recomputes the flag whenever desktop touches
+        the lot — a lot that still holds shares cannot be closed here
+        and the call refuses, naming the balance. Use this when a lot is
+        fully sold but the flag was never cached.
 
         Args:
             guid: Lot GUID (or 8+ char prefix).

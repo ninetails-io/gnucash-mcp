@@ -273,81 +273,34 @@ class TestSetBudgetAmount:
                 assert Decimal(acct["periods"][0]) == Decimal("700.00")
                 break
 
-    def test_subcent_amount_quantizes_consistently_on_insert_and_update(
+    def test_an_amount_finer_than_the_currency_unit_is_refused(
         self, budget_book: Path,
     ):
-        """Sub-cent input quantizes to commodity precision and produces
-        identical stored values via the insert and update paths.
-
-        Pre-fix, the insert path did ``int(amount * 100)`` which
-        truncated; the update path used piecash's hybrid setter which
-        did not. Same input produced different stored values depending
-        on whether a row already existed.
-        """
+        """12.345 was rounded to 12.34 and 0.001 to nothing, without a
+        word. Everywhere else money is entered, an amount finer than
+        the currency's unit is a typo and is refused (ruling
+        2026-09-27); budgets follow (adversarial review 2026-09-30,
+        C40). Both the insert and the update path refuse alike."""
         book = GnuCashBook(str(budget_book))
         book.create_budget(name="2026 Budget", year=2026, num_periods=12)
-
-        # Insert path (no existing row) — period 0
         book.set_budget_amount(
-            budget_name="2026 Budget",
-            account="Expenses:Groceries",
-            amount="499.995",
-            period=0,
+            budget_name="2026 Budget", account="Expenses:Groceries",
+            amount="500.00", period=1,
         )
-
-        # Update path — set period 0 again with same input
-        book.set_budget_amount(
-            budget_name="2026 Budget",
-            account="Expenses:Groceries",
-            amount="499.995",
-            period=0,
-        )
-
-        # And on a fresh period — also insert path
-        book.set_budget_amount(
-            budget_name="2026 Budget",
-            account="Expenses:Groceries",
-            amount="499.995",
-            period=1,
-        )
-
+        for period in (0, 1):  # no row yet; a row to update
+            for amount in ("499.995", "1234.567", "0.001"):
+                with pytest.raises(ValueError, match="Budget amount"):
+                    book.set_budget_amount(
+                        budget_name="2026 Budget",
+                        account="Expenses:Groceries",
+                        amount=amount, period=period,
+                    )
         budget = book.get_budget(compact=False, name="2026 Budget")
         groceries = next(
             a for a in budget["accounts"]
             if a["account"] == "Expenses:Groceries"
         )
-        # Banker's rounding: 499.995 → 500.00 (round half to even,
-        # 9 is odd → up to 10 → carry → 500.00).
-        expected = Decimal("500.00")
-        assert Decimal(groceries["periods"][0]) == expected
-        assert Decimal(groceries["periods"][1]) == expected
-        # Insert and update paths produce the same stored value.
-        assert groceries["periods"][0] == groceries["periods"][1]
-
-    def test_subcent_amount_truncation_does_not_silently_drop_digits(
-        self, budget_book: Path,
-    ):
-        """Larger sub-cent input rounds, doesn't truncate.
-
-        Pre-fix, ``int(Decimal('1234.567') * 100)`` truncated to
-        123456 → stored 1234.56 instead of rounding to 1234.57.
-        """
-        book = GnuCashBook(str(budget_book))
-        book.create_budget(name="2026 Budget", year=2026, num_periods=12)
-
-        book.set_budget_amount(
-            budget_name="2026 Budget",
-            account="Expenses:Groceries",
-            amount="1234.567",
-            period=0,
-        )
-
-        budget = book.get_budget(compact=False, name="2026 Budget")
-        groceries = next(
-            a for a in budget["accounts"]
-            if a["account"] == "Expenses:Groceries"
-        )
-        assert Decimal(groceries["periods"][0]) == Decimal("1234.57")
+        assert Decimal(groceries["periods"][1]) == Decimal("500.00")
 
     def test_set_nonexistent_budget_raises(self, budget_book: Path):
         """Setting amount on nonexistent budget raises ValueError."""
@@ -1198,3 +1151,470 @@ class TestBudgetIntegration:
                 break
         else:
             pytest.fail("Expenses:Groceries not found in budget")
+
+
+# ── Sign convention (GnuCash 3.8+ natural-sign storage) ─────────
+
+
+def _raw_amount(book_path, account_leaf, period=0):
+    from sqlalchemy import text
+    gb = GnuCashBook(str(book_path))
+    with gb.open(readonly=True) as book:
+        return book.session.execute(
+            text(
+                "SELECT amount_num FROM budget_amounts ba "
+                "JOIN accounts a ON a.guid = ba.account_guid "
+                "WHERE a.name = :n AND ba.period_num = :p"
+            ),
+            {"n": account_leaf, "p": period},
+        ).scalar()
+
+
+def _stamped(book_path):
+    from sqlalchemy import text
+    gb = GnuCashBook(str(book_path))
+    with gb.open(readonly=True) as book:
+        return book.session.execute(
+            text("SELECT COUNT(*) FROM slots WHERE name = "
+                 "'features/Use natural signs in budget amounts'")
+        ).scalar() == 1
+
+
+def _unstamp(book_path):
+    """Strip the feature stamp, as a pre-3.8 or pre-fix book has it."""
+    from sqlalchemy import text
+    gb = GnuCashBook(str(book_path))
+    with gb.open(readonly=False) as book:
+        book.session.execute(text(
+            "DELETE FROM slots WHERE name LIKE 'features%'"
+        ))
+        book.save()
+
+
+def _set_raw(book_path, account_leaf, amount_num, period=0):
+    from sqlalchemy import text
+    gb = GnuCashBook(str(book_path))
+    with gb.open(readonly=False) as book:
+        book.session.execute(
+            text(
+                "UPDATE budget_amounts SET amount_num = :v WHERE "
+                "account_guid = (SELECT guid FROM accounts WHERE name = :n) "
+                "AND period_num = :p"
+            ),
+            {"v": amount_num, "n": account_leaf, "p": period},
+        )
+        book.save()
+
+
+class TestBudgetSignConvention:
+    """GnuCash 3.8+ stores a 5,000 income target as -5000 and stamps
+    the book; the editor negates credit-normal types on entry and
+    display. This server's surface is magnitudes; the sign lives at
+    the storage boundary in _budget_targets / _budget_stored_sign.
+    Pre-fix every type was stored as a magnitude, so an income row
+    read "-5,000 / 0%" after GnuCash scrubbed the book, and showed
+    -5,000 in GnuCash when we wrote it (real book, 2026-09-09)."""
+
+    def _budget(self, gb):
+        gb.create_budget(name="B", num_periods=12, period_type="monthly",
+                         start_date="2026-01-01")
+        return "B"
+
+    def test_income_target_stored_natural_read_as_magnitude(self, budget_book):
+        gb = GnuCashBook(str(budget_book))
+        b = self._budget(gb)
+        gb.set_budget_amount(b, "Income:Salary", "5000.00", period=0)
+        gb.set_budget_amount(b, "Expenses:Groceries", "300.00", period=0)
+        assert _raw_amount(budget_book, "Salary") < 0
+        assert _raw_amount(budget_book, "Groceries") > 0
+        rows = {r["account"]: r["periods"] for r in gb.get_budget(b, compact=False)["accounts"]}
+        assert Decimal(rows["Income:Salary"][0]) == Decimal("5000.00")
+        assert Decimal(rows["Expenses:Groceries"][0]) == Decimal("300.00")
+        report = gb.get_budget_report(b, period=0, compact=False)
+        by_name = {a["account"]: a for a in report["accounts"]}
+        assert Decimal(by_name["Income:Salary"]["budgeted"]) == Decimal("5000.00")
+        assert Decimal(by_name["Expenses:Groceries"]["budgeted"]) == Decimal("300.00")
+
+    def test_create_budget_stamps_the_book(self, budget_book):
+        gb = GnuCashBook(str(budget_book))
+        assert not _stamped(budget_book)
+        self._budget(gb)
+        assert _stamped(budget_book)
+
+    def test_gnucash_native_book_reads_magnitudes(self, budget_book):
+        """A book whose budget was built in GnuCash 5: stamped, income
+        stored negative. Pre-fix: budgeted -5000, 0% used."""
+        gb = GnuCashBook(str(budget_book))
+        b = self._budget(gb)
+        gb.set_budget_amount(b, "Income:Salary", "1.00", period=0)
+        _set_raw(budget_book, "Salary", -500000)  # -5000.00 natural
+        assert _stamped(budget_book)
+        rows = {r["account"]: r["periods"] for r in gb.get_budget(b, compact=False)["accounts"]}
+        assert Decimal(rows["Income:Salary"][0]) == Decimal("5000.00")
+        report = gb.get_budget_report(b, period=0, compact=False)
+        line = next(a for a in report["accounts"] if a["account"] == "Income:Salary")
+        assert Decimal(line["budgeted"]) == Decimal("5000.00")
+
+    def test_legacy_unstamped_book_reads_via_heuristic_and_scrubs_on_write(self, budget_book):
+        """A pre-fix book from this server: un-stamped, income stored
+        +5000 (magnitude). GnuCash's scrub would pick CREDIT_ACC and
+        flip income to -5000 on open; we read it the same way before
+        that happens, and the next write performs the same scrub."""
+        gb = GnuCashBook(str(budget_book))
+        b = self._budget(gb)
+        gb.set_budget_amount(b, "Income:Salary", "5000.00", period=0)
+        gb.set_budget_amount(b, "Expenses:Groceries", "300.00", period=0)
+        _unstamp(budget_book)
+        _set_raw(budget_book, "Salary", 500000)  # legacy +5000.00
+        assert not _stamped(budget_book)
+        rows = {r["account"]: r["periods"] for r in gb.get_budget(b, compact=False)["accounts"]}
+        assert Decimal(rows["Income:Salary"][0]) == Decimal("5000.00")
+        assert Decimal(rows["Expenses:Groceries"][0]) == Decimal("300.00")
+        assert _raw_amount(budget_book, "Salary") > 0  # readers never write
+        gb.set_budget_amount(b, "Expenses:Dining", "50.00", period=0)
+        assert _stamped(budget_book)
+        assert _raw_amount(budget_book, "Salary") < 0  # scrubbed like GnuCash
+        assert _raw_amount(budget_book, "Groceries") > 0
+        rows = {r["account"]: r["periods"] for r in gb.get_budget(b, compact=False)["accounts"]}
+        assert Decimal(rows["Income:Salary"][0]) == Decimal("5000.00")
+
+    def test_heuristic_inc_exp_policy(self, budget_book):
+        """Un-stamped book kept under the 'income & expense' reversal:
+        expense totals negative. ScrubBudget.c flips income AND
+        expense rows; so do we, on read and on the next write."""
+        gb = GnuCashBook(str(budget_book))
+        b = self._budget(gb)
+        gb.set_budget_amount(b, "Income:Salary", "1.00", period=0)
+        gb.set_budget_amount(b, "Expenses:Groceries", "1.00", period=0)
+        _unstamp(budget_book)
+        _set_raw(budget_book, "Salary", 500000)      # +5000 (reversed era)
+        _set_raw(budget_book, "Groceries", -30000)   # -300 (reversed era)
+        rows = {r["account"]: r["periods"] for r in gb.get_budget(b, compact=False)["accounts"]}
+        assert Decimal(rows["Income:Salary"][0]) == Decimal("5000.00")
+        assert Decimal(rows["Expenses:Groceries"][0]) == Decimal("300.00")
+        gb.set_budget_amount(b, "Expenses:Dining", "50.00", period=0)
+        assert _raw_amount(budget_book, "Salary") == -500000
+        assert _raw_amount(budget_book, "Groceries") == 30000
+
+    def test_already_natural_unstamped_book_is_left_alone(self, budget_book):
+        """Income total negative, expense positive → policy NONE:
+        nothing flips, only the stamp lands."""
+        gb = GnuCashBook(str(budget_book))
+        b = self._budget(gb)
+        gb.set_budget_amount(b, "Income:Salary", "5000.00", period=0)
+        gb.set_budget_amount(b, "Expenses:Groceries", "300.00", period=0)
+        _unstamp(budget_book)
+        gb.set_budget_amount(b, "Expenses:Dining", "50.00", period=0)
+        assert _stamped(budget_book)
+        assert _raw_amount(budget_book, "Salary") == -500000
+        assert _raw_amount(budget_book, "Groceries") == 30000
+
+    def test_audit_prior_amounts_are_magnitudes(self, budget_book):
+        gb = GnuCashBook(str(budget_book))
+        b = self._budget(gb)
+        gb.set_budget_amount(b, "Income:Salary", "5000.00", period=0)
+        gb.set_budget_amount(b, "Income:Salary", "6000.00", period=0)
+        before = gb._consume_audit_before()
+        assert Decimal(before["prior_amounts"][0]) == Decimal("5000.00")
+
+    def test_dashboard_headline_agrees(self, budget_book):
+        """The dashboard's budget headline reads the same chokepoint.
+        Pre-fix a natural-sign income row summed into a negative
+        total and the headline vanished even with expense targets
+        present. (The headline paces expense targets only; an
+        income-only budget has no spending headline by design.)"""
+        from datetime import date
+        gb = GnuCashBook(str(budget_book))
+        today = date.today()
+        gb.create_budget(name="Now", num_periods=12, period_type="monthly",
+                         start_date=today.replace(day=1).isoformat())
+        gb.set_budget_amount("Now", "Income:Salary", "5000.00")
+        gb.set_budget_amount("Now", "Expenses:Groceries", "100.00")
+        _set_raw(budget_book, "Salary", -500000)  # native sign, as stored
+        with gb.open(readonly=True) as book:
+            headline = gb._budget_headline(book, list(book.transactions))
+        assert headline is not None
+
+
+class TestBudgetFeatureKey:
+    """The stamp key is GnuCash's, verbatim. A key GnuCash does not
+    know makes it refuse to open the book ("features not supported
+    by this version") — which is exactly what the first cut of this
+    branch did to the maintainer's production book. Pinned against
+    a copy of the #define, not a paraphrase."""
+
+    GNC_FEATURES_H_LINE = (
+        '#define GNC_FEATURE_BUDGET_UNREVERSED '
+        '"Use natural signs in budget amounts"'
+    )
+
+    def test_key_matches_gnc_features_h(self):
+        from gnucash_mcp.book._base import (
+            _BUDGET_UNREVERSED_FEATURE, _BUDGET_UNREVERSED_KEY,
+        )
+        import re
+        define = re.search(r'"([^"]+)"', self.GNC_FEATURES_H_LINE).group(1)
+        assert _BUDGET_UNREVERSED_FEATURE == define
+        assert _BUDGET_UNREVERSED_KEY == f"features/{define}"
+
+    def test_bogus_key_migrated_on_next_write(self, budget_book):
+        """A book stamped by the pre-merge branch: bogus key present,
+        real key absent. The next budget write deletes the bogus
+        row and writes the real stamp."""
+        from sqlalchemy import text
+        from gnucash_mcp.book._base import (
+            _BUDGET_UNREVERSED_BOGUS_KEY, _BUDGET_UNREVERSED_KEY,
+        )
+        gb = GnuCashBook(str(budget_book))
+        gb.create_budget(name="B", num_periods=12, period_type="monthly",
+                         start_date="2026-01-01")
+        _unstamp(budget_book)
+        with gb.open(readonly=False) as book:
+            book[_BUDGET_UNREVERSED_BOGUS_KEY] = "x"
+            book.save()
+        r = gb.set_budget_amount("B", "Expenses:Groceries", "300", period=0)
+        assert r.get("book_stamped") == "Use natural signs in budget amounts"
+        with gb.open(readonly=True) as book:
+            names = [row[0] for row in book.session.execute(
+                text("SELECT name FROM slots WHERE name LIKE 'features/%'")
+            ).fetchall()]
+        assert names == [_BUDGET_UNREVERSED_KEY]
+
+    def test_bogus_beside_real_is_deleted(self, budget_book):
+        """The bookkeeper's production case: desktop had already
+        written the real stamp, the branch added the bogus one
+        beside it. Delete the bogus row, touch nothing else, and
+        do NOT scrub — the real stamp says the rows are natural."""
+        from sqlalchemy import text
+        from gnucash_mcp.book._base import (
+            _BUDGET_UNREVERSED_BOGUS_KEY, _BUDGET_UNREVERSED_KEY,
+        )
+        gb = GnuCashBook(str(budget_book))
+        gb.create_budget(name="B", num_periods=12, period_type="monthly",
+                         start_date="2026-01-01")
+        gb.set_budget_amount("B", "Income:Salary", "5000", period=0)
+        with gb.open(readonly=False) as book:
+            book[_BUDGET_UNREVERSED_BOGUS_KEY] = "x"
+            book.save()
+        r = gb.set_budget_amount("B", "Expenses:Groceries", "300", period=0)
+        assert "book_stamped" not in r and "book_scrubbed" not in r
+        assert _raw_amount(budget_book, "Salary") == -500000
+        with gb.open(readonly=True) as book:
+            names = [row[0] for row in book.session.execute(
+                text("SELECT name FROM slots WHERE name LIKE 'features/%'")
+            ).fetchall()]
+        assert names == [_BUDGET_UNREVERSED_KEY]
+
+    def test_first_write_reports_the_stamp(self, budget_book):
+        gb = GnuCashBook(str(budget_book))
+        r = gb.create_budget(name="B", num_periods=12, period_type="monthly",
+                             start_date="2026-01-01")
+        assert r.get("book_stamped") == "Use natural signs in budget amounts"
+        r2 = gb.set_budget_amount("B", "Expenses:Groceries", "300", period=0)
+        assert "book_stamped" not in r2
+
+    def test_audit_lines_render_the_stamp(self):
+        from gnucash_mcp.logging_config import (
+            _fmt_budget_create, _fmt_budget_update,
+        )
+        feature = "Use natural signs in budget amounts"
+        create = _fmt_budget_create({
+            "timestamp": "2026-09-09T10:00:00",
+            "params": {"name": "B", "num_periods": 12},
+            "after_state": {"name": "B", "book_stamped": feature},
+        })
+        assert any(f'book stamped: "{feature}"' in l for l in create)
+        update = _fmt_budget_update({
+            "timestamp": "2026-09-09T10:00:00",
+            "params": {"budget_name": "B", "account": "Income:Salary", "amount": "5000"},
+            "before_state": {"prior_amounts": {"0": None}},
+            "after_state": {"periods_set": [0], "book_stamped": feature, "book_scrubbed": True},
+        })
+        assert any("book stamped" in l for l in update)
+        assert any("scrubbed to natural sign" in l for l in update)
+
+
+# ── Report sides (income vs. expenses) ──────────────────────────
+
+
+class TestBudgetReportSides:
+    """Income and expense targets are tallied on their own sides.
+    One side → TOTAL as always. Both → INCOME / EXPENSES / NET.
+    Pre-fix a 5,000 income target and 300 of expenses summed to a
+    TOTAL of 5,300 that read as spending (bookkeeper, 2026-09-09)."""
+
+    def _mixed(self, gb, salary_actual="4800", groceries_actual="250"):
+        from datetime import date as _date
+        gb.create_budget(name="M", num_periods=12, period_type="monthly",
+                         start_date="2026-01-01")
+        gb.set_budget_amount("M", "Income:Salary", "5000", period=5)
+        gb.set_budget_amount("M", "Expenses:Groceries", "300", period=5)
+        gb.create_transaction(
+            description="Pay",
+            splits=[
+                {"account": "Assets:Checking", "amount": salary_actual},
+                {"account": "Income:Salary", "amount": f"-{salary_actual}"},
+            ],
+            trans_date=_date(2026, 6, 15),
+        )
+        gb.create_transaction(
+            description="Food",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": groceries_actual},
+                {"account": "Assets:Checking", "amount": f"-{groceries_actual}"},
+            ],
+            trans_date=_date(2026, 6, 16),
+        )
+
+    def test_mixed_budget_reports_sides_and_net(self, budget_book):
+        gb = GnuCashBook(str(budget_book))
+        self._mixed(gb)
+        r = gb.get_budget_report("M", period=5, compact=False)
+        inc, exp = r["subtotals"]["income"], r["subtotals"]["expenses"]
+        assert (Decimal(inc["budgeted"]), Decimal(inc["actual"])) == (Decimal("5000"), Decimal("4800"))
+        assert (Decimal(exp["budgeted"]), Decimal(exp["actual"])) == (Decimal("300"), Decimal("250"))
+        t = r["totals"]
+        assert t["basis"] == "net (income - expenses)"
+        assert Decimal(t["budgeted"]) == Decimal("4700")
+        assert Decimal(t["actual"]) == Decimal("4550")
+        assert Decimal(t["remaining"]) == Decimal("150")
+        assert "percent_used" not in t  # a difference, not a ratio
+        text = gb.get_budget_report("M", period=5)
+        lines = text.splitlines()
+        assert lines[-3].startswith("INCOME")
+        assert lines[-2].startswith("EXPENSES")
+        assert lines[-1].startswith("NET")
+        assert lines[-1].rstrip().endswith("—")  # no %Used on NET
+        assert not any(l.startswith("TOTAL") for l in lines)
+
+    def test_single_side_unchanged(self, budget_book):
+        gb = GnuCashBook(str(budget_book))
+        gb.create_budget(name="E", num_periods=12, period_type="monthly",
+                         start_date="2026-01-01")
+        gb.set_budget_amount("E", "Expenses:Groceries", "300", period=0)
+        r = gb.get_budget_report("E", period=0, compact=False)
+        assert "subtotals" not in r
+        assert "basis" not in r["totals"]
+        assert Decimal(r["totals"]["budgeted"]) == Decimal("300")
+        assert gb.get_budget_report("E", period=0).splitlines()[-1].startswith("TOTAL")
+
+    def test_income_only_is_a_single_side(self, budget_book):
+        gb = GnuCashBook(str(budget_book))
+        gb.create_budget(name="I", num_periods=12, period_type="monthly",
+                         start_date="2026-01-01")
+        gb.set_budget_amount("I", "Income:Salary", "5000", period=0)
+        r = gb.get_budget_report("I", period=0, compact=False)
+        assert "subtotals" not in r
+        assert Decimal(r["totals"]["budgeted"]) == Decimal("5000")
+        assert gb.get_budget_report("I", period=0).splitlines()[-1].startswith("TOTAL")
+
+    def test_marker_fires_on_expenses_side_only(self, budget_book):
+        gb = GnuCashBook(str(budget_book))
+        self._mixed(gb, salary_actual="6000", groceries_actual="400")
+        lines = gb.get_budget_report("M", period=5).splitlines()
+        income_line = next(l for l in lines if l.startswith("INCOME"))
+        expenses_line = next(l for l in lines if l.startswith("EXPENSES"))
+        net_line = next(l for l in lines if l.startswith("NET"))
+        assert "⚠" not in income_line        # 120% of income is good news
+        salary_row = next(l for l in lines if l.startswith("Income:Salary"))
+        assert "⚠" not in salary_row         # nor on the row itself
+        assert expenses_line.endswith("⚠")   # 133% of expenses is not
+        assert "⚠" not in net_line
+
+
+class TestBudgetHeadlineExpensesOnly:
+    """The dashboard headline paces expense targets only."""
+
+    def _covering_today(self, gb):
+        from datetime import date as _date
+        today = _date.today()
+        # One period covering this month: the headline paces the
+        # whole budget span, so a 12-month budget would read 250
+        # against 6,000.
+        gb.create_budget(name="H", num_periods=1, period_type="monthly",
+                         start_date=today.replace(day=1).isoformat())
+        return today
+
+    def test_income_target_does_not_dilute_used_pct(self, budget_book):
+        gb = GnuCashBook(str(budget_book))
+        today = self._covering_today(gb)
+        gb.set_budget_amount("H", "Income:Salary", "5000")
+        gb.set_budget_amount("H", "Expenses:Groceries", "500")
+        gb.create_transaction(
+            description="Food",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "250"},
+                {"account": "Assets:Checking", "amount": "-250"},
+            ],
+            trans_date=today,
+        )
+        gb.create_transaction(
+            description="Pay",
+            splits=[
+                {"account": "Assets:Checking", "amount": "4800"},
+                {"account": "Income:Salary", "amount": "-4800"},
+            ],
+            trans_date=today,
+        )
+        with gb.open(readonly=True) as book:
+            h = gb._budget_headline(book, list(book.transactions))
+        assert h["used_pct"] == Decimal("50")  # 250 / 500, not 5050 / 5500
+
+    def test_income_only_budget_has_no_spending_headline(self, budget_book):
+        gb = GnuCashBook(str(budget_book))
+        self._covering_today(gb)
+        gb.set_budget_amount("H", "Income:Salary", "5000")
+        with gb.open(readonly=True) as book:
+            assert gb._budget_headline(book, list(book.transactions)) is None
+
+
+class TestBudgetAmountIsAMagnitude:
+    """Review C40 / IV-14. The ledger writes income as a negative, so
+    ``-5000`` is the natural slip on an income account — and it
+    stored a target in the wrong direction, which then cancelled a
+    correct one in the report."""
+
+    def _budget(self, budget_book):
+        book = GnuCashBook(str(budget_book))
+        book.create_budget(name="B", year=2026)
+        return book
+
+    @pytest.mark.parametrize("account", [
+        "Income:Salary", "Expenses:Groceries",
+    ])
+    def test_a_negative_amount_is_refused(self, budget_book, account):
+        book = self._budget(budget_book)
+        with pytest.raises(ValueError, match="positive numbers"):
+            book.set_budget_amount(
+                budget_name="B", account=account, amount="-5000",
+                period=0,
+            )
+        report = book.get_budget(name="B", compact=False)
+        assert account not in str(report.get("accounts", ""))
+
+    def test_income_target_does_not_cancel(self, budget_book):
+        book = self._budget(budget_book)
+        book.set_budget_amount(
+            budget_name="B", account="Income:Salary", amount="5000",
+            period=0,
+        )
+        with pytest.raises(ValueError):
+            book.set_budget_amount(
+                budget_name="B", account="Income:Salary",
+                amount="-5000", period=1,
+            )
+        book.set_budget_amount(
+            budget_name="B", account="Income:Salary", amount="5000",
+            period=1,
+        )
+        report = book.get_budget_report("B", period="all", compact=False)
+        row = next(
+            a for a in report["accounts"] if a["account"] == "Income:Salary"
+        )
+        assert Decimal(row["budgeted"]) == Decimal("10000")
+
+    def test_zero_still_clears_a_target(self, budget_book):
+        book = self._budget(budget_book)
+        assert book.set_budget_amount(
+            budget_name="B", account="Expenses:Groceries", amount="0",
+        )["status"] == "updated"

@@ -10,6 +10,7 @@ from gnucash_mcp.logging_config import (
     audit_log,
     get_log_dir,
 )
+from gnucash_mcp._format import _book_display_name
 from gnucash_mcp.tools._helpers import _json, safe_tool
 
 
@@ -45,7 +46,7 @@ def register(mcp, get_book) -> None:
         credit limit, reward rates, or any custom data.
 
         Args:
-            account: Account ref: full path (e.g., "Liabilities:Credit Cards:Capital One"), %short GUID, or full 32-char GUID.
+            account: Account name ("Assets:Checking") or %short guid ("%d53d547").
             key: Specific slot key to retrieve. If omitted, returns all slots.
         """
         book = get_book()
@@ -70,8 +71,8 @@ def register(mcp, get_book) -> None:
         Use for APR, credit limits, reward rates, or any per-account metadata.
 
         Args:
-            account: Account ref: full path (e.g., "Liabilities:Credit Cards:Capital One"), %short GUID, or full 32-char GUID.
-            key: Slot key (e.g., "apr", "credit_limit").
+            account: Account name ("Assets:Checking") or %short guid ("%d53d547").
+            key: Slot key (e.g., "apr", "credit_limit"). GnuCash's own keys (reconcile-info, lot-mgmt, ofx, import-map, placeholder, hidden, …) are refused; use update_account for placeholder.
             value: Slot value (always stored as string).
         """
         book = get_book()
@@ -94,12 +95,14 @@ def register(mcp, get_book) -> None:
         Permanent, and surgical: only the named key is deleted —
         other slots, the account, and its transactions are untouched.
         Errors, changing nothing, if the account ref or key doesn't
-        exist, or if the key contains '/' (reserved for internal
-        hierarchical slots; user slots are flat). get_account_slots
-        lists the removable keys; set_account_slot re-creates one.
+        exist, if the key contains '/' (reserved for internal
+        hierarchical slots; user slots are flat), or if the key is
+        GnuCash's own data rather than a custom string (reconcile-info,
+        ofx, import-map, placeholder, …). set_account_slot re-creates
+        a removed key.
 
         Args:
-            account: Account ref: full path (e.g., "Liabilities:Credit Cards:Capital One"), %short GUID, or full 32-char GUID.
+            account: Account name ("Assets:Checking") or %short guid ("%d53d547").
             key: Slot key to remove.
         """
         book = get_book()
@@ -196,6 +199,16 @@ def register(mcp, get_book) -> None:
                     header = "\n".join(header_lines[:i]).rstrip()
                     blocks.insert(0, "\n".join(header_lines[i:]))
                     break
+
+        if header:
+            # Day files written before 1.5 carry the book's absolute
+            # path in their header (it is baked in when the file is
+            # created). Name the book as everything else names it.
+            header = re.sub(
+                r"(?m)^Book: (.*)$",
+                lambda m: f"Book: {_book_display_name(m.group(1).strip())}",
+                header,
+            )
 
         total = len(blocks)
         # Recency-anchored window: offset counts back from the newest

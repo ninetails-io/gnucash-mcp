@@ -72,6 +72,17 @@ class TestBatchTsvParser:
         ]
         assert "notes" not in rows[0]
 
+    def test_empty_date_cell_rejects(self):
+        """A blank date cell is a format error, as it is for
+        enter_statement — never a silent default to today (the
+        results table carries no date to reveal the substitution)."""
+        tsv = (
+            "ref\tdate\tdescription\tamt1\tacct1\tamt2\tacct2\n"
+            "1\t\tNo date\t-10\tAssets:Checking\t10\tExpenses:Groceries"
+        )
+        with pytest.raises(ValueError, match="row 1.*not a valid YYYY-MM-DD"):
+            _parse_transactions_tsv(tsv)
+
     def test_unknown_header_columns_reject_by_name(self):
         """6c (bookkeeper finding): now that the header is load-
         bearing, unknown columns must fail on the FORMAT with the
@@ -1115,3 +1126,39 @@ class TestSignalSweepAmortization:
         )
         assert result["status"] in ("created", "rejected")
         assert sweep_calls["n"] == 1
+
+
+class TestSlippedYearIsFlaggedAtEntry:
+    """Review C34 / IV-7. The dashboard calls a date more than a
+    year ahead "likely a typo" — after the fact. The batch says so as
+    the row lands, dry run included."""
+
+    def _rows(self):
+        from datetime import date
+        def row(ref, d):
+            return {
+                "ref": ref, "date": d, "description": f"Row {ref}",
+                "splits": [
+                    {"account": "Expenses:Groceries", "amount": "5.00"},
+                    {"account": "Assets:Checking", "amount": "-5.00"},
+                ],
+            }
+        return [
+            row("future", date(2062, 1, 5)),
+            row("ancient", date(1500, 1, 5)),  # GnuCash holds 1400 on
+            row("old", date(2019, 3, 1)),       # a real historical import
+            row("now", date.today()),
+        ]
+
+    def test_dry_run_and_commit(self, test_book):
+        from gnucash_mcp.book import GnuCashBook
+        gb = GnuCashBook(str(test_book))
+        for dry_run in (True, False):
+            result = gb.create_transactions(self._rows(), dry_run=dry_run)
+            warned = {
+                line.split("\t")[0]: line
+                for line in result["warnings"].splitlines()[1:]
+            }
+            assert "more than a year ahead" in warned["future"]
+            assert "check the year" in warned["ancient"]
+            assert "old" not in warned and "now" not in warned

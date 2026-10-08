@@ -20,6 +20,14 @@ Everything the policy acts on is read from the book; the only
 constants left are the policy parameters themselves (buffers, shares,
 bounds — see DRIFT_ANALYSIS.md for the measured derivations).
 
+Dates: the engine DECIDES at calendar month-ends (balances are read
+as of the last day of the month) but its transfers are bank-to-bank
+ACH moves, so a persona that names a settlement calendar
+(``PersonaPolicy.holidays``) has sweeps, draws and top-ups POST on
+the last business day on or before that day (``ach_date``); interest
+credits keep the month-end value date. Personas without a calendar
+keep every row on its calendar day.
+
 Determinism: every randomized choice (payment lag days, settle lags)
 draws from ``random.Random(f"{persona}:{purpose}:{anchor}")`` — seeded
 per (persona, purpose, date), so a re-run over the same range emits
@@ -63,6 +71,9 @@ class CardPolicy:
     interest_account: str | None = None  # expense account for accrual
     # Absolute floor for the repair narrative (default: buffer / 2).
     repair_min: D | None = None
+    # Account the statement is paid FROM (default: the persona's
+    # household checking). A business card is paid by the business.
+    pay_from: str | None = None
 
 
 @dataclass(frozen=True)
@@ -82,6 +93,11 @@ class PersonaPolicy:
     rebalance_tranche: D            # per-quarter savings→invest amount
     max_monthly_sweep: D            # staging cap (repair pacing)
     min_sweep: D                    # ignore dribble surpluses below this
+    # The corridor top-up never empties savings past this — nobody runs
+    # a Tagesgeld to the cent, and a savings account drained to zero
+    # at a month-end is overdrawn by the first card row or the
+    # month-end interest the redate leaves behind. 0 = no floor.
+    savings_floor: D = D("0")
     # invest(book_path, when, amount, source_path) writes the persona's
     # investment purchase (lot-per-sweep etc.). None = surplus goes to
     # savings only.
@@ -95,20 +111,55 @@ class PersonaPolicy:
     # (e.g. Sabine's Ausgleichskonto clearing). Must be idempotent —
     # check the book before writing.
     book_repairs: Callable[[Path, date, date], list[str]] | None = None
+    # holidays(year) -> the dates no ACH settles on, beyond weekends
+    # (``federal_holidays`` for a US persona). Naming a calendar also
+    # OPTS the persona IN to ``ach_date``: the engine's month-end
+    # sweeps, owner's draws and top-ups then settle on the last
+    # business day on or before the calendar day they were decided
+    # on. None = weekends-only rolls for payments, and the engine's
+    # transfers keep their calendar day.
+    holidays: Callable[[int], frozenset[date]] | None = None
     # Accounts stamped with the server's no_reconcile opt-out slot:
     # loans, VAT clearing — no statement exists to reconcile against
     # (bookkeeper review §1: they'd otherwise sit forever in the
     # dashboard's "never reconciled ⚠" count).
     no_reconcile: tuple[str, ...] = ()
+    # The business-entity boundary (Alex, audit B3): the LLC's own
+    # operating account, its working-capital floor, a monthly reserve
+    # that accrues toward the December retirement contribution (reset
+    # in December, when the contribution spends it), and the equity
+    # clearing account each owner's draw passes through. Invoices and
+    # bills settle against ``business_checking`` when it is set; the
+    # month-end draw moves everything above the floor to the household.
+    business_checking: str | None = None
+    business_buffer: D = D("0")
+    business_reserve_monthly: D = D("0")
+    draw_equity: str | None = None
+    # Interest on the savings pile (APY), booked at each month end on
+    # the prior month-end balance. None = the savings earn nothing.
+    savings_apy: D | None = None
+    # Intra-month checking floor. When set, every month's day-end
+    # balances are walked BEFORE the month-end sweep and a top-up from
+    # savings (back to ``buffer``) is dated on the first day checking
+    # would close under the floor — the transfer a debit-card holder
+    # makes the day the mortgage lands, not at month end (Lin Wei audit
+    # R2: a 储蓄卡 has no overdraft, and the month-end top-up came a
+    # week after the debit had bounced). None = month-end corridor only.
+    floor: D | None = None
+    interest_income: str | None = None
     # Narrative templates. {month} is "%B %Y" of the statement close.
+    desc_draw: str = "Owner's draw — {month}"
+    desc_draw_deposit: str = "Owner's draw deposit — {month}"
+    desc_savings_interest: str = "Savings interest — {month}"
     desc_statement: str = "{label} — {month} statement payment"
-    desc_repair_card: str = "{label} — balance payoff (catching up after the summer)"
+    desc_repair_card: str = "Balance payoff — catching up after the summer"
     desc_sweep: str = "Transfer to savings (monthly surplus sweep)"
     desc_repair_sweep: str = "Transfer to savings — accumulated surplus"
     desc_topup: str = "Transfer from savings (checking top-up)"
     desc_interest: str = "{label} — interest"
     # A statement payment this many times the trailing month's charges
-    # (or larger) gets the repair narrative instead of the routine one.
+    # (or larger) gets the repair narrative (as the transaction's
+    # notes) alongside the routine description.
     repair_factor: D = D("3")
 
 
@@ -117,6 +168,99 @@ class PersonaPolicy:
 def _seeded(persona: str, purpose: str, anchor: date, lo: int, hi: int) -> int:
     rng = random.Random(f"{persona}:{purpose}:{anchor.isoformat()}")
     return rng.randint(lo, hi)
+
+
+def _nth_weekday(year: int, month: int, weekday: int, n: int) -> date:
+    """The ``n``-th (1-based; -1 = last) ``weekday`` of the month."""
+    if n > 0:
+        first = date(year, month, 1)
+        return first + timedelta(days=(weekday - first.weekday()) % 7
+                                 + 7 * (n - 1))
+    nxt = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
+    last = nxt - timedelta(days=1)
+    return last - timedelta(days=(last.weekday() - weekday) % 7)
+
+
+def _observed(d: date) -> date:
+    """5 U.S.C. 6103(b): a Saturday holiday is observed the Friday
+    before, a Sunday holiday the Monday after."""
+    if d.weekday() == 5:
+        return d - timedelta(days=1)
+    if d.weekday() == 6:
+        return d + timedelta(days=1)
+    return d
+
+
+def federal_holidays(year: int) -> frozenset[date]:
+    """The eleven US federal holidays of ``year`` as observed (5 U.S.C.
+    6103), plus any observed New Year's Day that falls on this year's
+    December 31. The Federal Reserve closes on each, so no ACH settles
+    (Alex cold audit R2: a contractor paid on Christmas Day)."""
+    days = {
+        _observed(date(year, 1, 1)),               # New Year's Day
+        _nth_weekday(year, 1, 0, 3),               # Birthday of MLK, Jr.
+        _nth_weekday(year, 2, 0, 3),               # Washington's Birthday
+        _nth_weekday(year, 5, 0, -1),              # Memorial Day
+        _observed(date(year, 6, 19)),              # Juneteenth
+        _observed(date(year, 7, 4)),               # Independence Day
+        _nth_weekday(year, 9, 0, 1),               # Labor Day
+        _nth_weekday(year, 10, 0, 2),              # Columbus Day
+        _observed(date(year, 11, 11)),             # Veterans Day
+        _nth_weekday(year, 11, 3, 4),              # Thanksgiving Day
+        _observed(date(year, 12, 25)),             # Christmas Day
+        _observed(date(year + 1, 1, 1)),           # may land on Dec 31
+    }
+    return frozenset(d for d in days if d.year == year)
+
+
+def is_business_day(d: date, holidays=None) -> bool:
+    """Weekday and, when ``holidays`` (a year → set-of-dates function)
+    is given, not one of its days."""
+    if d.weekday() >= 5:
+        return False
+    return holidays is None or d not in holidays(d.year)
+
+
+def business_day(d: date, holidays=None) -> date:
+    """``d`` rolled forward off a weekend — and off any day in
+    ``holidays(year)`` when a calendar is given — to the next business
+    day. Card statement payments and document settlements are ACH
+    movements and post on business days (Alex cold audit C3; federal
+    holidays R2); month-end interest credits stay on the calendar day
+    the engine reads them at, deliberately (a bank's Wertstellung).
+    The engine's own transfers roll BACK instead — see ``ach_date``.
+    Personas pass their own calendar through
+    ``PersonaPolicy.holidays``; None keeps weekends-only."""
+    while not is_business_day(d, holidays):
+        d += timedelta(days=1)
+    return d
+
+
+def business_day_back(d: date, holidays=None) -> date:
+    """``d`` rolled BACK off a weekend (and off ``holidays(year)`` when
+    a calendar is given) to the last business day on or before it."""
+    while not is_business_day(d, holidays):
+        d -= timedelta(days=1)
+    return d
+
+
+def ach_date(policy: PersonaPolicy, when: date, not_before: date) -> date:
+    """The posting date of one of the engine's own transfers — a
+    surplus sweep, an owner's draw, a checking top-up — that the
+    policy decides on calendar day ``when``. These are bank-to-bank
+    ACH moves (Alex cold audit R3 H2: Chase → Ally on a Saturday), so
+    a persona that names its settlement calendar (``policy.holidays``
+    set) has them settle on the last business day ON OR BEFORE
+    ``when`` — back, not forward, so the month-end balance the policy
+    read is what the month closes on. A persona without a calendar
+    keeps the calendar day (Sabine re-dates its own base rows). Never
+    at or before ``not_before`` (the frozen cutoff, or the first day
+    of a floor walk): a roll-back that would land inside the frozen
+    prefix keeps ``when`` instead."""
+    if policy.holidays is None:
+        return when
+    d = business_day_back(when, policy.holidays)
+    return d if d > not_before else when
 
 
 def month_ends(after: date, through: date) -> Iterator[date]:
@@ -164,11 +308,33 @@ def prefix_txn_count(book_path: Path, cutoff: date) -> int:
     (release-review finding 9: the interest write once slipped a
     pre-cutoff date past a pay_date-only guard, and
     verify_invariants replicated the same boundary blindness)."""
+    # Ledger transactions only. A scheduled transaction's TEMPLATE is
+    # a transaction row too (on an account under the template root,
+    # dated at the schedule's start), and since 1.5 the first schedule
+    # write converts every pre-1.5 recipe into one — 17 new rows dated
+    # inside Alex's frozen prefix, none of them ledger activity. The
+    # bundle build failed on exactly that from the day the conversion
+    # merged. Template accounts are every descendant of a ROOT that is
+    # not the book's root.
     con = sqlite3.connect(str(book_path))
     try:
         row = con.execute(
-            "SELECT COUNT(*) FROM transactions "
-            "WHERE date(post_date) <= ?",
+            """
+            WITH RECURSIVE tmpl(guid) AS (
+                SELECT guid FROM accounts
+                WHERE account_type = 'ROOT'
+                  AND guid <> (SELECT root_account_guid FROM books)
+                UNION ALL
+                SELECT a.guid FROM accounts a JOIN tmpl ON a.parent_guid = tmpl.guid
+            )
+            SELECT COUNT(*) FROM transactions t
+            WHERE date(t.post_date) <= ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM splits s
+                  WHERE s.tx_guid = t.guid
+                    AND s.account_guid IN (SELECT guid FROM tmpl)
+              )
+            """,
             (cutoff.isoformat(),),
         ).fetchone()
     finally:
@@ -217,6 +383,41 @@ def _month_charges(book: GnuCashBook, account: str, close: date) -> D:
     return delta if delta > 0 else D("0")
 
 
+def _account_guid(con: sqlite3.Connection, fullname: str) -> str:
+    guid = con.execute("SELECT root_account_guid FROM books").fetchone()[0]
+    for name in fullname.split(":"):
+        row = con.execute(
+            "SELECT guid FROM accounts WHERE parent_guid = ? AND name = ?",
+            (guid, name)).fetchone()
+        if row is None:
+            raise SystemExit(f"no account {fullname!r} in the book")
+        guid = row[0]
+    return guid
+
+
+def daily_net(book_path: Path, account: str, start: date,
+              end: date) -> dict[date, D]:
+    """Net quantity movement of ``account`` per post date, start..end
+    inclusive, voided splits excluded. One query per month instead of
+    one book open per day."""
+    con = sqlite3.connect(str(book_path))
+    try:
+        guid = _account_guid(con, account)
+        rows = con.execute(
+            "SELECT date(t.post_date), s.quantity_num, s.quantity_denom "
+            "FROM splits s JOIN transactions t ON t.guid = s.tx_guid "
+            "WHERE s.account_guid = ? AND s.reconcile_state <> 'v' "
+            "AND date(t.post_date) BETWEEN ? AND ?",
+            (guid, start.isoformat(), end.isoformat())).fetchall()
+    finally:
+        con.close()
+    net: dict[date, D] = {}
+    for post, num, denom in rows:
+        d = date.fromisoformat(post)
+        net[d] = net.get(d, D("0")) + D(num) / D(denom)
+    return net
+
+
 # ── Policy passes ───────────────────────────────────────────────
 
 def _pay_card(book: GnuCashBook, policy: PersonaPolicy, card: CardPolicy,
@@ -226,7 +427,7 @@ def _pay_card(book: GnuCashBook, policy: PersonaPolicy, card: CardPolicy,
     cycle closing at ``close``. No-ops when the payment would land in
     the frozen prefix or past the horizon."""
     pay_lag = _seeded(policy.key, f"paylag:{card.label}", close, 3, 7)
-    pay_date = close + timedelta(days=pay_lag)
+    pay_date = business_day(close + timedelta(days=pay_lag), policy.holidays)
     if pay_date <= cutoff or pay_date > through:
         return
 
@@ -285,9 +486,10 @@ def _pay_card(book: GnuCashBook, policy: PersonaPolicy, card: CardPolicy,
     if payment <= 0:
         return
 
-    # Never overdraft checking for a card payment; cap and warn. In a
-    # healthy book this cannot bind (PIF charges << checking).
-    available = _balance(book, policy.checking, pay_date) - D("100")
+    # Never overdraft the paying account for a card payment; cap and
+    # warn. In a healthy book this cannot bind (PIF charges << cash).
+    pay_from = card.pay_from or policy.checking
+    available = _balance(book, pay_from, pay_date) - D("100")
     if payment > available:
         log.append(f"WARN {card.label}: payment {payment} capped to "
                    f"available {available} on {pay_date}")
@@ -305,13 +507,18 @@ def _pay_card(book: GnuCashBook, policy: PersonaPolicy, card: CardPolicy,
     is_repair = (trailing > 0
                  and payment >= trailing * policy.repair_factor
                  and payment >= repair_min)
-    desc_tpl = policy.desc_repair_card if is_repair else policy.desc_statement
-    desc = desc_tpl.format(label=card.label, month=close.strftime("%B %Y"))
+    # The bank line is the plain statement payment; the repair story
+    # goes in the notes (Alex cold audit C4 — plot never lives in a
+    # description).
+    month = close.strftime("%B %Y")
+    desc = policy.desc_statement.format(label=card.label, month=month)
+    notes = (policy.desc_repair_card.format(label=card.label, month=month)
+             if is_repair else None)
 
     book.create_transaction(
-        description=desc, trans_date=pay_date,
+        description=desc, trans_date=pay_date, notes=notes,
         splits=[
-            {"account": policy.checking, "amount": str(-payment)},
+            {"account": pay_from, "amount": str(-payment)},
             {"account": card.account, "amount": str(payment)},
         ],
         check_duplicates=False,
@@ -321,10 +528,49 @@ def _pay_card(book: GnuCashBook, policy: PersonaPolicy, card: CardPolicy,
                f"(close {close})")
 
 
+def _floor_topups(book: GnuCashBook, policy: PersonaPolicy, book_path: Path,
+                  start: date, end: date, log: list[str]) -> None:
+    """Walk checking's day-ends over start..end; the first day it would
+    close under ``policy.floor`` gets a same-day top-up from savings
+    back to ``buffer`` (bounded by what savings holds). Runs before the
+    month's sweep, so the sweep sees the topped-up balance. The
+    transfer posts on the last business day on or before that day
+    when the persona names a calendar (``ach_date``; never before
+    ``start``) — the money is there by the day-end that needed it."""
+    if policy.floor is None or start > end:
+        return
+    bal = _balance(book, policy.checking, start - timedelta(days=1))
+    net = daily_net(book_path, policy.checking, start, end)
+    d = start
+    while d <= end:
+        bal += net.get(d, D("0"))
+        if bal < policy.floor:
+            post = ach_date(policy, d, start - timedelta(days=1))
+            available = _balance(book, policy.savings, post)
+            topup = min(policy.buffer - bal, available).quantize(D("0.01"))
+            if topup >= policy.min_sweep:
+                book.create_transaction(
+                    description=policy.desc_topup, trans_date=post,
+                    splits=[
+                        {"account": policy.savings, "amount": str(-topup)},
+                        {"account": policy.checking, "amount": str(topup)},
+                    ],
+                    check_duplicates=False,
+                )
+                bal += topup
+                log.append(f"topup←savings: {topup} on {post} "
+                           f"(day-end {d} under floor {policy.floor})")
+        d += timedelta(days=1)
+
+
 def _sweep(book: GnuCashBook, policy: PersonaPolicy, book_path: Path,
-           month_end: date, log: list[str]) -> None:
+           month_end: date, log: list[str], post: date | None = None) -> None:
     """Month-end surplus disposition: savings share monthly, invest
-    share in cadence months, both bounded by the staging cap."""
+    share in cadence months, both bounded by the staging cap. The
+    surplus is read AS OF ``month_end``; the bank transfer posts on
+    ``post`` (``ach_date`` — the last business day on or before it;
+    default: the month-end itself)."""
+    post = post or month_end
     checking = _balance(book, policy.checking, month_end)
     surplus = checking - policy.buffer
 
@@ -333,18 +579,18 @@ def _sweep(book: GnuCashBook, policy: PersonaPolicy, book_path: Path,
     # person makes when checking runs thin — Sabine's Bankkonto lives
     # this way). The sweep is the HIGH side of the same corridor.
     if checking < policy.buffer * D("0.5"):
-        available = _balance(book, policy.savings, month_end)
+        available = _balance(book, policy.savings, month_end) - policy.savings_floor
         topup = min(policy.buffer - checking, available).quantize(D("0.01"))
         if topup >= policy.min_sweep:
             book.create_transaction(
-                description=policy.desc_topup, trans_date=month_end,
+                description=policy.desc_topup, trans_date=post,
                 splits=[
                     {"account": policy.savings, "amount": str(-topup)},
                     {"account": policy.checking, "amount": str(topup)},
                 ],
                 check_duplicates=False,
             )
-            log.append(f"topup←savings: {topup} on {month_end}")
+            log.append(f"topup←savings: {topup} on {post}")
         return
 
     if surplus < policy.min_sweep:
@@ -370,14 +616,14 @@ def _sweep(book: GnuCashBook, policy: PersonaPolicy, book_path: Path,
     if to_savings >= policy.min_sweep:
         desc = policy.desc_repair_sweep if staged else policy.desc_sweep
         book.create_transaction(
-            description=desc, trans_date=month_end,
+            description=desc, trans_date=post,
             splits=[
                 {"account": policy.checking, "amount": str(-to_savings)},
                 {"account": policy.savings, "amount": str(to_savings)},
             ],
             check_duplicates=False,
         )
-        log.append(f"sweep→savings: {to_savings} on {month_end}"
+        log.append(f"sweep→savings: {to_savings} on {post}"
                    + (" (staged)" if staged else ""))
 
     if to_invest >= policy.min_sweep:
@@ -401,6 +647,87 @@ def _rebalance(book: GnuCashBook, policy: PersonaPolicy, book_path: Path,
         return
     policy.invest(book_path, month_end, tranche, policy.savings)
     log.append(f"rebalance savings→invest: {tranche} on {month_end}")
+
+
+def _savings_interest(book: GnuCashBook, policy: PersonaPolicy,
+                      month_end: date, log: list[str]) -> None:
+    """Monthly interest on the savings pile: APY/12 on the balance at
+    the PRIOR month end (so same-day sweeps don't compound within the
+    month), credited on ``month_end``. Idle money earns something
+    (audit B6)."""
+    if policy.savings_apy is None or policy.interest_income is None:
+        return
+    prev = month_end.replace(day=1) - timedelta(days=1)
+    principal = _balance(book, policy.savings, prev)
+    interest = (principal * policy.savings_apy / D("12")).quantize(D("0.01"))
+    if interest <= 0:
+        return
+    book.create_transaction(
+        description=policy.desc_savings_interest.format(
+            month=month_end.strftime("%B %Y")),
+        trans_date=month_end,
+        splits=[
+            {"account": policy.savings, "amount": str(interest)},
+            {"account": policy.interest_income, "amount": str(-interest)},
+        ],
+        check_duplicates=False,
+    )
+    log.append(f"savings interest: {interest} on {month_end}")
+
+
+def _owner_draw(book: GnuCashBook, policy: PersonaPolicy, month_end: date,
+                log: list[str], post: date | None = None) -> None:
+    """Month-end owner's draw: everything in the business account above
+    its floor (working capital + the reserve accrued so far this year)
+    moves to the household, rounded down to the hundred. Through the
+    equity clearing account when one is configured: the LLC side
+    debits Owner's Draw, the household side credits it back, so the
+    LLC's register shows the draw against equity and the combined
+    book's net worth is unchanged. The balance is read AS OF
+    ``month_end``; the transfer posts on ``post`` (``ach_date``;
+    default: the month-end itself)."""
+    if policy.business_checking is None:
+        return
+    post = post or month_end
+    reserve = (policy.business_reserve_monthly * month_end.month
+               if month_end.month != 12 else D("0"))
+    floor = policy.business_buffer + reserve
+    balance = _balance(book, policy.business_checking, month_end)
+    draw = ((balance - floor) / D("100")).to_integral_value(
+        rounding="ROUND_FLOOR") * D("100")
+    if draw < policy.min_sweep:
+        return
+    month = month_end.strftime("%B %Y")
+    if policy.draw_equity is None:
+        book.create_transaction(
+            description=policy.desc_draw.format(month=month),
+            trans_date=post,
+            splits=[
+                {"account": policy.business_checking, "amount": str(-draw)},
+                {"account": policy.checking, "amount": str(draw)},
+            ],
+            check_duplicates=False,
+        )
+    else:
+        book.create_transaction(
+            description=policy.desc_draw.format(month=month),
+            trans_date=post,
+            splits=[
+                {"account": policy.business_checking, "amount": str(-draw)},
+                {"account": policy.draw_equity, "amount": str(draw)},
+            ],
+            check_duplicates=False,
+        )
+        book.create_transaction(
+            description=policy.desc_draw_deposit.format(month=month),
+            trans_date=post,
+            splits=[
+                {"account": policy.draw_equity, "amount": str(-draw)},
+                {"account": policy.checking, "amount": str(draw)},
+            ],
+            check_duplicates=False,
+        )
+    log.append(f"owner's draw: {draw} on {post} (floor {floor})")
 
 
 def _card_closes(book: GnuCashBook, card: CardPolicy, cutoff: date,
@@ -439,12 +766,29 @@ def run_policy(policy: PersonaPolicy, book_path: Path, cutoff: date,
     events += [(e, "monthend", None) for e in month_ends(cutoff, through)]
     events.sort(key=lambda t: (t[0], t[1]))  # card pass before sweep on ties
 
+    walked = cutoff
     for when, kind, payload in events:
         if kind == "card":
             _pay_card(book, policy, payload, when, cutoff, through, log)
         else:
-            _sweep(book, policy, book_path, when, log)
+            # The floor pass covers the month's days first; then
+            # interest and the owner's draw land so the sweep sees the
+            # month's true household surplus. Interest keeps the
+            # calendar month-end (a bank's value date); the draw and
+            # the sweep are ACH moves and post on the last business
+            # day on or before it when the persona names a calendar.
+            post = ach_date(policy, when, cutoff)
+            _floor_topups(book, policy, book_path,
+                          walked + timedelta(days=1), when, log)
+            _savings_interest(book, policy, when, log)
+            _owner_draw(book, policy, when, log, post=post)
+            _sweep(book, policy, book_path, when, log, post=post)
             _rebalance(book, policy, book_path, when, log)
+            walked = when
+    # A partial last month has no sweep, but its days still get the
+    # floor pass (a build pinned to the 17th holds the invariant too).
+    _floor_topups(book, policy, book_path, walked + timedelta(days=1),
+                  through, log)
     return log
 
 
@@ -465,7 +809,10 @@ def settle_documents(policy: PersonaPolicy, book_path: Path, cutoff: date,
     genuinely recent open documents is preserved by construction."""
     log: list[str] = []
     book = GnuCashBook(str(book_path))
-    pay_from = payment_account or policy.checking
+    # Documents are the business's: settle against its account when
+    # the persona keeps one.
+    pay_from = (payment_account or policy.business_checking
+                or policy.checking)
 
     owner_by_type = {"invoice": "customer", "bill": "vendor",
                      "voucher": "employee"}
@@ -483,6 +830,7 @@ def settle_documents(policy: PersonaPolicy, book_path: Path, cutoff: date,
         if pay_date <= cutoff:
             pay_date = cutoff + timedelta(
                 days=_seeded(policy.key, "settle-late", posted, 4, 12))
+        pay_date = business_day(pay_date, policy.holidays)
         if pay_date > through:
             continue  # stays open — the recent window
         amount = D(str(doc.get("amount_due", "0")))
@@ -514,10 +862,16 @@ def reconcile_through(policy: PersonaPolicy, book_path: Path,
     open month leaves the natural first conversation ("this month's
     statement is ready to enter").
 
-    Dogfoods ``reconcile_account`` in bulk mode: the statement balance
-    is computed from the book (non-voided split quantities through the
-    statement date), so the server's own tie check verifies the sweep.
-    Idempotent — an account with nothing unreconciled is skipped."""
+    One ``reconcile_account`` call PER STATEMENT (Alex cold audit C1: a
+    single stamp across twenty months of statements is a generation
+    artifact — every reconciled split carries the date of the statement
+    that cleared it). Bank and cash accounts close at month-end; a card
+    closes on its ``statement_close_day`` slot. Dogfoods bulk mode: the
+    statement balance is computed from the book (non-voided split
+    quantities through the statement date), so the server's own tie
+    check verifies every sweep. Idempotent — a statement with nothing
+    unreconciled is skipped, so a continued book stamps only its new
+    months."""
     import piecash
 
     stmt = date(through.year, through.month, 1) - timedelta(days=1)
@@ -529,9 +883,11 @@ def reconcile_through(policy: PersonaPolicy, book_path: Path,
     for fullname in policy.no_reconcile:
         book.set_account_slot(fullname, "no_reconcile", "true")
 
-    # Enumerate reconcilable accounts + compute statement balances in
-    # one readonly pass (Decimal aggregation in Python — never in SQL).
-    targets: list[tuple[str, D, int]] = []
+    close_days = {card.account: card.close_day_default for card in policy.cards}
+
+    # Enumerate reconcilable accounts + their split ledgers in one
+    # readonly pass (Decimal aggregation in Python — never in SQL).
+    targets: list[tuple[str, str, list[tuple[date, D, bool]]]] = []
     gc_book = piecash.open_book(str(book_path), readonly=True,
                                 open_if_lock=True)
     try:
@@ -548,43 +904,199 @@ def reconcile_through(policy: PersonaPolicy, book_path: Path,
                 root = root.parent
             if root is template_root:
                 continue
-            balance = D("0")
-            pending = 0
+            rows: list[tuple[date, D, bool]] = []
             for split in account.splits:
                 if split.reconcile_state == "v":
                     continue
                 post = split.transaction.post_date
                 if post is None or post > stmt:
                     continue
-                balance += D(str(split.quantity))
-                if split.reconcile_state != "y":
-                    pending += 1
-            targets.append((account.fullname, balance, pending))
+                rows.append((post, D(str(split.quantity)),
+                             split.reconcile_state == "y"))
+            rows.sort(key=lambda r: r[0])
+            targets.append((account.fullname, account.type, rows))
     finally:
         gc_book.close()
 
     book = GnuCashBook(str(book_path))
-    for fullname, balance, pending in targets:
-        if pending == 0:
+    for fullname, atype, rows in targets:
+        if not rows:
             continue
-        result = book.reconcile_account(
-            fullname, statement_date=stmt, statement_balance=str(balance),
-            reconcile_all=True,
-        )
-        log.append(f"reconciled {fullname} through {stmt}: "
-                   f"{result.get('splits_reconciled')} splits")
+        close_day = None
+        if atype == "CREDIT":
+            close_day = _slot_int(book, fullname, "statement_close_day",
+                                  close_days.get(fullname, 31))
+        # Statement dates from the account's first activity to ``stmt``.
+        first = rows[0][0]
+        y, m = first.year, first.month
+        statements: list[date] = []
+        while True:
+            s = (_clamp_day(y, m, 31) if close_day is None
+                 else _clamp_day(y, m, close_day))
+            if s > stmt:
+                break
+            if s >= first:
+                statements.append(s)
+            y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+        n_calls = n_splits = 0
+        last: date | None = None
+        for s in statements:
+            balance = sum((q for post, q, _y in rows if post <= s), D("0"))
+            pending = [i for i, (post, _q, done) in enumerate(rows)
+                       if post <= s and not done]
+            if not pending:
+                continue
+            result = book.reconcile_account(
+                fullname, statement_date=s, statement_balance=str(balance),
+                reconcile_all=True,
+            )
+            for i in pending:
+                post, q, _done = rows[i]
+                rows[i] = (post, q, True)
+            n_calls += 1
+            n_splits += int(result.get("splits_reconciled") or 0)
+            last = s
+        if n_calls:
+            log.append(f"reconciled {fullname}: {n_splits} splits across "
+                       f"{n_calls} statements, last {last}")
     return log
+
+
+# ── Entry timestamps ────────────────────────────────────────────
+
+def stamp_enter_dates(book_path: Path, after: date | None = None) -> int:
+    """Set every transaction's ``enter_date`` to its POST DAY (noon UTC
+    plus a few seconds of write order), so a generated book does not
+    say every row was keyed in at the build moment (Alex cold audit
+    item 5, 2026-09-17). Rows posted at or before ``after`` are left
+    alone — the frozen prefix is never rewritten. The clone-side
+    updater does not call this: its rows really are entered when it
+    runs. Same-day rows keep the order they were written in (the
+    server's listing sort reads ``enter_date`` to break post-date
+    ties). Returns the number of rows rewritten."""
+    con = sqlite3.connect(str(book_path))
+    try:
+        rows = con.execute(
+            "SELECT guid, date(post_date) AS d, enter_date FROM transactions "
+            "ORDER BY date(post_date), enter_date, guid"
+        ).fetchall()
+        updates: list[tuple[str, str]] = []
+        day, k = None, 0
+        for guid, d, _entered in rows:
+            if after is not None and date.fromisoformat(d) <= after:
+                continue
+            if d != day:
+                day, k = d, 0
+            secs = 12 * 3600 + k * 23
+            stamp = f"{d} {secs // 3600:02d}:{secs % 3600 // 60:02d}:{secs % 60:02d}"
+            updates.append((stamp, guid))
+            k += 1
+        con.executemany(
+            "UPDATE transactions SET enter_date = ? WHERE guid = ?", updates)
+        con.commit()
+    finally:
+        con.close()
+    return len(updates)
 
 
 # ── Scheduled-transaction cursors (bookkeeper review §2) ────────
 
+def sx_instances(book_path: Path, through: date) -> dict[str, list[tuple[str, date]]]:
+    """Each schedule's instances in the ledger: ``{sx guid: [(txn guid,
+    post date)]}``, oldest first. An instance carries the template's
+    description, either alone, with a parenthesised suffix (Lin Wei's
+    overtime payslips), or after the schedule's name ("Electric -
+    Seattle City Light", Alex's statement style), and touches every
+    account the template's legs name. Template transactions are not
+    ledger rows."""
+    con = sqlite3.connect(f"file:{book_path}?mode=ro", uri=True)
+    try:
+        templates = {}
+        for sx_guid, name, desc, acct in con.execute("""
+            SELECT s.guid, s.name, t.description, sa.guid_val
+            FROM schedxactions s
+            JOIN splits sp ON sp.account_guid = s.template_act_guid
+            JOIN transactions t ON t.guid = sp.tx_guid
+            JOIN slots f ON f.obj_guid = sp.guid AND f.name = 'sched-xaction'
+            JOIN slots sa ON sa.obj_guid = f.guid_val
+                         AND sa.name = 'sched-xaction/account'
+        """):
+            entry = templates.setdefault(sx_guid, (name, desc, set()))
+            entry[2].add(acct)
+        template_txns = {row[0] for row in con.execute("""
+            SELECT sp.tx_guid FROM splits sp
+            JOIN accounts a ON a.guid = sp.account_guid
+            JOIN commodities c ON c.guid = a.commodity_guid
+            WHERE c.namespace = 'template'
+        """)}
+        ledger: dict[str, tuple[str, date, set]] = {}
+        for guid, desc, posted, acct in con.execute("""
+            SELECT t.guid, t.description, date(t.post_date), sp.account_guid
+            FROM transactions t JOIN splits sp ON sp.tx_guid = t.guid
+            WHERE date(t.post_date) <= ?
+        """, (through.isoformat(),)):
+            if guid in template_txns:
+                continue
+            entry = ledger.setdefault(
+                guid, (desc, date.fromisoformat(posted), set()))
+            entry[2].add(acct)
+    finally:
+        con.close()
+    found: dict[str, list[tuple[str, date]]] = {}
+    for sx_guid, (name, desc, accts) in templates.items():
+        forms = (desc, f"{name} - {desc}")
+        found[sx_guid] = sorted(
+            ((guid, posted) for guid, (tdesc, posted, taccts) in ledger.items()
+             if (tdesc in forms or tdesc.startswith(desc + " ("))
+             and accts <= taccts),
+            key=lambda r: (r[1], r[0]),
+        )
+    return found
+
+
+def write_sx_stamps(book_path: Path, pairs: list[tuple[str, str]]) -> int:
+    """Stamp ``(txn guid, sx guid)`` pairs as desktop's Since Last Run
+    and the server's create_transaction_from_scheduled do: a
+    ``from-sched-xaction`` GUID slot (type 5) with the filler columns
+    GnuCash leaves. Already-stamped transactions are skipped. Returns
+    the number of stamps written."""
+    con = sqlite3.connect(str(book_path))
+    try:
+        have = {row[0] for row in con.execute(
+            "SELECT obj_guid FROM slots WHERE name = 'from-sched-xaction'")}
+        n = 0
+        for txn_guid, sx_guid in pairs:
+            if txn_guid in have:
+                continue
+            con.execute(
+                "INSERT INTO slots (obj_guid, name, slot_type, int64_val, "
+                "timespec_val, guid_val, numeric_val_num, "
+                "numeric_val_denom) VALUES (?, 'from-sched-xaction', 5, "
+                "0, '1970-01-01 00:00:00', ?, 0, 1)", (txn_guid, sx_guid))
+            have.add(txn_guid)
+            n += 1
+        con.commit()
+    finally:
+        con.close()
+    return n
+
+
+def stamp_sx_instances(book_path: Path, through: date) -> int:
+    """Stamp every instance ``sx_instances`` finds. A builder that knows
+    its instances as it writes them (Alex) stamps them there; this pass
+    then finds them already stamped."""
+    return write_sx_stamps(book_path, [
+        (txn_guid, sx_guid)
+        for sx_guid, rows in sx_instances(book_path, through).items()
+        for txn_guid, _posted in rows
+    ])
+
+
 def advance_sx(book_path: Path, through: date) -> dict:
-    """Stamp every enabled SX's ``last_occur`` so its next occurrence
-    is upcoming — with AT MOST ONE schedule per book left overdue, and
-    only when its missed occurrence fell 3–7 days before ``through``
-    ("just came due", the bookkeeper's review §2). Books where no schedule
-    lands in that window get zero overdue and rely on the due-soon
-    line as the hook.
+    """Stamp every enabled SX's ``last_occur`` at its last occurrence on
+    or before ``through``, so every next occurrence is upcoming: the
+    books are current to the close, with no schedule overdue. Then
+    stamp the instances (``stamp_sx_instances``).
 
     Set directly via piecash: ``last_occur`` is GnuCash desktop's
     "Since Last Run" cursor, deliberately not exposed by the public
@@ -599,7 +1111,11 @@ def advance_sx(book_path: Path, through: date) -> dict:
         "quarterly": relativedelta(months=3),
         "yearly": relativedelta(years=1),
     }
-    info = {"enabled": 0, "upcoming": 0, "overdue": 0}
+    info = {"enabled": 0, "upcoming": 0}
+    latest_instance = {
+        sx_guid: rows[-1][1]
+        for sx_guid, rows in sx_instances(book_path, through).items() if rows
+    }
 
     book = piecash.open_book(str(book_path), readonly=False, do_backup=False)
     try:
@@ -628,23 +1144,15 @@ def advance_sx(book_path: Path, through: date) -> dict:
                 cur = cur + period[freq]
             rows.append((sx, occs))
 
-        # The one just-came-due hook: closest miss inside the window,
-        # name as the deterministic tie-break.
-        window = [
-            (sx, occs) for sx, occs in rows
-            if len(occs) >= 2 and 3 <= (through - occs[-1]).days <= 7
-        ]
-        window.sort(key=lambda r: ((through - r[1][-1]).days, r[0].name))
-        overdue_sx = window[0][0] if window else None
-
+        # Every cursor at its last occurrence on or before ``through``,
+        # or at its latest posted instance when that is later (a bill
+        # paid ahead of its date): current to the close, nothing
+        # overdue, never behind the ledger.
         for sx, occs in rows:
-            if not occs:
-                last = None
-            elif sx is overdue_sx:
-                last = occs[-2]
-                info["overdue"] += 1
-            else:
-                last = occs[-1]
+            dates = [d for d in (occs[-1] if occs else None,
+                                 latest_instance.get(sx.guid)) if d]
+            last = max(dates) if dates else None
+            if last is not None:
                 info["upcoming"] += 1
             sx.enabled = 1
             sx.last_occur = last
@@ -652,6 +1160,7 @@ def advance_sx(book_path: Path, through: date) -> dict:
         book.save()
     finally:
         book.close()
+    info["stamped"] = stamp_sx_instances(book_path, through)
     return info
 
 
@@ -678,6 +1187,12 @@ def verify_invariants(policy: PersonaPolicy, book_path: Path, cutoff: date,
             warnings.append(
                 f"buffer band: checking {checking} outside "
                 f"[{lo}, {hi}] at {month_end}")
+        if policy.business_checking is not None:
+            business = _balance(book, policy.business_checking, month_end)
+            if business < 0:
+                raise SystemExit(
+                    f"{policy.key}: OVERDRAFT — business checking "
+                    f"{business} at {month_end}")
         for card in policy.cards:
             limit = limits[card.account]
             owed = -_balance(book, card.account, month_end)
@@ -686,6 +1201,19 @@ def verify_invariants(policy: PersonaPolicy, book_path: Path, cutoff: date,
                     f"{policy.key}: {card.label} owes {owed} over limit "
                     f"{limit} at {month_end}")
 
+    if policy.floor is not None:
+        start = cutoff + timedelta(days=1)
+        bal = _balance(book, policy.checking, cutoff)
+        net = daily_net(book_path, policy.checking, start, through)
+        d = start
+        while d <= through:
+            bal += net.get(d, D("0"))
+            if bal < 0:
+                raise SystemExit(
+                    f"{policy.key}: OVERDRAFT — checking {bal} at day-end "
+                    f"{d}")
+            d += timedelta(days=1)
+
     for card in policy.cards:
         if card.kind != "pif":
             continue
@@ -693,7 +1221,8 @@ def verify_invariants(policy: PersonaPolicy, book_path: Path, cutoff: date,
         # that landed during the payment lag — a fraction of a cycle.
         for close in _card_closes(book, card, cutoff, through):
             lag = _seeded(policy.key, f"paylag:{card.label}", close, 3, 7)
-            pay_date = close + timedelta(days=lag)
+            pay_date = business_day(close + timedelta(days=lag),
+                                    policy.holidays)
             if pay_date <= cutoff or pay_date > through:
                 continue
             residual = -_balance(book, card.account, pay_date)

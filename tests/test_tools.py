@@ -64,7 +64,7 @@ class TestGetBookSummaryTool:
         assert isinstance(result, str)
         assert "Book:" in result
         assert "Currency: USD" in result
-        assert "Accounts:" in result
+        assert "Chart of accounts:" in result
         # The bottom-line "Net worth:" line was retired in favor of
         # the trajectory section's "now" anchor — single source of
         # truth for the net-worth number.
@@ -628,6 +628,61 @@ class TestReconcileAccountTool:
 
         data = json.loads(result)
         assert data["status"] == "reconciled"
+
+    def test_closing_balance_is_the_shared_name(self, setup_book_env):
+        """``closing_balance`` — the name enter_statement uses — is
+        accepted; ``statement_balance`` still works; both given and
+        disagreeing is refused; neither is refused (bookkeeper
+        route-around 3, ruled 2026-09-29)."""
+        from decimal import Decimal
+
+        unreconciled = json.loads(
+            server_module.get_unreconciled_splits("Assets:Checking", verbose=True)
+        )
+        total = sum((Decimal(s["amount"]) for s in unreconciled["splits"]), Decimal("0"))
+        guids = [s["guid"] for s in unreconciled["splits"]]
+
+        data = json.loads(server_module.reconcile_account(
+            account="Assets:Checking", statement_date="2024-01-31",
+            closing_balance=str(total), statement_balance="1.00",
+            split_guids=guids,
+        ))
+        assert "disagree" in data["error"]
+        data = json.loads(server_module.reconcile_account(
+            account="Assets:Checking", statement_date="2024-01-31",
+            split_guids=guids,
+        ))
+        assert "closing_balance is required" in data["error"]
+        data = json.loads(server_module.reconcile_account(
+            account="Assets:Checking", statement_date="2024-01-31",
+            closing_balance=str(total), split_guids=guids,
+        ))
+        assert data["status"] == "reconciled"
+        assert "warning" not in data
+
+    def test_future_statement_date_warns(self, setup_book_env):
+        """A statement is not dated in the future: the reconcile goes
+        through and the response carries the warning."""
+        from datetime import date as _date
+        from datetime import timedelta
+        from decimal import Decimal
+
+        unreconciled = json.loads(
+            server_module.get_unreconciled_splits("Assets:Checking", verbose=True)
+        )
+        total = sum((Decimal(s["amount"]) for s in unreconciled["splits"]), Decimal("0"))
+        guids = [s["guid"] for s in unreconciled["splits"]]
+        tomorrow = (_date.today() + timedelta(days=1)).isoformat()
+        data = json.loads(server_module.reconcile_account(
+            account="Assets:Checking", statement_date=tomorrow,
+            closing_balance=str(total), split_guids=guids,
+        ))
+        assert data["status"] == "reconciled"
+        assert data["warning"] == (
+            f"statement_date {tomorrow} is after today "
+            f"({_date.today().isoformat()}) — a statement is not dated "
+            f"in the future; check the transcription"
+        )
 
     def test_reconcile_account_balance_mismatch(self, setup_book_env):
         """Should return error when balance doesn't match."""
@@ -1320,6 +1375,62 @@ class TestConsolidatedBusinessSurface:
         assert paid["status"] == "paid"
         assert float(paid["remaining_balance"]) == 0.0
 
+    def test_overpayment_and_settling_from_it_through_the_tools(
+        self, setup_book_env,
+    ):
+        """``pay_document`` with no payment_account or amount is a
+        valid call once ``from_prepayment`` is set — the schema must
+        let it through (adversarial review 2026-09-30, C37 / C50)."""
+        server_module.create_account(
+            name="Accounts Receivable", account_type="RECEIVABLE",
+            parent="Assets",
+        )
+        c = json.loads(server_module.create_party(
+            party_type="customer", name="Acme Corp",
+        ))
+        ids = []
+        for price in ("100.00", "50.00"):
+            doc = json.loads(server_module.create_document(
+                document_type="invoice", owner_id=c["id"],
+            ))
+            server_module.add_document_entry(
+                document_type="invoice", id=doc["id"],
+                account="Income:Salary", description="Work",
+                quantity="1", price=price,
+            )
+            posted = json.loads(server_module.post_document(
+                id=doc["id"], document_type="invoice",
+                post_account="Assets:Accounts Receivable",
+            ))
+            assert posted.get("error") is None, posted
+            ids.append(doc["id"])
+
+        refused = json.loads(server_module.pay_document(
+            id=ids[0], document_type="invoice",
+            payment_account="Assets:Checking", amount="120.00",
+        ))
+        assert "allow_prepayment" in refused["error"]
+
+        paid = json.loads(server_module.pay_document(
+            id=ids[0], document_type="invoice",
+            payment_account="Assets:Checking", amount="120.00",
+            allow_prepayment=True,
+        ))
+        assert paid["prepayment"]["amount"] == "20.00"
+        assert "Unapplied payments" in server_module.get_outstanding_documents()
+
+        settled = json.loads(server_module.pay_document(
+            id=ids[1], document_type="invoice", from_prepayment=True,
+        ))
+        assert settled.get("error") is None, settled
+        assert settled["applied_from_prepayment"] == "20.00"
+        assert settled["remaining_balance"] == "30.00"
+
+        unposted = json.loads(server_module.unpost_document(
+            id=ids[0], document_type="invoice",
+        ))
+        assert unposted["payments_kept"][0]["amount"] == "100.00"
+
     def test_delete_document_unposted_invoice(self, setup_book_env):
         c = json.loads(server_module.create_party(
             party_type="customer", name="Ephemeral LLC",
@@ -1362,6 +1473,62 @@ class TestConsolidatedBusinessSurface:
             document_type="invoice", owner_id=c["id"],
         ))
         assert ok.get("error") is None, ok
+
+    def test_apply_credit_note_speaks_its_siblings_names(
+        self, setup_book_env,
+    ):
+        """Every document tool takes the document as ``id``, and
+        credit-note creation names its target ``applies_to_id``;
+        apply_credit_note now does too (the bookkeeper tripped on
+        credit_note_id / applies_to_invoice_id, 2026-09-27). The audit
+        line names both documents."""
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+
+        server_module.create_account(
+            name="Accounts Receivable", account_type="RECEIVABLE",
+            parent="Assets",
+        )
+        c = json.loads(server_module.create_party(
+            party_type="customer", name="Symmetry LLC",
+        ))
+        docs = {}
+        for kind, price in (("invoice", "500.00"), ("credit_note", "100.00")):
+            extra = (
+                {"party_type": "customer", "applies_to_id": docs["invoice"]}
+                if kind == "credit_note" else {}
+            )
+            doc = json.loads(server_module.create_document(
+                document_type=kind, owner_id=c["id"], **extra,
+            ))
+            docs[kind] = doc["id"]
+            server_module.add_document_entry(
+                document_type=kind, id=doc["id"], account="Income:Salary",
+                description="Work", quantity="1", price=price,
+                **({"party_type": "customer"} if kind == "credit_note" else {}),
+            )
+            posted = json.loads(server_module.post_document(
+                id=doc["id"], document_type=kind,
+                post_account="Assets:Accounts Receivable",
+                **({"party_type": "customer"} if kind == "credit_note" else {}),
+            ))
+            assert posted.get("error") is None, posted
+
+        result = json.loads(server_module.apply_credit_note(
+            id=docs["credit_note"], applies_to_id=docs["invoice"],
+            party_type="customer",
+        ))
+        assert result["status"] == "applied", result
+        assert result["amount_applied"] == "100.00"
+
+        rendered = _format_audit_entry_text({
+            "classification": "write", "entity_type": "credit_note",
+            "operation": "apply", "timestamp": "2026-09-27T12:00:00",
+            "params": {"id": docs["credit_note"],
+                       "applies_to_id": docs["invoice"]},
+            "after_state": result,
+        })
+        assert f"APPLY CREDIT NOTE  id:{docs['credit_note']}" in rendered
+        assert f"against: {docs['invoice']}" in rendered
 
     def test_delete_document_credit_note_id_collision(
         self, setup_book_env,

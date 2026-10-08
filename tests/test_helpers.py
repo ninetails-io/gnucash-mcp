@@ -153,9 +153,11 @@ class TestApplyLimit:
         items, notice = _apply_limit(list(range(100)), limit=0, default=10)
         assert len(items) == 10
 
-    def test_negative_limit_uses_default(self):
-        items, notice = _apply_limit(list(range(100)), limit=-5, default=10)
-        assert len(items) == 10
+    def test_negative_limit_is_refused(self):
+        """``limit=-5`` silently became the default page (adversarial
+        review 2026-09-30, IV-27)."""
+        with pytest.raises(ValueError, match="limit must be 0 or a positive"):
+            _apply_limit(list(range(100)), limit=-5, default=10)
 
     # ── Server-side cap ──────────────────────────────────────────
 
@@ -410,12 +412,10 @@ class TestPaginate:
         )
         assert len(page) == 10
 
-    def test_negative_offset_clamps_to_zero(self):
-        page, ind = _paginate(
-            list(range(10)), offset=-5, entity_name="x"
-        )
-        assert page == list(range(10))
-        assert ind == "Showing 1-10 of 10 x"
+    def test_negative_offset_is_refused(self):
+        # Was silently clamped to 0 (scoped review 2026-10-06, IN-20).
+        with pytest.raises(ValueError, match="offset must be"):
+            _paginate(list(range(10)), offset=-5, entity_name="x")
 
     def test_indicator_always_returned(self):
         # The contract: indicator is never None, for any input.

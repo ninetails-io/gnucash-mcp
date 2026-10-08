@@ -9,6 +9,8 @@ way (pure lazy-load orchestration, no hardcoded imports).
 from datetime import date
 
 from gnucash_mcp._format import (
+    _BATCH_CONTRACT,
+    _batch_row_fixed,
     _batch_row_splits,
     _batch_tsv_layout,
     _parse_statement_tsv,
@@ -33,8 +35,8 @@ def _parse_transactions_tsv(tsv: str) -> list[dict]:
     documented base header parses as positional ``(amount, account)``
     pairs exactly as before; ``memo`` and/or ``qty`` split columns
     widen each split group accordingly (field order per the header's
-    first group); a ``notes`` token in column 4 inserts a
-    per-transaction notes column after ``description``. Unknown or
+    first group); ``notes``, ``num``, ``link``, and ``cur`` tokens
+    after ``description`` insert per-transaction columns. Unknown or
     typo'd column names reject with the offending name.
 
     Rows may be ragged (2 splits vs 3). Raises ValueError on a
@@ -44,7 +46,8 @@ def _parse_transactions_tsv(tsv: str) -> list[dict]:
     lines = _tsv_lines(tsv, "the transactions TSV")
     if len(lines) < 2:
         raise ValueError(
-            "transactions TSV needs a header row and at least one data row"
+            "transactions TSV needs a header row and at least one data row; "
+            + _BATCH_CONTRACT
         )
     layout = _batch_tsv_layout(lines[0])
     group = layout["group"]
@@ -75,18 +78,26 @@ def _parse_transactions_tsv(tsv: str) -> list[dict]:
                 splits = _batch_row_splits(fields[fixed:], group)
             except ValueError as e:
                 raise ValueError(f"row {i} (ref {ref!r}): {e}")
+        # Same contract as enter_statement: a blank date cell is
+        # a format error, never a silent default to today — the
+        # results table carries no date, so a defaulted row would
+        # leave no trace of what it was booked on.
+        try:
+            trans_date = _parse_iso_date(dt)
+        except ValueError as e:
+            raise ValueError(f"row {i} (ref {ref!r}): {e}") from None
+        if trans_date is None:
+            raise ValueError(
+                f"row {i} (ref {ref!r}): date {dt!r} is not a valid "
+                f"YYYY-MM-DD date"
+            )
         txn = {
             "ref": ref,
-            "date": _parse_iso_date(dt) or date.today(),
+            "date": trans_date,
             "description": desc,
             "splits": splits,
         }
-        ni = layout["notes_idx"]
-        if ni is not None and len(fields) > ni and fields[ni].strip():
-            txn["notes"] = fields[ni].strip()
-        ci = layout["cur_idx"]
-        if ci is not None and len(fields) > ci and fields[ci].strip():
-            txn["currency"] = fields[ci].strip().upper()
+        txn.update(_batch_row_fixed(fields, layout))
         out.append(txn)
     return out
 
@@ -112,8 +123,12 @@ def register(mcp, get_book) -> None:
         # is added here, not in get_book_summary itself.
         from gnucash_mcp import server as _server
         if _server.multi_book_active():
-            from gnucash_mcp._format import _book_display_name
-            name = _book_display_name(book.book_path)
+            # source.display_name, not book_path: unreachable for a
+            # DB book today (multi_book_active() is False in URI
+            # mode) but this is the naming rule, and the trap it
+            # avoids — "not set" for a pathless book — is exactly
+            # what a future multi-book-over-URI would hit.
+            name = book.source.display_name
             count = len(_server._book_paths)
             summary = (
                 f"Current book: {name} ({count} books available — "
@@ -146,7 +161,9 @@ def register(mcp, get_book) -> None:
         transactions by text or amount, use ``search_transactions``.
 
         Args:
-            root: Filter to a subtree (e.g., "Expenses" for expense accounts only).
+            root: Subtree to list. Account name ("Assets:Checking") or %short guid ("%d53d547").
+                Prefix-matched on the path, so a second-level
+                branch ("Expenses:Auto") works too.
             verbose: If false (default), compact text output — optimized
                 for reading and token efficiency. If true, structured
                 JSON, for when you need machine-readable fields rather
@@ -179,7 +196,7 @@ def register(mcp, get_book) -> None:
         (APR, credit_limit, ...).
 
         Args:
-            name: Account ref: full path (e.g. 'Assets:Bank:Checking'), %short GUID, or full 32-char GUID
+            name: Account name ("Assets:Checking") or %short guid ("%d53d547").
         """
         book = get_book()
         result = book.get_account(name)
@@ -199,7 +216,7 @@ def register(mcp, get_book) -> None:
         an explicit ``as_of_date`` past today.
 
         Args:
-            account_name: Account ref: full path (e.g. 'Assets:Bank:Checking'), %short GUID, or full 32-char GUID
+            account_name: Account name ("Assets:Checking") or %short guid ("%d53d547").
             as_of_date: Date in ISO format (YYYY-MM-DD). Defaults to today.
         """
         book = get_book()
@@ -244,13 +261,23 @@ def register(mcp, get_book) -> None:
           ``DATE<TAB>guid<TAB>±Amount<TAB>Description<TAB>other splits``
           Column 3 is the signed impact on the filtered account; that
           account is dropped from the splits column.
+        - Either form then adds the notes when present, and a
+          labeled ``num:<number>`` cell when the transaction has a
+          Num.
+        - In a book with "Use Split Action Field for Number" on,
+          each account register's Num is that account's split
+          action: the register form's ``num:`` is the filtered
+          account's, a ``tnum:`` cell carries the transaction's own
+          number (desktop's T-Num), and the unfiltered form tags
+          each leg's number as ``#<number>``.
 
         Transactions with more than 4 splits collapse to the top 3 by
         |value| plus ``+N more`` — call ``get_transaction`` for the
         full breakdown.
 
         Args:
-            account: Filter by account name (switches output to register form)
+            account: Account name ("Assets:Checking") or %short guid ("%d53d547").
+                Filtering switches output to register form.
             start_date: Start date in ISO format (YYYY-MM-DD)
             end_date: End date in ISO format (YYYY-MM-DD)
             limit: Page size (default 50, max 250). 0 = count only.
@@ -277,6 +304,13 @@ def register(mcp, get_book) -> None:
         guid: TransactionGuid,
     ) -> str:
         """Get details for a specific transaction by GUID.
+
+        Returns its splits (account, value, quantity, memo,
+        ``action``, reconcile state) and, when set, ``notes``,
+        ``num`` (GnuCash's Num column) and ``doc_link`` (the
+        transaction's document link). In a book with "Use Split
+        Action Field for Number" on, a register's Num is that
+        account's split ``action``.
 
         Args:
             guid: Transaction GUID (32-character hex string, or 8+ char prefix)
@@ -311,6 +345,12 @@ def register(mcp, get_book) -> None:
 
             ref<TAB>date<TAB>description<TAB>amt1<TAB>acct1<TAB>amt2<TAB>acct2...
             1<TAB>2026-05-21<TAB>Gas<TAB>-54.19<TAB>Assets:Checking<TAB>54.19<TAB>Expenses:Auto:Fuel
+
+        An ``acct`` cell is an account name ("Assets:Checking") or a
+        %short guid ("%d53d547") as list_accounts prints them.
+        In wide batches, %guids in ``acct`` cells shrink the payload;
+        nothing is lost — the audit log records the resolved account
+        names regardless of which form the call used.
 
         Two opt-in extensions, each activated by naming it in the
         header (legacy headers parse exactly as before):
@@ -353,6 +393,26 @@ def register(mcp, get_book) -> None:
           Splits on accounts of any OTHER commodity still need
           ``qty``. The currency must already exist in the book, and
           ``cur`` cannot combine with an auto-fill row.
+
+        - PER-TRANSACTION NUM AND LINK — declare ``num`` and/or
+          ``link`` after ``description`` (any order with ``notes``
+          and ``cur``)::
+
+              ref<TAB>date<TAB>description<TAB>num<TAB>link<TAB>amt1<TAB>acct1<TAB>amt2<TAB>acct2
+              1<TAB>2026-07-01<TAB>Office chairs<TAB>ER 2658<TAB>file:///receipts/er2658.pdf<TAB>-120.00<TAB>Assets:Checking<TAB>120.00<TAB>Expenses:Office
+
+          ``num`` is GnuCash's Num column: a check number, invoice
+          reference, or receipt ID — whatever the source document
+          numbers itself with. Fill it whenever the source prints
+          one. ``link`` is the transaction's document link (a URL
+          or file path to the receipt/invoice; desktop opens it
+          from the register). Empty cells leave either unset.
+          In a book with "Use Split Action Field for Number" on,
+          ``num`` is the transaction's T-Num and an account
+          register's Num column shows that account's split action
+          instead: to put a check number in the bank register's
+          Num, write it in an ``act`` cell on the bank leg (see
+          PER-SPLIT ACTION). The duplicate screen reads both.
 
         - PER-SPLIT QUANTITY — declare ``qty`` split columns for
           splits whose ACCOUNT commodity differs from the book
@@ -431,8 +491,8 @@ def register(mcp, get_book) -> None:
           comparison rows, sorted strongest-correspondence first —
           ``ref, candidate_guid, confidence, state, date_new,
           date_old, date_delta_days, amt_new, amt_old, amt_delta,
-          cur, desc_new, desc_old, notes_old, memo_old, cat_new,
-          cat_old, split_match, signals``. ``_new`` = your proposed
+          cur, desc_new, desc_old, num_new, num_old, notes_old,
+          memo_old, cat_new, cat_old, split_match, signals``. ``_new`` = your proposed
           row, ``_old`` = the existing transaction; ``cat_*`` are
           the category (non-payment) legs as
           ``account=amount|...``; ``split_match``
@@ -440,6 +500,11 @@ def register(mcp, get_book) -> None:
           date+amount but ``none`` on category is usually a
           distinct purchase. Amounts are SIGNED (direction
           matters: a deposit is not a payment's twin).
+          ``signals`` reads description/amount/date (``D``/``A``/
+          ``D``, ``-`` = no match), plus ``N`` when both sides carry
+          the SAME Num or ``x`` when their Nums differ — a
+          different number means a different document, so an
+          ``x`` candidate is at most MEDIUM and never blocks.
           ``amt_delta`` is blank on cross-currency candidates
           (``cur`` names the candidate's currency exactly when
           the frames differ); ``memo_old`` and ``state`` blanks
@@ -513,10 +578,15 @@ def register(mcp, get_book) -> None:
 
         INPUT — ``lines`` is a TSV block. Header: ``ref, date``
         first, then any order of ``description``, ``notes``,
-        ``raw``, ``match``, ``amount`` (required), then optional
+        ``raw``, ``match``, ``num``, ``link``, ``amount``
+        (required), then optional
         ``amt, acct, memo, qty`` counter-split groups (batch
-        grammar). The statement account's own leg is SYNTHESIZED —
-        never a column. Dry-run typically needs only::
+        grammar; an ``acct`` cell is an account name or %short guid).
+        The statement account's own leg is SYNTHESIZED — never a
+        column. In wide batches, %guids in ``acct`` cells shrink the
+        payload; nothing is lost — the audit log records the resolved
+        account names regardless of which form the call used. Dry-run
+        typically needs only::
 
             ref<TAB>date<TAB>raw<TAB>amount
             1<TAB>2026-07-03<TAB>POS DEBIT WHOLEFDS #123<TAB>-87.12
@@ -524,6 +594,11 @@ def register(mcp, get_book) -> None:
         - ``raw`` = the verbatim statement line; it lands on the
           bank leg's memo (provenance). ``description``/``notes``
           are your interpretation (commit).
+        - ``num`` = the number the statement prints for the line
+          (check number, reference) — GnuCash's Num column; the
+          server stores it where the book's register reads it.
+          ``link`` = a document link for the transaction. Both
+          also apply to claim rows.
         - ``match`` = the split GUID this line claims instead of
           creating (from the dry-run candidates table). Claim rows
           may also carry ``raw`` (updates the claimed split's memo)
@@ -560,14 +635,18 @@ def register(mcp, get_book) -> None:
         SELF-CONTAINED comparison rows sorted
         strongest-correspondence first (``ref, candidate_guid,
         confidence, state, date_new/old + delta, amt_new/old +
-        delta, cur, desc_new/old, notes_old, memo_old, cat_new/old,
-        split_match, signals``; ``_new`` = the statement line in
+        delta, cur, desc_new/old, num_new/old, notes_old, memo_old,
+        cat_new/old, split_match, signals``; ``_new`` = the statement line in
         book convention, ``_old`` = the existing split — never
         re-read your own input; ``cur`` is structurally blank on
         this surface), plus ``warnings`` (only when present;
         ``candidates`` likewise) and ``tie`` — the projected
         reconciled balance vs the closing, with a count of rows
-        this exact payload would refuse at commit. The dry-run
+        this exact payload would refuse at commit. A candidate
+        whose Num differs from the line's (``signals`` ends in
+        ``x``) is a different check or document: it never drives
+        MATCH and never trips the exact-twin guard; the same Num
+        (``N``) counts as a signal. The dry-run
         rehearses the SAME disposition procedure commit runs —
         force included. The tie is the only verdict;
         MATCH/AMBIGUOUS rows are yours to rule.
@@ -580,7 +659,7 @@ def register(mcp, get_book) -> None:
         returns just ``summary`` + ``results``).
 
         Args:
-            account: Statement account ref (path, %short, or GUID).
+            account: Statement account. Account name ("Assets:Checking") or %short guid ("%d53d547").
                 BANK/CASH/ASSET/CREDIT/LIABILITY only.
             statement_date: The statement's closing date
                 (YYYY-MM-DD); every touched split reconciles at it.
@@ -630,10 +709,16 @@ def register(mcp, get_book) -> None:
         offset: int = 0,
         verbose: bool = False,
     ) -> str:
-        """Search transactions by description, memo, notes, or amount.
+        """Search transactions by description, memo, notes, num, or
+        amount.
 
         Compact format (default):
-        ``DATE<TAB>guid<TAB>Description<TAB>splits``
+        ``DATE<TAB>guid<TAB>Description<TAB>splits``, then the notes
+        when present and a labeled ``num:<number>`` cell when the
+        transaction has a Num. In a book with "Use Split Action
+        Field for Number" on, that cell reads ``tnum:`` (the
+        transaction's T-Num) and each leg's number follows it in
+        the splits as ``#<number>``.
         Transactions with more than 4 splits collapse to the top 3 by
         |value| plus ``+N more`` — call ``get_transaction`` for the
         full breakdown. Leads with a ``Showing X-Y of Z transactions``
@@ -641,7 +726,10 @@ def register(mcp, get_book) -> None:
 
         Args:
             query: Search query string. For amount, supports: exact ("100"), greater (">100"), less ("<100"), range ("100-200")
-            field: Field to search: 'description', 'memo', 'notes', or 'amount'
+            field: Field to search: 'description', 'memo', 'notes',
+                'num', or 'amount'. 'num' is GnuCash's Num column (a
+                check number, invoice or receipt reference) —
+                substring match, like the text fields.
             limit: Page size (default 50, max 250). 0 = count only.
             offset: 0-indexed first row to return (default 0).
             verbose: If false (default), compact text output — optimized
@@ -677,8 +765,8 @@ def register(mcp, get_book) -> None:
             account_type: One of ASSET, BANK, CASH, CREDIT, EQUITY,
                 EXPENSE, INCOME, LIABILITY, MUTUAL, STOCK, RECEIVABLE,
                 PAYABLE.
-            parent: Parent account ref (full path, %short GUID, or full
-                32-char GUID). Omit for top-level.
+            parent: Parent account. Account name ("Assets:Checking") or %short guid ("%d53d547").
+                Omit for top-level.
             description: Optional description.
             placeholder: Container-only account. Default False.
             commodity: ISO currency code ("USD") or stock/fund symbol
@@ -712,11 +800,12 @@ def register(mcp, get_book) -> None:
         placeholder: bool | None = None,
         account_type: str | None = None,
         notes: str | None = None,
+        hidden: bool | None = None,
     ) -> str:
         """Update an existing account's properties.
 
         Args:
-            name: Account ref to update (full path e.g. "Expenses:Groceries", %short GUID, or full 32-char GUID)
+            name: Account to update. Account name ("Assets:Checking") or %short guid ("%d53d547").
             new_name: New name for the account (just the leaf name, not full path)
             description: New description
             placeholder: New placeholder status (true = container only)
@@ -726,6 +815,9 @@ def register(mcp, get_book) -> None:
                 (e.g., ASSET to LIABILITY) are blocked.
             notes: New notes (max 4096 bytes; shared with GnuCash
                 desktop's Notes field). Pass "" to clear.
+            hidden: Hide the account (true) or show it again (false),
+                as the Hidden box in GnuCash's account editor does.
+                Balances and reports still count a hidden account.
         """
         book = get_book()
         result = book.update_account(
@@ -735,6 +827,7 @@ def register(mcp, get_book) -> None:
             placeholder=placeholder,
             account_type=account_type,
             notes=notes,
+            hidden=hidden,
         )
         return _json(result)
 
@@ -755,8 +848,8 @@ def register(mcp, get_book) -> None:
         rename in place instead of moving.
 
         Args:
-            name: Account ref to move (full path e.g. "Expenses:Old:Account", %short GUID, or full 32-char GUID)
-            new_parent: New parent account ref (full path, %short GUID, or full 32-char GUID)
+            name: Account to move. Account name ("Assets:Checking") or %short guid ("%d53d547").
+            new_parent: New parent. Account name ("Assets:Checking") or %short guid ("%d53d547").
         """
         book = get_book()
         result = book.move_account(name=name, new_parent=new_parent)
@@ -771,7 +864,7 @@ def register(mcp, get_book) -> None:
         Safeguards prevent deletion if the account has children or transactions.
 
         Args:
-            name: Account ref to delete (full path, %short GUID, or full 32-char GUID)
+            name: Account to delete. Account name ("Assets:Checking") or %short guid ("%d53d547").
         """
         book = get_book()
         result = book.delete_account(name=name)
@@ -787,8 +880,10 @@ def register(mcp, get_book) -> None:
         """Delete one transaction by GUID — or several in one call.
 
         Safeguards prevent deletion if a transaction has reconciled
-        splits (force=true overrides) or is an invoice's posting
-        record (unpost_document first).
+        splits or splits in lots — a lot split is cost basis or an
+        invoice payment, and deleting it reopens the lot (force=true
+        overrides either) — or is an invoice's posting record
+        (unpost_document first).
 
         Pass a LIST of GUIDs to delete several in one book open /
         one save. The batch is all-or-nothing: every guid is
@@ -800,7 +895,8 @@ def register(mcp, get_book) -> None:
         Args:
             guid: Transaction GUID (32-char hex or 8+ char prefix),
                 or a list of them.
-            force: Allow deleting transactions with reconciled splits.
+            force: Allow deleting transactions with reconciled splits
+                or splits in lots.
         """
         book = get_book()
         if isinstance(guid, list):
@@ -823,8 +919,9 @@ def register(mcp, get_book) -> None:
         """Update MANY transactions with per-row values (bulk edit).
 
         INPUT — ``updates`` is a TSV block: header ``guid`` plus any
-        of ``description``, ``notes``, ``date`` (at least one), then
-        one row per transaction::
+        of ``description``, ``notes``, ``date``, ``num`` (GnuCash's
+        Num column), ``link`` (the document link) — at least one —
+        then one row per transaction::
 
             guid<TAB>description<TAB>notes
             56926ac2<TAB>PayPal Credit Payment<TAB>Resolved — card payment
@@ -832,7 +929,7 @@ def register(mcp, get_book) -> None:
 
         An EMPTY cell leaves that field UNCHANGED. To blank a field,
         opt in with a ``clear`` column: its cell names the fields to
-        clear on that row (``notes`` or ``description,notes``) —
+        clear on that row (``notes``, ``num,link``, …) —
         explicit per row, so a sparse batch can never mass-erase by
         accident. ``date`` is not clearable; a row that sets and
         clears the same field rejects. Splits and memos are not
@@ -846,7 +943,10 @@ def register(mcp, get_book) -> None:
         sinks the batch on any bad row, ``"skip"`` keeps good rows.
         Date moves on transactions with reconciled splits are
         rejected per row unless ``force=true`` (they shift the
-        transaction out of its reconciled statement period).
+        transaction out of its reconciled statement period). A
+        voided transaction, or an invoice's posting record
+        (read-only, as in GnuCash: unpost_document first), is
+        rejected whatever ``force`` says.
         Returns a results TSV keyed by your input guids. This is
         the canonical update tool for one transaction or many (the
         former ``update_transaction`` tool was removed; this
@@ -857,7 +957,10 @@ def register(mcp, get_book) -> None:
         rows = _parse_update_tsv(updates)
         for r in rows:
             if "date" in r:
-                r["date"] = date.fromisoformat(r["date"])
+                try:
+                    r["date"] = _parse_iso_date(r["date"])
+                except ValueError as e:
+                    raise ValueError(f"guid {r.get('guid')!r}: {e}") from None
         result = book.update_transactions(
             updates=rows, on_error=on_error, force=force,
         )
@@ -894,7 +997,7 @@ def register(mcp, get_book) -> None:
                 - 'memo' (optional): Split memo
             force: Required only when the replacement would CHANGE a
                 reconciled split (or remove splits from lots) —
-                unchanged reconciled legs are preserved without it.
+                unchanged reconciled legs are preserved without it. Never overrides the refusal on a voided transaction or on an invoice's posting record (unpost_document first).
         """
         book = get_book()
         result = book.replace_splits(

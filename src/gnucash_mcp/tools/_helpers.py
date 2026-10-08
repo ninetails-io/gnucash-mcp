@@ -5,8 +5,11 @@ gnucash_mcp/tools/.
 """
 
 import json
+import re
 import logging
 import traceback
+
+from sqlalchemy.exc import StatementError
 from datetime import date
 from functools import wraps
 from typing import Annotated, Callable, Literal
@@ -14,6 +17,9 @@ from typing import Annotated, Callable, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from gnucash_mcp.book import GnuCashLockError, StaleFXRateError
+
+
+_ISO_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 
 def _parse_iso_date(s: str | None) -> date | None:
@@ -32,7 +38,13 @@ def _parse_iso_date(s: str | None) -> date | None:
     """
     if not s:
         return None
-    return date.fromisoformat(s)
+    # ``date.fromisoformat`` accepts ``20260105`` and ``2026-W02-1`` on
+    # Python 3.11+ and rejects them on 3.10, a supported target; the
+    # contract is YYYY-MM-DD everywhere (scoped review 2026-10-06,
+    # IN-13).
+    if not _ISO_DATE_RE.fullmatch(s.strip()):
+        raise ValueError(f"date {s!r} is not a valid YYYY-MM-DD date")
+    return date.fromisoformat(s.strip())
 
 # Re-exports from the layer-neutral format module. Tool wrappers can
 # keep importing from ``tools._helpers`` (the historical home) without
@@ -45,7 +57,13 @@ from gnucash_mcp._format import (  # noqa: F401
     _paginate,
 )
 
+from gnucash_mcp.logging_config import CredentialScrubFilter  # noqa: E402
+
 logger = logging.getLogger(__name__)
+# Every error a tool raises is logged here with its exception text,
+# and this logger propagates to the host's stderr handler. Mask
+# connection-string credentials before the record leaves.
+logger.addFilter(CredentialScrubFilter())
 
 
 # ── Shared GUID parameter annotations ──────────────────────────────
@@ -168,9 +186,8 @@ class SplitInput(BaseModel):
         str,
         Field(
             description=(
-                "Account ref: full path (e.g. 'Expenses:Rent'), "
-                "%short GUID (e.g. '%xxxxxxx' — 7+ hex chars copied "
-                "from list_accounts), or full 32-char GUID"
+                'Account name ("Assets:Checking") or %short guid '
+                '("%d53d547"), as list_accounts prints them.'
             )
         ),
     ]
@@ -276,59 +293,6 @@ def _json(obj) -> str:
     )
 
 
-def _gate_owner_type(owner_type: str | None) -> str | None:
-    """Enforce the Freelancer/Business module split at the
-    ``owner_type`` boundary.
-
-    The shared-lifecycle invoice tools live in Freelancer, but
-    vendor bills and employee vouchers travel through them via
-    owner_type dispatch — and Business owns both vendor and
-    employee management.
-
-    Three cases:
-
-    - Explicit ``'vendor'`` / ``'employee'`` without Business:
-      reject with a clear error.
-    - Omitted or ``'customer'`` without Business: coerce to
-      ``'customer'`` — the tool only sees customer entities.
-    - Business loaded: pass through unchanged.
-
-    Returns the (possibly coerced) owner_type for the book method.
-    Imports server lazily to avoid an import-time cycle.
-    """
-    from gnucash_mcp.server import is_module_enabled
-
-    # Gate on the business_complete LEAF (not the group alias) so an
-    # explicit business_complete-only selection also unlocks.
-    if is_module_enabled("business_complete"):
-        return owner_type  # All three halves available; no gating.
-
-    if owner_type == "vendor":
-        raise ValueError(
-            "owner_type='vendor' requires the business module. "
-            "Restart the server with --modules=business (or add "
-            "business_complete to your current selection) to access "
-            "vendor bills, or omit owner_type to operate on customer "
-            "invoices only."
-        )
-    if owner_type == "employee":
-        raise ValueError(
-            "owner_type='employee' requires the business module. "
-            "Employee expense vouchers live with employee "
-            "management. Restart the server with --modules=business "
-            "(or add business_complete to your current selection) "
-            "or omit owner_type to operate on customer invoices only."
-        )
-    # Only None / 'customer' coerce; anything else (typos, unknown
-    # future types) rejects loudly rather than masquerading as
-    # "searched customer invoices, found nothing".
-    if owner_type is not None and owner_type != "customer":
-        raise ValueError(
-            f"Invalid owner_type {owner_type!r}. Must be 'customer' "
-            f"(or omit). 'vendor' and 'employee' require the "
-            f"Business module."
-        )
-    return "customer"
 
 
 # The consolidated business surface's two type axes. Literal types
@@ -336,57 +300,6 @@ def _gate_owner_type(owner_type: str | None) -> str | None:
 # at decode time and a wrong value never reaches the server.
 PartyType = Literal["customer", "vendor", "employee"]
 DocumentType = Literal["invoice", "bill", "voucher", "credit_note"]
-
-# Which module side each species belongs to. The polymorphic tools
-# live in Freelancer; the vendor/employee species unlock when
-# business_complete is loaded (same split _gate_owner_type enforces
-# for the lifecycle tools).
-_CUSTOMER_SIDE_DOCS = {"invoice"}
-
-
-def _gate_party_type(party_type: str | None) -> str | None:
-    """Enforce the Freelancer/Business split on ``party_type``.
-
-    Freelancer owns the customer side; vendor and employee
-    management requires business_complete. ``None`` (where a tool
-    allows it, e.g. list_parties) coerces to 'customer' without
-    Business and passes through (= all types) with it.
-    """
-    from gnucash_mcp.server import is_module_enabled
-
-    if is_module_enabled("business_complete"):
-        return party_type
-    if party_type in ("vendor", "employee"):
-        raise ValueError(
-            f"party_type={party_type!r} requires the business "
-            f"module. Restart the server with --modules=business "
-            f"(or add business_complete) to manage vendors and "
-            f"employees; Freelancer covers customers."
-        )
-    return "customer"
-
-
-def _gate_document_type(document_type: str | None) -> str | None:
-    """Enforce the Freelancer/Business split on ``document_type``.
-
-    Customer invoices (and credit notes, which carry their own
-    party side) stay Freelancer; vendor bills and employee
-    vouchers require business_complete.
-    """
-    from gnucash_mcp.server import is_module_enabled
-
-    if is_module_enabled("business_complete"):
-        return document_type
-    if document_type in ("bill", "voucher"):
-        raise ValueError(
-            f"document_type={document_type!r} requires the "
-            f"business module. Restart the server with "
-            f"--modules=business (or add business_complete) for "
-            f"vendor bills and employee vouchers; Freelancer "
-            f"covers customer invoices and credit notes."
-        )
-    return document_type if document_type is not None else "invoice"
-
 
 def _resolve_id_alias(
     id: str | None,
@@ -535,7 +448,10 @@ def safe_tool(func: Callable) -> Callable:
                 {
                     "error": redact_paths(str(e)),
                     "error_type": "file_not_found",
-                    "suggestion": "Check that GNUCASH_BOOK_PATH is set correctly.",
+                    "suggestion": (
+                        "Check that GNUCASH_BOOK_PATH (or GNUCASH_BOOK_URI, "
+                        "for a database book) is set correctly."
+                    ),
                 }
             )
         except StaleFXRateError as e:
@@ -555,6 +471,29 @@ def safe_tool(func: Callable) -> Callable:
             return _json({
                 "error": redact_paths(str(e)),
                 "error_type": "validation_error",
+            })
+        except StatementError as e:
+            # A refusal raised while binding a value (a transaction
+            # date GnuCash cannot hold, in ``_date_bind``) reaches
+            # here wrapped by SQLAlchemy, with the statement and its
+            # parameters quoted. The inner ValueError is the message;
+            # anything else stays an unexpected error.
+            if isinstance(e.orig, ValueError):
+                logger.warning(
+                    f"Validation error in {func.__name__}: {e.orig}"
+                )
+                return _json({
+                    "error": redact_paths(str(e.orig)),
+                    "error_type": "validation_error",
+                })
+            logger.error(
+                f"Unexpected error in {func.__name__}: {e}\n{traceback.format_exc()}"
+            )
+            return _json({
+                "error": redact_paths(
+                    f"Unexpected error: {type(e).__name__}: {e}"
+                ),
+                "error_type": "unexpected_error",
             })
         except RuntimeError as e:
             # The _verify_* helpers raise RuntimeError for "the

@@ -69,6 +69,12 @@ _ADVANCED_REJECTED_KEYS = {
         "books are configured through the book picker / --book, "
         "which overrides this variable"
     ),
+    "GNUCASH_BOOK_URI": (
+        "database books are configured through --book-uri. The MCPB "
+        "bundle always passes --book from its file picker, so a URI "
+        "set here would be silently ignored; run the server directly "
+        "to serve a database book"
+    ),
 }
 
 

@@ -285,13 +285,14 @@ class TestUpdateTransactionNonDyadic:
 
 
 class TestScheduledSplitsPersistedAsStrings:
-    """The splits-json slot must never store a JSON numeric literal.
-    If a float slips through the schema layer, the write-side
-    normalization re-routes it through str(Decimal(str(x))) so every
-    future instantiation reads a clean decimal string."""
+    """A float that slips through the schema layer must not leave
+    its IEEE-754 epsilon in the recipe. The recipe is native template
+    rows now: each side is a gnc_numeric (num/denom at the currency
+    fraction) plus a formula string, so the persisted amount is exact
+    by construction — 94.87 lands as 9487/100 and "94.87", never
+    94.8699999…"""
 
     def test_slot_stores_string_amounts(self, scheduled_book: Path):
-        import json
         from sqlalchemy import text
 
         gc = GnuCashBook(str(scheduled_book))
@@ -306,24 +307,26 @@ class TestScheduledSplitsPersistedAsStrings:
             frequency="monthly",
         )
 
-        # Read the slot raw to confirm the stored JSON is strings.
         with gc.open(readonly=True) as book:
-            rows = book.session.execute(
+            numerics = book.session.execute(
                 text(
-                    "SELECT string_val FROM slots WHERE name = :name"
+                    "SELECT name, numeric_val_num, numeric_val_denom "
+                    "FROM slots WHERE name LIKE 'sched-xaction/%-numeric'"
                 ),
-                {"name": "splits-json"},
             ).fetchall()
-        assert len(rows) == 1
-        payload = json.loads(rows[0][0])
-        # json.loads preserves types: if amount were a float, it would
-        # parse as float, not str.
-        assert all(isinstance(s["amount"], str) for s in payload)
-        # And the values round-trip through Decimal exactly.
-        total = sum(
-            (Decimal(s["amount"]) for s in payload), Decimal("0"),
-        )
-        assert total == Decimal("0")
+            formulas = book.session.execute(
+                text(
+                    "SELECT string_val FROM slots WHERE name LIKE "
+                    "'sched-xaction/%-formula' AND string_val <> ''"
+                ),
+            ).fetchall()
+        assert sorted((n, d) for _, n, d in numerics) == [
+            (0, 1), (0, 1), (9487, 100), (9487, 100),
+        ]
+        assert sorted(f[0] for f in formulas) == ["94.87", "94.87"]
+        # And the recipe balances exactly when read back.
+        row = gc.list_scheduled_transactions(compact=False)["scheduled_transactions"][0]
+        assert sum(Decimal(s["amount"]) for s in row["splits"]) == Decimal("0")
 
     def test_instantiation_balances(self, scheduled_book: Path):
         """End-to-end: create a schedule with float amounts, then
@@ -495,24 +498,23 @@ class TestScalarAmountsAcceptFloat:
 class TestIsMarketPriceHelper:
     """Contract tests for the ``_is_market_price`` predicate.
 
-    Centralizing the ``type='transaction'`` check used to live as
-    inline conditionals in four places (core's ``_rates_as_of`` and
-    ``_collect_warnings``, reporting's ``_latest_market_rates``,
-    business's ``_find_exchange_rate``). All four now route through
-    this single predicate so adding any future placeholder type
-    (e.g., the auto-fx-account work later in this branch) only needs
-    one change.
+    Since the 2026-09-29 ruling valuation counts every price row,
+    ``type='transaction'`` included, as GnuCash desktop does. The
+    predicate now serves only the quote-staleness layer — the
+    dashboard's stale-price warning and ``list_commodities``'
+    staleness markers, via ``CurrencyMixin._market_prices_only`` —
+    and is still the single place that decides what a quote is.
     """
 
     def test_user_quote_is_market(self):
-        from gnucash_mcp.book._base import _is_market_price
+        from gnucash_mcp.book._currency import _is_market_price
 
         class _Price:
             type = "nav"
         assert _is_market_price(_Price()) is True
 
     def test_transaction_placeholder_is_not_market(self):
-        from gnucash_mcp.book._base import _is_market_price
+        from gnucash_mcp.book._currency import _is_market_price
 
         class _Price:
             type = "transaction"
@@ -521,8 +523,116 @@ class TestIsMarketPriceHelper:
     def test_missing_type_attr_treated_as_market(self):
         """Defensive: an ORM row without ``type`` shouldn't be
         silently skipped — better to value it than to under-count."""
-        from gnucash_mcp.book._base import _is_market_price
+        from gnucash_mcp.book._currency import _is_market_price
 
         class _Price:
             pass
         assert _is_market_price(_Price()) is True
+
+
+# ── Non-numeric input raises ValueError, never InvalidOperation ──────
+#
+# Whole-tree review (2026-09-04), class 2: ``decimal.InvalidOperation``
+# is an ArithmeticError, so it escaped every ``except ValueError`` on
+# the write paths. One ``$10`` cell sank a whole batch as
+# ``unexpected_error`` while ``create_prices`` happened to catch it
+# per row. ``_to_decimal`` now converts, so every caller and
+# ``safe_tool``'s ``validation_error`` mapping see one exception type.
+
+
+class TestToDecimalRejectsNonNumeric:
+
+    @pytest.mark.parametrize("bad", ["$10", "10x", "", "abc", "1,000"])
+    def test_text_raises_value_error_naming_the_input(self, bad):
+        with pytest.raises(ValueError, match="not a valid decimal") as exc:
+            _to_decimal(bad)
+        assert repr(bad) in str(exc.value)
+
+    @pytest.mark.parametrize("bad", ["NaN", "Infinity", "-inf", float("nan")])
+    def test_non_finite_raises_value_error(self, bad):
+        with pytest.raises(ValueError, match="finite"):
+            _to_decimal(bad)
+
+    def test_never_leaks_invalid_operation(self):
+        from decimal import InvalidOperation
+        try:
+            _to_decimal("$10")
+        except InvalidOperation:  # pragma: no cover — the bug shape
+            pytest.fail("InvalidOperation escaped _to_decimal")
+        except ValueError:
+            pass
+
+
+class TestBadAmountCellRejectsPerRow:
+    """The batch surfaces: a typo'd amount is a ROW rejection with a
+    readable reason, and ``on_error="skip"`` keeps the good rows."""
+
+    _TSV = (
+        "ref\tdate\tdescription\tamt1\tacct1\tamt2\tacct2\n"
+        "1\t2024-02-01\tGood row\t-10\tAssets:Checking\t10\tExpenses:Groceries\n"
+        "2\t2024-02-02\tBad row\t-$10\tAssets:Checking\t10\tExpenses:Groceries\n"
+    )
+
+    def _rows(self, results_tsv: str) -> dict:
+        lines = results_tsv.splitlines()
+        header = lines[0].split("\t")
+        return {r.split("\t")[0]: dict(zip(header, r.split("\t")))
+                for r in lines[1:]}
+
+    def test_create_transactions_skip_keeps_the_good_row(self, test_book):
+        from gnucash_mcp.tools.core import _parse_transactions_tsv
+        gb = GnuCashBook(str(test_book))
+        out = gb.create_transactions(
+            _parse_transactions_tsv(self._TSV), on_error="skip",
+        )
+        rows = self._rows(out["results"])
+        assert rows["1"]["status"] == "created"
+        assert rows["2"]["status"] == "rejected"
+        assert "not a valid decimal" in rows["2"]["reason"]
+        assert "$10" in rows["2"]["reason"]
+
+    def test_create_transactions_abort_names_the_bad_row(self, test_book):
+        from gnucash_mcp.tools.core import _parse_transactions_tsv
+        gb = GnuCashBook(str(test_book))
+        out = gb.create_transactions(_parse_transactions_tsv(self._TSV))
+        rows = self._rows(out["results"])
+        assert rows["1"]["reason"] == "batch_aborted"
+        assert "not a valid decimal" in rows["2"]["reason"]
+
+    def test_enter_statement_counter_split_typo_is_a_row_error(
+        self, test_book,
+    ):
+        """Counter-split cells flow through the shared validator; the
+        dispositions pass must catch them as row errors, not crash."""
+        from datetime import date
+        gb = GnuCashBook(str(test_book))
+        lines = [{
+            "ref": "1", "date": date(2024, 2, 1), "amount": "-10",
+            "description": "Bad counter",
+            "splits": [{"account": "Expenses:Groceries", "amount": "1O"}],
+        }]
+        out = gb.enter_statement(
+            "Assets:Checking", date(2024, 2, 28),
+            opening_balance="2850", closing_balance="2840",
+            lines=lines, dry_run=True,
+        )
+        assert "not a valid decimal" in out["warnings"]
+        assert "1 row(s) this payload would refuse" in out["tie"]
+
+    def test_tool_layer_reports_validation_error(self, test_book, monkeypatch):
+        """End to end through safe_tool: the error_type is
+        validation_error, not unexpected_error."""
+        import json
+        from gnucash_mcp.tools._helpers import safe_tool
+        gb = GnuCashBook(str(test_book))
+        guid = gb.list_transactions(compact=False)["transactions"][0]["guid"]
+
+        @safe_tool
+        def replace():
+            return gb.replace_splits(guid, [
+                {"account": "Assets:Checking", "amount": "ten"},
+                {"account": "Expenses:Groceries", "amount": "-10"},
+            ])
+        out = json.loads(replace())
+        assert out["error_type"] == "validation_error"
+        assert "ten" in out["error"]

@@ -7,16 +7,26 @@ from gnucash_mcp.logging_config import audit_log
 from gnucash_mcp.tools._helpers import (
     DocumentType,
     PartyType,
-    _gate_document_type,
-    _gate_party_type,
     BusinessAddressInput,
     BusinessNotes,
     BusinessNotesOptional,
-    _gate_owner_type,
     _json,
     _resolve_id_alias,
     safe_tool,
 )
+
+
+def _document_owner_type(document_type, party_type):
+    """The owner side a document tool passes to the book: the caller's
+    ``party_type`` when given, else the side ``document_type`` implies
+    (invoice → customer, bill → vendor, voucher → employee). None for
+    a credit note, which exists on both sides, or no type at all —
+    the book resolves the id or asks for ``party_type``."""
+    if party_type:
+        return party_type
+    return {
+        "invoice": "customer", "bill": "vendor", "voucher": "employee",
+    }.get(document_type)
 
 
 def register(mcp, get_book) -> None:
@@ -32,7 +42,8 @@ def register(mcp, get_book) -> None:
         notes: BusinessNotes = "",
         address: BusinessAddressInput | None = None,
     ) -> str:
-        """Create a customer, vendor, or employee.
+        """Create a customer (client), vendor (supplier, contractor,
+        payee), or employee record.
 
         Additive: each call creates a fresh party — names are NOT
         checked for duplicates, so list_parties first when unsure.
@@ -42,8 +53,10 @@ def register(mcp, get_book) -> None:
         party_type is required everywhere.
 
         Args:
-            party_type: "customer" (pays you), "vendor" (you pay),
-                or "employee" (expense-voucher workflows).
+            party_type: "customer" (a client who pays you — accounts
+                receivable), "vendor" (a supplier, contractor, or
+                payee you pay — accounts payable), or "employee"
+                (expense-voucher workflows).
             name: Party name (e.g., "Acme Corp", "Jane Smith").
             currency: ISO currency code (e.g., "USD", "EUR").
                 Defaults to book's default currency.
@@ -53,7 +66,6 @@ def register(mcp, get_book) -> None:
                 addr3, addr4, phone, fax, email. Each sub-field
                 capped at 1024 characters.
         """
-        party_type = _gate_party_type(party_type)
         book = get_book()
         addr = address.model_dump() if address else None
         if party_type == "employee":
@@ -106,7 +118,6 @@ def register(mcp, get_book) -> None:
             limit: Page size per type (default 50, max 250). 0 = count only.
             offset: 0-indexed first row to return (default 0).
         """
-        party_type = _gate_party_type(party_type)
         book = get_book()
         routes = {
             "customer": book.list_customers,
@@ -148,7 +159,6 @@ def register(mcp, get_book) -> None:
             id: Party ID (e.g., "000001"). This is the human-readable
                 ID shown in GnuCash, not the internal GUID.
         """
-        party_type = _gate_party_type(party_type)
         book = get_book()
         if party_type == "employee":
             result = book.get_employee(employee_id=id)
@@ -188,7 +198,6 @@ def register(mcp, get_book) -> None:
                 default listings but keep their history).
             address: Full replacement address (see create_party).
         """
-        party_type = _gate_party_type(party_type)
         book = get_book()
         addr = address.model_dump() if address else None
         if party_type == "employee":
@@ -234,7 +243,6 @@ def register(mcp, get_book) -> None:
                 counters collide across types — always required).
             id: Party ID (e.g., "000001").
         """
-        party_type = _gate_party_type(party_type)
         book = get_book()
         if party_type == "employee":
             result = book.delete_employee(employee_id=id)
@@ -315,8 +323,9 @@ def register(mcp, get_book) -> None:
         either a percentage rate or a flat-value surcharge routed to
         a specific GL account (ASSET for input-tax credit, LIABILITY
         for output sales tax payable). Multi-entry composites (e.g.,
-        GST 5% + PST 7%) produce multiple tax splits per line at
-        posting time.
+        GST 5% + PST 7%) post one tax split per tax account, each
+        the document's tax for that account rounded once, the way
+        GnuCash desktop totals an invoice.
 
         Args:
             name: Taxtable name, unique within the book
@@ -325,7 +334,7 @@ def register(mcp, get_book) -> None:
                 ``type``: "value" or "percentage".
                 ``amount``: positive decimal as string. Percentages
                 are the rate ("5.00" = 5%, not "0.05").
-                ``account``: account path, %short-guid, or full GUID.
+                ``account``: Account name ("Assets:Checking") or %short guid ("%d53d547").
                 Must be ASSET or LIABILITY type. All entries on a
                 single taxtable must reference accounts in the same
                 commodity.
@@ -452,9 +461,11 @@ def register(mcp, get_book) -> None:
         id: str | None = None,
         job_id: str | None = None,
         applies_to_id: str | None = None,
+        force: bool = False,
     ) -> str:
-        """Create a customer invoice, vendor bill, employee expense
-        voucher, or credit note.
+        """Create a customer invoice (accounts receivable), vendor
+        bill (accounts payable), employee expense voucher, or credit
+        note (credit memo).
 
         The owner side derives from the document type — invoice →
         customer, bill → vendor, voucher → employee. Credit notes
@@ -471,12 +482,17 @@ def register(mcp, get_book) -> None:
                 vouchers). ID counters are per type.
             party_type: Required for credit notes only ("customer"
                 or "vendor" — which side the credit belongs to).
-                Derived from document_type otherwise.
+                Omit for invoices, bills, and vouchers; it is
+                derived from document_type.
             date_opened: ISO date. Defaults to today (echoed in the
                 response).
             notes: Optional notes (max 4096 characters).
             currency: ISO code. Defaults to the owner's currency,
-                then the book default.
+                then the book default. Normally omitted: GnuCash
+                keeps a document in its owner's currency, and a
+                currency other than the owner's is refused unless
+                ``force`` is set. To bill a party in another
+                currency, create a party record in that currency.
             term: Billterm name (e.g., "Net 30"). Optional.
             id: Custom document number; auto-generated when omitted.
             job_id: Optional Job to group under (invoices and bills;
@@ -487,8 +503,12 @@ def register(mcp, get_book) -> None:
                 against any open document from the same owner (its
                 response notes the divergence when the applied
                 target differs from this link).
+            force: Create the document in ``currency`` even though
+                it is not the owner's. GnuCash desktop leaves such a
+                document out of the party's balance and resets its
+                currency when the document is saved there; the
+                response carries a warning saying so.
         """
-        document_type = _gate_document_type(document_type)
         # Type-scoped parameters refuse loudly when inapplicable.
         # These are DECLARED parameters, so extra="forbid" can't
         # catch them — without this check a supplied value would be
@@ -517,7 +537,6 @@ def register(mcp, get_book) -> None:
                     "party_type='customer' (reduces a receivable) "
                     "or party_type='vendor' (reduces a payable)."
                 )
-            party_type = _gate_party_type(party_type)
             if party_type == "employee":
                 raise ValueError(
                     "party_type='employee' is not valid for credit "
@@ -528,24 +547,25 @@ def register(mcp, get_book) -> None:
                 applies_to_invoice_id=applies_to_id,
                 date_opened=date_opened, notes=notes,
                 currency=currency, term=term, credit_note_id=id,
+                force=force,
             )
         elif document_type == "bill":
             result = book.create_bill(
                 vendor_id=owner_id, date_opened=date_opened,
                 notes=notes, currency=currency, term=term,
-                bill_id=id, job_id=job_id,
+                bill_id=id, job_id=job_id, force=force,
             )
         elif document_type == "voucher":
             result = book.create_voucher(
                 employee_id=owner_id, date_opened=date_opened,
                 notes=notes, currency=currency, term=term,
-                voucher_id=id,
+                voucher_id=id, force=force,
             )
         else:
             result = book.create_invoice(
                 customer_id=owner_id, date_opened=date_opened,
                 notes=notes, currency=currency, term=term,
-                invoice_id=id, job_id=job_id,
+                invoice_id=id, job_id=job_id, force=force,
             )
         result["type"] = document_type
         return _json(result)
@@ -579,19 +599,18 @@ def register(mcp, get_book) -> None:
                 "credit_note".
             id: Document ID (e.g., "000001").
             account: Income account for invoices / credit notes;
-                expense account for bills and vouchers. Full path,
-                %short GUID, or full GUID.
+                expense account for bills and vouchers.
+                Account name ("Assets:Checking") or %short guid ("%d53d547").
             description: Line item description.
             quantity: Quantity as a decimal string (e.g., "3").
             price: Unit price as a decimal string (e.g., "125.00").
             party_type: Credit notes only — disambiguates when a
                 customer and vendor credit note share an ID.
             taxtable: Tax table name to apply. Optional.
-            tax_included: Whether price already includes tax.
+            tax_included: Whether price already includes tax. The net and each tax are then rounded separately, as in GnuCash, so the document total can differ from the summed prices by a cent.
             notes: Optional entry notes.
             action: Optional entry action label (e.g., "Hours").
         """
-        document_type = _gate_document_type(document_type)
         book = get_book()
         if document_type == "credit_note":
             result = book.add_credit_note_entry(
@@ -651,7 +670,6 @@ def register(mcp, get_book) -> None:
                 same ID on the other side (ID counters are per
                 type).
         """
-        document_type = _gate_document_type(document_type)
         # The typed species imply their side; only credit notes
         # exist on both sides and can collide. Refuse a meaningless
         # party_type loudly rather than silently ignoring it.
@@ -666,8 +684,7 @@ def register(mcp, get_book) -> None:
         if document_type == "credit_note":
             result = book.delete_credit_note(
                 credit_note_id=id,
-                owner_type=_gate_owner_type(party_type)
-                if party_type else None,
+                owner_type=party_type or None,
             )
         elif document_type == "bill":
             result = book.delete_bill(bill_id=id)
@@ -682,11 +699,11 @@ def register(mcp, get_book) -> None:
     @safe_tool
     @audit_log(classification="write", operation="apply", entity_type="credit_note")
     def apply_credit_note(
-        credit_note_id: str,
-        applies_to_invoice_id: str,
+        id: str,
+        applies_to_id: str,
         amount: str | None = None,
         apply_date: str | None = None,
-        owner_type: str | None = None,
+        party_type: PartyType | None = None,
     ) -> str:
         """Net a posted credit note against a posted invoice or
         bill from the same owner. No cash moves — the credit
@@ -701,9 +718,9 @@ def register(mcp, get_book) -> None:
         settled by sending or receiving cash.
 
         Args:
-            credit_note_id: The credit note to apply (must be
-                posted).
-            applies_to_invoice_id: The target invoice/bill (must
+            id: The credit note to apply (must be posted) — the
+                same ``id`` every document tool takes.
+            applies_to_id: The target invoice/bill (must
                 be posted, same owner, same currency, same A/R
                 or A/P post account). Need not be the document
                 the credit note was created against — that link
@@ -715,17 +732,16 @@ def register(mcp, get_book) -> None:
                 as possible.
             apply_date: ISO date for the netting transaction.
                 Defaults to today.
-            owner_type: Optional 'customer' or 'vendor'
+            party_type: Optional 'customer' or 'vendor'
                 disambiguator for ID collisions.
         """
-        owner_type = _gate_owner_type(owner_type)
         book = get_book()
         result = book.apply_credit_note(
-            credit_note_id=credit_note_id,
-            applies_to_invoice_id=applies_to_invoice_id,
+            credit_note_id=id,
+            applies_to_invoice_id=applies_to_id,
             amount=amount,
             apply_date=apply_date,
-            owner_type=owner_type,
+            owner_type=party_type,
         )
         return _json(result)
 
@@ -753,7 +769,9 @@ def register(mcp, get_book) -> None:
         **open** = created and editable, not yet booked to A/R//A/P —
         not payable. **posted** = booked to A/R//A/P with a lot
         tracking its balance — payable. **paid** = posted with a zero
-        remaining balance (lot closed). **outstanding** = posted with
+        remaining balance (lot closed); a credit note at zero balance
+        reads **applied** instead, since it settles by application,
+        not cash. **outstanding** = posted with
         a remaining balance — the unpaid subset; get it directly from
         ``get_outstanding_documents`` rather than deriving it here.
         The ``status`` filter below covers document state
@@ -776,11 +794,7 @@ def register(mcp, get_book) -> None:
                 engagement?" listing pattern.
             offset: 0-indexed first row to return (default 0).
         """
-        owner_type = party_type if party_type else {
-            "invoice": "customer", "bill": "vendor",
-            "voucher": "employee",
-        }.get(_gate_document_type(document_type) if document_type else None)
-        owner_type = _gate_owner_type(owner_type)
+        owner_type = _document_owner_type(document_type, party_type)
         book = get_book()
         result = book.list_invoices(
             doc_type=document_type,
@@ -809,25 +823,38 @@ def register(mcp, get_book) -> None:
         Returns all entries with quantities, prices, and totals;
         the response's ``type`` field names the document kind.
 
-        Status vocabulary: open = editable, not yet booked; posted =
-        on the books, payable; paid = remaining balance zero. The
-        full definitions live on ``list_documents``; the unpaid list
-        is ``get_outstanding_documents``.
+        The response carries ``status`` (open = editable, not yet
+        booked; posted = on the books, balance owed; paid = balance
+        zero; applied = a credit note fully consumed against its
+        target) and, once posted, ``amount_paid`` and ``amount_due``
+        from the same lot arithmetic ``get_outstanding_documents``
+        uses; ``overpaid: true`` marks a negative balance. A paid
+        document keeps its amounts here after it leaves the unpaid
+        list. A posted document's ``total`` is the amount it was
+        posted at; ``total_note`` appears when its entries no longer
+        add up to that (a tax table edited since posting).
+
+        Once posted it also lists ``payments``, oldest first:
+        ``{guid, date, amount, from}`` per settlement. ``guid`` is
+        the settling transaction — pass it to ``void_transaction`` for
+        a bounced payment. ``from`` is the account the money moved
+        through, or the other document's title when a credit note was
+        applied. Voided payments are left out, as they are from the
+        balance.
 
         Args:
             id: Document ID (e.g., "000001"). This is the
                 human-readable ID, not the internal GUID.
             document_type: "invoice", "bill", "voucher", or
-                "credit_note" — disambiguates when IDs collide
-                across per-type counters.
+                "credit_note". ID counters are PER TYPE, so invoice
+                "000001" and bill "000001" can both exist; an ID
+                that matches more than one document is refused
+                with the candidates listed unless this (plus
+                party_type for a credit note) is given.
             party_type: Owner side ("customer"/"vendor") — needed
                 only for credit notes, which exist on both sides.
         """
-        owner_type = party_type if party_type else {
-            "invoice": "customer", "bill": "vendor",
-            "voucher": "employee",
-        }.get(_gate_document_type(document_type) if document_type else None)
-        owner_type = _gate_owner_type(owner_type)
+        owner_type = _document_owner_type(document_type, party_type)
         book = get_book()
         result = book.get_invoice(invoice_id=id, owner_type=owner_type)
         return _json(result)
@@ -863,21 +890,21 @@ def register(mcp, get_book) -> None:
 
         Args:
             id: Document ID (e.g., "000001").
-            post_account: A/R or A/P account path (e.g., "Assets:Accounts Receivable").
+            post_account: The A/R or A/P account. Account name ("Assets:Checking") or %short guid ("%d53d547").
             post_date: Date in ISO format (YYYY-MM-DD). Defaults to today.
             due_date: Payment due date (YYYY-MM-DD). Optional.
             description: Description for the posting transaction. Optional.
             document_type: "invoice", "bill", "voucher", or
-                "credit_note" — disambiguates when IDs collide.
+                "credit_note". ID counters are PER TYPE, so invoice
+                "000001" and bill "000001" can both exist; an ID
+                that matches more than one document is refused
+                with the candidates listed unless this (plus
+                party_type for a credit note) is given.
             party_type: Owner side, credit notes only.
             force: Override the stale-FX-rate guard and post with a
                 7–90 day stale rate. Default False.
         """
-        owner_type = party_type if party_type else {
-            "invoice": "customer", "bill": "vendor",
-            "voucher": "employee",
-        }.get(_gate_document_type(document_type) if document_type else None)
-        owner_type = _gate_owner_type(owner_type)
+        owner_type = _document_owner_type(document_type, party_type)
         book = get_book()
         result = book.post_invoice(
             invoice_id=id,
@@ -902,23 +929,30 @@ def register(mcp, get_book) -> None:
         voucher, or credit note (each keeps its type through the
         round-trip).
 
-        Deletes the posting transaction and lot, and clears the
-        invoice's posted-state metadata. The invoice returns to
-        "open" state and can be edited or re-posted. Refuses if
-        the invoice has any payments applied — void payments first,
-        then unpost.
+        Deletes the posting transaction and clears the document's
+        posted-state metadata. The document returns to "open" state
+        and can be edited or re-posted.
+
+        Payments are kept, as GnuCash keeps them: the money stays on
+        the books as the party's unapplied payment (``payments_kept``
+        in the response), and after re-posting the document is
+        settled from it with ``pay_document(from_prepayment=true)``.
+        Do NOT void a payment in order to unpost — the bank line is
+        real. A credit-note application is removed
+        (``links_removed``); re-apply it with ``apply_credit_note``
+        after re-posting.
 
         Args:
             id: Document ID (e.g., "000001").
             document_type: "invoice", "bill", "voucher", or
-                "credit_note" — disambiguates when IDs collide.
+                "credit_note". ID counters are PER TYPE, so invoice
+                "000001" and bill "000001" can both exist; an ID
+                that matches more than one document is refused
+                with the candidates listed unless this (plus
+                party_type for a credit note) is given.
             party_type: Owner side, credit notes only.
         """
-        owner_type = party_type if party_type else {
-            "invoice": "customer", "bill": "vendor",
-            "voucher": "employee",
-        }.get(_gate_document_type(document_type) if document_type else None)
-        owner_type = _gate_owner_type(owner_type)
+        owner_type = _document_owner_type(document_type, party_type)
         book = get_book()
         result = book.unpost_invoice(
             invoice_id=id,
@@ -931,8 +965,8 @@ def register(mcp, get_book) -> None:
     @audit_log(classification="write", operation="pay", entity_type="invoice")
     def pay_document(
         id: str,
-        payment_account: str,
-        amount: str,
+        payment_account: str | None = None,
+        amount: str | None = None,
         payment_date: str | None = None,
         description: str | None = None,
         document_type: DocumentType | None = None,
@@ -943,12 +977,22 @@ def register(mcp, get_book) -> None:
         force: bool = False,
         memo: str = "",
         dry_run: bool = False,
+        allow_prepayment: bool = False,
+        from_prepayment: bool = False,
+        payment_account_amount: str | None = None,
     ) -> str:
-        """Record a payment against a posted customer invoice,
-        vendor bill, employee voucher, or credit note.
+        """Record a payment against a posted customer invoice
+        (receive a customer payment), vendor bill (pay a supplier),
+        employee voucher (reimburse an employee), or credit note
+        (refund). Handles partial payments, early-payment discounts,
+        cross-currency FX gain/loss, and prepayments.
 
         Creates a payment transaction from the specified bank/cash account
-        to the document's A/R or A/P account. Partial payments are supported.
+        to the document's A/R or A/P account. Partial payments are supported:
+        the response's ``payment`` is this call's amount, ``total_paid``
+        is cumulative across all payments, and ``remaining_balance`` is
+        what is still owed; ``status`` is ``partial`` until the balance
+        reaches zero, then ``paid``.
 
         ``dry_run=true`` rehearses the payment without booking it:
         the full validation, conversion, discount, and FX pipeline
@@ -984,18 +1028,52 @@ def register(mcp, get_book) -> None:
         payments, ``Income:Purchase Discounts Taken`` for vendor
         bill payments).
 
+        OVERPAYMENT: when the party paid more than the document
+        owes, record what actually moved and pass
+        ``allow_prepayment=true``. The balance settles the document;
+        the excess is held in the receivable/payable account as the
+        party's unapplied payment (GnuCash's pre-payment lot). Never
+        book the excess as a credit note — that understates the bank
+        and the income.
+
+        PREPAYMENT: ``from_prepayment=true`` settles the document
+        from the party's unapplied payments (an earlier overpayment,
+        a payment made in GnuCash before the invoice existed, or the
+        payments kept when a document was unposted). No money moves
+        and no transaction is created, so ``payment_account`` is
+        omitted; ``amount`` is optional and defaults to everything
+        that can be applied. ``get_outstanding_documents`` lists
+        unapplied payments, and ``get_document`` shows
+        ``unapplied_payments_available`` on a document that could
+        use one.
+
+        CROSS-CURRENCY: ``amount`` is in the document's currency.
+        When the bank line is known, pass it as
+        ``payment_account_amount`` (in the payment account's
+        currency): that is what books, the rate paid is recorded as
+        the day's price, and no quote is needed. Without it the
+        amount is derived from the latest quote.
+
         Args:
             id: Document ID (e.g., "000001").
-            payment_account: Bank or cash account for payment (e.g., "Assets:Checking").
-            amount: Payment amount as decimal string (e.g., "500.00").
+            payment_account: Bank or cash account the payment moves
+                through. Account name ("Assets:Checking") or %short guid ("%d53d547").
+                Required unless ``from_prepayment``.
+            amount: Payment amount as decimal string (e.g., "500.00"),
+                in the document's currency. Required unless
+                ``from_prepayment``.
             payment_date: Payment date (YYYY-MM-DD). Defaults to today.
             description: Description for the payment transaction. Optional.
             document_type: "invoice", "bill", "voucher", or
-                "credit_note" — disambiguates when IDs collide.
+                "credit_note". ID counters are PER TYPE, so invoice
+                "000001" and bill "000001" can both exist; an ID
+                that matches more than one document is refused
+                with the candidates listed unless this (plus
+                party_type for a credit note) is given.
             party_type: Owner side, credit notes only.
             fx_account: Optional INCOME or EXPENSE account to receive
                 realized FX gain/loss (cross-currency payments only).
-                Accepts a full path, %short GUID, or full 32-char GUID.
+                Account name ("Assets:Checking") or %short guid ("%d53d547").
             apply_discount: When True, treat this payment as the
                 final settlement and absorb the early-payment
                 discount from the invoice's billterm. Default False
@@ -1003,8 +1081,7 @@ def register(mcp, get_book) -> None:
                 (refunds don't take discounts).
             discount_account: Optional INCOME or EXPENSE account to
                 receive the discount split. Auto-resolves when
-                omitted. Accepts full path, %short GUID, or full
-                32-char GUID.
+                omitted. Account name ("Assets:Checking") or %short guid ("%d53d547").
             force: Override the stale-FX-rate guard. A cross-currency
                 payment etches the rate at pay time; if the latest
                 price is 7–90 days from the payment date the payment
@@ -1018,18 +1095,27 @@ def register(mcp, get_book) -> None:
             dry_run: When True, rehearse without writing — returns
                 the proposed splits and projected outcome instead of
                 booking. Default False.
+            allow_prepayment: Accept an ``amount`` above the
+                outstanding balance and hold the excess as the
+                party's unapplied payment. Default False (an
+                overpayment is refused, since it is usually a typo).
+            from_prepayment: Settle from the party's unapplied
+                payments instead of new money. Default False.
+            payment_account_amount: What the payment account actually
+                moved, in ITS currency — cross-currency payments
+                only.
 
         Returns:
             ``status`` is ``"paid"`` when the document settles to
             zero, ``"partial"`` when a balance remains, and
-            ``"would_pay"`` on dry runs — plus the amount paid,
-            remaining balance, and transaction reference.
+            ``"would_pay"`` / ``"would_apply"`` on dry runs — plus
+            the amount paid, remaining balance, and transaction
+            reference. ``prepayment`` reports an excess held;
+            ``applied_from_prepayment`` / ``from_payments`` /
+            ``unapplied_remaining`` report a settlement from
+            unapplied payments.
         """
-        owner_type = party_type if party_type else {
-            "invoice": "customer", "bill": "vendor",
-            "voucher": "employee",
-        }.get(_gate_document_type(document_type) if document_type else None)
-        owner_type = _gate_owner_type(owner_type)
+        owner_type = _document_owner_type(document_type, party_type)
         book = get_book()
         result = book.pay_invoice(
             invoice_id=id,
@@ -1044,6 +1130,9 @@ def register(mcp, get_book) -> None:
             force=force,
             memo=memo,
             dry_run=dry_run,
+            allow_prepayment=allow_prepayment,
+            from_prepayment=from_prepayment,
+            payment_account_amount=payment_account_amount,
         )
         return _json(result)
 
@@ -1052,7 +1141,7 @@ def register(mcp, get_book) -> None:
     @audit_log(classification="write", operation="create", entity_type="job")
     def create_job(
         owner_id: str,
-        owner_type: str,
+        party_type: str,
         name: str,
         reference: str = "",
     ) -> str:
@@ -1066,18 +1155,17 @@ def register(mcp, get_book) -> None:
 
         Args:
             owner_id: Customer or vendor ID (e.g., "000001").
-            owner_type: "customer" or "vendor". Employees are
+            party_type: "customer" or "vendor". Employees are
                 not supported (no GnuCash desktop UI for
                 employee jobs).
             name: Human-readable job name (e.g., "API Rewrite").
             reference: Optional reference string (PO number,
                 project code).
         """
-        owner_type = _gate_owner_type(owner_type)
         book = get_book()
         result = book.create_job(
             owner_id=owner_id,
-            owner_type=owner_type,
+            owner_type=party_type,
             name=name,
             reference=reference,
         )
@@ -1088,7 +1176,7 @@ def register(mcp, get_book) -> None:
     @audit_log(classification="read")
     def list_jobs(
         id: str | None = None,
-        owner_type: str | None = None,
+        party_type: str | None = None,
         owner_id: str | None = None,
         active_only: bool = True,
         verbose: bool = False,
@@ -1107,10 +1195,10 @@ def register(mcp, get_book) -> None:
         Args:
             id: Job ID for a single-job detail lookup (e.g.,
                 "000001"). All other filters are ignored.
-            owner_type: Filter by "customer" or "vendor". Omit
+            party_type: Filter by "customer" or "vendor". Omit
                 for all.
             owner_id: Filter by specific customer or vendor ID
-                (requires owner_type).
+                (requires party_type).
             active_only: If True (default), exclude inactive jobs.
             verbose: If false (default), compact text output — optimized
                 for reading and token efficiency. If true, structured
@@ -1122,9 +1210,8 @@ def register(mcp, get_book) -> None:
         book = get_book()
         if id is not None:
             return _json(book.get_job(job_id=id))
-        owner_type = _gate_owner_type(owner_type)
         result = book.list_jobs(
-            owner_type=owner_type,
+            owner_type=party_type,
             owner_id=owner_id,
             active_only=active_only,
             compact=not verbose,
@@ -1257,24 +1344,7 @@ def register(mcp, get_book) -> None:
             limit: Page size (default 50, max 250). 0 = count only.
             offset: 0-indexed first row to return (default 0).
         """
-        owner_type = _gate_owner_type(party_type)
-        # When Business isn't loaded, vendor_id is also a vendor-only
-        # surface — reject it the same way an explicit
-        # owner_type='vendor' is rejected. _gate_owner_type already
-        # handled owner_type; vendor_id needs its own check.
-        if vendor_id is not None:
-            from gnucash_mcp.server import is_module_enabled
-            # Check the leaf (``business_complete``) rather than the
-            # ``business`` group alias, so a user who explicitly
-            # picked the vendor-side carve-out also gets vendor_id
-            # filtering. See _gate_owner_type for the rationale.
-            if not is_module_enabled("business_complete"):
-                raise ValueError(
-                    "vendor_id filtering requires the business module. "
-                    "Restart with --modules=business (or add "
-                    "business_complete to your current selection) to "
-                    "access vendor bills."
-                )
+        owner_type = party_type
         book = get_book()
         result = book.get_outstanding_invoices(
             owner_type=owner_type,

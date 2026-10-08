@@ -281,8 +281,18 @@ class TestResolveGuidValidation:
         assert set(book._GUID_TABLES) == set(book._GUID_TABLE_QUERIES.keys())
         # Each query string targets the right table and parameterizes
         # the prefix (no f-string-of-user-input hidden in there).
+        # The binding is NAMED (``:prefix``) rather than positional:
+        # these queries run through SQLAlchemy so one text serves
+        # every backend, and the DBAPIs disagree on positional
+        # paramstyle (sqlite3 wants ``?``, psycopg2 ``%s``).
         for table, sql in book._GUID_TABLE_QUERIES.items():
-            assert "?" in sql, f"{table} query lost its parameter binding"
+            assert ":prefix" in sql, (
+                f"{table} query lost its parameter binding"
+            )
+            assert "?" not in sql, (
+                f"{table} query uses a positional binding, which "
+                f"psycopg2 cannot execute"
+            )
             assert f"FROM {table}" in sql, (
                 f"{table} query doesn't target the right table: {sql}"
             )

@@ -523,3 +523,52 @@ class TestNullPostDateRows:
             check_duplicates=True,
         )
         assert result["status"] == "created"
+
+
+class TestNullDescriptionRows:
+    """``transactions.description`` is nullable in GnuCash's own SQL
+    schema (flags 0 in ``gnc-transaction-sql.cpp``, where ``num`` is
+    COL_NNUL), so a book written by another tool can carry NULL.
+    Every surface that reads descriptions must treat it as empty."""
+
+    def _null_grocery_description(self, gc: GnuCashBook) -> str:
+        from sqlalchemy import text
+
+        guid = gc.search_transactions(
+            "Weekly Groceries", compact=False,
+        )["transactions"][0]["guid"]
+        with gc.open(readonly=False) as book:
+            nulled = book.session.execute(text(
+                "UPDATE transactions SET description = NULL "
+                "WHERE description = 'Weekly Groceries'"
+            ))
+            assert nulled.rowcount == 1
+            book.save()
+        return guid
+
+    def test_surfaces_tolerate_null_description(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        guid = self._null_grocery_description(gc)
+
+        assert gc.search_transactions("coffee", compact=False)
+        gc.list_transactions(compact=True)
+        gc.list_transactions(compact=False)
+        assert gc.get_transaction(guid) is not None
+        gc.get_book_summary()
+
+    def test_create_tolerates_null_description(self, test_book: Path):
+        """The create-signals sweep lowercases every description for
+        duplicate and auto-fill matching; one NULL row must not sink
+        every create in the book."""
+        gc = GnuCashBook(str(test_book))
+        self._null_grocery_description(gc)
+        result = gc.create_transaction(
+            description="Corner Store",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "12.00"},
+                {"account": "Assets:Checking", "amount": "-12.00"},
+            ],
+            trans_date=date(2026, 6, 1),
+            check_duplicates=True,
+        )
+        assert result["status"] == "created"

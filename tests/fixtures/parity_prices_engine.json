@@ -1,0 +1,131 @@
+{
+ "better_source_after_worse": {
+  "results": [
+   "ok",
+   "ok"
+  ],
+  "rows": [
+   [
+    "EUR",
+    "USD",
+    "2026-06-01 10:59:00",
+    "Finance::Quote",
+    "last",
+    "111/100"
+   ]
+  ]
+ },
+ "different_days": {
+  "results": [
+   "ok",
+   "ok"
+  ],
+  "rows": [
+   [
+    "EUR",
+    "USD",
+    "2026-06-01 10:59:00",
+    "user:price-editor",
+    "last",
+    "11/10"
+   ],
+   [
+    "EUR",
+    "USD",
+    "2026-06-02 10:59:00",
+    "user:price-editor",
+    "last",
+    "28/25"
+   ]
+  ]
+ },
+ "other_direction_same_day": {
+  "results": [
+   "ok",
+   "ok"
+  ],
+  "rows": [
+   [
+    "USD",
+    "EUR",
+    "2026-06-01 10:59:00",
+    "user:price-editor",
+    "last",
+    "9/10"
+   ]
+  ]
+ },
+ "same_source_twice": {
+  "results": [
+   "ok",
+   "ok"
+  ],
+  "rows": [
+   [
+    "EUR",
+    "USD",
+    "2026-06-01 10:59:00",
+    "user:price-editor",
+    "last",
+    "28/25"
+   ]
+  ]
+ },
+ "three_sources_best_first": {
+  "results": [
+   "ok",
+   "rejected",
+   "rejected"
+  ],
+  "rows": [
+   [
+    "EUR",
+    "USD",
+    "2026-06-01 10:59:00",
+    "Finance::Quote",
+    "last",
+    "111/100"
+   ],
+   [
+    "EUR",
+    "USD",
+    "2026-06-01 10:59:00",
+    "user:price-editor",
+    "last",
+    "11/10"
+   ],
+   [
+    "EUR",
+    "USD",
+    "2026-06-01 10:59:00",
+    "user:split-register",
+    "transaction",
+    "109/100"
+   ]
+  ]
+ },
+ "worse_source_after_better": {
+  "results": [
+   "ok",
+   "rejected"
+  ],
+  "rows": [
+   [
+    "EUR",
+    "USD",
+    "2026-06-01 10:59:00",
+    "Finance::Quote",
+    "last",
+    "111/100"
+   ],
+   [
+    "EUR",
+    "USD",
+    "2026-06-01 10:59:00",
+    "user:price",
+    "last",
+    "11/10"
+   ]
+  ]
+ }
+}

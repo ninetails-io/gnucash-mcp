@@ -29,6 +29,11 @@ def register(mcp, get_book) -> None:
     ) -> str:
         """Create a recurring transaction template.
 
+        Stored in GnuCash's own template format, so the schedule
+        shows in GnuCash desktop's editor and its Since-Last-Run
+        posts it. Schedules made in desktop can be instantiated
+        here.
+
         Args:
             name: Scheduled transaction name (e.g., "Monthly Rent").
             description: Transaction description at instantiation.
@@ -115,8 +120,12 @@ def register(mcp, get_book) -> None:
 
         This is the "what bills are coming up?" query. Leads with a
         ``Showing X-Y of Z upcoming transactions (date range)`` line,
-        soonest first. Page with ``offset``; ``limit=0`` returns the
-        count only.
+        soonest first. Overdue occurrences (due date passed, never
+        entered) lead the list, marked ``N days overdue``; each
+        schedule appears once, at its oldest un-entered date, which
+        is the date ``create_transaction_from_scheduled`` posts by
+        default. Page with ``offset``; ``limit=0`` returns the count
+        only.
 
         Args:
             days: Look ahead window in days. Default 14.
@@ -149,7 +158,13 @@ def register(mcp, get_book) -> None:
 
         Args:
             guid: Scheduled transaction GUID (or 8+ char prefix).
-            transaction_date: Date for the transaction. Defaults to next occurrence.
+            transaction_date: Date for the transaction. Defaults to
+                the oldest occurrence not yet entered — the overdue
+                one if the dashboard reports one, else the next due.
+                Call again to walk forward through missed periods.
+                Any schedule still stored in the pre-native shape is
+                migrated on this call, nothing posted for the others
+                (``templates_migrated`` in the response).
         """
         book = get_book()
         result = book.create_transaction_from_scheduled(
@@ -166,12 +181,25 @@ def register(mcp, get_book) -> None:
         enabled: bool | None = None,
         end_date: str | None = None,
         notes: str | None = None,
+        start_date: str | None = None,
     ) -> str:
         """Update a scheduled transaction.
+
+        Any schedule still stored in the pre-native (1.2–1.4.4)
+        shape is converted to GnuCash's template format on this
+        call, nothing posted. A call with no changes is the
+        deliberate one-step conversion of a whole book: run it once
+        after upgrading, before the next GnuCash desktop session.
 
         Args:
             guid: Scheduled transaction GUID (or 8+ char prefix).
             enabled: Enable or disable.
+            start_date: ``"YYYY-MM-DD"`` to move the schedule's start
+                — what desktop's Scheduled Transaction Editor does.
+                The start is the recurrence's phase anchor, so a
+                monthly schedule moved from the 15th to the 3rd
+                falls on the 3rd from then on; transactions already
+                created are untouched. Omit to leave unchanged.
             end_date: Three-state field for the schedule's end date.
 
                 - Omit (or pass ``null``): leave unchanged.
@@ -196,6 +224,7 @@ def register(mcp, get_book) -> None:
             enabled=enabled,
             end_date=end_date,
             notes=notes,
+            start_date=start_date,
         )
         return _json(result)
 

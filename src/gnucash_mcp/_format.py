@@ -18,8 +18,9 @@ Two pieces:
 
 import calendar
 import os
+import re
 from datetime import date, datetime, timedelta
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN, ROUND_HALF_UP
 from typing import TypeVar
 
 
@@ -149,6 +150,7 @@ def _format_grouped_tsv(
     excluded: list[tuple[str, Decimal]],
     label: str,
     partial_labels: set[str] | None = None,
+    currency=None,
 ) -> str:
     """Render an entity × sub-period breakdown as a TSV table.
 
@@ -169,17 +171,29 @@ def _format_grouped_tsv(
     lines = ["\t".join([label, *header_labels, "Total", "Avg"])]
     for name, leaf in zip(displayed_names, leaves):
         per = totals.get(name, {})
-        cells = [leaf]
-        cells += [f"{per.get(pl, Decimal('0')):.2f}" for pl in period_labels]
+        cells = [_one_line(leaf)]
+        cells += [
+            _format_converted(per.get(pl, Decimal('0')), currency)
+            for pl in period_labels
+        ]
         tot = row_totals[name]
         avg = tot / num_periods if num_periods else Decimal("0")
-        cells += [f"{tot:.2f}", f"{avg:.2f}"]
+        cells += [
+            _format_converted(tot, currency),
+            _format_converted(avg, currency),
+        ]
         lines.append("\t".join(cells))
 
     avg_total = grand_total / num_periods if num_periods else Decimal("0")
     total_cells = ["TOTAL"]
-    total_cells += [f"{period_totals[pl]:.2f}" for pl in period_labels]
-    total_cells += [f"{grand_total:.2f}", f"{avg_total:.2f}"]
+    total_cells += [
+        _format_converted(period_totals[pl], currency)
+        for pl in period_labels
+    ]
+    total_cells += [
+        _format_converted(grand_total, currency),
+        _format_converted(avg_total, currency),
+    ]
     lines.append("\t".join(total_cells))
 
     out = "\n".join(lines)
@@ -187,7 +201,7 @@ def _format_grouped_tsv(
         out += f"\n{_PARTIAL_FOOTNOTE}"
     if excluded:
         netted = ", ".join(
-            f"{n} {t:,.2f}"
+            f"{n} {_format_converted(t, currency, separators=True)}"
             for n, t in sorted(excluded, key=lambda x: x[1])
         )
         out += (
@@ -220,15 +234,43 @@ _BATCH_SPLIT_TOKENS = {
 _BATCH_LEGACY_GROUP = ("amount", "account")
 
 
+# Per-transaction columns a batch header may declare after
+# ``description``, in any order, each at most once: header token →
+# row key. ``cur`` is exactly ``cur`` — "currency" stays an unknown
+# token so the typo'd-split-column rejection ("currency2") holds.
+# ``num`` is the register's Num column (transactions.num, as
+# desktop's CSV importer writes it); ``link`` is the document link
+# (Transaction.cpp ``xaccTransSetDocLink``).
+_BATCH_FIXED_TOKENS = {
+    "notes": "notes",
+    "cur": "currency",
+    "num": "num",
+    "link": "link", "doclink": "link",
+}
+
+
+# The whole batch-TSV contract in one sentence, printed by EVERY
+# refusal on the way in (bookkeeper friction, 2026-09-30: four
+# rounds to the first success when only the last error showed it).
+_BATCH_CONTRACT = (
+    "columns are ref, date, description, then any of notes, num, "
+    "link, cur, then amt, acct, memo, qty, act split groups (amt1, "
+    "acct1, memo1, qty1, amt2, …); tab-separated, one header row, "
+    "one transaction per row"
+)
+
+
 def _batch_tsv_layout(header_line: str) -> dict:
     """Column layout of a batch-entry TSV, derived from its header.
 
-    Fixed prefix ``ref, date, description``, an optional ``notes``
-    column, then split columns. The split-group field sequence is
-    whatever the header's FIRST group declares (``amt, acct`` pairs;
-    ``amt, acct, memo`` triples; ``amt, acct, qty``;
-    ``amt, acct, memo, qty`` — in any intra-group order): the header
-    is the schema, for field order too.
+    Fixed prefix ``ref, date, description``, then any of the
+    per-transaction columns in ``_BATCH_FIXED_TOKENS`` (``notes``,
+    ``num``, ``link``, ``cur``) in any order, then split columns.
+    The split-group field sequence is whatever the header's FIRST
+    group declares (``amt, acct`` pairs; ``amt, acct, memo``
+    triples; ``amt, acct, qty``; ``amt, acct, memo, qty`` — in any
+    intra-group order): the header is the schema, for field order
+    too.
 
     EVERY column name is validated. Now that the header is
     load-bearing, an unknown or typo'd token (``meno1``,
@@ -237,17 +279,20 @@ def _batch_tsv_layout(header_line: str) -> dict:
     decimal error on whatever landed in an amount slot (bookkeeper
     finding, 1.4.1 validation round).
 
-    Returns ``{"has_notes": bool, "has_cur": bool, "notes_idx":
-    int | None, "cur_idx": int | None, "fixed": int, "group":
-    tuple[str, ...]}`` with ``group`` in canonical names
-    (``amount`` / ``account`` / ``memo`` / ``quantity``).
-    ``fixed`` is the count of fixed-prefix columns; split cells
-    start there.
+    Returns ``{"fixed_idx": {row_key: column}, "fixed": int,
+    "group": tuple[str, ...]}`` with ``group`` in canonical names
+    (``amount`` / ``account`` / ``memo`` / ``quantity`` /
+    ``action``). ``fixed`` is the count of fixed-prefix columns;
+    split cells start there. Rows are read through
+    ``_batch_row_fixed`` and ``_batch_row_splits``.
 
     Raises ValueError naming the offending column on any unknown
     token, a wrong fixed prefix, or a first group missing
     amount/account.
     """
+    # A byte-order mark pasted with the header is invisible, and the
+    # error then named a first column that looked correct (IV-22).
+    header_line = header_line.lstrip("\ufeff")
     raw_tokens = [t.strip().lower() for t in header_line.split("\t")]
     # Tolerate trailing empty cells (a trailing tab on the header).
     while raw_tokens and not raw_tokens[-1]:
@@ -258,38 +303,21 @@ def _batch_tsv_layout(header_line: str) -> dict:
             or tokens[2] not in ("description", "desc"):
         raise ValueError(
             "batch header must start with ref, date, description "
-            f"— got {', '.join(raw_tokens[:3]) or '(empty header)'}"
+            f"— got {', '.join(raw_tokens[:3]) or '(empty header)'}. "
+            + _BATCH_CONTRACT
         )
-    # Optional per-transaction fixed columns after description, in
-    # either order: ``notes`` and ``cur`` (row's transaction
-    # currency). Exactly ``cur`` — "currency" stays an unknown
-    # token so the typo'd-split-column rejection story
-    # ("currency2") is unchanged.
-    notes_idx: int | None = None
-    cur_idx: int | None = None
+    fixed_idx: dict[str, int] = {}
     start = 3
-    while start < len(tokens) and tokens[start] in ("notes", "cur"):
-        name = tokens[start]
-        if (name == "notes" and notes_idx is not None) or (
-            name == "cur" and cur_idx is not None
-        ):
+    while start < len(tokens) and tokens[start] in _BATCH_FIXED_TOKENS:
+        key = _BATCH_FIXED_TOKENS[tokens[start]]
+        if key in fixed_idx:
             raise ValueError(
-                f"duplicate {name!r} column in batch header"
+                f"duplicate {tokens[start]!r} column in batch header"
             )
-        if name == "notes":
-            notes_idx = start
-        else:
-            cur_idx = start
+        fixed_idx[key] = start
         start += 1
-    has_notes = notes_idx is not None
 
-    layout_fixed = {
-        "has_notes": has_notes,
-        "has_cur": cur_idx is not None,
-        "notes_idx": notes_idx,
-        "cur_idx": cur_idx,
-        "fixed": start,
-    }
+    layout_fixed = {"fixed_idx": fixed_idx, "fixed": start}
 
     canonical: list[str] = []
     for raw, token in zip(raw_tokens[start:], tokens[start:]):
@@ -297,8 +325,7 @@ def _batch_tsv_layout(header_line: str) -> dict:
         if name is None:
             raise ValueError(
                 f"unrecognized column {raw!r} in batch header — "
-                f"columns are ref, date, description, notes, cur, "
-                f"then amt, acct, memo, qty split groups"
+                + _BATCH_CONTRACT
             )
         canonical.append(name)
 
@@ -322,6 +349,19 @@ def _batch_tsv_layout(header_line: str) -> dict:
             "account column"
         )
     return layout_fixed | {"group": tuple(group)}
+
+
+def _batch_row_fixed(fields: list[str], layout: dict) -> dict:
+    """A batch row's per-transaction cells, keyed as
+    ``_BATCH_FIXED_TOKENS`` names them; empty cells are left out.
+    The one reader of those columns, shared by the tool parse and
+    the audit log's display parse. ``currency`` is upper-cased."""
+    out: dict = {}
+    for key, idx in layout["fixed_idx"].items():
+        if len(fields) > idx and fields[idx].strip():
+            cell = fields[idx].strip()
+            out[key] = cell.upper() if key == "currency" else cell
+    return out
 
 
 def _batch_row_splits(rest: list[str], group: tuple[str, ...]) -> list[dict]:
@@ -410,7 +450,11 @@ def _tsv_lines(tsv: str, what: str) -> list[str]:
     # exotic as "the header" (review finding); and number the same
     # blank-filtered rows the parse loops number, so this
     # diagnosis and every other row error agree about a line.
-    text = tsv.replace("\r\n", "\n").replace("\r", "\n")
+    # A byte-order mark on the header is invisible, and a parser that
+    # kept it reported "got \ufeffref" as if the header were right
+    # (IV-22; one of four parsers stripped it — scoped review
+    # 2026-10-06, IN-8). Once, here, for all of them.
+    text = tsv.lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
     for ch, name in _EXOTIC_SEPARATORS.items():
         if ch in text:
             prior = text[: text.index(ch)].split("\n")[:-1]
@@ -438,6 +482,8 @@ _STATEMENT_FIXED_TOKENS = {
     "raw": "raw",
     "match": "match",
     "amount": "amount", "amt": "amount",
+    "num": "num",
+    "link": "link", "doclink": "link",
 }
 
 
@@ -447,8 +493,8 @@ def _statement_tsv_layout(header_line: str) -> dict:
     Same header-is-the-schema contract as ``_batch_tsv_layout``, with
     the statement dialect's fixed columns: ``ref, date`` first, then
     any order of ``description``/``desc``, ``notes``, ``raw``,
-    ``match``, ``amount`` (required — the self-consistency gate sums
-    it), then optional split-group columns for the COUNTER-side of
+    ``match``, ``num``, ``link``, ``amount`` (required — the
+    self-consistency gate sums it), then optional split-group columns for the COUNTER-side of
     created rows (``amt, acct, memo, qty, act`` — the statement
     account's own leg is synthesized by the server, never a column).
 
@@ -497,7 +543,8 @@ def _statement_tsv_layout(header_line: str) -> dict:
             raise ValueError(
                 f"unrecognized column {raw!r} in statement header — "
                 f"columns are ref, date, then "
-                f"description/notes/raw/match/amount in any order, "
+                f"description/notes/raw/match/num/link/amount in any "
+                f"order, "
                 f"then amt, acct, memo, qty counter-split groups "
                 f"(the statement account's own leg is synthesized — "
                 f"never a column)"
@@ -535,7 +582,8 @@ def _parse_statement_tsv(tsv: str) -> list[dict]:
     """Parse an ``enter_statement`` lines TSV into row dicts.
 
     Row shape: ``{ref, date (ISO string — the caller converts),
-    amount (string), description?, notes?, raw?, match?, splits}``.
+    amount (string), description?, notes?, raw?, match?, num?,
+    link?, splits}``.
     Optional fixed cells appear only when non-empty. ``date`` and
     ``amount`` cells are REQUIRED per row — a statement line without
     either isn't a transcription, and defaulting a date (as batch
@@ -607,9 +655,28 @@ _CANDIDATE_COMPARISON_COLUMNS = (
     "ref", "candidate_guid", "confidence", "state",
     "date_new", "date_old", "date_delta_days",
     "amt_new", "amt_old", "amt_delta", "cur",
-    "desc_new", "desc_old", "notes_old", "memo_old",
+    "desc_new", "desc_old", "num_new", "num_old", "notes_old", "memo_old",
     "cat_new", "cat_old", "split_match", "signals",
 )
+
+
+def _one_line(value) -> str:
+    """Book text made safe for a single output row WITHOUT changing
+    how it reads back as a reference: tabs, newlines, and the exotic
+    separators become visible escapes or spaces, and nothing else is
+    touched. For account paths, which a caller copies out of a
+    listing and sends back as an account ref — ``_tsv_cell`` would
+    double a backslash in the name and the copied path would no
+    longer resolve."""
+    if value is None:
+        return ""
+    s = str(value)
+    if not s:
+        return ""
+    s = s.replace("\t", "\\t").replace("\n", "\\n").replace("\r", "\\r")
+    for ch in _EXOTIC_SEPARATORS:
+        s = s.replace(ch, " ")
+    return s
 
 
 def _tsv_cell(value) -> str:
@@ -639,9 +706,55 @@ def _tsv_cell(value) -> str:
     return s
 
 
+# ── Correspondence signals ─────────────────────────────────────────
+#
+# A signals string is ``D``/``A``/``D`` (description, amount, date;
+# ``-`` = no match), plus a fourth character only when BOTH sides
+# carry a Num: ``N`` the same number, ``x`` different numbers. Every
+# reader goes through the three helpers below — the duplicate screen,
+# the statement scan, and the comparison table's sort agree by
+# construction.
+
+
+def _norm_num(value) -> str:
+    return " ".join(str(value or "").split()).casefold()
+
+
+def _num_signal(proposed, candidate_nums) -> str:
+    """The Num character: ``N`` when the proposal and the candidate
+    share a number, ``x`` when both have numbers and none agree,
+    ``""`` when either side has none (no evidence either way).
+    ``proposed`` is one number or several (a batch row's Num plus,
+    in a book that keeps Num on split actions, its ``act`` cells)."""
+    if proposed is None or isinstance(proposed, str):
+        proposed = [proposed]
+    mine = {_norm_num(n) for n in proposed} - {""}
+    theirs = {_norm_num(n) for n in candidate_nums} - {""}
+    if not mine or not theirs:
+        return ""
+    return "N" if mine & theirs else "x"
+
+
+def _signal_strength(signals) -> int:
+    """How many signals agree. ``x`` is evidence AGAINST, never for."""
+    return sum(1 for ch in str(signals or "") if ch in "DAN")
+
+
+def _signal_confidence(signals) -> str:
+    """HIGH / MEDIUM / LOW / "" for a signals string. Two documents
+    numbered differently are two events, so a Num conflict caps a
+    candidate at MEDIUM: shown for review, never blocking."""
+    n = _signal_strength(signals)
+    if n >= 3:
+        return "MEDIUM" if "x" in str(signals) else "HIGH"
+    return {2: "MEDIUM", 1: "LOW"}.get(n, "")
+
+
 def _candidate_risk(row: dict) -> int:
-    """Correspondence strength = lit signal count."""
-    return sum(1 for ch in str(row.get("signals", "")) if ch != "-")
+    """Sort rank of a comparison row: its confidence tier."""
+    return {"HIGH": 3, "MEDIUM": 2, "LOW": 1}.get(
+        _signal_confidence(row.get("signals", "")), 0,
+    )
 
 
 def _candidate_comparison_tsv(rows: list[dict]) -> str:
@@ -742,6 +855,17 @@ def _dry_run_summary(
 # ── Numeric formatting ─────────────────────────────────────────────
 
 
+def _format_rate(rate) -> str:
+    """A valuation rate for display: at most six decimals, trailing
+    zeros dropped. A rate read off an INVERSE price row is a long
+    repeating decimal (``1 / 0.877116``); since a pair's direct and
+    inverse rows compete as one list (2026-09-30) that is an
+    everyday rate, not a corner, and
+    ``9900 EUR @ 1.140100055180842670752785264`` is noise. Display
+    only — the value beside it is computed from the full rate."""
+    return _format_number(rate, decimals=6, strip_trailing=True)
+
+
 def _format_number(
     value,
     decimals: int = 2,
@@ -786,11 +910,353 @@ def _format_number(
     return format(rounded, "f")
 
 
+# ── Amount display: GnuCash's rules ────────────────────────────────
+#
+# Two rules from GnuCash 5.12, one per job (review C20):
+#
+# - DISPLAY is ``xaccPrintAmount`` with the commodity's print info
+#   (``gnc_commodity_print_info`` / ``gnc_account_print_info``,
+#   app-utils/gnc-ui-util.cpp): as many decimal places as the
+#   commodity's fraction has (``is_decimal_fraction``), all of them
+#   for an ISO currency (``min_decimal_places = max``), trailing zeros
+#   dropped for anything else (``min_decimal_places = 0``). A stored
+#   amount is exact at that unit and is never rounded; where the
+#   printer must round it adds 5 at the next place and truncates the
+#   magnitude (``PrintAmountInternal``): half-up, away from zero.
+# - CONVERSION is ``convert_amount_at_date`` (engine/gnc-pricedb.cpp):
+#   the product is rounded to the target currency's fraction with
+#   ``GNC_HOW_RND_ROUND``, which gnc-numeric.h defines as banker's
+#   rounding, half-even.
+#
+# A BHD 10.125 read 10.13, 10.12, and 10.12 on three surfaces while
+# every one of them assumed two places and they disagreed on how to
+# round a half.
+
+
+def _decimal_places(fraction) -> int | None:
+    """``is_decimal_fraction``: the places a power-of-ten fraction
+    gives (100 → 2, 1000 → 3, 1 → 0); None for any other fraction."""
+    fraction = int(fraction or 1)
+    places = 0
+    while fraction > 1 and fraction % 10 == 0:
+        fraction //= 10
+        places += 1
+    return places if fraction == 1 else None
+
+
+def _is_iso(commodity) -> bool:
+    """``gnc_commodity_is_iso``: the currency namespace."""
+    return getattr(commodity, "namespace", "CURRENCY") in (
+        "CURRENCY", "ISO4217",
+    )
+
+
+def _commodity_display(commodity):
+    """What the formatters read from a commodity (mnemonic, fraction,
+    namespace), detached from the session, for figures rendered after
+    the book closes."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        mnemonic=commodity.mnemonic,
+        fraction=commodity.fraction,
+        namespace=commodity.namespace,
+    )
+
+
+def _round_converted(value, commodity) -> Decimal:
+    """An amount converted into ``commodity``, rounded as GnuCash's
+    price database rounds a conversion: to the commodity's fraction,
+    half-even."""
+    fraction = int(getattr(commodity, "fraction", 100) or 1)
+    quantum = Decimal(1) / Decimal(fraction) if fraction > 1 else Decimal(1)
+    return Decimal(str(value)).quantize(quantum, rounding=ROUND_HALF_EVEN)
+
+
+def _format_amount(
+    value,
+    commodity=None,
+    *,
+    fraction: int | None = None,
+    separators: bool = False,
+) -> str:
+    """An amount the way GnuCash prints it in ``commodity`` (see the
+    block comment above). ``fraction`` overrides the commodity's (an
+    account's non-standard SCU, ``gnc_account_print_info``). With no
+    commodity, the book-agnostic default: two places, as GnuCash's
+    locale default for a currency."""
+    if value is None or value == "":
+        value = 0
+    try:
+        d = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return str(value)
+    if fraction is None:
+        fraction = getattr(commodity, "fraction", 100) if commodity is not None else 100
+    places = _decimal_places(fraction)
+    iso = commodity is None or _is_iso(commodity)
+    if places is None:
+        # A non-decimal fraction (1/8 shares): GnuCash prints the
+        # exact value; a decimal rendering of it is exact at six.
+        places, iso = 6, False
+    rounded = d.quantize(Decimal(1).scaleb(-places), rounding=ROUND_HALF_UP)
+    s = format(rounded, ",f" if separators else "f")
+    if not iso and "." in s:
+        s = s.rstrip("0").rstrip(".")
+    if s in ("-0", "") or (rounded == 0 and s.startswith("-")):
+        s = s.lstrip("-") or "0"
+    return s
+
+
+def _format_price(value, currency) -> str:
+    """A price per unit in ``currency``, as ``gnc_price_print_info``
+    prints it: the currency's places plus two (four for USD, five for
+    BHD, two for JPY), half-up where it must round."""
+    places = (_decimal_places(getattr(currency, "fraction", 100)) or 0) + 2
+    d = Decimal(str(value if value not in (None, "") else 0))
+    return format(
+        d.quantize(Decimal(1).scaleb(-places), rounding=ROUND_HALF_UP), "f",
+    )
+
+
+def _format_exact(value, *, separators: bool = True) -> str:
+    """An exact amount whose commodity the caller does not hold:
+    every digit kept, never rounded, at least two places."""
+    d = Decimal(str(value))
+    places = max(2, -d.as_tuple().exponent) if d.is_finite() else 2
+    return format(d, f"{',' if separators else ''}.{places}f")
+
+
+def _format_converted(value, commodity=None, *, separators: bool = False) -> str:
+    """A report figure valued into ``commodity`` (the book's default
+    currency): rounded as a conversion, printed as an amount."""
+    if commodity is None:
+        return _format_amount(value, separators=separators)
+    return _format_amount(
+        _round_converted(value, commodity), commodity, separators=separators,
+    )
+
+
 # ── Path display ───────────────────────────────────────────────────
 
 
+# The schemes GnuCash desktop writes, and the bare forms people type,
+# mapped to the driver this server installs: mysql:// and mariadb://
+# loaded SQLAlchemy's default MySQL driver (MySQLdb, not installed;
+# "No module named 'MySQLdb'"), and postgres:// no longer names a
+# SQLAlchemy dialect at all. A scheme that names a driver
+# (mysql+pymysql://, postgresql+psycopg2://) is left as written.
+_SCHEME_DEFAULTS = {
+    "mysql": "mysql+pymysql",
+    "mariadb": "mysql+pymysql",
+    "postgres": "postgresql",
+}
+
+
+def _with_installed_driver(uri: str) -> str:
+    """``uri`` with a bare MySQL/MariaDB/postgres scheme pointed at the
+    installed driver; anything else unchanged. Text-level, so the rest
+    of the string (a password included) is never re-encoded."""
+    scheme, sep, rest = uri.partition("://")
+    target = _SCHEME_DEFAULTS.get(scheme.lower()) if sep else None
+    return f"{target}://{rest}" if target else uri
+
+
+def _parse_book_url(uri: str):
+    """Parse ``uri`` into a SQLAlchemy URL, or raise ValueError.
+
+    Wraps ``make_url`` so every caller gets the same message — its
+    own ArgumentError text names internals a bookkeeper can't act on,
+    and QUOTES THE STRING IT COULD NOT PARSE. Neither that text nor
+    the input is echoed here: a connection string that fails to parse
+    is, more often than not, a good one with a typo in it, password
+    and all, and this message goes to stderr (which Claude Desktop
+    keeps on disk). ``_redact_uri``'s rule applies to errors too — if
+    we can't find the password we can't prove there isn't one.
+    """
+    from sqlalchemy.engine import make_url
+    from sqlalchemy.exc import ArgumentError
+
+    if not uri or not uri.strip():
+        raise ValueError("Book URI is empty")
+    try:
+        return make_url(uri.strip())
+    except ArgumentError:
+        raise ValueError(
+            "Not a valid database URL (the value is not shown, since "
+            "it may hold a password). Expected a SQLAlchemy "
+            "connection string such as "
+            "'postgresql://user:password@host:5432/gnucash'; check "
+            "the scheme and the '://' after it."
+        ) from None
+
+
+# ``scheme://…`` up to whitespace or a quote — how a connection string
+# appears inside an exception message (piecash quotes it, SQLAlchemy
+# quotes it, drivers print it bare).
+_URI_IN_TEXT_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s<>\"']+")
+_URI_PARTS_RE = re.compile(
+    r"^(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*://)(?P<authority>[^/?#]*)"
+    r"(?P<rest>.*)$",
+    re.S,
+)
+# Query parameters that carry a secret: libpq's ``password`` and
+# ``sslpassword``, pymysql's ``password`` / ``passwd``, and the
+# generic spellings.
+_SECRET_QUERY_RE = re.compile(
+    r"(?P<key>(?<![A-Za-z0-9_])[A-Za-z0-9_]*"
+    r"(?:pass(?:word|wd)?|pwd|secret|token)[A-Za-z0-9_]*)="
+    r"(?P<value>[^&;#\s]*)",
+    re.I,
+)
+# ``user:password@`` after one or more slashes — a string that is
+# not a well-formed URL but still shows a credential
+# (``postgresql:/u:pw@host/db``).
+_LOOSE_USERINFO_RE = re.compile(
+    r"(?P<pre>[A-Za-z][A-Za-z0-9+.-]*:/+[^\s/@:'\"]*):"
+    r"(?P<pw>[^\s@'\"]+)@"
+)
+
+
+def _mask_uri_secrets(uri: str) -> str:
+    """``uri`` with every credential replaced by ``***``, by shape
+    alone (no parsing, so it cannot fail):
+
+    - the userinfo password — everything between the first ``:`` and
+      the LAST ``@`` of the authority, so a password that itself
+      contains ``@`` is masked whole (SQLAlchemy's own
+      ``hide_password`` splits at the first one and leaves the tail
+      in the host);
+    - secret-bearing query parameters (``?password=``,
+      ``sslpassword=``, ``passwd=``…), which ``hide_password`` does
+      not touch at all.
+    """
+    m = _URI_PARTS_RE.match(uri)
+    if not m:
+        return uri
+    authority = m.group("authority")
+    if "@" in authority:
+        userinfo, host = authority.rsplit("@", 1)
+        if ":" in userinfo:
+            authority = f"{userinfo.split(':', 1)[0]}:***@{host}"
+    rest = _SECRET_QUERY_RE.sub(
+        lambda q: f"{q.group('key')}=***", m.group("rest"),
+    )
+    return f"{m.group('scheme')}{authority}{rest}"
+
+
+def _redact_uri(uri: str) -> str:
+    """A connection URI with its credentials masked: the userinfo
+    password and any secret-bearing query parameter.
+
+    UNCONDITIONAL — unlike path redaction, this is not gated on
+    ``GNUCASH_REDACT_PATHS``. A book path is a privacy preference; a
+    database password in an audit file or a tool result is a
+    credential leak, and the audit log is a file the user shares when
+    asking for help.
+
+    Unparseable input is reported as ``<database>`` rather than
+    echoed: if we can't find the password we can't prove there isn't
+    one.
+    """
+    try:
+        rendered = _parse_book_url(
+            _mask_uri_secrets(uri.strip())
+        ).render_as_string(hide_password=True)
+        # render_as_string percent-encodes the query mask.
+        return rendered.replace("%2A%2A%2A", "***")
+    except (ValueError, AttributeError):
+        return "<database>"
+
+
+# Secrets the server has been handed (a book URI's password, its
+# secret query values), raw and percent-encoded. The shape-based
+# scrubber below stops at a quote or a space, so a password holding
+# one went out unmasked when piecash quoted the connection string
+# (scoped review 2026-10-06, CS-1). Masking the known strings first
+# does not depend on the shape of the text around them.
+_KNOWN_SECRETS: set[str] = set()
+
+
+def register_secrets_from_url(uri: str) -> None:
+    """Remember every secret in ``uri`` so ``_scrub_credentials``
+    masks it literally. Best-effort; a URI that does not parse
+    registers nothing (and is never echoed anywhere)."""
+    from urllib.parse import quote, unquote
+
+    try:
+        from sqlalchemy.engine import make_url
+        url = make_url(uri)
+        secrets = set()
+        if url.password:
+            secrets.add(str(url.password))
+        for key, value in (url.query or {}).items():
+            if _SECRET_QUERY_RE.match(f"{key}={value}") and value:
+                secrets.add(str(value))
+    except Exception:
+        return
+    for secret in list(secrets):
+        if len(secret) < 2:
+            continue
+        _KNOWN_SECRETS.add(secret)
+        _KNOWN_SECRETS.add(quote(secret, safe=""))
+        _KNOWN_SECRETS.add(unquote(secret))
+
+
+def _mask_known_secrets(text: str) -> str:
+    if not _KNOWN_SECRETS or not text:
+        return text
+    # Longest first, so a secret that contains another is masked whole.
+    for secret in sorted(_KNOWN_SECRETS, key=len, reverse=True):
+        if secret in text:
+            text = text.replace(secret, "***")
+    return text
+
+
+def _scrub_credentials(text: str) -> str:
+    """Mask every connection-string credential inside arbitrary text.
+    The one scrubber for text that leaves the server by any road: a
+    tool result, an audit line, a log line, a startup error.
+
+    An exception raised while opening a database book routinely
+    quotes the whole connection string — piecash's ``Database
+    'postgresql://user:pw@host/db' does not exist``, SQLAlchemy's
+    ``Invalid SQLite URL: sqlite://user:pw@`` — and ``str(e)`` used
+    to go out as written, to the model, the audit file, and stderr,
+    beside a header that carefully masked the same password
+    (adversarial review 2026-09-30, C16a).
+
+    Unconditional, like ``_redact_uri``. A URL with no credential in
+    it is left exactly as written.
+    """
+    if not text:
+        return text
+    text = _mask_known_secrets(text)
+    if "://" not in text and ":/" not in text:
+        return text
+
+    def _one(match):
+        token = match.group(0)
+        tail = ""
+        while token and token[-1] in ").,;:":
+            tail = token[-1] + tail
+            token = token[:-1]
+        masked = _mask_uri_secrets(token)
+        if masked == token:
+            return match.group(0)
+        return masked + tail
+
+    text = _URI_IN_TEXT_RE.sub(_one, text)
+    return _LOOSE_USERINFO_RE.sub(
+        lambda m: f"{m.group('pre')}:***@"
+        if m.group("pw") != "***" else m.group(0),
+        text,
+    )
+
+
 def _book_display_name(book_path) -> str:
-    """Render a book path as filename only — no directory leakage.
+    """Render a book reference for display — no secrets, no directory
+    leakage.
 
     Routine LLM-visible responses must not carry the full book path:
     it leaks username and home-directory layout into every
@@ -798,10 +1264,35 @@ def _book_display_name(book_path) -> str:
     loaded. Always-on, unlike the opt-in ``redact_paths`` (which
     targets error-message paths where the directory can be
     load-bearing debugging signal). Falsy input → ``"not set"``.
+
+    A database URI takes the same trip through ``_redact_uri``: it
+    identifies the book by host and database name while masking the
+    password. Sending one of these through ``os.path.basename``
+    instead would print the credential verbatim, which is why the
+    URI branch lives HERE rather than at each call site — every
+    existing caller (the summary header, ``get_server_config``, the
+    audit-log header) inherits the masking by construction.
     """
     if not book_path:
         return "not set"
-    return os.path.basename(str(book_path))
+    text = str(book_path)
+    if _looks_like_book_uri(text):
+        return _redact_uri(text)
+    return os.path.basename(text)
+
+
+def _looks_like_book_uri(value: str) -> bool:
+    """True when ``value`` is a connection URI rather than a path.
+
+    Deliberately narrow: a ``scheme://`` prefix, where the scheme is
+    letters/digits/``+``/``-``/``.`` per RFC 3986. A Windows path
+    (``C:\\Users\\...``) has no ``//`` after the colon and a POSIX
+    path has no colon at all, so neither matches.
+    """
+    return bool(_URI_SCHEME_RE.match(value))
+
+
+_URI_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
 
 
 # ── Limit enforcement ──────────────────────────────────────────────
@@ -841,6 +1332,11 @@ def _apply_limit(
     Returns:
         ``(truncated, notice)``; ``notice`` is None only in case 3.
     """
+    if limit is not None and limit < 0:
+        # Was silently the default page (IV-27).
+        raise ValueError(
+            f"limit must be 0 or a positive number, got {limit}"
+        )
     if not limit or limit < 1:
         limit = default
     capped = limit > max_cap
@@ -962,6 +1458,13 @@ def _paginate(
             f"{_range_suffix(items, date_key)}"
         )
 
+    if offset is not None and offset < 0:
+        raise ValueError(f"offset must be 0 or a positive number, got {offset}")
+    if limit is not None and limit < 0:
+        # Was silently the default page (IV-27).
+        raise ValueError(
+            f"limit must be 0 or a positive number, got {limit}"
+        )
     if not limit or limit < 1:
         limit = default
     capped = limit > max_cap
@@ -993,21 +1496,24 @@ def _paginate(
 
 # ── Batch transaction-update TSV ──────────────────────────────────
 
-_UPDATE_TSV_FIELDS = ("description", "notes", "date")
+_UPDATE_TSV_FIELDS = ("description", "notes", "date", "num", "link")
+# Every field but the posting date can be blanked through ``clear``.
+_UPDATE_CLEARABLE = ("description", "notes", "num", "link")
 
 
 def _parse_update_tsv(tsv: str) -> list[dict]:
     """``update_transactions`` TSV → row dicts.
 
     Header: ``guid`` then any of ``description``, ``notes``,
-    ``date`` (at least one, any order, no repeats), plus an
+    ``date``, ``num``, ``link`` (at least one, any order, no
+    repeats), plus an
     optional ``clear`` column; unknown tokens reject by name. An
     EMPTY cell leaves that field unchanged — the key is simply
     absent from the row dict.
 
     ``clear`` is the explicit opt-in that empty-cell-means-
     unchanged deliberately forecloses: its cell holds
-    comma-separated field names (``description`` and/or ``notes``)
+    comma-separated field names (any of ``_UPDATE_CLEARABLE``)
     to blank on that row, emitted as ``""`` values (the book layer
     already treats empty as clear). ``date`` is not clearable —
     transactions must have one. A row that both sets and clears
@@ -1032,7 +1538,7 @@ def _parse_update_tsv(tsv: str) -> list[dict]:
     if not fields:
         raise ValueError(
             "updates header needs at least one field column "
-            "(description, notes, date) or a clear column"
+            "(description, notes, date, num, link) or a clear column"
         )
     seen: set = set()
     for tok in fields:
@@ -1040,7 +1546,7 @@ def _parse_update_tsv(tsv: str) -> list[dict]:
             raise ValueError(
                 f"unrecognized column {tok!r} in updates header — "
                 f"columns are guid, then description, notes, date, "
-                f"and optionally clear"
+                f"num, link, and optionally clear"
             )
         if tok in seen:
             raise ValueError(f"duplicate {tok!r} column in updates header")
@@ -1054,6 +1560,18 @@ def _parse_update_tsv(tsv: str) -> list[dict]:
             raise ValueError(f"row {i}: empty guid")
         row: dict = {"guid": guid}
         clear_spec = ""
+        # A cell past the last header column belongs to no field; it
+        # was dropped without a word (a stray tab inside a description
+        # shifts everything after it, and the tail fell off) — IV-23.
+        extra = [c for c in cells[len(fields) + 1:] if c.strip()]
+        if extra:
+            raise ValueError(
+                f"row {i}: {len(extra)} more cell"
+                f"{'' if len(extra) == 1 else 's'} than the header has "
+                f"columns ({extra[0]!r}"
+                f"{', …' if len(extra) > 1 else ''}). A tab inside a "
+                f"cell shifts the rest of the row."
+            )
         for j, tok in enumerate(fields, start=1):
             cell = cells[j].strip() if j < len(cells) else ""
             if tok == "clear":
@@ -1069,10 +1587,11 @@ def _parse_update_tsv(tsv: str) -> list[dict]:
                     f"row {i}: 'date' is not clearable — every "
                     f"transaction needs a posting date"
                 )
-            if name not in ("description", "notes"):
+            if name not in _UPDATE_CLEARABLE:
                 raise ValueError(
                     f"row {i}: unknown field {name!r} in clear cell "
-                    f"— clearable fields are description, notes"
+                    f"— clearable fields are "
+                    f"{', '.join(_UPDATE_CLEARABLE)}"
                 )
             if name in row:
                 raise ValueError(
@@ -1081,3 +1600,59 @@ def _parse_update_tsv(tsv: str) -> list[dict]:
             row[name] = ""
         out.append(row)
     return out
+
+
+def _pid_alive(pid: int) -> "bool | None":
+    """Is a process with this id running? True, False, or None when
+    it cannot be told.
+
+    The ONE place the question is asked (grep-locked by
+    ``tests/test_review_remaining.py``). ``os.kill(pid, 0)`` is the
+    POSIX probe; on Windows ``os.kill`` TERMINATES the process
+    (``TerminateProcess`` with the signal as exit code), so the probe
+    there is ``OpenProcess`` + ``GetExitCodeProcess`` (scoped review
+    2026-10-05, S-1: the audit intent's liveness check, and the
+    ``gnclock`` holder's, would have killed GnuCash desktop or a twin
+    server on Windows).
+    """
+    import os
+    import sys
+
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            handle = kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION, False, pid,
+            )
+            if not handle:
+                # ERROR_INVALID_PARAMETER (87): no such process.
+                return False if ctypes.get_last_error() == 87 else None
+            try:
+                code = wintypes.DWORD()
+                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                    return None
+                return code.value == STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:  # noqa: BLE001
+            return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return None
+    return True

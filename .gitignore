@@ -43,15 +43,14 @@ htmlcov/
 # Sample books ship with the repo — exempt them from the global
 # ``*.gnucash`` ignore so they're tracked. Personal books outside
 # ``samples/`` remain ignored.
-!samples/*.gnucash
 
 # ...but the *generated* books are regenerable from the build_*.py
 # scripts (+ market_data_cache.json), so they and their auto-backup /
 # .mcp sidecars are NOT committed. The scripts + cache are the source
 # of truth; run ``uv run python scripts/synthetic_book/build_*.py`` to
 # rebuild. (Later rules override the re-include above.)
-samples/*.generated.gnucash
-samples/*.generated.gnucash.*
+samples/*.gnucash
+samples/*.gnucash.*
 samples/*.gnucash.mcp/
 # piecash writes {book}.<timestamp>.log next to the book on some
 # operations; the bare *.gnucash.log rule above doesn't match the
@@ -62,9 +61,11 @@ samples/*.gnucash.*.log
 .DS_Store
 Thumbs.db
 
-# Claude Code local-only notes (cross-session handoffs, personal context).
-# The committed CLAUDE.md is the public contributor guide.
-CLAUDE.local.md
+# Local-only notes (cross-session handoffs, personal context,
+# pre-release changelog drafts). The `.local.md` suffix marks any
+# markdown file as maintainer-private; the committed CLAUDE.md is
+# the public contributor guide.
+*.local.md
 
 # Local-only working files — IDE / client state, scratch notes,
 # local test scripts that shouldn't pollute the shared repo.

@@ -134,3 +134,13 @@ Not a release yet — the running list of items deferred out of
 prior releases or flagged for attention.
 
 - [README.md](v1.5/README.md) — the backlog: patch candidates (1.4.1), deferred features (price auto-retrieval, i18n output localization, taxtable cascade, accrual FX revaluation, DB backend), and maintenance items.
+- [CLOSE_OUT.md](v1.5/CLOSE_OUT.md) — what the 1.5.0 close-out closed: the adversarial review's remaining items, both scoped reviews, the close-out rulings, and the commit for each fix.
+- [PLAN_BOOK_SUMMARY_MAP.md](v1.5/PLAN_BOOK_SUMMARY_MAP.md) — the chart-of-accounts map and `%guid` steering on the dashboard (#203).
+- [review/](v1.5/review/) — the adversarial and scoped reviews, with their resolution tables.
+- [testing/](v1.5/testing/) — the bookkeeper's test plans and reports.
+
+---
+
+## v1.5.1 — deferred out of 1.5
+
+- [README.md](v1.5.1/README.md) — what 1.5.0 shipped with open: the trading-accounts build-out, the second half of S-9, and five items from the second scoped review, each with where it lives and what the fix would be.

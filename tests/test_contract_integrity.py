@@ -22,6 +22,13 @@ Two contracts the codebase claimed but did not enforce:
   implicitly verified by SQLAlchemy's commit — they don't need
   explicit verification.
 
+- ``TestBackendPortabilityChokepoints`` — two rules the DB backend
+  introduced, both of the "an invariant exists but is enforced at
+  only some sites" shape this file exists to close. A book may now
+  be a PostgreSQL database rather than a SQLite file, so code must
+  not assume a file (``_cache_token``) and must not lean on
+  SQLite's silent bool→int coercion (``_gnc_bool``).
+
 If any of these tests fails without an intentional change to the
 contract, the bug class is open again.
 """
@@ -29,6 +36,7 @@ contract, the bug class is open again.
 from __future__ import annotations
 
 import ast
+import re
 from pathlib import Path
 
 import pytest
@@ -543,7 +551,7 @@ class TestWriteVerificationCoverage:
     def test_every_raw_sql_dml_site_has_paired_verify(self):
         import re
         verify_pattern = re.compile(
-            r"_verify_(write|composite_write|delete)\b"
+            r"_verify_(write|composite_write|delete|none_remaining)\b"
         )
         missing: list[str] = []
         for path, line_no, table, op in self._scan_dml_sites():
@@ -583,3 +591,440 @@ class TestWriteVerificationCoverage:
             f"Scanner found only {len(sites)} DML sites — "
             f"likely the regex regressed or a refactor hid them"
         )
+
+
+class TestBackendPortabilityChokepoints:
+    """Two rules that only hold as long as every site routes through
+    one helper — the bug class this file exists to close, applied to
+    the SQLite-file assumptions the database backend broke.
+    """
+
+    _BOOK_DIR = _REPO_ROOT / "src" / "gnucash_mcp" / "book"
+
+    def _book_sources(self) -> list[Path]:
+        return sorted(self._BOOK_DIR.glob("*.py"))
+
+    def test_no_site_stats_the_book_outside_cache_token(self):
+        """``_cache_token`` is the only place that may ask the book
+        file for its mtime.
+
+        The GUID-prefix caches key on ``st_mtime_ns``, which a
+        database-backed book has no equivalent for — ``_cache_token``
+        returns None there, and its callers read that as "always
+        rebuild". A new cache that stats the book directly would
+        crash on a DB book (``book_path`` is None) or, worse, quietly
+        serve a stale prefix map whose short GUIDs collide.
+        """
+        offenders = []
+        for path in self._book_sources():
+            for lineno, line in enumerate(
+                path.read_text().splitlines(), start=1
+            ):
+                if "st_mtime_ns" not in line:
+                    continue
+                if path.name == "_base.py" and "_cache_token" in _enclosing_def(
+                    path, lineno
+                ):
+                    continue
+                offenders.append(f"{path.name}:{lineno}: {line.strip()}")
+        assert not offenders, (
+            "st_mtime_ns read outside _cache_token. A database-backed "
+            "book has no file to stat — route the invalidation through "
+            "_cache_token, which returns None to disable caching "
+            "there.\n" + "\n".join(f"  {o}" for o in offenders)
+        )
+
+    # Every INTEGER flag column GnuCash's schema carries that this
+    # codebase writes. Extend when a new one is written.
+    _FLAG_COLUMNS = frozenset({
+        "placeholder", "hidden", "enabled", "is_closed", "active",
+        "invisible", "i_taxable", "i_taxincluded", "b_taxable",
+        "b_taxincluded",
+    })
+
+    def test_flag_columns_are_written_as_integers(self):
+        """GnuCash types every flag column as INTEGER, so writes must
+        go through ``_gnc_bool``.
+
+        SQLite has no boolean type and coerces silently; PostgreSQL
+        raises ``DatatypeMismatch: column "placeholder" is of type
+        integer but expression is of type boolean``. Assigning a
+        Python bool therefore worked for as long as SQLite was the
+        only backend, and broke ``create_account(placeholder=True)``
+        and ``update_party(active=False)`` outright on the new one.
+        """
+        offenders = []
+        for path in self._book_sources():
+            tree = ast.parse(path.read_text())
+            for node in ast.walk(tree):
+                for column, value in _flag_column_writes(
+                    node, self._FLAG_COLUMNS
+                ):
+                    if _is_integer_literal(value) or _is_gnc_bool_call(value):
+                        continue
+                    offenders.append(
+                        f"{path.name}:{node.lineno}: "
+                        f"{column}={ast.unparse(value)[:60]}"
+                    )
+        assert not offenders, (
+            "Flag column written from something other than an integer "
+            "literal or _gnc_bool(...). PostgreSQL rejects a Python "
+            "bool in an INTEGER column.\n"
+            + "\n".join(f"  {o}" for o in offenders)
+        )
+
+    def test_the_scanners_are_not_vacuous(self):
+        """Both scans above pass trivially if their patterns stop
+        matching anything. Pin the sites we know exist."""
+        base = (self._BOOK_DIR / "_base.py").read_text()
+        assert base.count("st_mtime_ns") >= 1
+        assert "_gnc_bool" in (self._BOOK_DIR / "core.py").read_text()
+        assert "_gnc_bool" in (self._BOOK_DIR / "business.py").read_text()
+
+    # SQLite accepts each of these; PostgreSQL and/or MySQL reject it.
+    # Pattern → the portable form to write instead.
+    _SQLITE_ONLY_SQL = (
+        (r"\bMAX\s*\(\s*[^()]*,", "scalar MAX(a, b): write CASE / GREATEST"),
+        (r"\bMIN\s*\(\s*[^()]*,", "scalar MIN(a, b): write CASE / LEAST"),
+        (r"\bstrftime\s*\(", "strftime(): compute the date in Python"),
+        (r"\bjulianday\s*\(", "julianday(): compute the date in Python"),
+        (r"\bdatetime\s*\(", "datetime(): compute the date in Python"),
+        (r"\bifnull\s*\(", "IFNULL(): write COALESCE"),
+        (r"\bINSERT\s+OR\b", "INSERT OR ...: not portable"),
+        (r"\bGLOB\b", "GLOB: write LIKE"),
+        (r"\bPRAGMA\b", "PRAGMA: SQLite-only"),
+        (r"\btypeof\s*\(", "typeof(): SQLite-only"),
+        (r"\|\|", "|| concatenation: MySQL reads it as OR"),
+        (r"(=|<>|!=|\bIS\b|\bIS\s+NOT\b)\s*''", "typed column vs '': only SQLite's dynamic typing allows the comparison"),
+    )
+
+    def test_raw_sql_avoids_sqlite_only_constructs(self):
+        """Every ``text(...)`` statement runs unchanged on all three
+        backends.
+
+        SQLite is the permissive dialect, and it is the one every
+        hermetic test runs on — so a statement only SQLite accepts
+        passes the whole suite and fails the first database book it
+        meets. Two shipped that way: the taxtable refcount clamp
+        ``MAX(0, refcount - :n)`` (PostgreSQL and MySQL know MAX only
+        as an aggregate; no tax-bearing draft could be deleted on a
+        database book) and ``_find_invoice``'s ``date_posted = ''``
+        heal, which aborted every PostgreSQL invoice lookup (#189).
+
+        A statement that genuinely must be one backend's is allowed
+        when it sits inside a ``_dialect_name(book) == "sqlite"``
+        guard, which is how the heal is written now.
+        """
+        import ast
+
+        offenders = []
+        for path in self._book_sources():
+            source = path.read_text()
+            lines = source.splitlines()
+            tree = ast.parse(source, filename=str(path))
+            for node in ast.walk(tree):
+                if not (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "text"
+                    and node.args
+                ):
+                    continue
+                pieces = [
+                    sub.value
+                    for sub in ast.walk(node.args[0])
+                    if isinstance(sub, ast.Constant) and isinstance(sub.value, str)
+                ]
+                sql = " ".join(pieces)
+                guarded = any(
+                    '_dialect_name(book) == "sqlite"' in ln
+                    for ln in lines[max(0, node.lineno - 30): node.lineno]
+                )
+                for pattern, advice in self._SQLITE_ONLY_SQL:
+                    if re.search(pattern, sql, flags=re.IGNORECASE) and not guarded:
+                        offenders.append(
+                            f"{path.name}:{node.lineno}: {advice}\n"
+                            f"      {sql.strip()[:110]}"
+                        )
+        assert not offenders, (
+            "SQLite-only SQL in a raw text() statement. The hermetic "
+            "suite runs on SQLite and cannot see this; PostgreSQL / "
+            "MySQL reject it at runtime. Write the portable form, or "
+            "gate the statement on _dialect_name(book) == \"sqlite\".\n"
+            + "\n".join(f"  {o}" for o in offenders)
+        )
+
+
+class TestDashboardHonestFailure:
+    """Every ``except`` in the three dashboard collectors routes
+    through ``_check_failed`` — spec:
+    specs/v1.5/DASHBOARD_HONEST_FAILURE_SPEC.md.
+
+    A handler that swallows on its own reports a failed check as a
+    clean book, and on PostgreSQL leaves the transaction aborted for
+    every collector after it. The ``ImportError`` guards (business or
+    scheduling module not loaded) are the one exemption: that is
+    configuration, not failure.
+    """
+
+    _CORE = _REPO_ROOT / "src" / "gnucash_mcp" / "book" / "core.py"
+    _COLLECTORS = (
+        "_open_documents",
+        "_business_summary_counts",
+        "_overdue_scheduled_warnings",
+        "_collect_warnings",
+    )
+
+    def test_every_collector_handler_calls_check_failed(self):
+        tree = ast.parse(self._CORE.read_text(), filename=str(self._CORE))
+        seen = set()
+        offenders = []
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.FunctionDef)
+                and node.name in self._COLLECTORS
+            ):
+                continue
+            seen.add(node.name)
+            for handler in ast.walk(node):
+                if not isinstance(handler, ast.ExceptHandler):
+                    continue
+                if (
+                    isinstance(handler.type, ast.Name)
+                    and handler.type.id == "ImportError"
+                ):
+                    continue
+                routed = any(
+                    isinstance(sub, ast.Call)
+                    and isinstance(sub.func, ast.Attribute)
+                    and sub.func.attr == "_check_failed"
+                    for sub in ast.walk(handler)
+                )
+                if not routed:
+                    offenders.append(f"{node.name}:{handler.lineno}")
+        assert seen == set(self._COLLECTORS), f"collectors not found: {seen}"
+        assert not offenders, (
+            "dashboard collector handler that does not call "
+            "_check_failed — a failed check must clear an aborted "
+            "transaction and render its reason, never fall silent:\n"
+            + "\n".join(f"  {o}" for o in offenders)
+        )
+
+    def test_stale_price_collector_reads_the_valuation_rate(self):
+        """Dashboard-accuracy spec A5: the stale-price warning reads
+        ``_rates_as_of_dated`` — the map valuation uses — never a
+        commodity's own price rows via ``_find_prices``. Keyed on
+        price rows, a EUR book's USD accounts read "no price on
+        file" forever while valuing correctly off the inverse."""
+        tree = ast.parse(self._CORE.read_text(), filename=str(self._CORE))
+        fn = next(
+            n for n in ast.walk(tree)
+            if isinstance(n, ast.FunctionDef) and n.name == "_collect_warnings"
+        )
+        called = {
+            sub.func.attr for sub in ast.walk(fn)
+            if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute)
+        }
+        assert "_find_prices" not in called
+        assert "_rates_as_of_dated" in called
+
+    def test_core_never_reads_a_lot_balance_directly(self):
+        """Dashboard-accuracy spec A1: every paid/due answer on the
+        dashboard comes from ``_document_settlement``. A direct
+        ``_calculate_lot_balance`` in core is the bug class where
+        an overpaid invoice rendered as past due (``abs()`` over
+        the raw balance) and the count disagreed with
+        get_outstanding_documents."""
+        assert "_calculate_lot_balance" not in self._CORE.read_text()
+
+
+def _enclosing_def(path: Path, lineno: int) -> str:
+    """Name of the function containing ``lineno``, or ""."""
+    tree = ast.parse(path.read_text())
+    best = ""
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if node.lineno <= lineno <= (node.end_lineno or node.lineno):
+            best = node.name
+    return best
+
+
+def _flag_column_writes(node: ast.AST, columns: frozenset):
+    """Yield ``(column, value)`` for each flag column ``node`` writes.
+
+    Two shapes reach storage: ``obj.column = value`` on an ORM object,
+    and ``column=value`` inside a row-shaped call — ``.values(...)``
+    on a Core insert/update, a ``dict(...)`` that builds one, or an
+    ORM constructor (CamelCase callee). A keyword on an ordinary
+    function is NOT a write: ``self._update_business_person(
+    active=active)`` hands a Python value along, and the write it
+    reaches is scanned where it happens.
+    """
+    if isinstance(node, ast.Assign):
+        for target in node.targets:
+            if isinstance(target, ast.Attribute) and target.attr in columns:
+                yield target.attr, node.value
+    elif isinstance(node, ast.Call) and _is_row_shaped_call(node.func):
+        for kw in node.keywords:
+            if kw.arg in columns:
+                yield kw.arg, kw.value
+
+
+def _is_row_shaped_call(func: ast.expr) -> bool:
+    if isinstance(func, ast.Attribute):
+        name = func.attr
+    elif isinstance(func, ast.Name):
+        name = func.id
+    else:
+        return False
+    return name in ("values", "dict") or name[:1].isupper()
+
+
+_LOT_FLAG_NAMES = frozenset({"_LOT_OPEN", "_LOT_CLOSED", "_LOT_CLOSED_UNKNOWN"})
+
+
+def _is_integer_literal(value: ast.expr) -> bool:
+    if isinstance(value, ast.Constant) and isinstance(value.value, int):
+        return not isinstance(value.value, bool)
+    # The lot flag's named integers (gnc-lot.cpp's tri-state).
+    if isinstance(value, ast.Name) and value.id in _LOT_FLAG_NAMES:
+        return True
+    # ``-1`` parses as a unary op, not a constant.
+    return (
+        isinstance(value, ast.UnaryOp)
+        and isinstance(value.op, ast.USub)
+        and _is_integer_literal(value.operand)
+    )
+
+
+def _is_gnc_bool_call(value: ast.expr) -> bool:
+    return (
+        isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Name)
+        and value.func.id == "_gnc_bool"
+    )
+
+
+# ── Account-ref docstrings ───────────────────────────────────────────
+
+class TestAccountRefDocstringConvention:
+    """Every tool parameter that resolves an account carries the one
+    sentence naming both forms the server accepts.
+
+    Across six live batteries the bookkeeper used the ``%short``
+    account guids exactly zero times in hundreds of calls, because
+    the docstrings said "account name" and nothing said the other
+    form existed (spec ``specs/v1.5/PLAN_BOOK_SUMMARY_MAP.md``,
+    change 3). The convention is prose, so the lock is the source:
+    every parameter whose name looks account-shaped is either in
+    the ref registry (and its Args entry carries the sentence) or in
+    the named list of look-alikes that are not refs. A new tool's
+    account parameter lands in one list or this fails.
+    """
+
+    SENTENCE = 'Account name ("Assets:Checking") or %short guid ("%d53d547").'
+    TOOLS_DIR = Path(__file__).resolve().parent.parent / "src" / "gnucash_mcp" / "tools"
+
+    REFS = {
+        ("get_account_slots", "account"), ("set_account_slot", "account"),
+        ("delete_account_slot", "account"),
+        ("set_budget_amount", "account"), ("get_budget_report", "account"),
+        ("add_document_entry", "account"), ("post_document", "post_account"),
+        ("pay_document", "payment_account"), ("pay_document", "fx_account"),
+        ("pay_document", "discount_account"),
+        ("list_accounts", "root"), ("get_account", "name"),
+        ("get_balance", "account_name"), ("list_transactions", "account"),
+        ("enter_statement", "account"), ("create_account", "parent"),
+        ("update_account", "name"), ("move_account", "name"),
+        ("move_account", "new_parent"), ("delete_account", "name"),
+        ("create_lot", "account"), ("list_lots", "account"),
+        ("get_unreconciled_splits", "account"),
+        ("reconcile_account", "account"), ("cash_flow", "account"),
+    }
+    # Account-shaped names that are not refs: a NEW leaf name, a
+    # type, an amount.
+    NOT_REFS = {
+        ("create_account", "name"), ("create_account", "account_type"),
+        ("update_account", "account_type"),
+        ("pay_document", "payment_account_amount"),
+    }
+
+    @staticmethod
+    def _is_tool(node: ast.FunctionDef) -> bool:
+        for d in node.decorator_list:
+            f = d.func if isinstance(d, ast.Call) else d
+            if isinstance(f, ast.Attribute) and f.attr == "tool":
+                return True
+        return False
+
+    @classmethod
+    def _candidates(cls):
+        found = {}
+        for path in sorted(cls.TOOLS_DIR.glob("*.py")):
+            tree = ast.parse(path.read_text(), filename=str(path))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.FunctionDef) or not cls._is_tool(node):
+                    continue
+                for a in node.args.args + node.args.kwonlyargs:
+                    n = a.arg
+                    looks = any(k in n for k in ("account", "parent", "root")) or (
+                        n == "name" and "account" in node.name
+                    )
+                    if looks:
+                        found[(node.name, n)] = ast.get_docstring(node) or ""
+        return found
+
+    @staticmethod
+    def _args_entry(doc: str, param: str) -> str:
+        lines = doc.splitlines()
+        out, grabbing, indent = [], False, 0
+        for line in lines:
+            stripped = line.lstrip()
+            if stripped.startswith(f"{param}: "):
+                grabbing, indent = True, len(line) - len(stripped)
+                out.append(stripped)
+                continue
+            if grabbing:
+                this = len(line) - len(stripped)
+                if not stripped or this <= indent:
+                    break
+                out.append(stripped)
+        return " ".join(out)
+
+    def test_every_account_shaped_parameter_is_classified(self):
+        found = set(self._candidates())
+        assert found == self.REFS | self.NOT_REFS, (
+            f"unclassified: {sorted(found - self.REFS - self.NOT_REFS)}; "
+            f"stale: {sorted((self.REFS | self.NOT_REFS) - found)}"
+        )
+
+    def test_every_ref_parameter_carries_the_sentence(self):
+        docs = self._candidates()
+        offenders = [
+            f"{tool}({param}): {self._args_entry(docs[(tool, param)], param)[:70]!r}"
+            for tool, param in sorted(self.REFS)
+            if self.SENTENCE not in self._args_entry(docs[(tool, param)], param)
+        ]
+        assert offenders == [], offenders
+
+    def test_tsv_and_split_inputs_carry_the_pitch(self):
+        """The TSV ``acct`` cells and the ``SplitInput`` field are the
+        account refs that are not parameters; the two TSV docs also
+        carry the payload pitch, which is where the savings are."""
+        core = (self.TOOLS_DIR / "core.py").read_text()
+        helpers = (self.TOOLS_DIR / "_helpers.py").read_text()
+        pitch = re.compile(r"%guids in ``acct`` cells shrink the\s+payload")
+        docs = {
+            name: ast.get_docstring(node) or ""
+            for node in ast.walk(ast.parse(core))
+            if isinstance(node, ast.FunctionDef)
+            for name in [node.name]
+            if name in {"create_transactions", "enter_statement"}
+        }
+        assert set(docs) == {"create_transactions", "enter_statement"}
+        for name, doc in docs.items():
+            assert pitch.search(doc), name
+            assert re.search(r"the audit log records the resolved\s+account", doc), name
+            assert "%short guid" in doc, name
+        assert 'Account name ("Assets:Checking") or %short guid' in helpers
