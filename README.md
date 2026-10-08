@@ -7,9 +7,10 @@ that supports MCP). Ask "how am I doing this month," dictate
 your transactions out loud, hand over the books for the AI to
 keep up while you focus on running your life or your business.
 
-Your data stays on your machine. Your audit log stays on your
-machine. Nothing is uploaded anywhere — the AI reads and writes
-your local GnuCash file, and that's it.
+The server runs on your machine and works on your local GnuCash
+file; the file and its audit log never leave it. Your AI
+assistant sees what its tool calls return (balances, payees,
+invoices), just as you would on screen.
 
 **Upgrading from 1.4?** Read [the upgrade guide](docs/UPGRADING.md)
 before your first write with 1.5.
@@ -24,21 +25,12 @@ Antigravity, and the rest — connects with
 subscription you already pay for becomes a bookkeeper that never
 sends a bill.
 
-Three real, populated sample books ship in this repo so you
-can try it before you commit anything. They're realistic — full
-years of activity, mixed currencies, customers, invoices,
-budgets, the works. Walk through one in five minutes; if it
-clicks, point the server at your own book and you're done.
-
-The repo commits no book files, only the builders that make them.
-One command
-(`uv run python scripts/synthetic_book/rebuild_all.py --skip-refresh`)
-builds all three into full books through today in about four
-minutes, offline and deterministically:
-statement payments from real balances, invoices settled, accounts
-reconciled, every row in the shapes GnuCash desktop reads. The
-bundle ships them built as of its build day, so a bundle user never
-runs anything.
+Three realistic sample books let you try it before you commit
+anything: full years of activity, mixed currencies, customers,
+invoices, and budgets. The Claude Desktop bundle includes them;
+from a clone, [one command builds them](samples/README.md). Walk
+through one in five minutes; if it clicks, point the server at
+your own book and you're done.
 
 ---
 
@@ -173,9 +165,8 @@ WeChat Pay).
 A Munich-based freelance designer. EUR-default, on a German
 SKR03 chart of accounts — every account name in German. 125
 accounts and about 1,900 transactions, with live VAT returns and a
-company car under the 1% rule. This is the i18n oracle: if a
-feature secretly assumes English account names or USD, Sabine's
-book is where it breaks.
+company car under the 1% rule. If a feature assumes English
+account names or USD, Sabine's book is where it breaks.
 
 All three books are fictional. See
 [samples/README.md](samples/README.md) for the full breakdown of
@@ -629,7 +620,7 @@ the dialog lists only the documents posted to the selected account.
 
 ## Privacy and safety
 
-**Your data does not leave your machine.** This server is a
+**Your book file never leaves your machine.** This server is a
 local process that reads and writes a local file. The AI
 assistant you're talking to (Claude Desktop, etc.) sees the
 results of your tool calls — the same content you'd see on
