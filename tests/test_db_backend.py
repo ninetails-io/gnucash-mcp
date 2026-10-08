@@ -1442,3 +1442,36 @@ class TestMySQLBackend(_RealDatabaseTests):
         "SELECT count(*) FROM information_schema.PROCESSLIST "
         "WHERE DB = DATABASE()"
     )
+
+
+class TestIN21AMissingDatabaseSaysSo:
+    """piecash's advice for a missing database ("use create_book …
+    check_exists=False") is for a developer; it reached the user as
+    an unexpected error (second scoped review IN-21). The server
+    reports a missing book as a missing book, with the cure."""
+
+    def test_a_missing_database_is_file_not_found(self, tmp_path):
+        uri = f"sqlite:///{tmp_path}/missing.gnucash"
+        gc = GnuCashBook(BookSource.from_uri(uri))
+        with pytest.raises(FileNotFoundError) as exc:
+            with gc.open():
+                pass
+        message = str(exc.value)
+        assert "does not exist" in message
+        assert "GNUCASH_BOOK_URI" in message
+        assert "create_book" not in message
+        assert "check_exists" not in message
+
+    def test_the_tool_layer_reports_file_not_found(self, tmp_path):
+        import json
+        from gnucash_mcp.tools._helpers import safe_tool
+
+        gc = GnuCashBook(BookSource.from_uri(f"sqlite:///{tmp_path}/missing.gnucash"))
+
+        @safe_tool
+        def probe():
+            return gc.get_book_summary()
+
+        result = json.loads(probe())
+        assert result["error_type"] == "file_not_found"
+        assert "create_book" not in result["error"]

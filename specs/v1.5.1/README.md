@@ -82,7 +82,9 @@ each listed under Known limitations in the CHANGELOG:
   refuses a report whose start is after its end; the statement
   balances name their field; every `_to_decimal` refusal carries the
   "plain digits" cure, and a statement line keeps it.
-- **IN-21** — piecash's `create_book` advice on a missing database.
+- **IN-21** — closed on `fix/1.5.0-input-gaps`: `open()` reports a
+  missing database as `FileNotFoundError` with the cure, not
+  piecash's `create_book` advice.
 
 ### Not the server's code
 

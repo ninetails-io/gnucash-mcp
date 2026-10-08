@@ -2319,6 +2319,20 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
                         f"Close GnuCash and try again."
                         f"{self._lock_holder_note()} Details: {e}"
                     ) from e
+                # piecash's own advice for a missing database ("use
+                # create_book … check_exists=False") is for a
+                # developer and reached the user as an unexpected
+                # error (review IN-21). A missing book is a missing
+                # book; safe_tool reports it as file_not_found.
+                if (isinstance(e, GnucashException)
+                        and "does not exist" in str(e)):
+                    raise FileNotFoundError(
+                        f"The book's database does not exist: "
+                        f"{self.source.display_name}. Create it from "
+                        f"GnuCash desktop (File > Save As, choosing "
+                        f"the database type), or check the database "
+                        f"name in GNUCASH_BOOK_URI."
+                    ) from None
                 raise
 
         if book is None:
