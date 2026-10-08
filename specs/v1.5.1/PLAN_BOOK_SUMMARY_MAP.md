@@ -129,3 +129,20 @@ create_document item, under its own conditions).
   `abe-bench/sr-alex` — every map count equals
   `list_accounts(root=…, limit=0)`, the hint returns the subtree,
   Alex 81 → 84 lines.
+
+## Acceptance — PASS (bookkeeper, 2026-10-08, 08:56)
+
+1. Counts tie: Alex map 111 total = listing's "of 111"; Investments
+   (9) = subtree's 9 of 9; sr-alex shows "(93 active, 2 hidden)"
+   with "Old Banks (2 hidden)" named on its branch.
+2. The drill-down hint validates VERBATIM — `root=` was added to
+   `list_accounts` rather than printed as fiction, and the example
+   localizes per book (资产:流动资产 on Lin Wei, the SKR03 path on
+   Sabine).
+3. A %guid `acct` cell (`%d53d547`) created a transaction whose
+   audit entry reads "Checking Account −2.50 / Dining 2.50" —
+   resolved names in the permanent record, as promised.
+4. The map replaced the scattered count lines; summary length
+   roughly flat.
+5. Verified on all three regenerated demos plus the hidden-parent
+   bench book. Nothing needs fixing.
