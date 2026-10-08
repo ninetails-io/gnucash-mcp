@@ -2,7 +2,7 @@
 
 Notable changes in each release. Pull request numbers are given where they exist.
 
-## v1.5.0 - Every database GnuCash speaks
+## v1.5.0 — 2026-10-08 — Every database GnuCash speaks
 
 Books can live in PostgreSQL or MySQL/MariaDB as well as a SQLite file, and everything the server stores is now written the way GnuCash desktop writes it, so the two can share a book.
 
@@ -62,7 +62,7 @@ Books can live in PostgreSQL or MySQL/MariaDB as well as a SQLite file, and ever
 - @JamesRao98 — the PostgreSQL invoice-lookup fix (#189).
 - @wernerwws — the Num and document-link gap.
 
-## v1.4.4 - The statement is the call
+## v1.4.4 — 2026-09-01 — The statement is the call
 
 A complete bank statement enters, claims its matches, and reconciles in one atomic call; every consequential write now rehearses before it books; a one-click Claude Desktop bundle ships from the project's first CI. (v1.4.3 was never released on GitHub — that number belongs to a registry-side rebuild.)
 
@@ -112,7 +112,7 @@ A complete bank statement enters, claims its matches, and reconciles in one atom
 - Credit note nets against a job-grouped invoice from the same customer (owner check compared a Job GUID against a Customer GUID) (#165).
 - Payment dry runs render as `PAY INVOICE (dry run)` in the audit log; partial payments report `partial`, not `paid` (#165).
 
-## v1.4.2 - One call wide, every surface honest
+## v1.4.2 — 2026-08-01 — One call wide, every surface honest
 
 The bulk grammar is complete — updates, prices, currency, and reconciliation are all one call wide — plus the project's first outside code contribution and an injection-hardening pass on the audit trail.
 
@@ -141,7 +141,7 @@ The bulk grammar is complete — updates, prices, currency, and reconciliation a
 ### Credits
 - @hpuri (Gemini CLI and `libdbd-sqlite3` guidance, issue #89), @uppaljs (the `Decimal(str(value))` rule behind `_to_decimal`), @alhosani-abdulla (issue #94, intermediate-currency chain valuation).
 
-## v1.4.1 - Batch entry grows up; every annotation field reachable
+## v1.4.1 — 2026-07-18 — Batch entry grows up; every annotation field reachable
 
 ### Added
 - `create_transactions` header-declared layout: per-split `memo` columns, per-transaction `notes` column, cross-commodity `qty` columns, field order fixed by the header's first group, trailing shorthand (a row may end after its last split's amount and account), auto-fill from history for rows with no split cells (`auto_filled_from:<guid>`, still duplicate-screened), strict header validation naming unknown columns.
@@ -166,7 +166,7 @@ The bulk grammar is complete — updates, prices, currency, and reconciliation a
 ### Tests
 - 1,856 passing.
 
-## v1.4.0 - Internationalization, batch entry, and multi-book
+## v1.4.0 — 2026-07-01 — Internationalization, batch entry, and multi-book
 
 ### Added
 - Locale-robust account resolution: top-level accounts resolved by `GNCAccountType`, book locale inferred by voting across type accounts, designated accounts (FX gain/loss, discounts) self-heal via a KVP slot.
@@ -184,7 +184,7 @@ The bulk grammar is complete — updates, prices, currency, and reconciliation a
 ### Tests
 - 1,714 passing.
 
-## v1.3.1 — Business module, role-aligned modules, multi-currency correctness
+## v1.3.1 — 2026-06-13 — Business module, role-aligned modules, multi-currency correctness
 
 ### Added
 - Employee expense vouchers (`create_voucher`, `add_voucher_entry`, polymorphic post/pay/unpost/delete).
@@ -235,7 +235,7 @@ The bulk grammar is complete — updates, prices, currency, and reconciliation a
 ### Tests
 - 1,584 passing (was 1,114).
 
-## v1.2.1 — Business module shipped, multi-currency hardened
+## v1.2.1 — 2026-04-30 — Business module shipped, multi-currency hardened
 
 ### Added
 - `update_customer`, `update_vendor`, `update_employee`.
@@ -261,7 +261,7 @@ The bulk grammar is complete — updates, prices, currency, and reconciliation a
 ### Tests
 - 1,114 passing (was 540).
 
-## v1.2.0 — Business module debut
+## v1.2.0 — 2026-02-25 — Business module debut (development release; shipped in v1.2.1)
 
 ### Added
 - Customers and vendors with full address support; billing terms (Net 30, early-payment discounts).
@@ -275,7 +275,7 @@ The bulk grammar is complete — updates, prices, currency, and reconciliation a
 ### Tests
 - 540 passing.
 
-## v1.1.0 — Modular tool loading
+## v1.1.0 — 2026-02-16 — Modular tool loading
 
 ### Added
 - `--modules=` flag: seven modules (core, reconciliation, reporting, budgets, scheduling, investments, admin); 52 tools down to as few as 15; `core` always loaded; `--modules=all`.
@@ -285,7 +285,7 @@ The bulk grammar is complete — updates, prices, currency, and reconciliation a
 ### Tests
 - 424 passing.
 
-## v1.0.2 — Compact output
+## v1.0.2 — 2026-02-15 — Compact output
 
 ### Changed
 - Compact one-line-per-item default output for `list_transactions`, `list_commodities`, `list_scheduled_transactions`, `get_unreconciled_splits`, `list_lots`; verbose JSON via `verbose=true`.
@@ -298,7 +298,7 @@ The bulk grammar is complete — updates, prices, currency, and reconciliation a
 ### Tests
 - 399 passing.
 
-## v1.0.0 — Stable release
+## v1.0.0 — 2026-02-14 — Stable release
 
 ### Added
 - `replace_splits` — wholesale split replacement on existing transactions.
@@ -310,7 +310,7 @@ The bulk grammar is complete — updates, prices, currency, and reconciliation a
 ### Tests
 - 394 passing.
 
-## v0.9.0 — Feature build-out
+## v0.9.0 — 2026-02-08 — Feature build-out
 
 ### Added
 - Investments: commodities, prices, lot-based cost basis, capital gain calculation.
@@ -324,7 +324,7 @@ The bulk grammar is complete — updates, prices, currency, and reconciliation a
 ### Tests
 - 187 passing.
 
-## v0.1.0 — Initial release
+## v0.1.0 — 2026-01-30 — Initial release
 
 ### Added
 - Account listing, balances, transaction CRUD, search.
