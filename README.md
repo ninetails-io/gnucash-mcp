@@ -21,7 +21,7 @@ before your first write with 1.5.
 double-click it, and you're running — no terminal, no config
 files. Every other MCP client — ChatGPT/Codex, Gemini,
 Antigravity, and the rest — connects with
-[a few lines of setup](#other-ai-clients). Either way, the AI
+[a few lines of setup](docs/CLIENTS.md). Either way, the AI
 subscription you already pay for becomes a bookkeeper that never
 sends a bill.
 
@@ -133,7 +133,7 @@ You don't need to be a developer. You need:
 
 The repo ships three sample personas — synthetic ledgers you can
 talk to without touching your real data. The bundle carries them
-fully built; from a clone, one build command produces them (below).
+fully built; from a clone, [one command builds them](samples/README.md).
 Pick one, point the server at it, and start asking questions.
 
 ### `samples/alex-chen-morales.gnucash` — Personal + freelance
@@ -176,7 +176,7 @@ what's in each.
 
 ## Quick Start
 
-### The one-click way (Claude Desktop)
+### Install in one click (Claude Desktop)
 
 Download the **`.mcpb` bundle** from the
 [latest release](https://github.com/ninetails-io/gnucash-mcp/releases/latest)
@@ -196,85 +196,9 @@ things:
   Everything else — budgets, scheduled transactions, investment
   tracking — is always on.
 
-That's the entire install. Skip ahead to
-[step 4](#4-try-it) to take it for a spin.
+That's the entire install.
 
-### The manual way (any MCP client, or development)
-
-The path below gives you an updatable git-clone install — for
-Claude Desktop without the bundle, for
-[other AI clients](#other-ai-clients), or for hacking on the
-server itself.
-
-### 1. Download and install
-
-```bash
-git clone https://github.com/ninetails-io/gnucash-mcp.git
-uv tool install -e ./gnucash-mcp
-```
-
-The second command gives you a `gnucash-mcp` command (in
-`~/.local/bin`) with its dependencies in a private environment —
-your other Python projects never see them. The `-e` makes it an
-*updatable* install: the command runs whatever code is in your
-clone, so updating is `git pull` plus a server restart. The one
-exception: if an update changes *dependencies*, run
-`uv tool install -e ./gnucash-mcp --reinstall` once.
-
-> If you don't have `uv`, install it with one line:
-> `curl -LsSf https://astral.sh/uv/install.sh | sh`
-
-### 2. Make a working copy of a sample book
-
-The repo holds no book files, only their builders, so build the
-book first (about a minute and a half, offline). The server then writes audit logs
-and auto-backups alongside the book file, and you don't want either
-committed back to the repo, so copy the built book somewhere outside
-it:
-
-```bash
-cd gnucash-mcp
-uv run python scripts/synthetic_book/rebuild_all.py --skip-refresh --only alex --no-promote
-mkdir -p ~/gnucash-mcp-scratch
-cp samples/alex.generated.gnucash ~/gnucash-mcp-scratch/alex.gnucash
-```
-
-### 3. Tell Claude Desktop about the server
-
-Find your Claude Desktop config:
-
-- **Mac:** `~/Library/Application Support/Claude/claude_desktop_config.json`
-- **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
-
-Add this — replace `yourname` in both paths:
-
-```json
-{
-  "mcpServers": {
-    "gnucash": {
-      "command": "/Users/yourname/.local/bin/gnucash-mcp",
-      "args": ["--modules=all"],
-      "env": {
-        "GNUCASH_BOOK_PATH": "/Users/yourname/gnucash-mcp-scratch/alex.gnucash"
-      }
-    }
-  }
-}
-```
-
-Use the **full path** to the command: GUI apps launch without
-your shell's PATH, so a bare `gnucash-mcp` may not resolve even
-though it works in your terminal. (`uv tool dir --bin` prints
-the right directory if yours differs.) `--modules=all` loads
-every tool (86 of them) so you can poke at anything. Once you
-know what you actually use, narrow it — see
-[choosing a module set](#choosing-a-module-set) below.
-
-Quit Claude Desktop completely (not just close the window —
-quit) and reopen it. Look for the hammer 🔨 icon next to the
-text input. That means the server's connected.
-
-### 4. Try it
+### Try it
 
 Ask Claude:
 
@@ -287,9 +211,15 @@ Ask Claude:
 The first response usually starts with the dashboard from
 above. Everything after that is conversational.
 
-When you're ready to point at your own book, replace the
-`GNUCASH_BOOK_PATH` value with the path to your real `.gnucash`
-file (more on that next), restart Claude Desktop, and ask away.
+When you're ready for your own book, see
+[Connecting to your own book](#connecting-to-your-own-book) below.
+
+### Other AI clients, or installing from source
+
+ChatGPT and Codex, Claude Code, Gemini CLI, Google Antigravity,
+and any other MCP client connect through an install from a git
+clone, as do database books and anyone working on the server:
+see [docs/CLIENTS.md](docs/CLIENTS.md).
 
 ---
 
@@ -326,15 +256,12 @@ and later mark any book with a budget the same way when they open
 it, so this only matters if you still run an older 3.x. The server
 is tested against GnuCash 5.12.
 
-### Set the path
+### Point the server at it
 
-Update `GNUCASH_BOOK_PATH` in your Claude Desktop config to
-point at your own SQLite-format book. Restart Claude Desktop.
-
-> **Use absolute paths**, not `~` or relative paths. On
-> Mac/Linux: `/Users/yourname/Documents/mybook.gnucash`. On
-> Windows: `C:\\Users\\yourname\\Documents\\mybook.gnucash`
-> (note the doubled backslashes — that's a JSON requirement).
+With the bundle, choose the book in the GnuCash extension's settings
+in Claude Desktop, then restart Claude Desktop. With a clone install,
+set `GNUCASH_BOOK_PATH` to the book's absolute path; see
+[Using your own book](docs/CLIENTS.md#using-your-own-book).
 
 ### Or: keep the book in PostgreSQL or MySQL
 
@@ -355,7 +282,7 @@ string instead of a path:
 
 Install the driver alongside the server — `postgres` or `mysql`
 (MariaDB uses the same one). From inside your clone (the
-`gnucash-mcp` folder):
+`gnucash-mcp` folder; see [installing from source](docs/CLIENTS.md)):
 
 ```bash
 uv tool install -e ".[postgres]" --reinstall
@@ -408,95 +335,6 @@ Worth knowing before you switch:
 
 Both dialects are exercised by the test suite and CI: PostgreSQL
 16 and MariaDB 11, each against a real server.
-
-### Other AI clients
-
-This is an [MCP](https://modelcontextprotocol.io/) server, so
-it works with any client that speaks MCP. Everywhere below,
-`gnucash-mcp` means the full path from the install step
-(`/Users/yourname/.local/bin/gnucash-mcp`; `uv tool dir --bin`
-prints yours).
-
-- **ChatGPT desktop / Codex (the GUI form)** — likely your path
-  if this is your first time clicking "Codex." The whole setup
-  is fill-in-the-blanks; no config file is involved, so there's
-  nothing to break. One habit to unlearn: type every value
-  bare, **no quotes** — these fields aren't a terminal, so
-  quotes become literal characters in the value and the launch
-  silently fails.
-  1. The app opens in ChatGPT mode — click the **∨** next to
-     "ChatGPT" (top left) and choose **Codex** ("Build, debug,
-     and ship").
-  2. Open **Settings** (the ChatGPT menu → Settings…, ⌘, on
-     Mac), and under **Integrations** pick **Plugins** — not
-     "Connections" under Coding, which is a different thing.
-  3. Top right: **Add ∨** → **Add MCP server**. The "Connect to
-     a custom MCP" form appears. **Name** it `gnucash`; leave
-     **Type** on **STDIO** (the default).
-  4. **Command to launch**: the full `gnucash-mcp` path from
-     the install step (`uv tool dir --bin` prints the
-     directory).
-     *Cloned the repo but skipped the install step?* Then
-     there is no `gnucash-mcp` command — launch `uv` itself:
-     command = the full path to `uv` (`which uv` prints it),
-     and the first four argument rows become `run`,
-     `--directory`, `/path/to/your/clone`, `gnucash-mcp` —
-     ahead of the `--modules=all` row below. Run `uv sync`
-     once in the clone first, so the first launch isn't a
-     cold dependency install racing the app's startup
-     timeout.
-  5. **Arguments**: `--modules=all` — one argument per row
-     ("+ Add argument" for each; don't space-join several into
-     one row).
-  6. **Environment variables**: key `GNUCASH_BOOK_PATH`, value
-     = your book's full path. Several books? Join them with `:`
-     (Mac/Linux) or `;` (Windows) and switch between them
-     in-chat.
-  7. **Environment variable passthrough** and **Working
-     directory**: leave empty. **Save** — your server appears
-     under the **MCPs** tab.
-
-  Then ask Codex "how am I doing this month?"
-- **Claude Code**: `claude mcp add-json gnucash '{"command":"/Users/yourname/.local/bin/gnucash-mcp","args":["--modules=all"],"env":{"GNUCASH_BOOK_PATH":"/path/to/your/book.gnucash"}}'`
-  Add `--scope user` for all projects, `--scope project` for
-  this one only.
-- **Codex CLI**: one command, no config file to hand-edit:
-  `codex mcp add gnucash --env GNUCASH_BOOK_PATH="/path/to/your/book.gnucash" -- /Users/yourname/.local/bin/gnucash-mcp --modules=all`
-  (Codex stores it in `~/.codex/config.toml`; the same config
-  serves the Codex VS Code extension. `codex mcp list` confirms
-  registration.)
-- **Gemini CLI**: `gemini mcp add -e GNUCASH_BOOK_PATH="/path/to/your/book.gnucash" gnucash /Users/yourname/.local/bin/gnucash-mcp --modules=all`
-  This writes a project `.gemini/settings.json` with the server
-  registered; run `/mcp list` inside Gemini to confirm it shows
-  `gnucash - Ready`. (Verified on Linux — if GnuCash never offered
-  a SQLite3 export, see the `libdbd-sqlite3` note above. The Gemini
-  walkthrough and the Linux driver fix both come from
-  [@hpuri](https://github.com/hpuri)'s testing in
-  [#89](https://github.com/ninetails-io/gnucash-mcp/issues/89) —
-  thanks.)
-- **Google Antigravity (IDE or CLI)**: add the server to
-  `~/.gemini/config/mcp_config.json` (global) or your
-  workspace's `.agents/mcp_config.json`:
-  ```json
-  {
-    "mcpServers": {
-      "gnucash": {
-        "command": "/home/yourname/.local/bin/gnucash-mcp",
-        "args": ["--modules=all"],
-        "env": { "GNUCASH_BOOK_PATH": "/path/to/your/book.gnucash" }
-      }
-    }
-  }
-  ```
-  Use the absolute command path. On Linux the same
-  `libdbd-sqlite3` note as the Gemini walkthrough applies if
-  GnuCash won't offer a SQLite3 save format.
-- **Anything else**: set `GNUCASH_BOOK_PATH` and run
-  `gnucash-mcp`. No install at all? `uv run --directory
-  /path/to/gnucash-mcp gnucash-mcp` and
-  `python -m gnucash_mcp` (with the repo on the path) both
-  still work. Any client that can spawn a command and speak
-  MCP over stdio will do.
 
 ---
 
