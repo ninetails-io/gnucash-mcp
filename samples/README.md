@@ -41,7 +41,7 @@ cp samples/alex-chen-morales.gnucash ~/gnucash-mcp-scratch/
 ```
 
 Then point `GNUCASH_BOOK_PATH` at the copy, as in the main
-[installation guide](../docs/CLIENTS.md#2-make-a-working-copy-of-a-sample-book). To serve
+[installation guide](../docs/CLIENTS.md#2-build-a-sample-book). To serve
 all three, join their paths with `:` (`;` on Windows) and switch
 between them in chat.
 

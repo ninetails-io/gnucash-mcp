@@ -24,13 +24,13 @@ exception: if an update changes *dependencies*, run
 > If you don't have `uv`, install it with one line:
 > `curl -LsSf https://astral.sh/uv/install.sh | sh`
 
-## 2. Make a working copy of a sample book
+## 2. Build a sample book
 
-The repo holds no book files, only their builders, so build the
-book first (about a minute and a half, offline). The server then writes audit logs
-and auto-backups alongside the book file, and you don't want either
-committed back to the repo, so copy the built book somewhere outside
-it:
+A clone has no sample books, only the builders that make them, so
+build one first. This builds Alex, offline, in about a minute and a
+half, then copies the book out of the repo: the server writes an
+audit log and backups beside a book, and those don't belong in your
+clone.
 
 ```bash
 cd gnucash-mcp
@@ -38,6 +38,13 @@ uv run python scripts/synthetic_book/rebuild_all.py --skip-refresh --only alex -
 mkdir -p ~/gnucash-mcp-scratch
 cp samples/alex.generated.gnucash ~/gnucash-mcp-scratch/alex.gnucash
 ```
+
+Drop `--only alex` to build all three (about four minutes); they
+land as `samples/alex.generated.gnucash`,
+`samples/lin-wei.generated.gnucash`, and
+`samples/sabine-brenner.generated.gnucash`.
+[samples/README.md](../samples/README.md) describes each book and
+every build option.
 
 ## 3. Connect your AI client
 
