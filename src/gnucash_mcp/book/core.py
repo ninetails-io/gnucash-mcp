@@ -2940,7 +2940,7 @@ class CoreMixin:
         every book's tree by bouncing off did-you-mean errors; this
         hands over the shape in one place, in the book's own
         language, with a drill-down call that validates (spec
-        ``specs/v1.5.1/PLAN_BOOK_SUMMARY_MAP.md``).
+        ``specs/v1.5/PLAN_BOOK_SUMMARY_MAP.md``).
 
         Only children that are themselves branches (a subtree of
         more than one account) are listed; leaves are implied by

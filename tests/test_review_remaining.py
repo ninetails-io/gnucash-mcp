@@ -3,7 +3,7 @@
 One class per finding, named for it, each with the test that fails on
 the code as it stood. The findings are in
 ``specs/v1.5/testing/ADVERSARIAL_REVIEW_1.5.md`` (sections 5, 7, 8)
-and were listed in ``specs/v1.5.1/README.md`` until they were fixed.
+and the record of how each was closed is ``specs/v1.5/CLOSE_OUT.md``.
 """
 
 import sqlite3
@@ -2105,7 +2105,7 @@ class TestSecondReviewMinor:
 
 class TestBookkeeperSecondLoop:
     """The bookkeeper's second-review loop
-    (specs/v1.5.1/testing/BOOKKEEPER_REPORT_SECOND_REVIEW.md): two
+    (specs/v1.5/testing/BOOKKEEPER_REPORT_SECOND_REVIEW.md): two
     findings, two queries, and the friction ledger."""
 
     def test_billterm_and_taxtable_names_are_one_line(self, business_book):

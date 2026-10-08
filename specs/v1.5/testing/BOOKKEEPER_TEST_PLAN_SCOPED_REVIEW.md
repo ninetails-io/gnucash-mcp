@@ -3,7 +3,7 @@
 What the scoped review's fixes changed that a bookkeeper would see.
 Every item has a unit test and was re-run against the reviewers' own
 reproduction scripts; none has had a live pass. The findings and
-their resolution are in `specs/v1.5.1/review/SCOPED_REVIEW_2026-10-05.md`.
+their resolution are in `specs/v1.5/review/SCOPED_REVIEW_2026-10-05.md`.
 
 **Server:** `fix/1.5.0-scoped-review` at its tip. Bounce it first.
 **Books:** a scratch copy of the multi-currency Alex; a scratch copy

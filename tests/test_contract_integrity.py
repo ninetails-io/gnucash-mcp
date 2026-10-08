@@ -915,7 +915,7 @@ class TestAccountRefDocstringConvention:
     Across six live batteries the bookkeeper used the ``%short``
     account guids exactly zero times in hundreds of calls, because
     the docstrings said "account name" and nothing said the other
-    form existed (spec ``specs/v1.5.1/PLAN_BOOK_SUMMARY_MAP.md``,
+    form existed (spec ``specs/v1.5/PLAN_BOOK_SUMMARY_MAP.md``,
     change 3). The convention is prose, so the lock is the source:
     every parameter whose name looks account-shaped is either in
     the ref registry (and its Args entry carries the sentence) or in

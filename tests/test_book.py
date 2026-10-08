@@ -337,7 +337,7 @@ class TestGetBookSummary:
 
 class TestGetBookSummaryChartMap:
     """The chart-of-accounts map (spec
-    ``specs/v1.5.1/PLAN_BOOK_SUMMARY_MAP.md``): one tree, depth two,
+    ``specs/v1.5/PLAN_BOOK_SUMMARY_MAP.md``): one tree, depth two,
     replacing the scattered per-type count lines. Every count ties
     to ``list_accounts`` under the same filters; the drill-down
     hint names a call that validates. The header adds how many are
