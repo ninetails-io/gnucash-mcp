@@ -91,8 +91,11 @@ each listed under Known limitations in the CHANGELOG:
 ### Not the server's code
 
 - **FC-18 — the bundled demo books are old piecash-format files.**
-  Belongs to the sample-book regeneration (`feat/demo-books-legal-
-  pass` and the round branches).
+  Closed by #202: no book is committed, and the builders make all
+  three from nothing through the server's own write paths (prices
+  through `create_prices`, splits through `_new_split`, schedule
+  stamps through one shared writer). A converting write on a fresh
+  build reports nothing to convert.
 
 ### Closed by ruling; do not pick up without a new one
 
