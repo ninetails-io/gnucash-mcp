@@ -343,16 +343,19 @@ string instead of a path:
 }
 ```
 
-Install the driver alongside the server — `postgres` or `mysql`
-(MariaDB uses the same one):
+Install the driver alongside the server from your clone — `postgres`
+or `mysql` (MariaDB uses the same one):
 
 ```bash
-uv tool install "gnucash-mcp[postgres]"
+uv tool install -e "./gnucash-mcp[postgres]"
 ```
 
 For MySQL / MariaDB the connection string is
 `mysql+pymysql://user:password@localhost:3306/gnucash` and the extra
-is `"gnucash-mcp[mysql]"`.
+is `[mysql]`: `uv tool install -e "./gnucash-mcp[mysql]"`.
+
+Install from the clone, as above, not by name: the name `gnucash-mcp`
+on PyPI belongs to a different project.
 
 To move an existing book across: open it in GnuCash,
 **File → Save As**, pick **postgres** or **mysql**, and fill in the

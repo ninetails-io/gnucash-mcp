@@ -1994,8 +1994,9 @@ Options:
                        exclusive with --book. Exactly one book — a
                        connection string has no filename for
                        switch_book to match. Requires the driver
-                       (`pip install "gnucash-mcp[postgres]"` or
-                       `"gnucash-mcp[mysql]"`) and GNUCASH_LOG_DIR.
+                       (from the clone: `uv tool install -e
+                       ".[postgres]"` or `".[mysql]"`) and
+                       GNUCASH_LOG_DIR.
                        Backups are the server's one unavailable
                        feature there: snapshot the database with
                        pg_dump / mysqldump instead.
