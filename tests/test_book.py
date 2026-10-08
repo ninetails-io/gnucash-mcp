@@ -465,7 +465,8 @@ class TestGetBookSummaryChartMap:
         assert re.search(r"^Assets: USD ", summary, re.M)
         assert (
             "Frequently used accounts (last 180 days — any account "
-            "parameter accepts the %guid or the full name):"
+            "parameter accepts the %guid or the full name; a %guid is "
+            "fewer tokens and faster to write):"
         ) in summary or "Frequently used accounts" not in summary
 
 
@@ -14765,7 +14766,8 @@ class TestFrequentAccounts:
         summary = gc.get_book_summary()
         assert (
             "Frequently used accounts (last 180 days — any account "
-            "parameter accepts the %guid or the full name):"
+            "parameter accepts the %guid or the full name; a %guid is "
+            "fewer tokens and faster to write):"
         ) in summary
         section = summary.split("Frequently used accounts")[1]
         lines = [

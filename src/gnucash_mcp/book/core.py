@@ -3019,7 +3019,8 @@ class CoreMixin:
         short_map = self._account_short_guid_map(book)
         lines = [
             f"Frequently used accounts (last {days} days — any account "
-            f"parameter accepts the %guid or the full name):"
+            f"parameter accepts the %guid or the full name; a %guid is "
+            f"fewer tokens and faster to write):"
         ]
         for g, _n in ranked:
             lines.append(

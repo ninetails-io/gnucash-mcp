@@ -55,7 +55,8 @@ Keep the top-15 list exactly as is (it is the exact-spelling and
 guid source callers copy from). Change only its header:
 
     Frequently used accounts (last 180 days — any account parameter
-    accepts the %guid or the full name):
+    accepts the %guid or the full name; a %guid is fewer tokens and
+    faster to write):
 
 ## Change 3 — docstring updates on account-taking parameters
 
