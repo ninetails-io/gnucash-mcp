@@ -13,7 +13,42 @@ These books are **fictional**. Names, addresses, tax IDs, account
 numbers, and amounts are invented; tax IDs are well-formed and
 deliberately invalid. Use them freely.
 
-## Building the books
+## Cloned the repo? Build the books first
+
+A clone has no book files, only the builders. (The Claude Desktop
+bundle ships the books already built.) From the top of your clone:
+
+```bash
+uv run python scripts/synthetic_book/rebuild_all.py --skip-refresh
+```
+
+It takes about four minutes and needs no network. When it finishes,
+this folder holds `alex-chen-morales.gnucash`, `lin-wei.gnucash`, and
+`sabine-brenner.gnucash`, each built through today. To build only
+one, add `--only alex` (or `lin-wei`, `sabine`); Alex alone takes
+about a minute and a half.
+
+If it stops with "A gnucash-mcp server appears to be running", quit
+your AI client and run the command again: the last step replaces the
+books here, and it won't do that while a server might be using them.
+
+**Using a book.** The server writes an audit log and backups in a
+folder beside the book, so copy it out of the repo first:
+
+```bash
+mkdir -p ~/gnucash-mcp-scratch
+cp samples/alex-chen-morales.gnucash ~/gnucash-mcp-scratch/
+```
+
+Then point `GNUCASH_BOOK_PATH` at the copy, as in the main
+[README](../README.md#2-make-a-working-copy-of-a-sample-book). To serve
+all three, join their paths with `:` (`;` on Windows) and switch
+between them in chat.
+
+The books stop on the day you built them. Run the command again
+whenever you want them current.
+
+## Build options
 
 ```bash
 uv run python scripts/synthetic_book/rebuild_all.py --skip-refresh
