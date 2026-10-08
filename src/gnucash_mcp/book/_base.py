@@ -47,6 +47,7 @@ from gnucash_mcp._format import (
     _format_amount,
     _one_line,
     _parse_book_url,
+    _with_installed_driver,
     _tsv_cell,
     _pid_alive,
     register_secrets_from_url,
@@ -533,19 +534,42 @@ def _set_split_amounts(split, value, quantity) -> None:
     _lot_forget_flag(split.lot)
 
 
+# GnuCash stores an amount as a 64-bit count of its commodity's
+# smallest unit (gnc_numeric's int64 numerator over the fraction).
+_GNC_INT64_MAX = 2**63 - 1
+
+
+def _unit_count_error(amount, unit: Decimal, mnemonic: str,
+                      what: str) -> ValueError | None:
+    """The refusal for an amount whose count of ``unit`` does not fit
+    GnuCash's 64-bit numerator. ``_to_decimal`` bounds magnitude and
+    places separately, without knowing the commodity, so 10^16 dollars
+    (10^18 cents) passed the dry run and failed the whole batch at
+    commit (review IN-7). None when it fits."""
+    if abs(amount / unit) <= _GNC_INT64_MAX:
+        return None
+    largest = (Decimal(_GNC_INT64_MAX) * unit).normalize()
+    return ValueError(
+        f"{what}: {amount} is too large to store in {mnemonic} — "
+        f"GnuCash keeps an amount as a 64-bit count of its smallest "
+        f"unit, so the largest it can hold is {largest:f}"
+    )
+
+
 def _money_precision_error(amount, commodity, what: str) -> ValueError | None:
     """The refusal for money typed finer than its currency's unit
     (maintainer ruling, 2026-09-27): "12.345" dollars is a typo to
-    catch, not a value to round. None when the amount fits."""
+    catch, not a value to round, and for money too large to store
+    (``_unit_count_error``). None when the amount fits."""
     quantum = _commodity_quantum(commodity)
-    if amount == amount.quantize(quantum, ROUND_HALF_UP):
-        return None
-    places = max(-quantum.as_tuple().exponent, 0)
-    return ValueError(
-        f"{what}: {amount} carries finer precision than "
-        f"{commodity.mnemonic} allows ({places} decimals) — re-check "
-        f"the transcription"
-    )
+    if amount != amount.quantize(quantum, ROUND_HALF_UP):
+        places = max(-quantum.as_tuple().exponent, 0)
+        return ValueError(
+            f"{what}: {amount} carries finer precision than "
+            f"{commodity.mnemonic} allows ({places} decimals) — re-check "
+            f"the transcription"
+        )
+    return _unit_count_error(amount, quantum, commodity.mnemonic, what)
 
 
 def _all_slot_columns():
@@ -812,6 +836,39 @@ _LEDGER_DATE_MIN = date(1400, 1, 1)
 _LEDGER_DATE_MAX = date(9998, 12, 31)
 
 
+def _check_report_range(start, end) -> None:
+    """Refuse a report whose start is after its end: it answered an
+    empty total without comment (review IN-20). ``None`` or
+    ``date.max`` on either side is an open bound and passes."""
+    if start is None or end is None or end == date.max:
+        return
+    if start > end:
+        raise ValueError(
+            f"start_date {start.isoformat()} is after end_date "
+            f"{end.isoformat()}, so the report would cover nothing. "
+            f"Swap the dates."
+        )
+
+
+def _far_date_warning(value) -> "str | None":
+    """The slipped-year warning every dated write attaches (C34,
+    review IN-5): more than a year ahead ("2062 for 2026") or before
+    1900 ("0026"). A warning, never a refusal — historical imports
+    are ordinary. None for an ordinary date or no date."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        value = value.date()
+    if (value - date.today()).days > 365:
+        return (
+            f"dated {value.isoformat()}, more than a year ahead — "
+            f"likely a typo; check the year"
+        )
+    if value.year < 1900:
+        return f"dated {value.isoformat()} — check the year"
+    return None
+
+
 def _check_ledger_date(value, what: str) -> None:
     """Refuse a date GnuCash cannot hold. ``None`` passes; a datetime
     is judged by its day."""
@@ -961,8 +1018,11 @@ def _to_decimal(value) -> Decimal:
     try:
         d = Decimal(str(value))
     except InvalidOperation:
+        # The cure rides every refusal, a thousands separator above
+        # all ("2,850.00"): review IN-20.
         raise ValueError(
-            f"not a valid decimal amount: {value!r}"
+            f"not a valid decimal amount: {value!r} (use plain digits "
+            f"and a decimal point, e.g. 1234.56)"
         ) from None
     if not d.is_finite():
         raise ValueError(f"amount must be a finite number, got {value!r}")
@@ -2004,6 +2064,7 @@ class BookSource:
         Raises:
             ValueError: the URI doesn't parse as a SQLAlchemy URL.
         """
+        uri = _with_installed_driver(uri)
         url = _parse_book_url(uri)
         register_secrets_from_url(uri)
         db_name = (url.database or "").strip("/") or "book"
@@ -2260,6 +2321,20 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
                         f"Close GnuCash and try again."
                         f"{self._lock_holder_note()} Details: {e}"
                     ) from e
+                # piecash's own advice for a missing database ("use
+                # create_book … check_exists=False") is for a
+                # developer and reached the user as an unexpected
+                # error (review IN-21). A missing book is a missing
+                # book; safe_tool reports it as file_not_found.
+                if (isinstance(e, GnucashException)
+                        and "does not exist" in str(e)):
+                    raise FileNotFoundError(
+                        f"The book's database does not exist: "
+                        f"{self.source.display_name}. Create it from "
+                        f"GnuCash desktop (File > Save As, choosing "
+                        f"the database type), or check the database "
+                        f"name in GNUCASH_BOOK_URI."
+                    ) from None
                 raise
 
         if book is None:

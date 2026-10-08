@@ -17,7 +17,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 import piecash
 
@@ -86,6 +86,8 @@ from gnucash_mcp.book._base import (
     _is_voided,
     _lot_forget_flag,
     _money_precision_error,
+    _unit_count_error,
+    _account_unit,
     _format_account_amount,
     _new_split,
     _no_price_if_rounded,
@@ -106,6 +108,7 @@ from gnucash_mcp.book._base import (
     _check_control_chars,
     _check_one_line,
     _check_ledger_date,
+    _far_date_warning,
 )
 
 
@@ -2937,7 +2940,7 @@ class CoreMixin:
         every book's tree by bouncing off did-you-mean errors; this
         hands over the shape in one place, in the book's own
         language, with a drill-down call that validates (spec
-        ``specs/v1.5.1/PLAN_BOOK_SUMMARY_MAP.md``).
+        ``specs/v1.5/PLAN_BOOK_SUMMARY_MAP.md``).
 
         Only children that are themselves branches (a subtree of
         more than one account) are listed; leaves are implied by
@@ -4581,14 +4584,22 @@ class CoreMixin:
             elif "quantity" in split:
                 quantity = _to_decimal(split["quantity"])
                 # A foreign-currency account holds money too; shares
-                # round at storage instead (_split_amounts).
+                # round at storage instead (_split_amounts), and must
+                # still fit once rounded (IN-7).
                 if account.commodity.namespace == "CURRENCY":
                     error = _money_precision_error(
                         quantity, account.commodity,
                         f"Split for '{ref}' quantity",
                     )
-                    if error:
-                        raise error
+                else:
+                    unit = _account_unit(account)
+                    error = _unit_count_error(
+                        quantity.quantize(unit, ROUND_HALF_UP), unit,
+                        account.commodity.mnemonic,
+                        f"Split for '{ref}' quantity",
+                    )
+                if error:
+                    raise error
                 if quantity * value < 0:
                     raise ValueError(
                         f"Split for '{ref}': quantity and value "
@@ -5186,7 +5197,6 @@ class CoreMixin:
             # (non-blocking) — surfaced as a side table keyed by ref,
             # so a decimal slip in a bulk import is caught too.
             warn_rows: list = []
-            today = date.today()
             read_only_before = self._read_only_before(book)
             for p, _dc, _mc in accepted:
                 closed = self._read_only_period_note(
@@ -5201,16 +5211,9 @@ class CoreMixin:
                 # ahead ("2062 for 2026"), or a year no ledger holds
                 # ("0026"). Historical imports are the point of this
                 # tool, so an ordinary old date draws nothing.
-                row_date = p["trans_date"]
-                if (row_date - today).days > 365:
-                    warn_rows.append((p["ref"], (
-                        f"dated {row_date.isoformat()}, more than a "
-                        f"year ahead — likely a typo; check the year"
-                    )))
-                elif row_date.year < 1900:
-                    warn_rows.append((p["ref"], (
-                        f"dated {row_date.isoformat()} — check the year"
-                    )))
+                far = _far_date_warning(p["trans_date"])
+                if far:
+                    warn_rows.append((p["ref"], far))
                 for w in p["auto_fill_warnings"]:
                     warn_rows.append((p["ref"], w["message"]))
                 for w in self._fx_sanity_warnings(
@@ -5539,8 +5542,16 @@ class CoreMixin:
                 "duplicate ref in statement — each line needs a "
                 "unique ref"
             )
-        opening = _to_decimal(opening_balance)
-        closing = _to_decimal(closing_balance)
+        # Name the field: "2,850.00" errored without saying which
+        # number it meant (review IN-20).
+        try:
+            opening = _to_decimal(opening_balance)
+        except ValueError as e:
+            raise ValueError(f"opening_balance: {e}") from None
+        try:
+            closing = _to_decimal(closing_balance)
+        except ValueError as e:
+            raise ValueError(f"closing_balance: {e}") from None
 
         with self.open(readonly=dry_run) as book:
             default_currency = self._require_default_currency(book)
@@ -5570,11 +5581,10 @@ class CoreMixin:
             for ln in lines:
                 try:
                     amt = _to_decimal(ln["amount"])
-                except ValueError:
-                    raise ValueError(
-                        f"line {ln['ref']}: amount "
-                        f"{ln['amount']!r} is not a decimal"
-                    )
+                except ValueError as e:
+                    # _to_decimal's message carries the cure ("use
+                    # plain digits"); keep it (review IN-20).
+                    raise ValueError(f"line {ln['ref']}: {e}") from None
                 # Sub-quantum precision is a transcription error,
                 # not a rounding job — and rounding here would let
                 # the self-check gate and the tie compute different
@@ -7940,6 +7950,14 @@ class CoreMixin:
                 )
                 for u, txn in prepared
             } if read_only_before else {}
+            # The reason column also carries a slipped year on a new
+            # date (review IN-5).
+            for u, _txn in prepared:
+                far = _far_date_warning(u.get("date"))
+                if far:
+                    closed_notes[u["guid"]] = "; ".join(
+                        n for n in (closed_notes.get(u["guid"]), far) if n
+                    )
 
             for u, txn in prepared:
                 if "description" in u:
@@ -8209,6 +8227,11 @@ class CoreMixin:
             if closed:
                 fx_warnings = list(fx_warnings) + [
                     {"type": "read_only_period", "message": closed}
+                ]
+            far = _far_date_warning(trans_date)
+            if far:
+                fx_warnings = list(fx_warnings) + [
+                    {"type": "far_date", "message": far}
                 ]
             if fx_warnings:
                 result["warnings"] = fx_warnings

@@ -52,6 +52,7 @@ from gnucash_mcp.book._base import (  # noqa: F401 — re-exported ports
     _SLOT_TEXT_WIDTH,
     _check_one_line,
     _check_ledger_date,
+    _far_date_warning,
 )
 from gnucash_mcp._format import _paginate
 
@@ -1739,6 +1740,9 @@ class SchedulingMixin:
         response.update(shapes)
         if closed and response["status"] != "rejected":
             response["read_only_period"] = closed
+        far = _far_date_warning(txn_date)
+        if far and response["status"] != "rejected":
+            response["date_warning"] = far
         if txn_result.get("status") == "rejected":
             # Evidence that the rejection is the CORRECT outcome —
             # without it, the natural retry instinct re-triggers the

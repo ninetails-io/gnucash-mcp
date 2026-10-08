@@ -7,9 +7,10 @@ that supports MCP). Ask "how am I doing this month," dictate
 your transactions out loud, hand over the books for the AI to
 keep up while you focus on running your life or your business.
 
-Your data stays on your machine. Your audit log stays on your
-machine. Nothing is uploaded anywhere — the AI reads and writes
-your local GnuCash file, and that's it.
+The server runs on your machine and works on your local GnuCash
+file; the file and its audit log never leave it. Your AI
+assistant sees what its tool calls return (balances, payees,
+invoices), just as you would on screen.
 
 **Upgrading from 1.4?** Read [the upgrade guide](docs/UPGRADING.md)
 before your first write with 1.5.
@@ -20,25 +21,16 @@ before your first write with 1.5.
 double-click it, and you're running — no terminal, no config
 files. Every other MCP client — ChatGPT/Codex, Gemini,
 Antigravity, and the rest — connects with
-[a few lines of setup](#other-ai-clients). Either way, the AI
+[a few lines of setup](docs/CLIENTS.md). Either way, the AI
 subscription you already pay for becomes a bookkeeper that never
 sends a bill.
 
-Three real, populated sample books ship in this repo so you
-can try it before you commit anything. They're realistic — full
-years of activity, mixed currencies, customers, invoices,
-budgets, the works. Walk through one in five minutes; if it
-clicks, point the server at your own book and you're done.
-
-The repo commits no book files, only the builders that make them.
-One command
-(`uv run python scripts/synthetic_book/rebuild_all.py --skip-refresh`)
-builds all three into full books through today in about four
-minutes, offline and deterministically:
-statement payments from real balances, invoices settled, accounts
-reconciled, every row in the shapes GnuCash desktop reads. The
-bundle ships them built as of its build day, so a bundle user never
-runs anything.
+Three realistic sample books let you try it before you commit
+anything: full years of activity, mixed currencies, customers,
+invoices, and budgets. The Claude Desktop bundle includes them;
+from a clone, [one command builds them](samples/README.md). Walk
+through one in five minutes; if it clicks, point the server at
+your own book and you're done.
 
 ---
 
@@ -48,55 +40,60 @@ This is what your AI assistant sees when it opens one of the
 sample books — a complete financial dashboard in a single call:
 
 ```
-Book: samples/alex-chen-morales.gnucash
+Book: alex-chen-morales.gnucash
 Currency: USD
-Data range: 2025-01-01 to 2026-05-31
-Last entry: 2026-04-30 (today) (1 future-dated, latest 2026-05-31)
-Warnings:
-  ⚠ Past due invoice: Berlin Digital GmbH 58 days overdue, EUR 4,200.00
-  ⚠ Stale price: GBP last updated 150 days ago
-Chart of accounts (108 active) — drill into any branch with list_accounts(root="Assets:Investments"):
-  Assets (20): Investments (8), Current Assets (4), Fixed Assets (3), Receivables (3)
-  Liabilities (8): Credit Card (3), Loans (3)
-  Equity (2)
-  Income (10): Investment Income (4)
-  Expenses (56): Taxes (8), Business (7), Utilities (6), Housing (5), Auto (4), Insurance (4), Interest (4), Pet (3)
-Assets: USD 602680.49
-  Condo: USD 473250.00
-  VTSAX: 230.7620 VTSAX @ 170.99 (USD 39457.99)
-  Vehicle: USD 27845.00
-  401k: USD 13404.62
-  Checking Account: USD 12393.11
+Data range: 2025-01-01 to 2026-10-08
+Last entry: 2026-10-08 (today)
+Chart of accounts: 111 total (109 active) — drill into any branch with list_accounts(root="Assets:Investments"):
+  Assets (25 total): Investments (9), Current Assets (5), Fixed Assets (3), Receivables (3), Retirement (3)
+  Liabilities (8 total): Credit Card (3), Loans (3)
+  Equity (3 total)
+  Income (11 total): Investment Income (6)
+  Expenses (64 total): Business (14), Taxes (10), Utilities (6), Auto (4), Housing (4), Interest (4), Insurance (3), Pet (3)
+Assets: USD 874270.54
+  Condo: USD 475000.00
+  VTSAX: 453.4039 VTSAX @ 185.53 (USD 84120.03)
+  UWRP 403(b): USD 74778.40
+  Savings Account: USD 60000.00
+  Cascade Code LLC Checking: USD 41390.64
   ...
-Liabilities: USD 418457.79
-  Credit cards (2): USD 38044.26
-  Loans (2): USD 380413.53
-  Top 3: Mortgage USD 372199.55, Chase Sapphire USD 22383.23, Business Amex USD 15661.03
-Receivables: 3 accounts, USD 10246.46
-  Accounts Receivable EUR: USD 4908.96
-  Accounts Receivable: USD 3500.00
-  Accounts Receivable CAD: USD 1837.50
+Liabilities: USD 389695.79
+  Credit cards (2): USD 1319.99
+  Loans & other (2): USD 385873.30
+  Top 3: Mortgage USD 373846.80, Auto Loan USD 12026.50, Chase Sapphire USD 876.31
+Receivables: 2 accounts, USD 27324.47 (4 invoices, 0 overdue; included in Assets total)
+  Accounts Receivable: USD 22425.00
+  Accounts Receivable EUR: USD 4899.47
+Payables: 1 account, USD 2502.50 (1 bill, 0 overdue; included in Liabilities total)
+  Accounts Payable: USD 2502.50
+Jobs: 3 active
+Frequently used accounts (last 180 days — any account parameter accepts the %guid or the full name; a %guid is fewer tokens and faster to write):
+  %528b7d9	Assets:Current Assets:Checking Account [BANK]
+  %8799a0a	Liabilities:Credit Card:Chase Sapphire [CREDIT]
+  %839fcf8	Expenses:Dining
+  ...
 Reconciliation:
-  Checking Account: 174 splits unreconciled (4 months behind, oldest: 2025-12-30) ⚠
-  7 accounts never reconciled ⚠
+  6 accounts current
 Net worth trajectory:
-  12mo ago: USD 187,925
-   6mo ago: USD 180,614
-   3mo ago: USD 191,350
-   1mo ago: USD 185,444
-       now: USD 184,223
-Monthly net (last 6 months):
-  Apr 2026 (MTD): -9,056
-  Mar 2026: +3,092
-  Feb 2026: +5,202
-  Jan 2026: +1,086
-  Dec 2025: +4,853
-  Nov 2025: -1,494
-Runway: 121 days (USD 84,579 liquid / USD 694/day burn)
-Budget (2026 Annual Budget): USD 24,600 spent / USD 22,800 expected by today (+8%)
-Transactions: 2473
-Scheduled: 13 recurring, none due in next 7 days
-Business: 4 customers, 2 vendors, 1 employee
+  12mo ago: USD 345,969
+   6mo ago: USD 381,961
+   3mo ago: USD 429,392
+   1mo ago: USD 443,546
+       now: USD 484,575
+Monthly net (income - expenses, last 6 months):
+  Oct 2026 (MTD): +11,955 (vs Sep 1-8: -2,365)
+  Sep 2026: +25,894
+  Aug 2026: +7,588
+  Jul 2026: +10,307
+  Jun 2026: +24,092
+  May 2026: +9,017
+Runway: 579 days (USD 246,844 liquid / USD 426/day cash out incl. debt paydown, 180-day avg; cards owe USD 1,320)
+Budget (2026 Annual Budget): USD 27,736 spent / USD 28,683 expected by today (-3%)
+Transactions: 2227
+Scheduled: 20 recurring, 16 due in next 7 days (USD 15,128 out)
+Business: 8 customers, 3 vendors
+Budgets: 2
+Commodities: AAPL, CAD, ETH, EUR, MSFT, USD, VBTLX, VTSAX
 ```
 
 That's not a screenshot — that's the AI's actual orientation
@@ -136,35 +133,40 @@ You don't need to be a developer. You need:
 
 The repo ships three sample personas — synthetic ledgers you can
 talk to without touching your real data. The bundle carries them
-fully built; from a clone, one build command produces them (below).
+fully built; from a clone, [one command builds them](samples/README.md).
 Pick one, point the server at it, and start asking questions.
 
 ### `samples/alex-chen-morales.gnucash` — Personal + freelance
 
-A Seattle-based independent software contractor with a US LLC.
-USD-default. ~141 accounts, ~2,475 transactions across 2025–
-2026. Has a mortgage, a brokerage with VTSAX/VBTLX/AAPL/MSFT/ETH
-holdings, a 401(k), four customers spanning USD/EUR/GBP/CAD with
-foreign-currency invoices, scheduled bills, a budget — pretty
-much everything the server can do, all in one book.
+A Seattle-based independent software contractor with a
+single-member LLC and a spouse on a hospital payroll. USD-default.
+111 accounts and over 2,000 transactions from 2025 to the build
+date. Has a mortgage, a brokerage with VTSAX/VBTLX/AAPL/MSFT/ETH
+holdings, a Solo 401(k) beside the spouse's 403(b), eight
+customers invoiced in USD, EUR and CAD, a subcontractor billed
+through A/P, Washington B&O tax, scheduled bills, budgets —
+pretty much everything the server can do, all in one book.
 
-### `samples/lin-wei.gnucash` — Cross-border small business
+### `samples/lin-wei.gnucash` — Shenzhen software studio
 
-A Shenzhen-based small-business owner running a cross-border
-e-commerce operation. CNY-default. ~105 accounts, ~1,960
-transactions. Chinese-named customers paying in CNY, USD/EUR
-customers paying in foreign currency with realized FX gain/loss
-on rate moves, domestic Chinese investments (茅台, 宁德时代,
-ETFs), an LPR-based mortgage, mixed payment rails (checking +
-Alipay + WeChat Pay).
+A Shenzhen developer running a registered sole-proprietor studio
+that builds cross-border e-commerce software, with a spouse on a
+hospital payroll. CNY-default, on a native zh_CN chart. 101
+accounts and about 3,000 transactions. Shenzhen tech clients
+(Tencent, DJI, SF Tech and others) paying in CNY, USD/EUR clients
+paying in foreign currency with
+realized FX gain/loss on rate moves, domestic Chinese investments
+(宁德时代 and two ETFs), a part-time employee, an HKD credit card,
+a mortgage, and mixed payment rails (corporate account + Alipay +
+WeChat Pay).
 
 ### `samples/sabine-brenner.gnucash` — German freelancer, SKR03 chart
 
-A Munich-based freelance consultant. EUR-default, on a German
-SKR03 chart of accounts — every account name in German. ~110
-accounts, ~1,500 transactions. This is the i18n oracle: if a
-feature secretly assumes English account names or USD, Sabine's
-book is where it breaks.
+A Munich-based freelance designer. EUR-default, on a German
+SKR03 chart of accounts — every account name in German. 125
+accounts and about 1,900 transactions, with live VAT returns and a
+company car under the 1% rule. If a feature assumes English
+account names or USD, Sabine's book is where it breaks.
 
 All three books are fictional. See
 [samples/README.md](samples/README.md) for the full breakdown of
@@ -174,7 +176,7 @@ what's in each.
 
 ## Quick Start
 
-### The one-click way (Claude Desktop)
+### Install in one click (Claude Desktop)
 
 Download the **`.mcpb` bundle** from the
 [latest release](https://github.com/ninetails-io/gnucash-mcp/releases/latest)
@@ -194,85 +196,9 @@ things:
   Everything else — budgets, scheduled transactions, investment
   tracking — is always on.
 
-That's the entire install. Skip ahead to
-[step 4](#4-try-it) to take it for a spin.
+That's the entire install.
 
-### The manual way (any MCP client, or development)
-
-The path below gives you an updatable git-clone install — for
-Claude Desktop without the bundle, for
-[other AI clients](#other-ai-clients), or for hacking on the
-server itself.
-
-### 1. Download and install
-
-```bash
-git clone https://github.com/ninetails-io/gnucash-mcp.git
-uv tool install -e ./gnucash-mcp
-```
-
-The second command gives you a `gnucash-mcp` command (in
-`~/.local/bin`) with its dependencies in a private environment —
-your other Python projects never see them. The `-e` makes it an
-*updatable* install: the command runs whatever code is in your
-clone, so updating is `git pull` plus a server restart. The one
-exception: if an update changes *dependencies*, run
-`uv tool install -e ./gnucash-mcp --reinstall` once.
-
-> If you don't have `uv`, install it with one line:
-> `curl -LsSf https://astral.sh/uv/install.sh | sh`
-
-### 2. Make a working copy of a sample book
-
-The repo holds no book files, only their builders, so build the
-book first (about a minute and a half, offline). The server then writes audit logs
-and auto-backups alongside the book file, and you don't want either
-committed back to the repo, so copy the built book somewhere outside
-it:
-
-```bash
-cd gnucash-mcp
-uv run python scripts/synthetic_book/rebuild_all.py --skip-refresh --only alex --no-promote
-mkdir -p ~/gnucash-mcp-scratch
-cp samples/alex.generated.gnucash ~/gnucash-mcp-scratch/alex.gnucash
-```
-
-### 3. Tell Claude Desktop about the server
-
-Find your Claude Desktop config:
-
-- **Mac:** `~/Library/Application Support/Claude/claude_desktop_config.json`
-- **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
-
-Add this — replace `yourname` in both paths:
-
-```json
-{
-  "mcpServers": {
-    "gnucash": {
-      "command": "/Users/yourname/.local/bin/gnucash-mcp",
-      "args": ["--modules=all"],
-      "env": {
-        "GNUCASH_BOOK_PATH": "/Users/yourname/gnucash-mcp-scratch/alex.gnucash"
-      }
-    }
-  }
-}
-```
-
-Use the **full path** to the command: GUI apps launch without
-your shell's PATH, so a bare `gnucash-mcp` may not resolve even
-though it works in your terminal. (`uv tool dir --bin` prints
-the right directory if yours differs.) `--modules=all` loads
-every tool (86 of them) so you can poke at anything. Once you
-know what you actually use, narrow it — see
-[choosing a module set](#choosing-a-module-set) below.
-
-Quit Claude Desktop completely (not just close the window —
-quit) and reopen it. Look for the hammer 🔨 icon next to the
-text input. That means the server's connected.
-
-### 4. Try it
+### Try it
 
 Ask Claude:
 
@@ -285,9 +211,15 @@ Ask Claude:
 The first response usually starts with the dashboard from
 above. Everything after that is conversational.
 
-When you're ready to point at your own book, replace the
-`GNUCASH_BOOK_PATH` value with the path to your real `.gnucash`
-file (more on that next), restart Claude Desktop, and ask away.
+When you're ready for your own book, see
+[Connecting to your own book](#connecting-to-your-own-book) below.
+
+### Other AI clients, or installing from source
+
+ChatGPT and Codex, Claude Code, Gemini CLI, Google Antigravity,
+and any other MCP client connect through an install from a git
+clone, as do database books and anyone working on the server:
+see [docs/CLIENTS.md](docs/CLIENTS.md).
 
 ---
 
@@ -324,15 +256,12 @@ and later mark any book with a budget the same way when they open
 it, so this only matters if you still run an older 3.x. The server
 is tested against GnuCash 5.12.
 
-### Set the path
+### Point the server at it
 
-Update `GNUCASH_BOOK_PATH` in your Claude Desktop config to
-point at your own SQLite-format book. Restart Claude Desktop.
-
-> **Use absolute paths**, not `~` or relative paths. On
-> Mac/Linux: `/Users/yourname/Documents/mybook.gnucash`. On
-> Windows: `C:\\Users\\yourname\\Documents\\mybook.gnucash`
-> (note the doubled backslashes — that's a JSON requirement).
+With the bundle, choose the book in the GnuCash extension's settings
+in Claude Desktop, then restart Claude Desktop. With a clone install,
+set `GNUCASH_BOOK_PATH` to the book's absolute path; see
+[Using your own book](docs/CLIENTS.md#using-your-own-book).
 
 ### Or: keep the book in PostgreSQL or MySQL
 
@@ -351,16 +280,19 @@ string instead of a path:
 }
 ```
 
-Install the driver alongside the server from your clone — `postgres`
-or `mysql` (MariaDB uses the same one):
+Install the driver alongside the server — `postgres` or `mysql`
+(MariaDB uses the same one). From inside your clone (the
+`gnucash-mcp` folder; see [installing from source](docs/CLIENTS.md)):
 
 ```bash
-uv tool install -e "./gnucash-mcp[postgres]"
+uv tool install -e ".[postgres]" --reinstall
 ```
 
 For MySQL / MariaDB the connection string is
 `mysql+pymysql://user:password@localhost:3306/gnucash` and the extra
-is `[mysql]`: `uv tool install -e "./gnucash-mcp[mysql]"`.
+is `[mysql]`: `uv tool install -e ".[mysql]" --reinstall`. The
+shorter forms GnuCash itself writes, `mysql://` and `postgres://`,
+work too; the server uses the driver the extra installed.
 
 Install from the clone, as above, not by name: the name `gnucash-mcp`
 on PyPI belongs to a different project.
@@ -406,128 +338,37 @@ Worth knowing before you switch:
 Both dialects are exercised by the test suite and CI: PostgreSQL
 16 and MariaDB 11, each against a real server.
 
-### Other AI clients
-
-This is an [MCP](https://modelcontextprotocol.io/) server, so
-it works with any client that speaks MCP. Everywhere below,
-`gnucash-mcp` means the full path from the install step
-(`/Users/yourname/.local/bin/gnucash-mcp`; `uv tool dir --bin`
-prints yours).
-
-- **ChatGPT desktop / Codex (the GUI form)** — likely your path
-  if this is your first time clicking "Codex." The whole setup
-  is fill-in-the-blanks; no config file is involved, so there's
-  nothing to break. One habit to unlearn: type every value
-  bare, **no quotes** — these fields aren't a terminal, so
-  quotes become literal characters in the value and the launch
-  silently fails.
-  1. The app opens in ChatGPT mode — click the **∨** next to
-     "ChatGPT" (top left) and choose **Codex** ("Build, debug,
-     and ship").
-  2. Open **Settings** (the ChatGPT menu → Settings…, ⌘, on
-     Mac), and under **Integrations** pick **Plugins** — not
-     "Connections" under Coding, which is a different thing.
-  3. Top right: **Add ∨** → **Add MCP server**. The "Connect to
-     a custom MCP" form appears. **Name** it `gnucash`; leave
-     **Type** on **STDIO** (the default).
-  4. **Command to launch**: the full `gnucash-mcp` path from
-     the install step (`uv tool dir --bin` prints the
-     directory).
-     *Cloned the repo but skipped the install step?* Then
-     there is no `gnucash-mcp` command — launch `uv` itself:
-     command = the full path to `uv` (`which uv` prints it),
-     and the first four argument rows become `run`,
-     `--directory`, `/path/to/your/clone`, `gnucash-mcp` —
-     ahead of the `--modules=all` row below. Run `uv sync`
-     once in the clone first, so the first launch isn't a
-     cold dependency install racing the app's startup
-     timeout.
-  5. **Arguments**: `--modules=all` — one argument per row
-     ("+ Add argument" for each; don't space-join several into
-     one row).
-  6. **Environment variables**: key `GNUCASH_BOOK_PATH`, value
-     = your book's full path. Several books? Join them with `:`
-     (Mac/Linux) or `;` (Windows) and switch between them
-     in-chat.
-  7. **Environment variable passthrough** and **Working
-     directory**: leave empty. **Save** — your server appears
-     under the **MCPs** tab.
-
-  Then ask Codex "how am I doing this month?"
-- **Claude Code**: `claude mcp add-json gnucash '{"command":"/Users/yourname/.local/bin/gnucash-mcp","args":["--modules=all"],"env":{"GNUCASH_BOOK_PATH":"/path/to/your/book.gnucash"}}'`
-  Add `--scope user` for all projects, `--scope project` for
-  this one only.
-- **Codex CLI**: one command, no config file to hand-edit:
-  `codex mcp add gnucash --env GNUCASH_BOOK_PATH="/path/to/your/book.gnucash" -- /Users/yourname/.local/bin/gnucash-mcp --modules=all`
-  (Codex stores it in `~/.codex/config.toml`; the same config
-  serves the Codex VS Code extension. `codex mcp list` confirms
-  registration.)
-- **Gemini CLI**: `gemini mcp add -e GNUCASH_BOOK_PATH="/path/to/your/book.gnucash" gnucash /Users/yourname/.local/bin/gnucash-mcp --modules=all`
-  This writes a project `.gemini/settings.json` with the server
-  registered; run `/mcp list` inside Gemini to confirm it shows
-  `gnucash - Ready`. (Verified on Linux — if GnuCash never offered
-  a SQLite3 export, see the `libdbd-sqlite3` note above. The Gemini
-  walkthrough and the Linux driver fix both come from
-  [@hpuri](https://github.com/hpuri)'s testing in
-  [#89](https://github.com/ninetails-io/gnucash-mcp/issues/89) —
-  thanks.)
-- **Google Antigravity (IDE or CLI)**: add the server to
-  `~/.gemini/config/mcp_config.json` (global) or your
-  workspace's `.agents/mcp_config.json`:
-  ```json
-  {
-    "mcpServers": {
-      "gnucash": {
-        "command": "/home/yourname/.local/bin/gnucash-mcp",
-        "args": ["--modules=all"],
-        "env": { "GNUCASH_BOOK_PATH": "/path/to/your/book.gnucash" }
-      }
-    }
-  }
-  ```
-  Use the absolute command path. On Linux the same
-  `libdbd-sqlite3` note as the Gemini walkthrough applies if
-  GnuCash won't offer a SQLite3 save format.
-- **Anything else**: set `GNUCASH_BOOK_PATH` and run
-  `gnucash-mcp`. No install at all? `uv run --directory
-  /path/to/gnucash-mcp gnucash-mcp` and
-  `python -m gnucash_mcp` (with the repo on the path) both
-  still work. Any client that can spawn a command and speak
-  MCP over stdio will do.
-
 ---
 
 ## Choosing a module set
 
 `--modules=all` is the easy default — every tool, 86 of them.
 For day-to-day use you'll probably want less. Pick the role that
-matches how you'll talk to the server. Each role is a *group*
-that expands to the underlying tool modules; you can also pick
-the leaves individually for a finer cut.
+matches how you'll talk to the server; you can also pick the
+modules behind each role individually for a finer cut.
 
 | Role | What it gives you | Tools |
 |---|---|---|
 | `core` | Ledger primitives — accounts, transactions, balances, slots, audit log, backups, balance sheet, **reconciliation**. **Always loaded.** | 29 |
-| `bookkeeper` | Run reports, manage budgets, schedule recurring transactions. The personal-finance management cluster. (Reconciliation moved into core — any configuration that handles money needs it.) | 17 |
-| `investor` | Cost-basis tracking + price/commodity management. Tax-lot accounting needs prices to compute gains, so the bundle is the useful unit. | 12 |
-| `freelancer` | Party + document management (polymorphic: customers by default; vendors/employees unlock with `business_complete`), sales tax, billterms, jobs, credit notes. The full solo-consultant toolkit. | 26 |
-| `business` | Full small-business package — group alias: `freelancer`'s tools with the vendor/employee sides unlocked, plus vendor reports. | 27 |
+| `bookkeeper` | Everything except business: reports, budgets, scheduled transactions, prices, and investment lots. The personal-finance set. | 30 |
+| `investor` | Cost-basis tracking and price management only (a subset of `bookkeeper`). | 13 |
+| `business` | Customers, vendors, and employees; invoices, bills, vouchers, and credit notes; sales tax, payment terms, jobs, and vendor reports. | 27 |
 
 Pick one or more, comma-separated:
 
 ```json
 "args": ["--modules=bookkeeper"]            // personal finance
 "args": ["--modules=investor"]              // self-directed investor
-"args": ["--modules=freelancer"]            // solo contractor
-"args": ["--modules=business"]              // small business (= freelancer + business_complete)
-"args": ["--modules=bookkeeper,investor,freelancer"]  // most things
+"args": ["--modules=business"]              // invoicing, freelance or small business
+"args": ["--modules=bookkeeper,business"]   // everything (same as all)
 ```
 
-`core` is force-added regardless; the explicit listing in the
-examples above is for clarity. The leaf modules behind each
-group (`reconciliation`, `reporting`, `budgets`, `scheduling`,
-`tax_lots`, `portfolio`, etc.) are individually selectable too —
-run `uv run gnucash-mcp --help` from the repo for the full menu.
+`core` is added regardless. `freelancer` and `business_complete`,
+the names 1.4 used, are still accepted and mean `business`. The
+modules behind each role (`reconciliation`, `reporting`,
+`budgets`, `scheduling`, `tax_lots`, `portfolio`, etc.) are
+individually selectable too — run `uv run gnucash-mcp --help` from
+the repo for the full menu.
 
 ---
 
@@ -619,7 +460,7 @@ the dialog lists only the documents posted to the selected account.
 
 ## Privacy and safety
 
-**Your data does not leave your machine.** This server is a
+**Your book file never leaves your machine.** This server is a
 local process that reads and writes a local file. The AI
 assistant you're talking to (Claude Desktop, etc.) sees the
 results of your tool calls — the same content you'd see on
@@ -674,14 +515,34 @@ you which one it's doing.
 
 ---
 
+## Known limitations
+
+- **Don't edit in GnuCash desktop and through the server at the
+  same time.** The server respects GnuCash's lock but doesn't hold
+  one of its own (it opens the book for one call at a time), so
+  GnuCash won't warn you that the server is using the book.
+- **Books with "Use Trading Accounts" turned on:** transactions
+  across currencies or commodities, including stock and fund
+  purchases, are refused, because the server can't yet write
+  trading splits the way GnuCash does. Enter those in GnuCash
+  desktop; everything in a single currency works as usual.
+- **GnuCash 3.8 or newer.** A book the server has written to
+  carries a feature marker that GnuCash 3.0–3.7 can't open.
+- **Foreign-currency spending and income** are valued at each
+  month's closing rate in the spending and income reports, not at
+  the cash that paid for them; `cash_flow` reports the cash.
+
+The full list is in [CHANGELOG.md](CHANGELOG.md).
+
+---
+
 ## Limiting what the AI can see
 
 Each tool's description lives in the AI's system prompt, which
 costs context on every message. Narrowing the toolset to what
 you actually use makes every conversation cheaper. See
 [choosing a module set](#choosing-a-module-set) above for the
-five role-based options (`core`, `bookkeeper`, `investor`,
-`freelancer`, `business`).
+four roles (`core`, `bookkeeper`, `investor`, `business`).
 
 You can also set `GNUCASH_MCP_MODULES=core,bookkeeper` as an
 environment variable instead of `--modules=...` in the JSON
@@ -689,151 +550,30 @@ args.
 
 ---
 
-## What's new in v1.4.4
+## What's new in v1.5.0
 
-The statement is the call — the bulk-operations line closes with
-its capstone, and rehearsal spreads to every consequential write:
+- **Books in a database.** Point the server at a book GnuCash keeps
+  in PostgreSQL or MySQL/MariaDB, not just a SQLite file — see
+  [Or: keep the book in PostgreSQL or MySQL](#or-keep-the-book-in-postgresql-or-mysql).
+  PostgreSQL support was contributed by
+  [@vchatela](https://github.com/vchatela).
+- **Everything is stored the way GnuCash desktop stores it.**
+  Scheduled transactions run in desktop's Since Last Run, budgets,
+  invoices, credit notes, voids, and prices read the same in both,
+  and invoice totals match GnuCash's own to the cent. Upgrading
+  from 1.4? Read [the upgrade guide](docs/UPGRADING.md) first.
+- **Prepayments.** Record a customer's or vendor's overpayment as
+  money held for them, settle a later invoice from it, and unpost
+  a paid invoice without losing the payment.
+- **Num and document links** on every transaction tool, with the
+  number used as a duplicate check.
+- **A map of your chart of accounts** on the dashboard, so the
+  assistant knows where every account lives before it asks.
+- **Sample books built from source**, each checked against its own
+  country's tax practice (US/Washington, Germany, China) and
+  current to the day they're built.
 
-- **`enter_statement`** — a complete bank statement (opening
-  balance, closing balance, every line) enters, claims its
-  matches against transactions already in the book, and
-  reconciles in ONE atomic call. Dry-run first by default: every
-  line classified with side-by-side evidence, and a projected
-  balance tie that guarantees a rehearsal that ties is a commit
-  that will tie. No half-landed months, ever.
-- **Rehearsal everywhere** — `pay_document` gains `dry_run`
-  (proposed splits, FX and discount treatment, projected balance,
-  zero writes), and batch entry's dry-run shows self-contained
-  duplicate comparisons with a `review_required` status that
-  never masquerades as clearance.
-- **One-click install** — the MCPB bundle: download, double-click,
-  and Claude Desktop runs the server. Built by the project's first
-  CI on every PR.
-- **A surface that tells the truth about itself** — MCP
-  ToolAnnotations on every tool (read-only says so, destructive
-  says so), strict CLI arguments, a defined status vocabulary,
-  and a debt plan that names every debt it had to leave out.
-- **The un-blooming, completed in one release** — the tool
-  surface peaked at 111 and ships at 86: the business surface
-  consolidated (48 tools → 27, one polymorphic family per verb),
-  and the batch tools are now THE entry/update tools (the
-  singular create/update removed at full capability parity).
-
-**Tests:** 2,100+ passing, parallel by default (full suite < 40s).
-
-## What's new in v1.4.2
-
-One call wide, every surface honest — every entry traces to a
-named moment of live friction:
-
-- **The bulk grammar is complete** — `update_transactions`
-  (per-row TSV edits), broadcast updates (one change, many GUIDs),
-  `create_prices` (batch quotes + a stale-price work list), and a
-  `cur` column so foreign-denominated transactions batch-enter
-  like everything else.
-- **Reconciliation kept honest** — `reconcile_all` honors its
-  statement-date bound; a new `get_reconciliation_status` tool
-  drills down behind the dashboard's counts; statement-less
-  accounts opt out of nagging with the `no_reconcile` slot; paid-off
-  dormant cards stop warning forever.
-- **The dashboard hands each session its vocabulary** — your top
-  accounts by recent posting frequency, in short-GUID form, so the
-  AI reaches for compact refs from the first call.
-- **First outside code contribution** — @bhbrunt's price-lookup
-  memoization and split-graph preload took a 33k-split book's
-  summary from never-completing to under 10 seconds (and made
-  small books ~45% faster too).
-- **Audit trail hardened** — user text is escaped before it
-  reaches the audit log (no forged entries, no smuggled
-  instructions), price dry-runs agree with live execution, and
-  moving the date of a reconciled transaction now requires
-  `force=true` (behavior change).
-
-**Tests:** 1,954 passing.
-
-## What's new in v1.4.1
-
-Batch entry grows up, driven by the bookkeeper's daily workflow:
-
-- **The TSV header declares the layout** — opt-in `memo` columns
-  (per-split memos), a `notes` column (per-transaction notes), and
-  `qty` columns (investment shares / foreign-currency splits).
-  Legacy submissions parse unchanged; typo'd column names reject
-  by name; a row may simply end once its last split's amount and
-  account are present.
-- **Auto-fill from history** — a row with no split cells at all
-  reproduces your most recent transaction with that description,
-  marked with its source. Twelve recurring bills = twelve
-  ref-date-description rows; `dry_run` the batch to preview every
-  match first.
-- **Batch delete** — `delete_transaction` takes a list of GUIDs:
-  one call, one save, all-or-nothing.
-- **Every annotation field reachable** — notes + action on
-  invoice/bill/voucher/credit-note line items, a payment memo on
-  `pay_document`, account notes (shared with GnuCash desktop's
-  editor), and scheduled transactions that actually keep their
-  description.
-- **Find accounts without paging** — `query` on `list_accounts`
-  matches path and description, so "4930" finds the SKR03 account.
-- Plus the v1.4 adversarial-review hardening (transactional
-  `switch_book`, per-book backup scoping, i18n fixes) and
-  monthly-close valuation for flow reports.
-
-**Tests:** 1,856 passing.
-
-## What's in v1.4.0
-
-The release where batch transaction entry entered the scene.
-v1.3 finished the business
-module; v1.4 makes the server work correctly on non-English books,
-adds bulk and multi-book workflows, and lands a second
-multi-currency correctness pass.
-
-**Internationalization:**
-
-- Account resolution keys off `GNCAccountType`, never a localized
-  account *name* — so a `de_DE`, `es_MX`, or `zh_CN` book resolves
-  Income, Imbalance, and FX accounts correctly. Designated
-  accounts (FX gain/loss, discounts) self-heal via a KVP slot that
-  is locale- and rename-proof after first use.
-- Suspense / Imbalance accounts are excluded from runway and
-  low-cash signals so a lopsided book doesn't skew the dashboard.
-- Three synthetic personas ship in-repo: **Alex** (USD), **Lin
-  Wei** (CNY, zh_CN chart of accounts), and **Sabine Brenner**
-  (German DATEV SKR03, EUR) — the German book is what makes the
-  i18n bug class visible.
-
-**Batch and multi-book workflows:**
-
-- `create_transactions` enters many transactions in one atomic
-  call and returns a per-transaction result you can correlate back
-  by a caller-supplied `ref`, plus a duplicates table keyed to it.
-- `GNUCASH_BOOK_PATH` accepts an `os.pathsep`-separated list of
-  books; `switch_book` flips the active book mid-session (matched
-  by unique filename prefix) with a context-reset banner so
-  cross-book references don't leak.
-
-**Reporting:**
-
-- Every list-returning tool paginates with `offset` and a
-  `Showing X-Y of Z` indicator; dated tools also render the
-  covered date range.
-- The aggregation reports take `group_by` for sub-period columns.
-
-**Multi-currency correctness (second pass):**
-
-- FX gain/loss booked in the book's default currency, both-foreign
-  posting splits valued at the posting-date rate, and lot cost
-  basis in the default currency. Foreign debts with no FX rate are
-  excluded from `debt_payoff_plan` with a warning.
-- An FX entry-sanity warning fires when a cross-currency
-  transaction's implied rate diverges sharply from the latest
-  price on file.
-
-**Tests:** 1,714 passing.
-
-A condensed changelog of major releases lives in
-[CHANGELOG.md](CHANGELOG.md).
+Earlier releases are in [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
@@ -916,7 +656,7 @@ Contributor guide and design notes live in
 
 ```bash
 uv sync --extra dev
-uv run pytest                       # 2,100+ tests as of v1.4.4, parallel by default
+uv run pytest                       # 3,300+ tests as of v1.5.0, parallel by default
 uv run ruff check src/ tests/
 uv run black --check src/ tests/
 ```

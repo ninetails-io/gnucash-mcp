@@ -1178,7 +1178,7 @@ ruling 6.*
 | C20 three-decimal currencies shown at two | Listed. Display only. |
 | MM-12 budget report at one period-end rate | Listed. |
 | C26, C28, C32, C53, SS-17, DS-10, DS-11, DS-16, FC-14, SEC-17 | Listed, one line apiece. |
-| FC-18, FC-19, FC-20 | Listed. FC-19 is narrower than it was: the engine twins, the converter's false-positive test, and the GUI gate now run against rows GnuCash wrote. |
+| FC-18, FC-19, FC-20 | FC-18 closed by #202 (the demo books are built from source through the server's write paths). FC-19 and FC-20 listed. FC-19 is narrower than it was: the engine twins, the converter's false-positive test, and the GUI gate now run against rows GnuCash wrote. |
 | Side-findings 9, 11, 12 | Listed. |
 | Side-finding 13 (the 644.57) | The bookkeeper's, during the generator top-up. Not a server defect as far as anyone has shown. |
 | IV-20, IV-21, MM-10, SEC-15 (the narrowed fixes) | Listed, in one line. |

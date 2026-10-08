@@ -704,7 +704,7 @@ Established chokepoints and the rule each one owns:
   implied rate; nothing values inside it.
 - **From the 1.5 close-out (`fix/1.5.0-numbers`, 2026-10-05)**,
   each the one place its rule lives; status of every item is in
-  `specs/v1.5.1/README.md`:
+  `specs/v1.5/CLOSE_OUT.md`:
   - `_query_filtered_splits` decides a date range on the DECODED
     date. SQL takes the range with two days of slack (plus, on a
     SQLite book that holds them, every row in GnuCash 2.6's compact
@@ -767,7 +767,7 @@ Established chokepoints and the rule each one owns:
   books a realized FX split where GnuCash books none. What has to be
   built before the refusal lifts is listed in
   `specs/v1.5.1/README.md`; an engine twin decides when it has.
-- **From the scoped review (`specs/v1.5.1/review/`, 2026-10-05):**
+- **From the scoped review (`specs/v1.5/review/`, 2026-10-05):**
   `_pid_alive` (`_format.py`) is the ONE process probe — `os.kill(pid,
   0)` terminates the process on Windows, and the audit intent and the
   `gnclock` holder note both asked it (grep-locked). `_check_control_
@@ -781,7 +781,7 @@ Established chokepoints and the rule each one owns:
   it draws (Arabic, Indic, emoji, tag sequences) and drops it
   between Latin letters. Transaction dates bind through
   `_neutral_time` (`_date_bind`), not piecash's flat 10:59.
-- **From the second scoped review (`specs/v1.5.1/review/
+- **From the second scoped review (`specs/v1.5/review/
   SCOPED_REVIEW_2026-10-06.md`, four readers over the whole close-out
   diff):** `_check_one_line` is the rule for every name-like field
   (party, schedule, budget, bill term, job, lot title, document ID,

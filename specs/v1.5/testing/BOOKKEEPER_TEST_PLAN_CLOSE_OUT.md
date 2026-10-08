@@ -4,7 +4,7 @@ What the branch changed that a bookkeeper would see, as steps. Every
 item was unit-tested, and the business ones were checked against
 GnuCash's engine headlessly; this loop is the live server on a real
 book, and the windows only GnuCash can show. Status of every review
-item is in `specs/v1.5.1/README.md`.
+item is in `specs/v1.5/CLOSE_OUT.md`.
 
 **Server:** `fix/1.5.0-numbers` at its tip. Bounce it first.
 **Book:** a scratch copy of a multi-currency book (Alex), plus any
