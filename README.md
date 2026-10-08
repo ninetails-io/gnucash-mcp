@@ -155,12 +155,14 @@ customers invoiced in USD, EUR and CAD, a subcontractor billed
 through A/P, Washington B&O tax, scheduled bills, budgets —
 pretty much everything the server can do, all in one book.
 
-### `samples/lin-wei.gnucash` — Cross-border small business
+### `samples/lin-wei.gnucash` — Shenzhen software studio
 
-A Shenzhen-based small-business owner running a cross-border
-e-commerce operation. CNY-default, on a native zh_CN chart. 101
-accounts and about 3,000 transactions. Chinese-named customers
-paying in CNY, USD/EUR customers paying in foreign currency with
+A Shenzhen developer running a registered sole-proprietor studio
+that builds cross-border e-commerce software, with a spouse on a
+hospital payroll. CNY-default, on a native zh_CN chart. 101
+accounts and about 3,000 transactions. Shenzhen tech clients
+(Tencent, DJI, SF Tech and others) paying in CNY, USD/EUR clients
+paying in foreign currency with
 realized FX gain/loss on rate moves, domestic Chinese investments
 (宁德时代 and two ETFs), a part-time employee, an HKD credit card,
 a mortgage, and mixed payment rails (corporate account + Alipay +
@@ -360,16 +362,17 @@ string instead of a path:
 }
 ```
 
-Install the driver alongside the server from your clone — `postgres`
-or `mysql` (MariaDB uses the same one):
+Install the driver alongside the server — `postgres` or `mysql`
+(MariaDB uses the same one). From inside your clone (the
+`gnucash-mcp` folder):
 
 ```bash
-uv tool install -e "./gnucash-mcp[postgres]"
+uv tool install -e ".[postgres]" --reinstall
 ```
 
 For MySQL / MariaDB the connection string is
 `mysql+pymysql://user:password@localhost:3306/gnucash` and the extra
-is `[mysql]`: `uv tool install -e "./gnucash-mcp[mysql]"`.
+is `[mysql]`: `uv tool install -e ".[mysql]" --reinstall`.
 
 Install from the clone, as above, not by name: the name `gnucash-mcp`
 on PyPI belongs to a different project.
@@ -510,33 +513,31 @@ prints yours).
 
 `--modules=all` is the easy default — every tool, 86 of them.
 For day-to-day use you'll probably want less. Pick the role that
-matches how you'll talk to the server. Each role is a *group*
-that expands to the underlying tool modules; you can also pick
-the leaves individually for a finer cut.
+matches how you'll talk to the server; you can also pick the
+modules behind each role individually for a finer cut.
 
 | Role | What it gives you | Tools |
 |---|---|---|
 | `core` | Ledger primitives — accounts, transactions, balances, slots, audit log, backups, balance sheet, **reconciliation**. **Always loaded.** | 29 |
-| `bookkeeper` | Run reports, manage budgets, schedule recurring transactions. The personal-finance management cluster. (Reconciliation moved into core — any configuration that handles money needs it.) | 17 |
-| `investor` | Cost-basis tracking + price/commodity management. Tax-lot accounting needs prices to compute gains, so the bundle is the useful unit. | 12 |
-| `freelancer` | Party + document management (polymorphic: customers by default; vendors/employees unlock with `business_complete`), sales tax, billterms, jobs, credit notes. The full solo-consultant toolkit. | 26 |
-| `business` | Full small-business package — group alias: `freelancer`'s tools with the vendor/employee sides unlocked, plus vendor reports. | 27 |
+| `bookkeeper` | Everything except business: reports, budgets, scheduled transactions, prices, and investment lots. The personal-finance set. | 30 |
+| `investor` | Cost-basis tracking and price management only (a subset of `bookkeeper`). | 13 |
+| `business` | Customers, vendors, and employees; invoices, bills, vouchers, and credit notes; sales tax, payment terms, jobs, and vendor reports. | 27 |
 
 Pick one or more, comma-separated:
 
 ```json
 "args": ["--modules=bookkeeper"]            // personal finance
 "args": ["--modules=investor"]              // self-directed investor
-"args": ["--modules=freelancer"]            // solo contractor
-"args": ["--modules=business"]              // small business (= freelancer + business_complete)
-"args": ["--modules=bookkeeper,investor,freelancer"]  // most things
+"args": ["--modules=business"]              // invoicing, freelance or small business
+"args": ["--modules=bookkeeper,business"]   // everything (same as all)
 ```
 
-`core` is force-added regardless; the explicit listing in the
-examples above is for clarity. The leaf modules behind each
-group (`reconciliation`, `reporting`, `budgets`, `scheduling`,
-`tax_lots`, `portfolio`, etc.) are individually selectable too —
-run `uv run gnucash-mcp --help` from the repo for the full menu.
+`core` is added regardless. `freelancer` and `business_complete`,
+the names 1.4 used, are still accepted and mean `business`. The
+modules behind each role (`reconciliation`, `reporting`,
+`budgets`, `scheduling`, `tax_lots`, `portfolio`, etc.) are
+individually selectable too — run `uv run gnucash-mcp --help` from
+the repo for the full menu.
 
 ---
 
@@ -683,14 +684,34 @@ you which one it's doing.
 
 ---
 
+## Known limitations
+
+- **Don't edit in GnuCash desktop and through the server at the
+  same time.** The server respects GnuCash's lock but doesn't hold
+  one of its own (it opens the book for one call at a time), so
+  GnuCash won't warn you that the server is using the book.
+- **Books with "Use Trading Accounts" turned on:** transactions
+  across currencies or commodities, including stock and fund
+  purchases, are refused, because the server can't yet write
+  trading splits the way GnuCash does. Enter those in GnuCash
+  desktop; everything in a single currency works as usual.
+- **GnuCash 3.8 or newer.** A book the server has written to
+  carries a feature marker that GnuCash 3.0–3.7 can't open.
+- **Foreign-currency spending and income** are valued at each
+  month's closing rate in the spending and income reports, not at
+  the cash that paid for them; `cash_flow` reports the cash.
+
+The full list is in [CHANGELOG.md](CHANGELOG.md).
+
+---
+
 ## Limiting what the AI can see
 
 Each tool's description lives in the AI's system prompt, which
 costs context on every message. Narrowing the toolset to what
 you actually use makes every conversation cheaper. See
 [choosing a module set](#choosing-a-module-set) above for the
-five role-based options (`core`, `bookkeeper`, `investor`,
-`freelancer`, `business`).
+four roles (`core`, `bookkeeper`, `investor`, `business`).
 
 You can also set `GNUCASH_MCP_MODULES=core,bookkeeper` as an
 environment variable instead of `--modules=...` in the JSON
@@ -698,151 +719,30 @@ args.
 
 ---
 
-## What's new in v1.4.4
+## What's new in v1.5.0
 
-The statement is the call — the bulk-operations line closes with
-its capstone, and rehearsal spreads to every consequential write:
+- **Books in a database.** Point the server at a book GnuCash keeps
+  in PostgreSQL or MySQL/MariaDB, not just a SQLite file — see
+  [Or: keep the book in PostgreSQL or MySQL](#or-keep-the-book-in-postgresql-or-mysql).
+  PostgreSQL support was contributed by
+  [@vchatela](https://github.com/vchatela).
+- **Everything is stored the way GnuCash desktop stores it.**
+  Scheduled transactions run in desktop's Since Last Run, budgets,
+  invoices, credit notes, voids, and prices read the same in both,
+  and invoice totals match GnuCash's own to the cent. Upgrading
+  from 1.4? Read [the upgrade guide](docs/UPGRADING.md) first.
+- **Prepayments.** Record a customer's or vendor's overpayment as
+  money held for them, settle a later invoice from it, and unpost
+  a paid invoice without losing the payment.
+- **Num and document links** on every transaction tool, with the
+  number used as a duplicate check.
+- **A map of your chart of accounts** on the dashboard, so the
+  assistant knows where every account lives before it asks.
+- **Sample books built from source**, each checked against its own
+  country's tax practice (US/Washington, Germany, China) and
+  current to the day they're built.
 
-- **`enter_statement`** — a complete bank statement (opening
-  balance, closing balance, every line) enters, claims its
-  matches against transactions already in the book, and
-  reconciles in ONE atomic call. Dry-run first by default: every
-  line classified with side-by-side evidence, and a projected
-  balance tie that guarantees a rehearsal that ties is a commit
-  that will tie. No half-landed months, ever.
-- **Rehearsal everywhere** — `pay_document` gains `dry_run`
-  (proposed splits, FX and discount treatment, projected balance,
-  zero writes), and batch entry's dry-run shows self-contained
-  duplicate comparisons with a `review_required` status that
-  never masquerades as clearance.
-- **One-click install** — the MCPB bundle: download, double-click,
-  and Claude Desktop runs the server. Built by the project's first
-  CI on every PR.
-- **A surface that tells the truth about itself** — MCP
-  ToolAnnotations on every tool (read-only says so, destructive
-  says so), strict CLI arguments, a defined status vocabulary,
-  and a debt plan that names every debt it had to leave out.
-- **The un-blooming, completed in one release** — the tool
-  surface peaked at 111 and ships at 86: the business surface
-  consolidated (48 tools → 27, one polymorphic family per verb),
-  and the batch tools are now THE entry/update tools (the
-  singular create/update removed at full capability parity).
-
-**Tests:** 2,100+ passing, parallel by default (full suite < 40s).
-
-## What's new in v1.4.2
-
-One call wide, every surface honest — every entry traces to a
-named moment of live friction:
-
-- **The bulk grammar is complete** — `update_transactions`
-  (per-row TSV edits), broadcast updates (one change, many GUIDs),
-  `create_prices` (batch quotes + a stale-price work list), and a
-  `cur` column so foreign-denominated transactions batch-enter
-  like everything else.
-- **Reconciliation kept honest** — `reconcile_all` honors its
-  statement-date bound; a new `get_reconciliation_status` tool
-  drills down behind the dashboard's counts; statement-less
-  accounts opt out of nagging with the `no_reconcile` slot; paid-off
-  dormant cards stop warning forever.
-- **The dashboard hands each session its vocabulary** — your top
-  accounts by recent posting frequency, in short-GUID form, so the
-  AI reaches for compact refs from the first call.
-- **First outside code contribution** — @bhbrunt's price-lookup
-  memoization and split-graph preload took a 33k-split book's
-  summary from never-completing to under 10 seconds (and made
-  small books ~45% faster too).
-- **Audit trail hardened** — user text is escaped before it
-  reaches the audit log (no forged entries, no smuggled
-  instructions), price dry-runs agree with live execution, and
-  moving the date of a reconciled transaction now requires
-  `force=true` (behavior change).
-
-**Tests:** 1,954 passing.
-
-## What's new in v1.4.1
-
-Batch entry grows up, driven by the bookkeeper's daily workflow:
-
-- **The TSV header declares the layout** — opt-in `memo` columns
-  (per-split memos), a `notes` column (per-transaction notes), and
-  `qty` columns (investment shares / foreign-currency splits).
-  Legacy submissions parse unchanged; typo'd column names reject
-  by name; a row may simply end once its last split's amount and
-  account are present.
-- **Auto-fill from history** — a row with no split cells at all
-  reproduces your most recent transaction with that description,
-  marked with its source. Twelve recurring bills = twelve
-  ref-date-description rows; `dry_run` the batch to preview every
-  match first.
-- **Batch delete** — `delete_transaction` takes a list of GUIDs:
-  one call, one save, all-or-nothing.
-- **Every annotation field reachable** — notes + action on
-  invoice/bill/voucher/credit-note line items, a payment memo on
-  `pay_document`, account notes (shared with GnuCash desktop's
-  editor), and scheduled transactions that actually keep their
-  description.
-- **Find accounts without paging** — `query` on `list_accounts`
-  matches path and description, so "4930" finds the SKR03 account.
-- Plus the v1.4 adversarial-review hardening (transactional
-  `switch_book`, per-book backup scoping, i18n fixes) and
-  monthly-close valuation for flow reports.
-
-**Tests:** 1,856 passing.
-
-## What's in v1.4.0
-
-The release where batch transaction entry entered the scene.
-v1.3 finished the business
-module; v1.4 makes the server work correctly on non-English books,
-adds bulk and multi-book workflows, and lands a second
-multi-currency correctness pass.
-
-**Internationalization:**
-
-- Account resolution keys off `GNCAccountType`, never a localized
-  account *name* — so a `de_DE`, `es_MX`, or `zh_CN` book resolves
-  Income, Imbalance, and FX accounts correctly. Designated
-  accounts (FX gain/loss, discounts) self-heal via a KVP slot that
-  is locale- and rename-proof after first use.
-- Suspense / Imbalance accounts are excluded from runway and
-  low-cash signals so a lopsided book doesn't skew the dashboard.
-- Three synthetic personas ship in-repo: **Alex** (USD), **Lin
-  Wei** (CNY, zh_CN chart of accounts), and **Sabine Brenner**
-  (German DATEV SKR03, EUR) — the German book is what makes the
-  i18n bug class visible.
-
-**Batch and multi-book workflows:**
-
-- `create_transactions` enters many transactions in one atomic
-  call and returns a per-transaction result you can correlate back
-  by a caller-supplied `ref`, plus a duplicates table keyed to it.
-- `GNUCASH_BOOK_PATH` accepts an `os.pathsep`-separated list of
-  books; `switch_book` flips the active book mid-session (matched
-  by unique filename prefix) with a context-reset banner so
-  cross-book references don't leak.
-
-**Reporting:**
-
-- Every list-returning tool paginates with `offset` and a
-  `Showing X-Y of Z` indicator; dated tools also render the
-  covered date range.
-- The aggregation reports take `group_by` for sub-period columns.
-
-**Multi-currency correctness (second pass):**
-
-- FX gain/loss booked in the book's default currency, both-foreign
-  posting splits valued at the posting-date rate, and lot cost
-  basis in the default currency. Foreign debts with no FX rate are
-  excluded from `debt_payoff_plan` with a warning.
-- An FX entry-sanity warning fires when a cross-currency
-  transaction's implied rate diverges sharply from the latest
-  price on file.
-
-**Tests:** 1,714 passing.
-
-A condensed changelog of major releases lives in
-[CHANGELOG.md](CHANGELOG.md).
+Earlier releases are in [CHANGELOG.md](CHANGELOG.md).
 
 ---
 

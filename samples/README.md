@@ -92,8 +92,9 @@ Audited as an IRS-minded read four times, 2026-09-11 to 09-17
 
 ## lin-wei.gnucash (林微)
 
-Shenzhen cross-border e-commerce seller whose spouse (周子航) is on a
-hospital payroll. A **native zh_CN chart, CNY default**, with USD,
+Shenzhen developer whose registered studio (个体工商户) builds
+cross-border e-commerce software for Shenzhen tech clients and two
+foreign ones; her spouse (周子航) is on a hospital payroll. A **native zh_CN chart, CNY default**, with USD,
 EUR and HKD in the book. Built: about 2,950 transactions, 101
 accounts.
 
