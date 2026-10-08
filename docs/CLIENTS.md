@@ -17,9 +17,9 @@ The second command gives you a `gnucash-mcp` command (in
 `~/.local/bin`) with its dependencies in a private environment —
 your other Python projects never see them. The `-e` makes it an
 *updatable* install: the command runs whatever code is in your
-clone, so updating is `git pull` plus a server restart. The one
-exception: if an update changes *dependencies*, run
-`uv tool install -e ./gnucash-mcp --reinstall` once.
+clone, so updating is `git pull` (inside the clone) plus a server
+restart. The one exception: if an update changes *dependencies*,
+also run `uv tool install -e . --reinstall` there, once.
 
 > If you don't have `uv`, install it with one line:
 > `curl -LsSf https://astral.sh/uv/install.sh | sh`
