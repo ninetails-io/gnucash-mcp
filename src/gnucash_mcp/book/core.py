@@ -170,13 +170,17 @@ class _SummaryData:
     other_liab_total: Decimal = Decimal("0")
 
     # Chart map: one entry per top-level account (direct child of
-    # ROOT), each with its second-level children. Counts are of the
-    # subtree INCLUDING the branch node, split into active (not
-    # hidden, by ``_is_hidden``'s inherited rule) and hidden, so
-    # ``active + hidden`` is exactly what ``list_accounts(root=
-    # <branch>)`` returns under the same template filter.
+    # ROOT), each with its second-level children. Branch counts are
+    # TOTALS of the subtree INCLUDING the branch node (hidden ones
+    # by ``_is_hidden``'s inherited rule called out beside them), so
+    # every count is exactly what ``list_accounts(root=<branch>)``
+    # returns under the same template filter. The header adds how
+    # many accounts are active: the account, or one under it,
+    # carries a split (a placeholder parent of used accounts is in
+    # use; an account nothing has ever posted to is not).
     chart: list["_ChartBranch"] = field(default_factory=list)
-    chart_active: int = 0
+    chart_total: int = 0
+    chart_active_guids: set = field(default_factory=set)
     chart_hidden: int = 0
 
 
@@ -2868,10 +2872,11 @@ class CoreMixin:
             return
         lineage.reverse()  # top-level first
         hidden = _is_hidden(account)
+        data.chart_total += 1
         if hidden:
             data.chart_hidden += 1
-        else:
-            data.chart_active += 1
+        if account.splits:
+            data.chart_active_guids.update(a.guid for a in lineage)
 
         top = lineage[0]
         branch = branches.get(top.guid)
@@ -2912,12 +2917,16 @@ class CoreMixin:
         return ordered
 
     @staticmethod
-    def _chart_count_label(active: int, hidden: int) -> str:
-        if hidden and active:
-            return f"{active}, +{hidden} hidden"
+    def _chart_count_label(total: int, hidden: int, word: str = "") -> str:
+        """A branch's count: its total, which is what
+        ``list_accounts(root=…)`` lists, with any hidden share named.
+        ``word`` ("total") marks a top-level branch."""
+        n = f"{total} {word}".rstrip()
+        if hidden and hidden == total and not word:
+            return f"{hidden} hidden"
         if hidden:
-            return f"+{hidden} hidden"
-        return str(active)
+            return f"{n}, {hidden} hidden"
+        return n
 
     def _render_chart_map(self, data: _SummaryData) -> list[str]:
         """Render the chart of accounts as one tree, depth two.
@@ -2940,7 +2949,7 @@ class CoreMixin:
         lines: list[str] = []
         example: str | None = None
         for branch in data.chart:
-            label = f"{_one_line(branch.fullname)} ({self._chart_count_label(branch.active, branch.hidden)})"
+            label = f"{_one_line(branch.fullname)} ({self._chart_count_label(branch.total, branch.hidden, 'total')})"
             sub = [c for c in branch.children if c.total > 1]
             cls = _CHART_TYPE_ORDER.get(branch.type, 6)
             elided = False
@@ -2951,7 +2960,7 @@ class CoreMixin:
                 example = sub[0].fullname
             parts = [
                 f"{_one_line(c.fullname.split(':')[-1])} "
-                f"({self._chart_count_label(c.active, c.hidden)})"
+                f"({self._chart_count_label(c.total, c.hidden)})"
                 for c in sub
             ]
             if elided:
@@ -2962,8 +2971,9 @@ class CoreMixin:
         if example is None and data.chart:
             example = data.chart[0].fullname
         head = (
-            f"Chart of accounts ({data.chart_active} active"
-            + (f", +{data.chart_hidden} hidden" if data.chart_hidden else "")
+            f"Chart of accounts: {data.chart_total} total "
+            f"({len(data.chart_active_guids)} active"
+            + (f", {data.chart_hidden} hidden" if data.chart_hidden else "")
             + ")"
         )
         if example is not None:
