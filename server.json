@@ -1,0 +1,21 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.ninetails-io/gnucash-mcp",
+  "title": "gnucash-mcp",
+  "description": "Talk to your GnuCash books: a financial dashboard, statements reconciled in one call, and invoicing.",
+  "repository": {
+    "url": "https://github.com/ninetails-io/gnucash-mcp",
+    "source": "github"
+  },
+  "version": "1.5.0",
+  "packages": [
+    {
+      "registryType": "mcpb",
+      "identifier": "https://github.com/ninetails-io/gnucash-mcp/releases/download/v1.5.0/gnucash-mcp-1.5.0.mcpb",
+      "fileSha256": "de2d74478d6e6ff6feec1ba27fa4a2b8b97bfeb0aa1bbd518f874b29651c0e57",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}
