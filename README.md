@@ -27,10 +27,13 @@ sends a bill.
 
 Three realistic sample books let you try it before you commit
 anything: full years of activity, mixed currencies, customers,
-invoices, and budgets. The Claude Desktop bundle includes them;
-from a clone, [one command builds them](samples/README.md). Walk
-through one in five minutes; if it clicks, point the server at
-your own book and you're done.
+invoices, and budgets. The Claude Desktop bundle includes them,
+though its installer asks for one book of your own first; an
+empty book saved from GnuCash is enough
+([how](#install-in-one-click-claude-desktop)). From a clone,
+[one command builds them](samples/README.md). Walk through one
+in five minutes; if it clicks, point the server at your own book
+and you're done.
 
 ---
 
@@ -133,8 +136,10 @@ You don't need to be a developer. You need:
 
 The repo ships three sample personas — synthetic ledgers you can
 talk to without touching your real data. The bundle carries them
-fully built; from a clone, [one command builds them](samples/README.md).
-Pick one, point the server at it, and start asking questions.
+fully built (its installer still asks for a book of your own; see
+[the install steps](#install-in-one-click-claude-desktop)); from a
+clone, [one command builds them](samples/README.md). Pick one,
+point the server at it, and start asking questions.
 
 ### `samples/alex-chen-morales.gnucash` — Personal + freelance
 
@@ -188,9 +193,13 @@ things:
   SQLite format; if yours is the older XML format, do the
   [one-time conversion](#one-time-conversion-gnucash-file-format)
   first. Pick several books to switch between them in-chat.
+  The picker is required. To try the server before giving it
+  your real book, make an empty one in GnuCash (**File → New**,
+  then **File → Save As** with the **sqlite3** format) and pick
+  that.
 - **Demo books** — one checkbox serves the three sample books
   described above, so you can explore on fictional money before
-  (or instead of) connecting your own.
+  connecting your own. Say "switch to the alex book" in chat.
 - **"Do you invoice clients?"** — yes adds the business suite
   (customer invoices, vendor bills, employee expenses).
   Everything else — budgets, scheduled transactions, investment
