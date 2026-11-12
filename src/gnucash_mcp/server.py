@@ -2376,7 +2376,43 @@ def main() -> None:
         debug_log(f"Modules: {modules_display}")
         debug_log(f"Tools loaded: {tool_count}")
 
-    mcp.run()
+    _run_server()
+
+
+def _run_server() -> None:
+    """Start the server on the transport named by the environment.
+
+    Defaults to stdio, so existing stdio launchers are unaffected. The
+    networked transports exist so one long-lived process can serve several
+    clients instead of one process per client.
+
+    GNUCASH_MCP_TRANSPORT  stdio (default) | sse | streamable-http
+    GNUCASH_MCP_HOST       bind address for the networked transports
+                           (default 127.0.0.1)
+    GNUCASH_MCP_PORT       bind port for the networked transports
+                           (default 8000)
+
+    The host default is loopback on purpose: this server exposes tools that
+    write to the book and the HTTP transports carry no authentication, so
+    binding anywhere reachable has to be a deliberate act.
+    """
+    valid = ("stdio", "sse", "streamable-http")
+    transport = os.environ.get("GNUCASH_MCP_TRANSPORT", "stdio").strip().lower()
+    if transport not in valid:
+        raise SystemExit(
+            f"GNUCASH_MCP_TRANSPORT must be one of {', '.join(valid)} "
+            f"(got {transport!r})"
+        )
+
+    if transport != "stdio":
+        mcp.settings.host = os.environ.get("GNUCASH_MCP_HOST", "127.0.0.1")
+        port_raw = os.environ.get("GNUCASH_MCP_PORT", "8000")
+        try:
+            mcp.settings.port = int(port_raw)
+        except ValueError:
+            raise SystemExit(f"GNUCASH_MCP_PORT must be an integer (got {port_raw!r})")
+
+    mcp.run(transport=transport)
 
 
 if __name__ == "__main__":
