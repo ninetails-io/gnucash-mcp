@@ -2391,6 +2391,12 @@ def _run_server() -> None:
                            (default 127.0.0.1)
     GNUCASH_MCP_PORT       bind port for the networked transports
                            (default 8000)
+    GNUCASH_MCP_ALLOWED_HOSTS
+                           comma-separated Host headers to accept. Defaults
+                           to the bind address, with and without the port.
+                           Set this when reaching the server through a proxy
+                           or a hostname, which would otherwise be refused
+                           by the DNS-rebinding protection.
 
     The host default is loopback on purpose: this server exposes tools that
     write to the book and the HTTP transports carry no authentication, so
@@ -2405,12 +2411,31 @@ def _run_server() -> None:
         )
 
     if transport != "stdio":
-        mcp.settings.host = os.environ.get("GNUCASH_MCP_HOST", "127.0.0.1")
+        from mcp.server.transport_security import TransportSecuritySettings
+
+        host = os.environ.get("GNUCASH_MCP_HOST", "127.0.0.1")
         port_raw = os.environ.get("GNUCASH_MCP_PORT", "8000")
         try:
-            mcp.settings.port = int(port_raw)
+            port = int(port_raw)
         except ValueError:
             raise SystemExit(f"GNUCASH_MCP_PORT must be an integer (got {port_raw!r})")
+
+        mcp.settings.host = host
+        mcp.settings.port = port
+
+        # DNS-rebinding protection refuses any Host header it was not told
+        # about, and the default list does not include whatever address we
+        # were asked to bind to. Trust that address by default so binding to
+        # a LAN or VPN interface works as expected; the env var is the escape
+        # hatch for a proxy or a hostname.
+        configured = os.environ.get("GNUCASH_MCP_ALLOWED_HOSTS", "")
+        allowed = [h.strip() for h in configured.split(",") if h.strip()]
+        if not allowed:
+            allowed = [f"{host}:{port}", host]
+        mcp.settings.transport_security = TransportSecuritySettings(
+            allowed_hosts=allowed,
+            allowed_origins=allowed + [f"http://{h}" for h in allowed],
+        )
 
     mcp.run(transport=transport)
 
